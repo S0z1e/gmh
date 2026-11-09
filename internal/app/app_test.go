@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"minimalharness/internal/agent"
+	"minimalharness/internal/tools"
 )
 
 func mockServer(t *testing.T) *httptest.Server {
@@ -210,6 +211,49 @@ func TestRunnerNoCostWithoutRates(t *testing.T) {
 	}
 	if !strings.Contains(joined, "fee: OpenConsole 實價未驗證") {
 		t.Fatalf("unverified label missing: %v", printed)
+	}
+}
+
+// /jobs lists background jobs: none, then running, then done with exit code.
+func TestRunnerJobsCommand(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	root := t.TempDir()
+	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	var printed []string
+	r := &Runner{App: a, Print: func(format string, args ...any) {
+		printed = append(printed, fmt.Sprintf(format, args...))
+	}}
+	if quit := r.Handle(context.Background(), "/jobs"); quit {
+		t.Fatal("/jobs should not quit")
+	}
+	if !strings.Contains(strings.Join(printed, "\n"), "No background jobs.") {
+		t.Fatalf("/jobs with no jobs printed: %v", printed)
+	}
+	job, err := a.Cfg.Exec.BashBackground(context.Background(), tools.BashArgs{Command: "sleep 2; echo done"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	printed = nil
+	if quit := r.Handle(context.Background(), "/jobs"); quit {
+		t.Fatal("/jobs should not quit")
+	}
+	joined := strings.Join(printed, "\n")
+	if !strings.Contains(joined, "bg-1") || !strings.Contains(joined, "running") || !strings.Contains(joined, "sleep 2") {
+		t.Fatalf("/jobs should list the running job: %v", printed)
+	}
+	<-job.Done()
+	printed = nil
+	if quit := r.Handle(context.Background(), "/jobs"); quit {
+		t.Fatal("/jobs should not quit")
+	}
+	joined = strings.Join(printed, "\n")
+	if !strings.Contains(joined, "bg-1") || !strings.Contains(joined, "done") || !strings.Contains(joined, "exit 0") {
+		t.Fatalf("/jobs should list the finished job with exit 0: %v", printed)
 	}
 }
 

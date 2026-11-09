@@ -32,6 +32,7 @@ func main() {
 		ui        = flag.String("ui", "auto", "ui: auto, plain or tui (ignored by -p, which is always plain)")
 		deny      = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1; -p always denies)")
 		bashTO    = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 60, or env OPENAI_BASH_TIMEOUT_SECONDS)")
+		bgThresh  = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 10s default, 0 = never)")
 	)
 	flag.Parse()
 
@@ -44,7 +45,7 @@ func main() {
 			fatal(err)
 		}
 		if uiMode == "tui" {
-			if err := execTUI(*root, *mode, *model, *api, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO); err != nil {
+			if err := execTUI(*root, *mode, *model, *api, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh); err != nil {
 				fmt.Fprintf(os.Stderr, "harness: TUI unavailable (%v); continuing in plain mode.\n", err)
 			}
 			// execTUI replaces this process on success; reaching here
@@ -55,16 +56,18 @@ func main() {
 	}
 
 	a, err := app.Setup(app.Params{
-		Root:                *root,
-		Mode:                *mode,
-		Model:               *model,
-		API:                 *api,
-		MaxSteps:            *maxSteps,
-		ContextLimit:        *ctxLimit,
-		Resume:              *resume,
-		SessionID:           *sessionID,
-		DenyInsteadOfPrompt: *deny || *printMode != "",
-		BashTimeoutSeconds:  *bashTO,
+		Root:                       *root,
+		Mode:                       *mode,
+		Model:                      *model,
+		API:                        *api,
+		MaxSteps:                   *maxSteps,
+		ContextLimit:               *ctxLimit,
+		Resume:                     *resume,
+		SessionID:                  *sessionID,
+		DenyInsteadOfPrompt:        *deny || *printMode != "",
+		BashTimeoutSeconds:         *bashTO,
+		BackgroundThresholdSeconds: *bgThresh,
+		DisableBackground:          *printMode != "",
 	})
 	if err != nil {
 		fatal(err)
@@ -85,10 +88,22 @@ func main() {
 		case agent.EventTextDelta:
 			fmt.Print(ev.Text)
 			textPending = true
-		default:
-			if textPending {
-				fmt.Println()
-				textPending = false
+			return
+		}
+		if textPending {
+			fmt.Println()
+			textPending = false
+		}
+		switch ev.Kind {
+		case agent.EventToolBackgrounded:
+			fmt.Printf("… bash running in background (%s)\n", ev.JobID)
+		case agent.EventBackgroundWait:
+			fmt.Printf("waiting for background jobs: %s\n", ev.Text)
+		case agent.EventToolBackgroundDone:
+			if ev.ToolErr != nil {
+				fmt.Printf("background job %s finished with error: %v\n", ev.JobID, ev.ToolErr)
+			} else {
+				fmt.Printf("background job %s finished\n", ev.JobID)
 			}
 		}
 	}
@@ -106,7 +121,7 @@ func main() {
 	}
 
 	// REPL
-	fmt.Println("Type a task, /skill:<name> to load a skill, /usage for session totals, /clear to drop context, /compact to summarise context, or /quit to exit.")
+	fmt.Println("Type a task, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /clear to drop context, /compact to summarise context, or /quit to exit.")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for {
@@ -123,7 +138,7 @@ func main() {
 // execTUI replaces this process with the sibling harness-tui binary,
 // passing the same flags through. It returns only if the sibling cannot
 // be started (then the caller falls back to plain mode).
-func execTUI(root, mode, model, api string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO int) error {
+func execTUI(root, mode, model, api string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -144,6 +159,7 @@ func execTUI(root, mode, model, api string, maxSteps int, resume, sessionID stri
 		"-context-limit", strconv.Itoa(ctxLimit),
 		"-deny-instead-of-prompt", strconv.FormatBool(deny),
 		"-bash-timeout", strconv.Itoa(bashTO),
+		"-bg-threshold", strconv.Itoa(bgThresh),
 	}
 	return syscall.Exec(sibling, args, os.Environ())
 }

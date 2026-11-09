@@ -33,6 +33,13 @@ type Params struct {
 	// BashTimeoutSeconds overrides the default 60s bash timeout
 	// (0 = default, or OPENAI_BASH_TIMEOUT_SECONDS).
 	BashTimeoutSeconds int
+	// BackgroundThresholdSeconds is how long a bash call runs before
+	// the loop backgrounds it: -1 = unset (env OPENAI_BG_THRESHOLD_SECONDS
+	// or the 10s default), 0 = never background, >0 = seconds.
+	BackgroundThresholdSeconds int
+	// DisableBackground turns backgrounding off entirely. -p print
+	// mode sets it: a one-shot run stays synchronous.
+	DisableBackground bool
 }
 
 type App struct {
@@ -125,6 +132,28 @@ func Setup(p Params) (*App, error) {
 	}
 	executor.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 
+	// Background threshold: flag wins, else env, else the 10s default.
+	// 0 disables backgrounding; -p disables it outright.
+	bgThreshold := tools.DefaultBackgroundThreshold
+	if p.BackgroundThresholdSeconds == 0 {
+		bgThreshold = 0
+	} else if p.BackgroundThresholdSeconds > 0 {
+		bgThreshold = time.Duration(p.BackgroundThresholdSeconds) * time.Second
+	} else if v := os.Getenv("OPENAI_BG_THRESHOLD_SECONDS"); v != "" {
+		var secs int
+		if _, err := fmt.Sscanf(v, "%d", &secs); err == nil {
+			if secs == 0 {
+				bgThreshold = 0
+			} else if secs > 0 {
+				bgThreshold = time.Duration(secs) * time.Second
+			}
+		}
+	}
+	if p.DisableBackground {
+		bgThreshold = 0
+	}
+	executor.BackgroundThreshold = bgThreshold
+
 	deny := p.DenyInsteadOfPrompt
 	if v := os.Getenv("OPENAI_DENY_INSTEAD_OF_PROMPT"); v == "1" || strings.EqualFold(v, "true") {
 		deny = true
@@ -195,6 +224,9 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 	case "/usage":
 		r.Print("[usage] session: %s | %s", r.SessionUsage, r.costLine(r.SessionCost))
 		return false
+	case "/jobs":
+		r.printJobs()
+		return false
 	case "/clear":
 		if err := r.App.Store.Clear(); err != nil {
 			r.Print("[error] %v", err)
@@ -209,6 +241,30 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 	}
 	r.runOnce(ctx, line)
 	return false
+}
+
+// printJobs lists the background bash jobs of this process, oldest
+// first: id, status, elapsed time, command, and exit code once done.
+func (r *Runner) printJobs() {
+	jobs := r.App.Cfg.Exec.Jobs()
+	if len(jobs) == 0 {
+		r.Print("No background jobs.")
+		return
+	}
+	for _, j := range jobs {
+		cmd := j.Command
+		if len(cmd) > 80 {
+			cmd = cmd[:77] + "…"
+		}
+		line := fmt.Sprintf("%s  %s  %s  %s", j.ID, j.Status(), j.Elapsed().Round(time.Second), cmd)
+		if res, ok := j.Result(); ok {
+			line += fmt.Sprintf("  exit %d", res.ExitCode)
+			if res.Err != nil {
+				line += fmt.Sprintf("  (%v)", res.Err)
+			}
+		}
+		r.Print("%s", line)
+	}
 }
 
 func (r *Runner) runOnce(ctx context.Context, task string) {

@@ -28,6 +28,7 @@ func main() {
 		ctxLimit  = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT or 1048576)")
 		deny      = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1)")
 		bashTO    = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 60, or env OPENAI_BASH_TIMEOUT_SECONDS)")
+		bgThresh  = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 10s default, 0 = never)")
 	)
 	flag.Parse()
 
@@ -38,16 +39,17 @@ func main() {
 	}
 
 	a, err := app.Setup(app.Params{
-		Root:                *root,
-		Mode:                *mode,
-		Model:               *model,
-		API:                 *api,
-		MaxSteps:            *maxSteps,
-		ContextLimit:        *ctxLimit,
-		Resume:              *resume,
-		SessionID:           *sessionID,
-		DenyInsteadOfPrompt: *deny,
-		BashTimeoutSeconds:  *bashTO,
+		Root:                       *root,
+		Mode:                       *mode,
+		Model:                      *model,
+		API:                        *api,
+		MaxSteps:                   *maxSteps,
+		ContextLimit:               *ctxLimit,
+		Resume:                     *resume,
+		SessionID:                  *sessionID,
+		DenyInsteadOfPrompt:        *deny,
+		BashTimeoutSeconds:         *bashTO,
+		BackgroundThresholdSeconds: *bgThresh,
 	})
 	if err != nil {
 		fatal(err)
@@ -56,7 +58,7 @@ func main() {
 
 	// Header lines go into the model's initial view: prog.Println before
 	// prog.Run() would block forever (the event loop hasn't started).
-	info := fmt.Sprintf("harness-tui  api=%s  model=%s  root=%s  mode=%s  session=%s\nType a task, /skill:<name>, /usage, /clear, /compact, or /quit. Ctrl-C quits.", a.Cfg.Client.API, a.Cfg.Client.Model, a.Root, a.Cfg.Mode, a.Store.ID)
+	info := fmt.Sprintf("harness-tui  api=%s  model=%s  root=%s  mode=%s  session=%s\nType a task, /skill:<name>, /usage, /jobs, /clear, /compact, or /quit. Ctrl-C quits.", a.Cfg.Client.API, a.Cfg.Client.Model, a.Root, a.Cfg.Mode, a.Store.ID)
 	if a.ResumedMessage != "" {
 		info = a.ResumedMessage + "\n" + info
 	}

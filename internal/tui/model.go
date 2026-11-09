@@ -6,6 +6,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -144,6 +145,18 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	case agent.EventStepUsage:
 		// Usage lines are printed by the runner via PrintMsg, through
 		// the same queue, so they land after the reply text.
+	case agent.EventToolBackgrounded:
+		// The tool keeps running as a job; it no longer blocks the
+		// live region. Tell the scrollback, like a finished turn.
+		m.liveTool = ""
+		return m, tea.Println(fmt.Sprintf("… bash running in background (%s)", ev.JobID))
+	case agent.EventBackgroundWait:
+		return m, tea.Println(fmt.Sprintf("waiting for background jobs: %s", ev.Text))
+	case agent.EventToolBackgroundDone:
+		if ev.ToolErr != nil {
+			return m, tea.Println(fmt.Sprintf("background job %s finished with error: %v", ev.JobID, ev.ToolErr))
+		}
+		return m, tea.Println(fmt.Sprintf("background job %s finished", ev.JobID))
 	case agent.EventDone:
 		text := strings.TrimRight(m.live.String(), "\n")
 		m.live.Reset()

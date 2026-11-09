@@ -6,11 +6,12 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"minimalharness/internal/skills"
@@ -21,6 +22,9 @@ const (
 	MaxOutBytes        = 64 << 10
 	DefaultBashTimeout = 60 * time.Second
 	MaxBashTimeout     = 300 * time.Second
+	// DefaultBackgroundThreshold is how long a bash call runs before
+	// the loop backgrounds it instead of blocking (0 = disabled).
+	DefaultBackgroundThreshold = 10 * time.Second
 )
 
 type Executor struct {
@@ -28,9 +32,16 @@ type Executor struct {
 	// BashTimeout overrides the default 60s bash timeout (0 = default).
 	// The per-call timeout argument still caps at 300s.
 	BashTimeout time.Duration
+	// BackgroundThreshold is how long a bash call may run before the
+	// loop backgrounds it (0 = never background; DefaultBackgroundThreshold
+	// when Setup leaves it unset).
+	BackgroundThreshold time.Duration
 	// Audit receives one entry per bash execution and denylist denial
 	// (nil = no audit). Approval decisions are audited by the loop.
 	Audit func(AuditEntry)
+
+	jobsMu sync.Mutex
+	jobs   *JobRegistry
 }
 
 func (e *Executor) audit(entry AuditEntry) {
@@ -172,13 +183,9 @@ type BashArgs struct {
 	Timeout int    `json:"timeout,omitempty"` // seconds, default 60, max 300
 }
 
-func (e *Executor) Bash(ctx context.Context, a BashArgs) (string, error) {
-	// Denylist first: the refusal is an observation, not a crash, and
-	// it is audited like any other denial.
-	if reason := DeniedCommand(a.Command); reason != "" {
-		e.audit(AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
-		return "", fmt.Errorf("denied by policy: %s (this is harm reduction, not a sandbox — see README)", reason)
-	}
+// bashTimeout resolves the effective timeout for one bash call:
+// per-call argument (capped at 300s), else the executor default.
+func (e *Executor) bashTimeout(a BashArgs) time.Duration {
 	timeout := DefaultBashTimeout
 	if e.BashTimeout > 0 {
 		timeout = e.BashTimeout
@@ -189,26 +196,30 @@ func (e *Executor) Bash(ctx context.Context, a BashArgs) (string, error) {
 			timeout = MaxBashTimeout
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", "-c", a.Command)
-	cmd.Dir = e.Root
-	out, err := cmd.CombinedOutput()
-	s := truncate(string(out), MaxOutBytes)
-	exitCode := -1
-	if cmd.ProcessState != nil {
-		exitCode = cmd.ProcessState.ExitCode()
+	return timeout
+}
+
+func (e *Executor) Bash(ctx context.Context, a BashArgs) (string, error) {
+	// Denylist first: the refusal is an observation, not a crash, and
+	// it is audited like any other denial.
+	if reason := DeniedCommand(a.Command); reason != "" {
+		e.audit(AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
+		return "", fmt.Errorf("denied by policy: %s (this is harm reduction, not a sandbox — see README)", reason)
 	}
-	if ctx.Err() == context.DeadlineExceeded {
+	timeout := e.bashTimeout(a)
+	s, exitCode, err := runBashCmd(ctx, e.Root, a.Command, timeout)
+	var te *timeoutError
+	switch {
+	case errors.As(err, &te):
 		e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: fmt.Sprintf("timed out after %s", timeout)})
-		return s, fmt.Errorf("bash timed out after %s", timeout)
-	}
-	if err != nil {
+		return s, err
+	case err != nil:
 		e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: exitCode, Error: err.Error()})
-		return s, fmt.Errorf("exit: %w", err)
+		return s, err
+	default:
+		e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: exitCode})
+		return s, nil
 	}
-	e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: exitCode})
-	return s, nil
 }
 
 // Dispatch runs a tool call by name and returns the observation string.

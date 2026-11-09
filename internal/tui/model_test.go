@@ -69,6 +69,33 @@ func TestPrintMsgReturnsPrintln(t *testing.T) {
 	}
 }
 
+// Background events clear the live tool and print a scrollback notice.
+func TestModelBackgroundEvents(t *testing.T) {
+	m := NewModel("")
+	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventTextDelta, Text: "working"}})
+	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventToolStart, ToolName: "bash"}})
+	if m.liveTool != "bash" {
+		t.Fatalf("liveTool = %q, want bash", m.liveTool)
+	}
+	next, cmd := m.Update(EventMsg{Event: agent.Event{Kind: agent.EventToolBackgrounded, JobID: "bg-1"}})
+	if cmd == nil {
+		t.Fatal("backgrounded event should return a print command")
+	}
+	nm, ok := next.(Model)
+	if !ok {
+		t.Fatalf("Update returned %T, want Model", next)
+	}
+	if nm.liveTool != "" {
+		t.Fatalf("liveTool = %q after backgrounded, want empty", nm.liveTool)
+	}
+	if _, cmd := nm.Update(EventMsg{Event: agent.Event{Kind: agent.EventBackgroundWait, Text: "bg-1"}}); cmd == nil {
+		t.Fatal("background wait event should return a print command")
+	}
+	if _, cmd := nm.Update(EventMsg{Event: agent.Event{Kind: agent.EventToolBackgroundDone, JobID: "bg-1"}}); cmd == nil {
+		t.Fatal("background done event should return a print command")
+	}
+}
+
 func TestModelStreamsTextIntoLiveRegion(t *testing.T) {
 	m := NewModel("")
 	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventTextDelta, Text: "hello "}})

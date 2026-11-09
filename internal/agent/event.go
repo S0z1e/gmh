@@ -21,8 +21,19 @@ const (
 	// Text carries the approval prompt. The answer itself is visible
 	// in the following ToolEnd (denied) or ToolStart/ToolEnd (approved).
 	EventApproval EventKind = "approval"
-	EventDone     EventKind = "done"
-	EventError    EventKind = "error"
+	// EventToolBackgrounded fires when a bash call runs past the
+	// background threshold and keeps running as a job. JobID names it;
+	// the tool result delivered to the model says the same.
+	EventToolBackgrounded EventKind = "tool_backgrounded"
+	// EventBackgroundWait fires once when the turn ends with jobs
+	// still running and the loop waits for them. Text lists the job ids.
+	EventBackgroundWait EventKind = "background_wait"
+	// EventToolBackgroundDone fires when a background job finishes and
+	// its result is fed back into the loop as a tool message.
+	// ToolOutput is the result; ToolErr the failure, if any.
+	EventToolBackgroundDone EventKind = "tool_background_done"
+	EventDone               EventKind = "done"
+	EventError              EventKind = "error"
 )
 
 type Event struct {
@@ -36,6 +47,8 @@ type Event struct {
 	// prefix when ToolErr is set).
 	ToolOutput string
 	ToolErr    error
+	// JobID names the background job for the background events.
+	JobID string
 	// Usage is the per-call usage for StepUsage, the turn total for Done.
 	Usage llm.Usage
 	// Err is the failure for EventError.
