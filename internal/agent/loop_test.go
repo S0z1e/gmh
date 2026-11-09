@@ -115,7 +115,7 @@ func TestRunEmitsEventsForDeniedToolCall(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected step-cap error after repeated denials")
 	}
-	var sawStart, sawEnd bool
+	var sawStart, sawEnd, sawApproval bool
 	for _, e := range events {
 		if e.Kind == EventToolStart && e.ToolName == "write" {
 			sawStart = true
@@ -123,8 +123,14 @@ func TestRunEmitsEventsForDeniedToolCall(t *testing.T) {
 		if e.Kind == EventToolEnd && e.ToolName == "write" {
 			sawEnd = true
 		}
+		if e.Kind == EventApproval && e.Text != "" {
+			sawApproval = true
+		}
 	}
 	if !sawStart || !sawEnd {
 		t.Fatalf("denied tool call missing start/end events: %+v", events)
+	}
+	if !sawApproval {
+		t.Fatalf("denied tool call missing approval event: %+v", events)
 	}
 }

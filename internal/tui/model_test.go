@@ -89,6 +89,67 @@ func TestModelBackspaceAndCursor(t *testing.T) {
 	}
 }
 
+func TestModelApprovalDialogReplacesInput(t *testing.T) {
+	req := &ApprovalRequest{Prompt: `Run write {"path":"x.txt"}?`, Reply: make(chan bool, 1)}
+	m := NewModel("")
+	m = apply(t, m, ApprovalMsg{Request: req})
+	view := m.View().Content
+	if !strings.Contains(view, "Approval") || !strings.Contains(view, "write") {
+		t.Fatalf("dialog not rendered: %q", view)
+	}
+	if !strings.Contains(view, "[y] approve") || !strings.Contains(view, "[n] deny") {
+		t.Fatalf("dialog missing y/n hints: %q", view)
+	}
+	// Typing while the dialog is up must not reach the input line.
+	m = apply(t, m, tea.KeyPressMsg{Text: "z", Code: 'z'})
+	if strings.Contains(m.View().Content, "> z") {
+		t.Fatal("input should be ignored while approval is pending")
+	}
+}
+
+func TestModelApprovalYesNo(t *testing.T) {
+	// Yes.
+	req := &ApprovalRequest{Prompt: "Run bash?", Reply: make(chan bool, 1)}
+	m := NewModel("")
+	m = apply(t, m, ApprovalMsg{Request: req})
+	m = apply(t, m, tea.KeyPressMsg{Text: "y", Code: 'y'})
+	select {
+	case got := <-req.Reply:
+		if !got {
+			t.Fatal("y should approve")
+		}
+	default:
+		t.Fatal("y did not reply")
+	}
+	if m.approval != nil {
+		t.Fatal("approval should clear after answering")
+	}
+	// No.
+	req2 := &ApprovalRequest{Prompt: "Run bash?", Reply: make(chan bool, 1)}
+	m = apply(t, m, ApprovalMsg{Request: req2})
+	m = apply(t, m, tea.KeyPressMsg{Text: "n", Code: 'n'})
+	select {
+	case got := <-req2.Reply:
+		if got {
+			t.Fatal("n should deny")
+		}
+	default:
+		t.Fatal("n did not reply")
+	}
+	// Esc also denies.
+	req3 := &ApprovalRequest{Prompt: "Run bash?", Reply: make(chan bool, 1)}
+	m = apply(t, m, ApprovalMsg{Request: req3})
+	m = apply(t, m, tea.KeyPressMsg{Code: tea.KeyEscape})
+	select {
+	case got := <-req3.Reply:
+		if got {
+			t.Fatal("Esc should deny")
+		}
+	default:
+		t.Fatal("Esc did not reply")
+	}
+}
+
 func TestModelCtrlCQuits(t *testing.T) {
 	m := NewModel("")
 	_, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})

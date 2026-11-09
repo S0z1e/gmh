@@ -17,8 +17,12 @@ const (
 	EventStepUsage EventKind = "step_usage"
 	EventToolStart EventKind = "tool_start"
 	EventToolEnd   EventKind = "tool_end"
-	EventDone      EventKind = "done"
-	EventError     EventKind = "error"
+	// EventApproval fires when the loop pauses for a tool approval.
+	// Text carries the approval prompt. The answer itself is visible
+	// in the following ToolEnd (denied) or ToolStart/ToolEnd (approved).
+	EventApproval EventKind = "approval"
+	EventDone     EventKind = "done"
+	EventError    EventKind = "error"
 )
 
 type Event struct {

@@ -117,7 +117,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		for _, tc := range assistant.ToolCalls {
 			c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments})
 			if c.needsApproval(tc.Function.Name) {
-				ok, err := c.ask(fmt.Sprintf("Run %s %s?", tc.Function.Name, truncate(tc.Function.Arguments, 200)))
+				prompt := fmt.Sprintf("Run %s %s?", tc.Function.Name, truncate(tc.Function.Arguments, 200))
+				c.emit(Event{Kind: EventApproval, Text: prompt})
+				ok, err := c.ask(prompt)
 				if err != nil {
 					c.emit(Event{Kind: EventError, Err: err})
 					return lastText, total, err

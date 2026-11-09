@@ -18,7 +18,7 @@ import (
 func main() {
 	var (
 		root      = flag.String("root", ".", "workspace root")
-		mode      = flag.String("mode", "auto", "auto (suggest is refused until the approval dialog lands in 3c)")
+		mode      = flag.String("mode", "suggest", "suggest (ask in a y/n dialog) or auto")
 		model     = flag.String("model", "", "model (default OPENAI_MODEL or deepseek-v4.1-flash)")
 		api       = flag.String("api", "", "chat or responses (default OPENAI_API_MODE or chat)")
 		maxSteps  = flag.Int("max-steps", 50, "max agent steps")
@@ -27,10 +27,6 @@ func main() {
 		ctxLimit  = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT or 1048576)")
 	)
 	flag.Parse()
-
-	if *mode == "suggest" {
-		fatal(fmt.Errorf("TUI approval dialog is not built yet (v0.2 P1-3c); use -mode auto"))
-	}
 
 	a, err := app.Setup(app.Params{
 		Root:         *root,
@@ -64,6 +60,11 @@ func main() {
 	// program; Bubble Tea owns the main goroutine and stdin.
 	a.Cfg.OnEvent = func(ev agent.Event) {
 		prog.Send(tui.EventMsg{Event: ev})
+	}
+	// In suggest mode, approvals go through the TUI dialog: the agent
+	// blocks on a reply channel, the model answers it from a y/n key.
+	if a.Cfg.Mode == "suggest" {
+		a.Cfg.Ask = tui.NewApprover(prog).Ask
 	}
 
 	runner := &app.Runner{App: a, Print: func(format string, args ...any) {
