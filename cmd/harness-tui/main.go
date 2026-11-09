@@ -26,6 +26,8 @@ func main() {
 		resume    = flag.String("resume", "", "resume session id")
 		sessionID = flag.String("session", "", "session id (default: timestamp)")
 		ctxLimit  = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT or 1048576)")
+		deny      = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1)")
+		bashTO    = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 60, or env OPENAI_BASH_TIMEOUT_SECONDS)")
 	)
 	flag.Parse()
 
@@ -36,14 +38,16 @@ func main() {
 	}
 
 	a, err := app.Setup(app.Params{
-		Root:         *root,
-		Mode:         *mode,
-		Model:        *model,
-		API:          *api,
-		MaxSteps:     *maxSteps,
-		ContextLimit: *ctxLimit,
-		Resume:       *resume,
-		SessionID:    *sessionID,
+		Root:                *root,
+		Mode:                *mode,
+		Model:               *model,
+		API:                 *api,
+		MaxSteps:            *maxSteps,
+		ContextLimit:        *ctxLimit,
+		Resume:              *resume,
+		SessionID:           *sessionID,
+		DenyInsteadOfPrompt: *deny,
+		BashTimeoutSeconds:  *bashTO,
 	})
 	if err != nil {
 		fatal(err)

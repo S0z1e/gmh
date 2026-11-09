@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
@@ -27,6 +28,11 @@ type Config struct {
 	// (There is no OnText: streamed text arrives as TextDelta events.)
 	OnEvent func(Event)
 	Ask     func(prompt string) (bool, error) // nil = use stdin prompt
+	// DenyInsteadOfPrompt refuses every approval without asking (copy of
+	// Claude Code's permissions.denyInsteadOfPrompting). -p print mode
+	// sets it: an unattended run must never block waiting for a human.
+	// It only ever denies, never approves.
+	DenyInsteadOfPrompt bool
 
 	// LastPromptTokens is the prompt-token count of the most recent LLM
 	// call in the last Run: the current context size, since history is
@@ -53,6 +59,9 @@ func ToolDefs() []llm.ToolDef {
 }
 
 func (c *Config) ask(prompt string) (bool, error) {
+	if c.DenyInsteadOfPrompt {
+		return false, nil
+	}
 	if c.Ask != nil {
 		return c.Ask(prompt)
 	}
@@ -121,6 +130,19 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				prompt := fmt.Sprintf("Run %s %s?", tc.Function.Name, truncate(tc.Function.Arguments, 200))
 				c.emit(Event{Kind: EventApproval, Text: prompt})
 				ok, err := c.ask(prompt)
+				// Audit every decision (approved, denied, or errored)
+				// to the session sidecar, for later review.
+				if c.Session != nil {
+					entry := tools.AuditEntry{TS: time.Now(), Kind: "approval", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), ExitCode: -1}
+					if err != nil {
+						entry.Error = err.Error()
+					} else if ok {
+						entry.Decision = "approved"
+					} else {
+						entry.Decision = "denied"
+					}
+					_ = c.Session.Audit(entry)
+				}
 				if err != nil {
 					c.emit(Event{Kind: EventError, Err: err})
 					return lastText, total, err

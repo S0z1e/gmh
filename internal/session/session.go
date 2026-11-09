@@ -14,9 +14,35 @@ import (
 )
 
 type Store struct {
-	ID   string
-	Path string
-	file *os.File
+	ID        string
+	Path      string
+	file      *os.File
+	auditFile *os.File // lazily opened sidecar for audit records
+}
+
+// AuditPath is the sidecar file holding approval/bash audit records
+// (one JSON line each), next to the session transcript.
+func (s *Store) AuditPath() string {
+	ext := filepath.Ext(s.Path)
+	return s.Path[:len(s.Path)-len(ext)] + "-audit.jsonl"
+}
+
+// Audit appends one record to the audit sidecar. It never breaks the
+// caller: errors are returned but the loop ignores them.
+func (s *Store) Audit(v any) error {
+	if s.auditFile == nil {
+		f, err := os.OpenFile(s.AuditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		s.auditFile = f
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = s.auditFile.Write(append(b, '\n'))
+	return err
 }
 
 func Dir() string {
@@ -90,7 +116,12 @@ func (s *Store) ArchiveCopy(name string) (string, error) {
 	return dst, nil
 }
 
-func (s *Store) Close() error { return s.file.Close() }
+func (s *Store) Close() error {
+	if s.auditFile != nil {
+		s.auditFile.Close()
+	}
+	return s.file.Close()
+}
 
 // Load replays a JSONL session. A trailing dangling assistant tool call
 // (tool call with no matching tool result) is dropped so resume does not

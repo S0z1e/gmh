@@ -27,6 +27,12 @@ type Params struct {
 	ContextLimit int
 	Resume       string
 	SessionID    string
+	// DenyInsteadOfPrompt refuses approvals without asking. -p print
+	// mode sets it; the flag and OPENAI_DENY_INSTEAD_OF_PROMPT do too.
+	DenyInsteadOfPrompt bool
+	// BashTimeoutSeconds overrides the default 60s bash timeout
+	// (0 = default, or OPENAI_BASH_TIMEOUT_SECONDS).
+	BashTimeoutSeconds int
 }
 
 type App struct {
@@ -108,14 +114,31 @@ func Setup(p Params) (*App, error) {
 	a.Skills = skillList
 	system := agent.SystemPrompt + skills.Listing(skillList)
 
+	executor := &tools.Executor{Root: absRoot}
+	if p.BashTimeoutSeconds > 0 {
+		executor.BashTimeout = time.Duration(p.BashTimeoutSeconds) * time.Second
+	} else if v := os.Getenv("OPENAI_BASH_TIMEOUT_SECONDS"); v != "" {
+		var secs int
+		if _, err := fmt.Sscanf(v, "%d", &secs); err == nil && secs > 0 {
+			executor.BashTimeout = time.Duration(secs) * time.Second
+		}
+	}
+	executor.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
+
+	deny := p.DenyInsteadOfPrompt
+	if v := os.Getenv("OPENAI_DENY_INSTEAD_OF_PROMPT"); v == "1" || strings.EqualFold(v, "true") {
+		deny = true
+	}
+
 	a.Cfg = &agent.Config{
-		Client:   &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl, API: apiMode},
-		Exec:     &tools.Executor{Root: absRoot},
-		Tools:    agent.ToolDefs(),
-		System:   system,
-		Mode:     mode,
-		MaxSteps: p.MaxSteps,
-		Session:  store,
+		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl, API: apiMode},
+		Exec:                executor,
+		Tools:               agent.ToolDefs(),
+		System:              system,
+		Mode:                mode,
+		MaxSteps:            p.MaxSteps,
+		Session:             store,
+		DenyInsteadOfPrompt: deny,
 	}
 
 	contextLimit := p.ContextLimit

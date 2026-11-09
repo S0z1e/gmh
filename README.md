@@ -4,6 +4,21 @@ A minimal, Pi-light coding agent harness in Go. Stdlib only, zero dependencies.
 OpenAI-compatible chat completions + SSE streaming. Six tools: read, write, edit, bash, grep, glob.
 Usage is shown per turn and per session (prompt, cached, completion, total tokens). Token counts always come from the API's returned usage — the harness never estimates tokens locally (no local tokenizer; tiktoken would undercount non-OpenAI models by ~15–20%). Cost is estimated only when you set rates: `OPENAI_PRICE_INPUT_PER_MTOK`, `OPENAI_PRICE_OUTPUT_PER_MTOK`, `OPENAI_PRICE_CACHED_PER_MTOK` (USD per 1M tokens), plus `_PEAK_` variants and `OPENAI_PRICE_SOURCE` to label where the rates came from. Peak hours are Mon–Fri 01:00–04:00 and 06:00–10:00 UTC; without peak rates the off-peak rates apply. Every estimate is labelled with its source and "OpenConsole 實價未驗證"; without rates, no estimate is shown.
 
+## Safety (suggest mode) — what it can and cannot promise
+
+Approval is a policy boundary, **not a sandbox**. In `-mode suggest`, write/edit/bash ask first (stdin in plain mode, a y/n dialog in the TUI); read, grep, glob and `load_skill` never ask. `-p` print mode and `--deny-instead-of-prompt` (also `OPENAI_DENY_INSTEAD_OF_PROMPT=1`) refuse every approval without asking — they only ever deny, never approve, and the turn continues with the denial as an observation.
+
+What is enforced:
+- read/write/edit/grep/glob paths are jailed to the workspace root (`..` escapes refused); bash starts in the root.
+- bash has a timeout (default 60s, per-call up to 300s, `-bash-timeout` / `OPENAI_BASH_TIMEOUT_SECONDS`) and a 64 KiB output cap.
+- A denylist refuses the obvious catastrophes before they run: `rm -rf /` (or `~`), `mkfs` with a device, `dd` to a device, writes into `~/.ssh` / `~/.aws` / `~/.config/gcloud` / `~/.kube` / `~/.docker`, and anything touching the Docker socket.
+- Every approval decision, every bash run (with exit code), and every denial is written to `<session>-audit.jsonl` next to the session transcript, for later review.
+
+What is NOT promised (residual risk — run on disposable copies or in a container):
+- The denylist is pattern matching over the command text; it can be bypassed with variables, quoting, or indirection.
+- Bash is only started in the root — once a bash call is approved it can `cd` out and write anywhere, including paths the write/edit tools refuse. Denying write/edit does not stop bash from writing.
+- There is no OS sandbox in v0.2 (no bwrap / sandbox-exec); the denylist and jail are harm reduction, not isolation.
+
 ## Layout
 
 ```

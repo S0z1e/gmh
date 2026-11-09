@@ -17,13 +17,27 @@ import (
 )
 
 const (
-	MaxReadBytes = 1 << 20 // 1 MiB per read
-	MaxOutBytes  = 64 << 10
-	BashTimeout  = 60 * time.Second
+	MaxReadBytes       = 1 << 20 // 1 MiB per read
+	MaxOutBytes        = 64 << 10
+	DefaultBashTimeout = 60 * time.Second
+	MaxBashTimeout     = 300 * time.Second
 )
 
 type Executor struct {
 	Root string
+	// BashTimeout overrides the default 60s bash timeout (0 = default).
+	// The per-call timeout argument still caps at 300s.
+	BashTimeout time.Duration
+	// Audit receives one entry per bash execution and denylist denial
+	// (nil = no audit). Approval decisions are audited by the loop.
+	Audit func(AuditEntry)
+}
+
+func (e *Executor) audit(entry AuditEntry) {
+	if e.Audit != nil {
+		entry.TS = time.Now()
+		e.Audit(entry)
+	}
 }
 
 func (e *Executor) resolve(p string) (string, error) {
@@ -159,11 +173,20 @@ type BashArgs struct {
 }
 
 func (e *Executor) Bash(ctx context.Context, a BashArgs) (string, error) {
-	timeout := BashTimeout
+	// Denylist first: the refusal is an observation, not a crash, and
+	// it is audited like any other denial.
+	if reason := DeniedCommand(a.Command); reason != "" {
+		e.audit(AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
+		return "", fmt.Errorf("denied by policy: %s (this is harm reduction, not a sandbox — see README)", reason)
+	}
+	timeout := DefaultBashTimeout
+	if e.BashTimeout > 0 {
+		timeout = e.BashTimeout
+	}
 	if a.Timeout > 0 {
 		timeout = time.Duration(a.Timeout) * time.Second
-		if timeout > 300*time.Second {
-			timeout = 300 * time.Second
+		if timeout > MaxBashTimeout {
+			timeout = MaxBashTimeout
 		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -172,12 +195,19 @@ func (e *Executor) Bash(ctx context.Context, a BashArgs) (string, error) {
 	cmd.Dir = e.Root
 	out, err := cmd.CombinedOutput()
 	s := truncate(string(out), MaxOutBytes)
+	exitCode := -1
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
 	if ctx.Err() == context.DeadlineExceeded {
+		e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: fmt.Sprintf("timed out after %s", timeout)})
 		return s, fmt.Errorf("bash timed out after %s", timeout)
 	}
 	if err != nil {
+		e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: exitCode, Error: err.Error()})
 		return s, fmt.Errorf("exit: %w", err)
 	}
+	e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: exitCode})
 	return s, nil
 }
 

@@ -36,6 +36,37 @@ func TestClearDropsEarlierMessagesOnLoad(t *testing.T) {
 	}
 }
 
+// Audit records land in a sidecar file, not in the transcript.
+func TestAuditSidecar(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s, err := New("audit-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Append(llm.Message{Role: "user", Content: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Audit(map[string]any{"kind": "approval", "tool": "write", "decision": "denied"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(s.AuditPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"decision":"denied"`) {
+		t.Fatalf("audit sidecar = %s", data)
+	}
+	// The transcript itself has no audit record.
+	msgs, err := Load("audit-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].Content != "hi" {
+		t.Fatalf("transcript = %+v", msgs)
+	}
+}
+
 func TestLoadWithoutClearReturnsAll(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store, err := New("test-noclear")

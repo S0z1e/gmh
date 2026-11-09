@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"minimalharness/internal/llm"
+	"minimalharness/internal/session"
 	"minimalharness/internal/tools"
 )
 
@@ -187,6 +188,65 @@ func TestRunLoadSkillReference(t *testing.T) {
 	}
 	if !strings.Contains(secondBody, "REF-BODY-789") {
 		t.Fatalf("second request did not contain the reference content: %s", secondBody)
+	}
+}
+
+// DenyInsteadOfPrompt refuses a write without asking anyone, the turn
+// continues, and the denial is audited to the session sidecar.
+func TestRunDenyInsteadOfPrompt(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	store, err := session.New("deny-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"nope.txt\\\",\\\"content\\\":\\\"x\\\"}\"}}]}}]}\n\n")
+			fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), "User denied this tool call") {
+			t.Errorf("second request should carry the denial observation: %s", body)
+		}
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"understood, I will not write it\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":3,\"total_tokens\":23}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &Config{
+		Client:              &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
+		Exec:                &tools.Executor{Root: root},
+		Tools:               ToolDefs(),
+		System:              "test system",
+		Mode:                "suggest",
+		MaxSteps:            5,
+		Session:             store,
+		DenyInsteadOfPrompt: true,
+	}
+	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "write nope.txt"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "understood, I will not write it" {
+		t.Fatalf("final text = %q", text)
+	}
+	if _, err := os.Stat(filepath.Join(root, "nope.txt")); !os.IsNotExist(err) {
+		t.Fatal("denied write must not create the file")
+	}
+	data, err := os.ReadFile(store.AuditPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"decision":"denied"`) || !strings.Contains(string(data), `"tool":"write"`) {
+		t.Fatalf("audit sidecar = %s", data)
 	}
 }
 

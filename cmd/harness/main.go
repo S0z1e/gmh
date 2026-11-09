@@ -30,6 +30,8 @@ func main() {
 		sessionID = flag.String("session", "", "session id (default: timestamp)")
 		ctxLimit  = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT or 1048576)")
 		ui        = flag.String("ui", "auto", "ui: auto, plain or tui (ignored by -p, which is always plain)")
+		deny      = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1; -p always denies)")
+		bashTO    = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 60, or env OPENAI_BASH_TIMEOUT_SECONDS)")
 	)
 	flag.Parse()
 
@@ -42,7 +44,7 @@ func main() {
 			fatal(err)
 		}
 		if uiMode == "tui" {
-			if err := execTUI(*root, *mode, *model, *api, *maxSteps, *resume, *sessionID, *ctxLimit); err != nil {
+			if err := execTUI(*root, *mode, *model, *api, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO); err != nil {
 				fmt.Fprintf(os.Stderr, "harness: TUI unavailable (%v); continuing in plain mode.\n", err)
 			}
 			// execTUI replaces this process on success; reaching here
@@ -53,14 +55,16 @@ func main() {
 	}
 
 	a, err := app.Setup(app.Params{
-		Root:         *root,
-		Mode:         *mode,
-		Model:        *model,
-		API:          *api,
-		MaxSteps:     *maxSteps,
-		ContextLimit: *ctxLimit,
-		Resume:       *resume,
-		SessionID:    *sessionID,
+		Root:                *root,
+		Mode:                *mode,
+		Model:               *model,
+		API:                 *api,
+		MaxSteps:            *maxSteps,
+		ContextLimit:        *ctxLimit,
+		Resume:              *resume,
+		SessionID:           *sessionID,
+		DenyInsteadOfPrompt: *deny || *printMode != "",
+		BashTimeoutSeconds:  *bashTO,
 	})
 	if err != nil {
 		fatal(err)
@@ -119,7 +123,7 @@ func main() {
 // execTUI replaces this process with the sibling harness-tui binary,
 // passing the same flags through. It returns only if the sibling cannot
 // be started (then the caller falls back to plain mode).
-func execTUI(root, mode, model, api string, maxSteps int, resume, sessionID string, ctxLimit int) error {
+func execTUI(root, mode, model, api string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO int) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -138,6 +142,8 @@ func execTUI(root, mode, model, api string, maxSteps int, resume, sessionID stri
 		"-resume", resume,
 		"-session", sessionID,
 		"-context-limit", strconv.Itoa(ctxLimit),
+		"-deny-instead-of-prompt", strconv.FormatBool(deny),
+		"-bash-timeout", strconv.Itoa(bashTO),
 	}
 	return syscall.Exec(sibling, args, os.Environ())
 }
