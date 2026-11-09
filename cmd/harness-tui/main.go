@@ -13,6 +13,7 @@ import (
 	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
 	"minimalharness/internal/tui"
+	"minimalharness/internal/uimode"
 )
 
 func main() {
@@ -27,6 +28,12 @@ func main() {
 		ctxLimit  = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT or 1048576)")
 	)
 	flag.Parse()
+
+	// The TUI needs a real terminal. When stdout is piped, say so
+	// plainly instead of failing inside Bubble Tea's TTY open.
+	if !uimode.IsTTY(os.Stdout) {
+		fatal(fmt.Errorf("harness-tui needs a terminal; run harness (plain mode) or harness --ui plain instead"))
+	}
 
 	a, err := app.Setup(app.Params{
 		Root:         *root,

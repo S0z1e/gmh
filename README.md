@@ -51,6 +51,7 @@ Notes:
 - REPL commands: `/usage` shows session token totals, `/clear` drops the conversation context (a marker is written to the session file; `--resume` starts from the clear point, older messages stay in the file).
 - Compaction: `/compact` summarises the conversation into a 6-section brief and replaces history with it; the original transcript is saved to `<session>-pre-compact-<time>.jsonl`. It also triggers automatically when the last call's context reaches 70% of the window (`-context-limit`, default 1048576 for deepseek-v4.1-flash).
 - Events: the agent loop emits an event stream (`text_delta`, `step_usage`, `tool_start`, `tool_end`, `done`, `error`); the CLI is one renderer of it, a future TUI will be another. The loop never imports UI code.
+- UI selection (`--ui auto|plain|tui`, default `auto`): precedence is flag > `NO_COLOR` (non-empty) > `TERM=dumb` > TTY. On a terminal, `auto` opens the TUI; piped, `NO_COLOR`, or `TERM=dumb` means plain. `-p` is always plain and ignores `--ui`. `harness --ui tui` without a terminal falls back to plain with a warning. The TUI is a separate binary (`harness-tui` next to `harness`); `harness` re-execs it when the TUI is selected, so `-p` / the plain CLI never import Bubble Tea.
 - TUI (Bubble Tea v2, inline-first): a separate binary so `-p` / the plain CLI never import it:
   ```
   go run ./cmd/harness-tui -root /path/to/project
