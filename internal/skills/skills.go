@@ -97,9 +97,43 @@ func Listing(skills []Skill) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("\n\nAvailable skills (use /skill:<name> to load the full text, or call the model with the skill name):\n")
+	b.WriteString("\n\nAvailable skills (call load_skill with the name to read the full instructions, or the user can /skill:<name>):\n")
 	for _, sk := range skills {
 		fmt.Fprintf(&b, "- %s: %s\n", sk.Name, sk.Description)
 	}
 	return b.String()
+}
+
+// MatchKeywords returns the skills whose name appears in text as a whole
+// word (case-insensitive). "demo" matches "use the demo skill" but not
+// "demonstrate"; "code-review" does not match "code-reviews".
+func MatchKeywords(text string, skills []Skill) []Skill {
+	lower := strings.ToLower(text)
+	var out []Skill
+	for _, sk := range skills {
+		name := strings.ToLower(sk.Name)
+		if name == "" {
+			continue
+		}
+		for i := 0; i+len(name) <= len(lower); {
+			j := strings.Index(lower[i:], name)
+			if j < 0 {
+				break
+			}
+			start := i + j
+			end := start + len(name)
+			beforeOK := start == 0 || !isWordChar(lower[start-1])
+			afterOK := end == len(lower) || !isWordChar(lower[end])
+			if beforeOK && afterOK {
+				out = append(out, sk)
+				break
+			}
+			i = start + 1
+		}
+	}
+	return out
+}
+
+func isWordChar(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '_' || b == '-'
 }

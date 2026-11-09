@@ -90,6 +90,57 @@ func TestRunnerHandleClear(t *testing.T) {
 	}
 }
 
+// The keyword trigger: a task naming a skill loads its body into the
+// turn before the model sees the task.
+func TestRunnerKeywordTriggerLoadsSkill(t *testing.T) {
+	srv := mockServer(t)
+	defer srv.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	root := t.TempDir()
+	skillDir := filepath.Join(root, ".agents", "skills", "greeter")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: greeter\ndescription: Greets people.\n---\n# Greeter\nSay hello warmly.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	if len(a.Skills) != 1 || a.Skills[0].Name != "greeter" {
+		t.Fatalf("skills = %v, want [greeter]", a.Skills)
+	}
+	var printed []string
+	r := &Runner{App: a, Print: func(format string, args ...any) {
+		printed = append(printed, fmt.Sprintf(format, args...))
+	}}
+	r.Handle(context.Background(), "use the greeter skill to say hi")
+	if len(a.History) < 3 {
+		t.Fatalf("history = %d messages, want >= 3 (skill + task + assistant)", len(a.History))
+	}
+	if !strings.Contains(a.History[0].Content, "Say hello warmly.") {
+		t.Fatalf("first history message = %q, want the skill body", a.History[0].Content)
+	}
+	if !strings.Contains(strings.Join(printed, "\n"), "Auto-loaded skill greeter") {
+		t.Fatalf("no auto-load notice printed: %v", printed)
+	}
+	// A task that does not name the skill loads nothing.
+	a2, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5, SessionID: "other-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a2.Store.Close()
+	r2 := &Runner{App: a2, Print: func(format string, args ...any) {}}
+	r2.Handle(context.Background(), "just do something unrelated")
+	if len(a2.History) != 2 { // task + assistant only
+		t.Fatalf("history = %d messages, want 2 (no skill loaded)", len(a2.History))
+	}
+}
+
 func TestRunnerHandleQuit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("OPENAI_API_KEY", "test-key")

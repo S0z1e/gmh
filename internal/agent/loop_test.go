@@ -3,10 +3,12 @@ package agent
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -82,6 +84,56 @@ func TestRunEmitsEventsInOrder(t *testing.T) {
 	}
 	if events[6].Text != "done" || events[6].Usage.TotalTokens != 38 {
 		t.Fatalf("done event = %+v", events[6])
+	}
+}
+
+// The model-request trigger: when the model calls load_skill, the skill
+// body reaches it as a tool result on the next call.
+func TestRunLoadSkillTool(t *testing.T) {
+	root := t.TempDir()
+	skillDir := filepath.Join(root, ".agents", "skills", "demo")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: demo\ndescription: A demo skill.\n---\n# Demo\nMARKER-BODY-123\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var calls int32
+	var secondBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"load_skill\",\"arguments\":\"{\\\"name\\\":\\\"demo\\\"}\"}}]}}]}\n\n")
+			fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		secondBody = string(body)
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":3,\"total_tokens\":23}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &Config{
+		Client:   &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
+		Exec:     &tools.Executor{Root: root},
+		Tools:    ToolDefs(),
+		System:   "test system",
+		Mode:     "auto",
+		MaxSteps: 5,
+	}
+	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "do the demo thing"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "done" {
+		t.Fatalf("final text = %q, want %q", text, "done")
+	}
+	if !strings.Contains(secondBody, "MARKER-BODY-123") {
+		t.Fatalf("second request did not contain the skill body: %s", secondBody)
 	}
 }
 

@@ -184,6 +184,18 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		r.Print("Unknown skill: %s", name)
 		return
 	}
+	// Keyword trigger: if the task names a skill as a whole word, load
+	// its full text into the turn before the model sees the task.
+	for _, sk := range skills.MatchKeywords(task, r.App.Skills) {
+		body, err := sk.Body()
+		if err != nil {
+			continue
+		}
+		r.Print("Auto-loaded skill %s (mentioned in your task).", sk.Name)
+		skillMsg := llm.Message{Role: "user", Content: "Skill " + sk.Name + ":\n" + body}
+		r.App.History = append(r.App.History, skillMsg)
+		_ = r.App.Store.Append(skillMsg)
+	}
 	userMsg := llm.Message{Role: "user", Content: task}
 	r.App.History = append(r.App.History, userMsg)
 	_ = r.App.Store.Append(userMsg)

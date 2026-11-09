@@ -1,5 +1,6 @@
-// Package tools provides the four tools: read, write, edit, bash.
-// All paths are jailed to the workspace root. bash runs with a timeout.
+// Package tools provides the tools: read, write, edit, bash, grep, glob,
+// load_skill. All paths are jailed to the workspace root. bash runs with
+// a timeout.
 package tools
 
 import (
@@ -11,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"minimalharness/internal/skills"
 )
 
 const (
@@ -217,7 +220,44 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (string,
 			return "", fmt.Errorf("bad glob args: %w", err)
 		}
 		return e.Glob(ctx, a)
+	case "load_skill":
+		var a LoadSkillArgs
+		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+			return "", fmt.Errorf("bad load_skill args: %w", err)
+		}
+		return e.LoadSkill(a)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
+}
+
+// LoadSkillArgs names one skill to load.
+type LoadSkillArgs struct {
+	Name string `json:"name"`
+}
+
+// LoadSkill returns the full SKILL.md body for a skill by name.
+// Read-only: it never writes, so it needs no approval. The name match
+// is exact first, then case-insensitive.
+func (e *Executor) LoadSkill(a LoadSkillArgs) (string, error) {
+	name := strings.TrimSpace(a.Name)
+	if name == "" {
+		return "", fmt.Errorf("load_skill needs a skill name")
+	}
+	found := skills.Discover(e.Root)
+	for _, sk := range found {
+		if sk.Name == name {
+			return sk.Body()
+		}
+	}
+	for _, sk := range found {
+		if strings.EqualFold(sk.Name, name) {
+			return sk.Body()
+		}
+	}
+	var names []string
+	for _, sk := range found {
+		names = append(names, sk.Name)
+	}
+	return "", fmt.Errorf("unknown skill %q (available: %s)", name, strings.Join(names, ", "))
 }
