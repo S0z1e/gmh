@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -40,6 +41,24 @@ func TestStreamAccumulatesFragmentedToolCall(t *testing.T) {
 	}
 	if want := `{"path":"README.md"}`; got.ToolCalls[0].Function.Arguments != want {
 		t.Fatalf("arguments = %q, want %q", got.ToolCalls[0].Function.Arguments, want)
+	}
+}
+
+// A stream that ends without [DONE] was cut off mid-reply: fail
+// loudly instead of returning a half-accumulated tool call as if it
+// were complete.
+func TestStreamChatRequiresDone(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"half a\"}}]}\n\n")
+		// No [DONE]; the handler just returns, closing the stream.
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model"}
+	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {})
+	if err == nil || !strings.Contains(err.Error(), "without [DONE]") {
+		t.Fatalf("err = %v, want a missing-[DONE] error", err)
 	}
 }
 

@@ -386,6 +386,66 @@ func TestRunFastBashStaysSynchronous(t *testing.T) {
 	}
 }
 
+// When the step cap hits with background jobs still running, their
+// results are delivered before the cap error is reported — the work
+// is not silently lost.
+func TestRunStepCapDrainsPendingJobs(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	store, err := session.New("cap-drain-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// The mock always returns a slow bash call (a fresh call id each
+	// time), so the loop backgrounds one, then backgrounds another,
+	// then hits the cap.
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := atomic.AddInt32(&calls, 1)
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_%d\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 1; echo CAP-OK\\\"}\"}}]}}]}\n\n", n)
+		fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	var events []Event
+	cfg := &Config{
+		Client:   &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
+		Exec:     &tools.Executor{Root: root, BackgroundThreshold: 300 * time.Millisecond},
+		Tools:    ToolDefs(),
+		System:   "test system",
+		Mode:     "auto",
+		MaxSteps: 2,
+		Session:  store,
+		OnEvent:  func(e Event) { events = append(events, e) },
+	}
+	_, _, err = cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "run the slow command"}})
+	if err == nil || !strings.Contains(err.Error(), "step cap") {
+		t.Fatalf("err = %v, want a step-cap error", err)
+	}
+	data, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "Background job bg-1 finished") || !strings.Contains(string(data), "CAP-OK") {
+		t.Fatalf("session should carry the drained bg-1 result: %s", data)
+	}
+	if !strings.Contains(string(data), "Background job bg-2 finished") {
+		t.Fatalf("session should carry the drained bg-2 result: %s", data)
+	}
+	var done int
+	for _, e := range events {
+		if e.Kind == EventToolBackgroundDone {
+			done++
+		}
+	}
+	if done != 2 {
+		t.Fatalf("want 2 background-done events, got %d: %+v", done, events)
+	}
+}
+
 // A denied tool call still emits tool start/end so renderers stay in sync.
 func TestRunEmitsEventsForDeniedToolCall(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

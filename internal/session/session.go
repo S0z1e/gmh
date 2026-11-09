@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"minimalharness/internal/llm"
@@ -18,6 +19,10 @@ type Store struct {
 	Path      string
 	file      *os.File
 	auditFile *os.File // lazily opened sidecar for audit records
+	// mu guards Append and Audit: a background job's completion audit
+	// can land on its own goroutine while the loop appends or audits
+	// on the main one.
+	mu sync.Mutex
 }
 
 // AuditPath is the sidecar file holding approval/bash audit records
@@ -30,6 +35,8 @@ func (s *Store) AuditPath() string {
 // Audit appends one record to the audit sidecar. It never breaks the
 // caller: errors are returned but the loop ignores them.
 func (s *Store) Audit(v any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.auditFile == nil {
 		f, err := os.OpenFile(s.AuditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
@@ -70,6 +77,8 @@ func New(id string) (*Store, error) {
 }
 
 func (s *Store) Append(m llm.Message) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err

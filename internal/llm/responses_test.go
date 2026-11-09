@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -106,6 +107,51 @@ func TestToResponsesInputDeniedToolResult(t *testing.T) {
 	out, ok := input[2].(map[string]any)
 	if !ok || out["type"] != "function_call_output" || out["call_id"] != "c9" || out["output"] != "User denied this tool call. Do not retry it." {
 		t.Fatalf("input[2] = %#v, want function_call_output c9 with the denial", input[2])
+	}
+}
+
+// A Responses stream that ends without response.completed was cut off
+// mid-reply: fail loudly instead of running a half-accumulated call.
+func TestResponsesStreamRequiresCompleted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"half a\"}\n\n")
+		// No response.completed; the handler just returns.
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "responses"}
+	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {})
+	if err == nil || !strings.Contains(err.Error(), "without response.completed") {
+		t.Fatalf("err = %v, want a missing-completed error", err)
+	}
+}
+
+// When response.completed lists only one of two calls the stream
+// carried, the other must still survive, merged from the fragments.
+func TestResponsesStreamMergesPartialCompleted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"read\"}}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"delta\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item_2\",\"call_id\":\"call_2\",\"name\":\"write\"}}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_2\",\"delta\":\"{\\\"path\\\":\\\"b.txt\\\"}\"}\n\n")
+		// completed lists only the first call.
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}],\"usage\":{\"input_tokens\":20,\"output_tokens\":10,\"total_tokens\":30}}}\n\n")
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "responses"}
+	var got Message
+	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "do two things"}}, nil, nil, func(m Message, u Usage) { got = m })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.ToolCalls) != 2 {
+		t.Fatalf("want 2 tool calls, got %d: %+v", len(got.ToolCalls), got.ToolCalls)
+	}
+	if got.ToolCalls[0].Function.Name != "read" || got.ToolCalls[1].Function.Name != "write" {
+		t.Fatalf("wrong calls: %+v", got.ToolCalls)
 	}
 }
 

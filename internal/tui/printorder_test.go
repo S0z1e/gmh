@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"bytes"
 	"strings"
 	"testing"
 	"time"
@@ -15,7 +14,9 @@ import (
 // prog.Println path, where the session usage line printed above the
 // turn line. Callers must combine lines into one PrintMsg.)
 func TestPrintMsgKeepsEmbeddedLineOrder(t *testing.T) {
-	var out bytes.Buffer
+	// syncBuffer, not bytes.Buffer: Bubble Tea writes to the output
+	// from two goroutines (see sync_buffer_test.go).
+	var out syncBuffer
 	prog := tea.NewProgram(NewModel(""), tea.WithInput(strings.NewReader("")), tea.WithOutput(&out))
 	done := make(chan struct{})
 	go func() {

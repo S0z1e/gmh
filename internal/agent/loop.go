@@ -133,6 +133,64 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (string, *tools.
 	}
 }
 
+// pendingJob is one backgrounded bash call waiting for its result.
+// A slice, not a map keyed by call id: two calls must never share an
+// entry even if a provider ever reuses a call id.
+type pendingJob struct {
+	callID string
+	job    *tools.Job
+}
+
+// drainPending waits for the jobs still running and feeds each result
+// back as a user message (appended to msgs and the session), then
+// returns the extended msgs. The result is a user message, NOT a
+// second tool message for the same call id: the call already has its
+// tool result (the "still running" observation), and a second one
+// with the same id is a 400 from the API (verified live, P2-8). The
+// output is capped like a recent tool result: the fed-back message is
+// a user message, so truncateToolResults never trims it.
+func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending []pendingJob) ([]llm.Message, error) {
+	jobs := make([]*tools.Job, 0, len(pending))
+	jobIDs := make([]string, 0, len(pending))
+	for _, p := range pending {
+		jobs = append(jobs, p.job)
+		jobIDs = append(jobIDs, p.job.ID)
+	}
+	// Only announce the wait when something is actually still running.
+	waiting := false
+	for _, job := range jobs {
+		if _, ok := job.Result(); !ok {
+			waiting = true
+			break
+		}
+	}
+	if waiting {
+		c.emit(Event{Kind: EventBackgroundWait, Text: strings.Join(jobIDs, ", ")})
+	}
+	for _, job := range jobs {
+		select {
+		case <-job.Done():
+		case <-ctx.Done():
+			return msgs, ctx.Err()
+		}
+		res, _ := job.Result()
+		var obs string
+		var toolErr error
+		if res.Err != nil {
+			obs = fmt.Sprintf("Background job %s finished with error: %v (exit %d).\nOutput:\n%s", job.ID, res.Err, res.ExitCode, capText(res.Output, 32*1024))
+			toolErr = res.Err
+		} else {
+			obs = fmt.Sprintf("Background job %s finished (exit %d).\nOutput:\n%s", job.ID, res.ExitCode, capText(res.Output, 32*1024))
+		}
+		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID})
+		msgs = append(msgs, llm.Message{Role: "user", Content: obs})
+		if c.Session != nil {
+			_ = c.Session.Append(msgs[len(msgs)-1])
+		}
+	}
+	return msgs, nil
+}
+
 // Run executes one user turn. It appends messages to the session store
 // and returns the assistant's final text, total tokens used, and error.
 func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Usage, error) {
@@ -143,11 +201,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 	msgs := append([]llm.Message{{Role: "system", Content: c.System}}, history...)
 	var total llm.Usage
 	var lastText string
-	// pending background bash jobs, keyed by the tool call id they
-	// belong to, in call order. Their results are fed back as tool
-	// messages with the original call id when the turn would end.
-	pending := map[string]*tools.Job{}
-	var pendingOrder []string
+	// pending background bash jobs, in call order. Their results are
+	// fed back as user messages when the turn would otherwise end
+	// (see drainPending).
+	var pending []pendingJob
 
 	for step := 0; step < steps; step++ {
 		var assistant llm.Message
@@ -163,6 +220,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		})
 		if err != nil {
 			wrapped := fmt.Errorf("step %d: %w", step+1, err)
+			// The turn is over, but a running job's result is still
+			// the user's data: deliver it before reporting the error
+			// so it is not silently lost.
+			if len(pending) > 0 {
+				_, _ = c.drainPending(ctx, msgs, pending)
+			}
 			c.emit(Event{Kind: EventError, Err: wrapped})
 			return lastText, total, wrapped
 		}
@@ -175,47 +238,18 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 			_ = c.Session.Append(assistant)
 		}
 		if len(assistant.ToolCalls) == 0 {
-			if len(pendingOrder) == 0 {
+			if len(pending) == 0 {
 				c.emit(Event{Kind: EventDone, Text: lastText, Usage: total})
 				return lastText, total, nil
 			}
 			// The model stopped calling tools but background jobs are
-			// still running: wait for them and feed each result back
-			// as a user message, then let the model act on them in
-			// the next LLM call. The result is a user message, NOT
-			// a second tool message for the same call id: the call
-			// already has its tool result (the "still running"
-			// observation), and a second one with the same id is a
-			// 400 from the API (verified live, P2-8).
-			jobs := make([]*tools.Job, 0, len(pendingOrder))
-			jobIDs := make([]string, 0, len(pendingOrder))
-			for _, id := range pendingOrder {
-				jobs = append(jobs, pending[id])
-				jobIDs = append(jobIDs, pending[id].ID)
-			}
-			pending = map[string]*tools.Job{}
-			pendingOrder = nil
-			c.emit(Event{Kind: EventBackgroundWait, Text: strings.Join(jobIDs, ", ")})
-			for _, job := range jobs {
-				select {
-				case <-job.Done():
-				case <-ctx.Done():
-					return lastText, total, ctx.Err()
-				}
-				res, _ := job.Result()
-				var obs string
-				var toolErr error
-				if res.Err != nil {
-					obs = fmt.Sprintf("Background job %s finished with error: %v (exit %d).\nOutput:\n%s", job.ID, res.Err, res.ExitCode, res.Output)
-					toolErr = res.Err
-				} else {
-					obs = fmt.Sprintf("Background job %s finished (exit %d).\nOutput:\n%s", job.ID, res.ExitCode, res.Output)
-				}
-				c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID})
-				msgs = append(msgs, llm.Message{Role: "user", Content: obs})
-				if c.Session != nil {
-					_ = c.Session.Append(msgs[len(msgs)-1])
-				}
+			// still running: wait for them, feed the results back,
+			// and let the model act on them in the next LLM call.
+			var err error
+			msgs, err = c.drainPending(ctx, msgs, pending)
+			pending = nil
+			if err != nil {
+				return lastText, total, err
 			}
 			continue
 		}
@@ -260,8 +294,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				var job *tools.Job
 				obs, job = c.execBash(ctx, tc)
 				if job != nil {
-					pending[tc.ID] = job
-					pendingOrder = append(pendingOrder, tc.ID)
+					pending = append(pending, pendingJob{callID: tc.ID, job: job})
 				}
 			} else {
 				out, dispatchErr := c.Exec.Dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
@@ -278,6 +311,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				_ = c.Session.Append(msgs[len(msgs)-1])
 			}
 		}
+	}
+	// The step cap hit with jobs still running: deliver their results
+	// before reporting the cap, so the work is not silently lost.
+	if len(pending) > 0 {
+		_, _ = c.drainPending(ctx, msgs, pending)
 	}
 	capped := fmt.Errorf("step cap reached (%d); the task was not finished", steps)
 	c.emit(Event{Kind: EventError, Err: capped})

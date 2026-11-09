@@ -220,6 +220,17 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 	}
 	switch line {
 	case "/quit", "/exit":
+		// Quitting abandons running background jobs (their child
+		// processes keep running, orphaned): say so plainly.
+		var running []string
+		for _, j := range r.App.Cfg.Exec.Jobs() {
+			if j.Status() == tools.JobRunning {
+				running = append(running, j.ID)
+			}
+		}
+		if len(running) > 0 {
+			r.Print("Background jobs still running (%s); quitting abandons them.", strings.Join(running, ", "))
+		}
 		return true
 	case "/usage":
 		r.Print("[usage] session: %s | %s", r.SessionUsage, r.costLine(r.SessionCost))

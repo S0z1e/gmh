@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"bytes"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +29,9 @@ func TestPrintMsgOrderedAfterDoneText(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		// A real renderer (not WithoutRenderer): tea.Println output
 		// only reaches the output writer through the renderer.
-		var out bytes.Buffer
+		// syncBuffer, not bytes.Buffer: Bubble Tea writes to the
+		// output from two goroutines (see sync_buffer_test.go).
+		var out syncBuffer
 		prog := tea.NewProgram(NewModel(""), tea.WithInput(strings.NewReader("")), tea.WithOutput(&out))
 		done := make(chan struct{})
 		go func() {

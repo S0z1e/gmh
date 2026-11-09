@@ -266,6 +266,7 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	sawDone := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || !strings.HasPrefix(line, "data:") {
@@ -273,6 +274,7 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			sawDone = true
 			break
 		}
 		var chunk streamChunk
@@ -309,6 +311,12 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 	}
 	if err := scanner.Err(); err != nil {
 		return err
+	}
+	// A stream that ends without [DONE] was cut off mid-reply; a
+	// half-accumulated tool call would otherwise run as if it were
+	// complete. Fail loudly instead of returning partial text.
+	if !sawDone {
+		return fmt.Errorf("stream ended without [DONE]")
 	}
 	for _, idx := range order {
 		a := accs[idx]
@@ -406,6 +414,10 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	// OpenConsole's Responses stream ends with response.completed and
+	// no [DONE] (verified live), so completion — not [DONE] — is the
+	// terminal marker here.
+	sawCompleted := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || !strings.HasPrefix(line, "data:") {
@@ -496,6 +508,7 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 				}
 			}
 		case "response.completed":
+			sawCompleted = true
 			for _, out := range ev.Response.Output {
 				switch out.Type {
 				case "function_call":
@@ -530,19 +543,28 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 	if err := scanner.Err(); err != nil {
 		return err
 	}
-	// If response.completed did not already add tool calls, build them
-	// from the accumulated fragments.
-	if len(msg.ToolCalls) == 0 {
-		for _, id := range order {
-			a := accs[id]
-			if a.name == "" {
-				continue
-			}
-			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
-				ID: a.callID, Type: "function",
-				Function: FunctionCall{Name: a.name, Arguments: a.args.String()},
-			})
+	// A stream that ends without response.completed was cut off
+	// mid-reply; fail loudly instead of running a half-accumulated
+	// tool call as if it were complete.
+	if !sawCompleted {
+		return fmt.Errorf("stream ended without response.completed")
+	}
+	// Merge any call the completed event did not already list, from
+	// the accumulated fragments — a partial completed list must not
+	// drop a call the stream actually carried.
+	have := map[string]bool{}
+	for _, tc := range msg.ToolCalls {
+		have[tc.ID] = true
+	}
+	for _, id := range order {
+		a := accs[id]
+		if a.name == "" || a.callID == "" || have[a.callID] {
+			continue
 		}
+		msg.ToolCalls = append(msg.ToolCalls, ToolCall{
+			ID: a.callID, Type: "function",
+			Function: FunctionCall{Name: a.name, Arguments: a.args.String()},
+		})
 	}
 	if onDone != nil {
 		onDone(msg, usage)
