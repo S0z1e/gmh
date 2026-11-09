@@ -1,0 +1,539 @@
+// Package llm is a tiny OpenAI-compatible client, stdlib only.
+// Two API modes, selected with Client.API ("chat" or "responses"):
+//   - chat:      POST /v1/chat/completions, messages[], choices[0].message
+//   - responses: POST /v1/responses, instructions + input[], output[]
+//
+// Both support SSE streaming and accumulate partial tool-call arguments,
+// which is the part a non-streaming client gets wrong.
+// The agent loop only sees the shared Message / ToolCall types; the
+// translation to either wire format lives here.
+package llm
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type Message struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function FunctionCall `json:"function"`
+}
+
+type FunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type ToolDef struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		Parameters  json.RawMessage `json:"parameters"`
+	} `json:"function"`
+}
+
+func Tool(name, description, parameters string) ToolDef {
+	var t ToolDef
+	t.Type = "function"
+	t.Function.Name = name
+	t.Function.Description = description
+	t.Function.Parameters = json.RawMessage(parameters)
+	return t
+}
+
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+type chatRequest struct {
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+	Tools    []ToolDef `json:"tools,omitempty"`
+	Stream   bool      `json:"stream"`
+}
+
+// streamChunk is the wire shape for one Chat Completions SSE delta.
+type streamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage Usage `json:"usage"`
+}
+
+// --- Responses API wire shapes ---
+
+type responsesTool struct {
+	Type        string          `json:"type"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+type responsesRequest struct {
+	Model        string          `json:"model"`
+	Instructions string          `json:"instructions,omitempty"`
+	Input        []any           `json:"input"`
+	Tools        []responsesTool `json:"tools,omitempty"`
+	Stream       bool            `json:"stream"`
+	Store        bool            `json:"store"` // false: stateless, we resend full input (JSONL is the store)
+}
+
+type responsesUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	TotalTokens  int `json:"total_tokens"`
+}
+
+// responsesEvent is the common envelope for Responses SSE events.
+type responsesEvent struct {
+	Type      string `json:"type"`
+	Delta     string `json:"delta"`
+	ItemID    string `json:"item_id"`
+	Arguments string `json:"arguments"`
+	Item      struct {
+		Type      string `json:"type"`
+		ID        string `json:"id"`
+		CallID    string `json:"call_id"`
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+		Content   []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"item"`
+	Response struct {
+		Output []struct {
+			Type      string `json:"type"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+			Content   []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+		Usage responsesUsage `json:"usage"`
+	} `json:"response"`
+}
+
+type Client struct {
+	BaseURL string // may be with or without /v1
+	APIKey  string
+	Model   string
+	API     string // "chat" (default) or "responses"
+	HTTP    *http.Client
+}
+
+// Mode returns the normalised API mode.
+func (c *Client) Mode() string {
+	if strings.ToLower(strings.TrimSpace(c.API)) == "responses" {
+		return "responses"
+	}
+	return "chat"
+}
+
+// endpoint normalises baseURL to .../v1/chat/completions or .../v1/responses.
+func (c *Client) endpoint() string {
+	base := strings.TrimSuffix(strings.TrimSpace(c.BaseURL), "/")
+	if base == "" {
+		base = "https://api.openai.com/v1"
+	}
+	base = strings.TrimSuffix(base, "/chat/completions")
+	base = strings.TrimSuffix(base, "/responses")
+	if !strings.HasSuffix(base, "/v1") {
+		base += "/v1"
+	}
+	if c.Mode() == "responses" {
+		return base + "/responses"
+	}
+	return base + "/chat/completions"
+}
+
+func (c *Client) httpClient() *http.Client {
+	if c.HTTP != nil {
+		return c.HTTP
+	}
+	return &http.Client{Timeout: 180 * time.Second}
+}
+
+func (c *Client) doPost(ctx context.Context, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return nil, fmt.Errorf("LLM API %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	return resp, nil
+}
+
+// Chat is a non-streaming convenience wrapper around Stream.
+func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolDef, onText func(string)) (Message, Usage, error) {
+	var msg Message
+	var usage Usage
+	err := c.Stream(ctx, messages, tools, func(text string) {
+		if onText != nil {
+			onText(text)
+		}
+	}, func(m Message, u Usage) {
+		msg = m
+		usage = u
+	})
+	return msg, usage, err
+}
+
+// Stream dispatches to the selected API mode.
+func (c *Client) Stream(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage)) error {
+	if c.APIKey == "" {
+		return fmt.Errorf("missing API key: set OPENAI_API_KEY")
+	}
+	if c.Mode() == "responses" {
+		return c.streamResponses(ctx, messages, tools, onText, onDone)
+	}
+	return c.streamChat(ctx, messages, tools, onText, onDone)
+}
+
+func (c *Client) streamChat(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage)) error {
+	body, err := json.Marshal(chatRequest{Model: c.Model, Messages: messages, Tools: tools, Stream: true})
+	if err != nil {
+		return err
+	}
+	resp, err := c.doPost(ctx, body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var msg Message
+	msg.Role = "assistant"
+	var usage Usage
+	type acc struct {
+		id   string
+		name string
+		args strings.Builder
+	}
+	accs := map[int]*acc{}
+	order := []int{}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+		var chunk streamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if chunk.Usage.TotalTokens != 0 {
+			usage = chunk.Usage
+		}
+		for _, ch := range chunk.Choices {
+			if ch.Delta.Content != "" {
+				msg.Content += ch.Delta.Content
+				if onText != nil {
+					onText(ch.Delta.Content)
+				}
+			}
+			for _, tc := range ch.Delta.ToolCalls {
+				a, ok := accs[tc.Index]
+				if !ok {
+					a = &acc{}
+					accs[tc.Index] = a
+					order = append(order, tc.Index)
+				}
+				if tc.ID != "" {
+					a.id = tc.ID
+				}
+				if tc.Function.Name != "" {
+					a.name = tc.Function.Name
+				}
+				a.args.WriteString(tc.Function.Arguments)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	for _, idx := range order {
+		a := accs[idx]
+		msg.ToolCalls = append(msg.ToolCalls, ToolCall{
+			ID:       a.id,
+			Type:     "function",
+			Function: FunctionCall{Name: a.name, Arguments: a.args.String()},
+		})
+	}
+	if onDone != nil {
+		onDone(msg, usage)
+	}
+	return nil
+}
+
+// toResponsesInput converts the shared Message history into Responses
+// instructions + input items. System becomes instructions; everything
+// else becomes typed items (message / function_call / function_call_output).
+func toResponsesInput(messages []Message) (string, []any) {
+	var instructions []string
+	var input []any
+	for _, m := range messages {
+		switch m.Role {
+		case "system":
+			instructions = append(instructions, m.Content)
+		case "user":
+			input = append(input, map[string]any{
+				"role": "user",
+				"content": []any{map[string]any{
+					"type": "input_text", "text": m.Content,
+				}},
+			})
+		case "assistant":
+			if m.Content != "" {
+				input = append(input, map[string]any{
+					"role": "assistant",
+					"content": []any{map[string]any{
+						"type": "output_text", "text": m.Content,
+					}},
+				})
+			}
+			for _, tc := range m.ToolCalls {
+				input = append(input, map[string]any{
+					"type":      "function_call",
+					"call_id":   tc.ID,
+					"name":      tc.Function.Name,
+					"arguments": tc.Function.Arguments,
+				})
+			}
+		case "tool":
+			input = append(input, map[string]any{
+				"type":    "function_call_output",
+				"call_id": m.ToolCallID,
+				"output":  m.Content,
+			})
+		}
+	}
+	return strings.Join(instructions, "\n"), input
+}
+
+func (c *Client) streamResponses(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage)) error {
+	instructions, input := toResponsesInput(messages)
+	var rtools []responsesTool
+	for _, t := range tools {
+		rtools = append(rtools, responsesTool{
+			Type:        "function",
+			Name:        t.Function.Name,
+			Description: t.Function.Description,
+			Parameters:  t.Function.Parameters,
+		})
+	}
+	body, err := json.Marshal(responsesRequest{
+		Model: c.Model, Instructions: instructions, Input: input,
+		Tools: rtools, Stream: true, Store: false,
+	})
+	if err != nil {
+		return err
+	}
+	resp, err := c.doPost(ctx, body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var msg Message
+	msg.Role = "assistant"
+	var usage Usage
+	type acc struct {
+		callID string
+		name   string
+		args   strings.Builder
+	}
+	accs := map[string]*acc{} // keyed by item_id
+	order := []string{}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+		var ev responsesEvent
+		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+			continue
+		}
+		switch ev.Type {
+		case "response.output_text.delta":
+			if ev.Delta != "" {
+				msg.Content += ev.Delta
+				if onText != nil {
+					onText(ev.Delta)
+				}
+			}
+		case "response.output_item.added":
+			if ev.Item.Type == "function_call" {
+				id := ev.Item.ID
+				if id == "" {
+					id = ev.Item.CallID
+				}
+				if _, ok := accs[id]; !ok {
+					accs[id] = &acc{callID: ev.Item.CallID, name: ev.Item.Name}
+					order = append(order, id)
+				}
+			}
+		case "response.function_call_arguments.delta":
+			id := ev.ItemID
+			a, ok := accs[id]
+			if !ok {
+				a = &acc{}
+				accs[id] = a
+				order = append(order, id)
+			}
+			a.args.WriteString(ev.Delta)
+		case "response.function_call_arguments.done":
+			id := ev.ItemID
+			a, ok := accs[id]
+			if !ok {
+				a = &acc{}
+				accs[id] = a
+				order = append(order, id)
+			}
+			if ev.Arguments != "" {
+				// done carries the full arguments; prefer it over fragments.
+				a.args.Reset()
+				a.args.WriteString(ev.Arguments)
+			}
+		case "response.output_item.done":
+			if ev.Item.Type == "function_call" {
+				id := ev.Item.ID
+				if id == "" {
+					id = ev.Item.CallID
+				}
+				a, ok := accs[id]
+				if !ok {
+					a = &acc{}
+					accs[id] = a
+					order = append(order, id)
+				}
+				if ev.Item.CallID != "" {
+					a.callID = ev.Item.CallID
+				}
+				if ev.Item.Name != "" {
+					a.name = ev.Item.Name
+				}
+				if ev.Item.Arguments != "" && a.args.Len() == 0 {
+					a.args.WriteString(ev.Item.Arguments)
+				}
+			}
+			if ev.Item.Type == "message" {
+				for _, part := range ev.Item.Content {
+					if part.Text != "" && !strings.Contains(msg.Content, part.Text) {
+						// Text already arrived via deltas; only fill if missing.
+						if msg.Content == "" {
+							msg.Content += part.Text
+							if onText != nil {
+								onText(part.Text)
+							}
+						}
+					}
+				}
+			}
+		case "response.completed":
+			for _, out := range ev.Response.Output {
+				switch out.Type {
+				case "function_call":
+					// Completed carries the authoritative call list.
+					found := false
+					for _, tc := range msg.ToolCalls {
+						if tc.ID == out.CallID {
+							found = true
+							_ = tc
+						}
+					}
+					if !found {
+						msg.ToolCalls = append(msg.ToolCalls, ToolCall{
+							ID: out.CallID, Type: "function",
+							Function: FunctionCall{Name: out.Name, Arguments: out.Arguments},
+						})
+					}
+				case "message":
+					if msg.Content == "" {
+						for _, part := range out.Content {
+							msg.Content += part.Text
+						}
+					}
+				}
+			}
+			u := ev.Response.Usage
+			if u.TotalTokens != 0 {
+				usage = Usage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	// If response.completed did not already add tool calls, build them
+	// from the accumulated fragments.
+	if len(msg.ToolCalls) == 0 {
+		for _, id := range order {
+			a := accs[id]
+			if a.name == "" {
+				continue
+			}
+			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
+				ID: a.callID, Type: "function",
+				Function: FunctionCall{Name: a.name, Arguments: a.args.String()},
+			})
+		}
+	}
+	if onDone != nil {
+		onDone(msg, usage)
+	}
+	return nil
+}
