@@ -155,7 +155,7 @@ func main() {
 	}
 
 	// REPL
-	fmt.Println("Type a task, /skill:<name> to load a skill, /usage for session totals, or /quit to exit.")
+	fmt.Println("Type a task, /skill:<name> to load a skill, /usage for session totals, /clear to drop context, or /quit to exit.")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for {
@@ -169,6 +169,15 @@ func main() {
 		}
 		if line == "/usage" {
 			fmt.Printf("[usage] session: %s | fee: OpenConsole 實價未驗證\n", sessionUsage)
+			continue
+		}
+		if line == "/clear" {
+			if err := store.Clear(); err != nil {
+				fmt.Printf("[error] %v\n", err)
+				continue
+			}
+			history = nil
+			fmt.Printf("Context cleared. Cleared messages stay in %s but won't reload on --resume (it starts from the clear point).\n", store.Path)
 			continue
 		}
 		runOnce(line)

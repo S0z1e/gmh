@@ -48,3 +48,4 @@ Notes:
 - Modes: `-mode suggest` (default, ask before write/edit/bash), `-mode auto` (no prompts, use only on a disposable copy).
 - Skills: put `SKILL.md` files under `.agents/skills/<name>/` in the project, or `~/.config/minimal-harness/skills/`. Only name + description are loaded at startup; the full file loads on demand via `/skill:<name>`.
 - Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`.
+- REPL commands: `/usage` shows session token totals, `/clear` drops the conversation context (a marker is written to the session file; `--resume` starts from the clear point, older messages stay in the file).

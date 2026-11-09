@@ -52,6 +52,16 @@ func (s *Store) Append(m llm.Message) error {
 	return err
 }
 
+// clearMarkerRole marks a /clear point in the JSONL. Everything before
+// the last marker is kept in the file but never reloaded by Load.
+const clearMarkerRole = "__clear__"
+
+// Clear records a clear point in the session file. The caller also drops
+// its in-memory history; Load after this returns only later messages.
+func (s *Store) Clear() error {
+	return s.Append(llm.Message{Role: clearMarkerRole})
+}
+
 func (s *Store) Close() error { return s.file.Close() }
 
 // Load replays a JSONL session. A trailing dangling assistant tool call
@@ -74,6 +84,11 @@ func Load(id string) ([]llm.Message, error) {
 		}
 		var m llm.Message
 		if err := json.Unmarshal(line, &m); err != nil {
+			continue
+		}
+		if m.Role == clearMarkerRole {
+			// /clear point: forget everything before it (file keeps it).
+			msgs = nil
 			continue
 		}
 		msgs = append(msgs, m)
