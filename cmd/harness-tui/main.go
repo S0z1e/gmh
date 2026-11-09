@@ -78,8 +78,11 @@ func main() {
 		a.Cfg.Ask = tui.NewApprover(prog).Ask
 	}
 
+	// Runner output goes through the program's message queue (PrintMsg),
+	// not prog.Println: direct prints race the model's own tea.Println
+	// of the finished turn and can land above the reply text.
 	runner := &app.Runner{App: a, Print: func(format string, args ...any) {
-		prog.Println(fmt.Sprintf(format, args...))
+		prog.Send(tui.PrintMsg{Text: fmt.Sprintf(format, args...)})
 	}}
 
 	ctx := context.Background()

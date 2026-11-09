@@ -18,6 +18,21 @@ type EventMsg struct {
 	Event agent.Event
 }
 
+// PrintMsg is one block the runner wants in the scrollback (usage
+// lines, /usage output, notices). It goes through the program's message
+// queue like every other output, so it can never overtake the model's
+// own tea.Println of the finished turn's text: the runner's prog.Println
+// used to race that print and the usage lines landed above the reply.
+//
+// One rule for callers: a PrintMsg may contain embedded newlines, but
+// never send two PrintMsgs back-to-back expecting order — consecutive
+// tea.Println calls reverse their order in Bubble Tea v2 (verified
+// live: turn/session usage printed session-first). Combine the lines
+// into one PrintMsg.
+type PrintMsg struct {
+	Text string
+}
+
 // Model is the TUI state.
 type Model struct {
 	info     string // e.g. resumed-session message, shown once at the top
@@ -54,6 +69,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil // ignore releases; presses already handled
 	case EventMsg:
 		return m.handleEvent(msg.Event)
+	case PrintMsg:
+		return m, tea.Println(msg.Text)
 	case ApprovalMsg:
 		m.approval = msg.Request
 		return m, nil
@@ -125,7 +142,8 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	case agent.EventToolEnd:
 		m.liveTool = ""
 	case agent.EventStepUsage:
-		// Usage lines are printed by the runner via program.Println.
+		// Usage lines are printed by the runner via PrintMsg, through
+		// the same queue, so they land after the reply text.
 	case agent.EventDone:
 		text := strings.TrimRight(m.live.String(), "\n")
 		m.live.Reset()

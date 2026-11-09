@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -17,6 +19,54 @@ func apply(t *testing.T, m Model, msg tea.Msg) Model {
 		t.Fatalf("Update returned %T, want Model", next)
 	}
 	return nm
+}
+
+// A PrintMsg sent right after the done event must land below the
+// reply text in the scrollback, never above it. The runner used to
+// call prog.Println directly, which raced the model's tea.Println of
+// the turn text and printed the usage lines first. Run the race
+// several times: with the queue it is deterministic.
+func TestPrintMsgOrderedAfterDoneText(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		// A real renderer (not WithoutRenderer): tea.Println output
+		// only reaches the output writer through the renderer.
+		var out bytes.Buffer
+		prog := tea.NewProgram(NewModel(""), tea.WithInput(strings.NewReader("")), tea.WithOutput(&out))
+		done := make(chan struct{})
+		go func() {
+			_, _ = prog.Run()
+			close(done)
+		}()
+		// Stream the reply, then finish the turn and immediately ask
+		// the runner to print a usage line — the two sends race.
+		prog.Send(EventMsg{Event: agent.Event{Kind: agent.EventTextDelta, Text: "hello reply"}})
+		prog.Send(EventMsg{Event: agent.Event{Kind: agent.EventDone, Text: "hello reply"}})
+		prog.Send(PrintMsg{Text: "[usage] turn: prompt=1"})
+		time.Sleep(300 * time.Millisecond)
+		prog.Quit()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("program did not quit")
+		}
+		s := out.String()
+		// The reply also appears in live-region renders while it
+		// streams; the last occurrence is the Println commit at Done.
+		iReply := strings.LastIndex(s, "hello reply")
+		iUsage := strings.Index(s, "[usage] turn:")
+		if iReply < 0 || iUsage < 0 || iReply > iUsage {
+			t.Fatalf("iteration %d: reply at %d, usage at %d in %q", i, iReply, iUsage, s)
+		}
+	}
+}
+
+// PrintMsg renders through tea.Println.
+func TestPrintMsgReturnsPrintln(t *testing.T) {
+	m := NewModel("")
+	_, cmd := m.Update(PrintMsg{Text: "hi"})
+	if cmd == nil {
+		t.Fatal("PrintMsg should return a command")
+	}
 }
 
 func TestModelStreamsTextIntoLiveRegion(t *testing.T) {

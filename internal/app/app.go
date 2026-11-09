@@ -162,7 +162,8 @@ func Setup(p Params) (*App, error) {
 }
 
 // Runner executes one line at a time: a task, or a slash command.
-// Print is the line printer (plain: fmt.Printf; TUI: program.Println).
+// Print is the line printer (plain: fmt.Printf; TUI: sent as a message
+// so it stays ordered with the model's own scrollback prints).
 // Session totals accumulate across turns. Cost is estimated only when
 // rates are configured (App.Rates); the estimate is always labelled
 // with its source, and OpenConsole's real price stays unverified.
@@ -255,12 +256,14 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	r.SessionUsage.Add(usage)
 	turnCost := r.App.Rates.Cost(usage, time.Now())
 	r.SessionCost += turnCost
+	// One Print call for both lines: consecutive tea.Println calls
+	// reverse their order in Bubble Tea v2 (verified), so the turn
+	// and session lines must travel as a single print.
+	turnLine := fmt.Sprintf("[usage] turn: %s", usage)
 	if r.App.Rates.Configured {
-		r.Print("\n[usage] turn: %s | est. cost: ~$%.4f", usage, turnCost)
-	} else {
-		r.Print("\n[usage] turn: %s", usage)
+		turnLine += fmt.Sprintf(" | est. cost: ~$%.4f", turnCost)
 	}
-	r.Print("[usage] session: %s | %s", r.SessionUsage, r.costLine(r.SessionCost))
+	r.Print("\n%s\n[usage] session: %s | %s", turnLine, r.SessionUsage, r.costLine(r.SessionCost))
 	// Auto-compact when the last call's context hit 70% of the window.
 	if agent.ShouldCompact(r.App.Cfg.LastPromptTokens, r.App.ContextLimit) {
 		r.Print("[compact] context at %d tokens (limit %d), compacting…", r.App.Cfg.LastPromptTokens, r.App.ContextLimit)
