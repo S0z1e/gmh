@@ -34,6 +34,7 @@ func ToolDefs() []llm.ToolDef {
 		llm.Tool("edit", "Replace exact oldText (must match once) with newText in an existing file.", `{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["path","oldText","newText"]}`),
 		llm.Tool("bash", "Run a shell command in the workspace root. Timeout in seconds, default 60, max 300.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]}`),
 		llm.Tool("grep", "Search file contents with a regex. Prefer this over bash grep/rg. Returns file:line matches, capped (truncation is marked).", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"},"exclude":{"type":"string"},"context":{"type":"integer"},"maxMatches":{"type":"integer"}},"required":["pattern"]}`),
+		llm.Tool("glob", "List files matching a glob pattern, e.g. **/*.go. Prefer this over bash find/ls for discovering files.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer"}},"required":["pattern"]}`),
 	}
 }
 

@@ -211,6 +211,12 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (string,
 			return "", fmt.Errorf("bad grep args: %w", err)
 		}
 		return e.Grep(ctx, a)
+	case "glob":
+		var a GlobArgs
+		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+			return "", fmt.Errorf("bad glob args: %w", err)
+		}
+		return e.Glob(ctx, a)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
