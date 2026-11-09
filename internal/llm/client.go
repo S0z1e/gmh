@@ -1,10 +1,12 @@
 // Package llm is a tiny OpenAI-compatible client, stdlib only.
-// Two API modes, selected with Client.API ("chat" or "responses"):
+// Three API modes, selected with Client.API ("chat", "responses" or
+// "anthropic"):
 //   - chat:      POST /v1/chat/completions, messages[], choices[0].message
 //   - responses: POST /v1/responses, instructions + input[], output[]
+//   - anthropic: POST /v1/messages, system + messages[], content blocks
 //
-// Both support SSE streaming and accumulate partial tool-call arguments,
-// which is the part a non-streaming client gets wrong.
+// All three support SSE streaming and accumulate partial tool-call
+// arguments, which is the part a non-streaming client gets wrong.
 // The agent loop only sees the shared Message / ToolCall types; the
 // translation to either wire format lives here.
 package llm
@@ -17,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -160,19 +163,45 @@ type Client struct {
 	BaseURL string // may be with or without /v1
 	APIKey  string
 	Model   string
-	API     string // "chat" (default) or "responses"
-	HTTP    *http.Client
+	API     string // "chat" (default), "responses" or "anthropic"
+	// MaxTokens is the Anthropic per-response output budget.
+	// 0 = defaultAnthropicMaxTokens. Ignored by the OpenAI modes,
+	// which set no max_tokens.
+	MaxTokens int
+	HTTP      *http.Client
 }
 
 // Mode returns the normalised API mode.
 func (c *Client) Mode() string {
-	if strings.ToLower(strings.TrimSpace(c.API)) == "responses" {
+	switch strings.ToLower(strings.TrimSpace(c.API)) {
+	case "responses":
 		return "responses"
+	case "anthropic":
+		return "anthropic"
 	}
 	return "chat"
 }
 
-// endpoint normalises baseURL to .../v1/chat/completions or .../v1/responses.
+// ProviderName returns a short display name for the base URL host,
+// used in the "real price unverified" label. Unknown hosts are shown
+// as-is.
+func (c *Client) ProviderName() string {
+	host := strings.TrimSpace(c.BaseURL)
+	if u, err := url.Parse(host); err == nil && u.Host != "" {
+		host = u.Host
+	}
+	switch {
+	case strings.Contains(host, "openconsole"):
+		return "OpenConsole"
+	case strings.Contains(host, "intern-ai"):
+		return "Discovery"
+	default:
+		return host
+	}
+}
+
+// endpoint normalises baseURL to .../v1/chat/completions,
+// .../v1/responses or .../v1/messages.
 func (c *Client) endpoint() string {
 	base := strings.TrimSuffix(strings.TrimSpace(c.BaseURL), "/")
 	if base == "" {
@@ -180,11 +209,15 @@ func (c *Client) endpoint() string {
 	}
 	base = strings.TrimSuffix(base, "/chat/completions")
 	base = strings.TrimSuffix(base, "/responses")
+	base = strings.TrimSuffix(base, "/messages")
 	if !strings.HasSuffix(base, "/v1") {
 		base += "/v1"
 	}
-	if c.Mode() == "responses" {
+	switch c.Mode() {
+	case "responses":
 		return base + "/responses"
+	case "anthropic":
+		return base + "/messages"
 	}
 	return base + "/chat/completions"
 }
@@ -197,12 +230,25 @@ func (c *Client) httpClient() *http.Client {
 }
 
 func (c *Client) doPost(ctx context.Context, body []byte) (*http.Response, error) {
+	return c.doPostHeaders(ctx, body, nil, true)
+}
+
+// doPostHeaders is doPost plus extra headers and an auth switch.
+// withBearer sets the Authorization header; the Anthropic mode
+// passes false for api.anthropic.com, which reads x-api-key instead
+// (and must not receive a Bearer header alongside it).
+func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[string]string, withBearer bool) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	if withBearer {
+		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	req.Header.Set("Accept", "text/event-stream")
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
@@ -236,8 +282,11 @@ func (c *Client) Stream(ctx context.Context, messages []Message, tools []ToolDef
 	if c.APIKey == "" {
 		return fmt.Errorf("missing API key: set OPENAI_API_KEY")
 	}
-	if c.Mode() == "responses" {
+	switch c.Mode() {
+	case "responses":
 		return c.streamResponses(ctx, messages, tools, onText, onDone)
+	case "anthropic":
+		return c.streamAnthropic(ctx, messages, tools, onText, onDone)
 	}
 	return c.streamChat(ctx, messages, tools, onText, onDone)
 }

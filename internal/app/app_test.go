@@ -175,7 +175,7 @@ func TestRunnerCostEstimate(t *testing.T) {
 	if !strings.Contains(joined, "rates: test rates") {
 		t.Fatalf("rate source not labelled: %v", printed)
 	}
-	if !strings.Contains(joined, "OpenConsole 實價未驗證") {
+	if !strings.Contains(joined, "實價未驗證") {
 		t.Fatalf("unverified label missing: %v", printed)
 	}
 	if r.SessionCost != 0.02 {
@@ -209,7 +209,10 @@ func TestRunnerNoCostWithoutRates(t *testing.T) {
 	if strings.Contains(joined, "est. cost") {
 		t.Fatalf("no estimate should appear without rates: %v", printed)
 	}
-	if !strings.Contains(joined, "fee: OpenConsole 實價未驗證") {
+	// The label names the provider from the base URL: the mock server
+	// is not OpenConsole, so it shows its own host. The mapping
+	// itself is covered by TestAnthropicEndpointNormalisation.
+	if !strings.Contains(joined, "fee: 127.0.0.1") || !strings.Contains(joined, "實價未驗證") {
 		t.Fatalf("unverified label missing: %v", printed)
 	}
 }

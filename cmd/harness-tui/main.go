@@ -21,7 +21,7 @@ func main() {
 		root      = flag.String("root", ".", "workspace root")
 		mode      = flag.String("mode", "suggest", "suggest (ask in a y/n dialog) or auto")
 		model     = flag.String("model", "", "model (default OPENAI_MODEL or deepseek-v4.1-flash)")
-		api       = flag.String("api", "", "chat or responses (default OPENAI_API_MODE or chat)")
+		api       = flag.String("api", "", "chat, responses or anthropic (default OPENAI_API_MODE or chat)")
 		maxSteps  = flag.Int("max-steps", 50, "max agent steps")
 		resume    = flag.String("resume", "", "resume session id")
 		sessionID = flag.String("session", "", "session id (default: timestamp)")

@@ -44,13 +44,16 @@ cd minimal-harness
 export OPENAI_API_KEY="..."
 export OPENAI_BASE_URL="https://www.openconsole.cn/v1"
 export OPENAI_MODEL="deepseek-v4.1-flash"
-export OPENAI_API_MODE="chat"   # chat (default) or responses
+export OPENAI_API_MODE="chat"   # chat (default), responses or anthropic
 
 # print mode (headless, v1)
 go run ./cmd/harness -p -root /path/to/project "look at this project and add a test"
 
 # Responses API instead of Chat Completions
 go run ./cmd/harness -api responses -p -root /path/to/project "look at this project and add a test"
+
+# Anthropic Messages API (e.g. Discovery's Anthropic route)
+go run ./cmd/harness -api anthropic -p -root /path/to/project "look at this project and add a test"
 
 # interactive REPL
 go run ./cmd/harness -root /path/to/project
@@ -63,9 +66,10 @@ Notes:
 - The API key is read only from the environment. Never commit it, never put it in a file.
 - `OPENAI_BASE_URL` may be given with or without a trailing `/v1`; the client normalises it.
 - `-api chat` uses `POST /v1/chat/completions` (messages, `tool_calls[]`); `-api responses` uses `POST /v1/responses` (instructions + input items, `function_call` / `function_call_output`, `store: false` — stateless, JSONL is the store). Not every provider/model supports Responses; if OpenConsole rejects it, the error is returned verbatim.
+- `-api anthropic` uses `POST /v1/messages` (system string + messages with `tool_use` / `tool_result` content blocks). The same base URL works: `.../v1` normalises to `.../v1/messages`. Auth is picked by host: `api.anthropic.com` gets `x-api-key` only; every other host (including Discovery) gets Bearer only — sending both breaks Discovery, which prefers `x-api-key` and then rejects the unexchanged surrogate (verified live 2026-11-09). History is translated at call time, so sessions stay in the shared format and replay across modes; consecutive same-role messages merge into one (Anthropic requires strict user/assistant alternation), and an empty tool result replays as `(no output)`. Thinking blocks are skipped like `reasoning_content` in chat mode. Anthropic requires `max_tokens` per response: default 8192, or `ANTHROPIC_MAX_TOKENS`. Verified live 2026-11-09 against Discovery `Agents-A1`: 4-turn REPL (read → write, read-back → write, empty-output bash, follow-up question answered from history) plus a `--resume` run that answered from the earlier calls — tool_use/tool_result pairing and the empty-result placeholder both replay cleanly. The fee label names the provider from the base URL (`Discovery 實價未驗證` on Discovery, `OpenConsole 實價未驗證` on OpenConsole) instead of hardcoding OpenConsole.
 - End-to-end with the vault credential: `scripts/run_with_vault_key.py` fetches an `hsurr:` surrogate from authd and passes it to the harness as `OPENAI_API_KEY` in the child process only, never printing or storing it. Verified 2026-11-09: chat mode listed, wrote and verified `hello.txt` (6 bytes, usage total 4655); responses mode read, wrote and verified `count.txt` (usage total 3591). Both sessions are in `~/.minimal-harness/sessions/`.
 - Responses API live compatibility, verified 2026-11-09 against OpenConsole `deepseek-v4.1-flash` (P2-7): multi-turn tool loop (read → write → read-back, `summary.txt` exact), fragmented tool-call arguments (raw SSE showed one call split into 8 tiny deltas; a 15-line `write` call landed correctly), two tool calls in one turn, prompt caching (`input_tokens_details.cached_tokens` present — 128 on a replayed call, 6528 in one harness turn — and the cost line prints in responses mode), session resume with replayed `function_call` + `function_call_output` pairs (the model answered from the earlier calls, nothing dropped), and error shapes (bad model → HTTP 403 `{"error":{"message":"当前模型不可用…","code":"model_unavailable"}}`, surfaced verbatim as `LLM API 403 Forbidden: …`). No reasoning events are sent by this model, so there is nothing to surface or drop. No code fix was needed; the regression tests added in `internal/llm/responses_test.go` lock in the verified behaviour (two calls in one turn, denied-call replay pairing, cached-token mapping).
-- Stream integrity: a chat stream that ends without `[DONE]`, or a Responses stream without `response.completed`, is an error, not a silently truncated reply. (OpenConsole's Responses stream sends `response.completed` and no `[DONE]` — verified live 2026-11-09.) A Responses `response.completed` that lists only some of the calls the stream carried no longer drops the rest: the missing ones are merged from the accumulated fragments.
+- Stream integrity: a chat stream that ends without `[DONE]`, a Responses stream without `response.completed`, or an Anthropic stream without `message_stop`, is an error, not a silently truncated reply. (OpenConsole's Responses stream sends `response.completed` and no `[DONE]` — verified live 2026-11-09.) A Responses `response.completed` that lists only some of the calls the stream carried no longer drops the rest: the missing ones are merged from the accumulated fragments.
 - Modes: `-mode suggest` (default, ask before write/edit/bash), `-mode auto` (no prompts, use only on a disposable copy).
 - Skills: put `SKILL.md` files under `.agents/skills/<name>/` in the project, or `~/.config/minimal-harness/skills/`. Only name + description are loaded at startup; the full text loads on demand three ways: the user types `/skill:<name>`, the task names a skill as a whole word (auto-loaded before the turn), or the model calls the `load_skill` tool when a task matches a skill. A skill's `references/` files are never loaded up front: `load_skill` lists them in a footer, and the model loads one with `load_skill {name, reference}` (paths are jailed to that skill's `references/`).
 - Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`.

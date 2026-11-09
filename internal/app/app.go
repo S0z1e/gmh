@@ -22,7 +22,7 @@ type Params struct {
 	Root         string
 	Mode         string // suggest (ask) or auto
 	Model        string
-	API          string // chat or responses
+	API          string // chat, responses or anthropic
 	MaxSteps     int
 	ContextLimit int
 	Resume       string
@@ -89,8 +89,8 @@ func Setup(p Params) (*App, error) {
 	if apiMode == "" {
 		apiMode = "chat"
 	}
-	if apiMode != "chat" && apiMode != "responses" {
-		return nil, fmt.Errorf("invalid -api %q: use chat or responses", apiMode)
+	if apiMode != "chat" && apiMode != "responses" && apiMode != "anthropic" {
+		return nil, fmt.Errorf("invalid -api %q: use chat, responses or anthropic", apiMode)
 	}
 	mode := p.Mode
 	if mode == "" {
@@ -159,8 +159,15 @@ func Setup(p Params) (*App, error) {
 		deny = true
 	}
 
+	// Anthropic requires max_tokens per response; the OpenAI modes
+	// set none. Default 8192, or ANTHROPIC_MAX_TOKENS.
+	maxTokens := 0
+	if v := os.Getenv("ANTHROPIC_MAX_TOKENS"); v != "" {
+		fmt.Sscanf(v, "%d", &maxTokens)
+	}
+
 	a.Cfg = &agent.Config{
-		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl, API: apiMode},
+		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl, API: apiMode, MaxTokens: maxTokens},
 		Exec:                executor,
 		Tools:               agent.ToolDefs(),
 		System:              system,
@@ -195,7 +202,7 @@ func Setup(p Params) (*App, error) {
 // so it stays ordered with the model's own scrollback prints).
 // Session totals accumulate across turns. Cost is estimated only when
 // rates are configured (App.Rates); the estimate is always labelled
-// with its source, and OpenConsole's real price stays unverified.
+// with its source, and the provider's real price stays unverified.
 type Runner struct {
 	App          *App
 	SessionUsage llm.Usage
@@ -204,12 +211,15 @@ type Runner struct {
 }
 
 // costLine renders the estimate suffix for a usage line, or the
-// unverified label when no rates are configured.
+// unverified label when no rates are configured. The label names the
+// provider from the base URL: a second provider must not inherit
+// OpenConsole's name.
 func (r *Runner) costLine(cost float64) string {
+	label := r.App.Cfg.Client.ProviderName() + " 實價未驗證"
 	if !r.App.Rates.Configured {
-		return "fee: OpenConsole 實價未驗證"
+		return "fee: " + label
 	}
-	return fmt.Sprintf("est. cost: ~$%.4f (rates: %s; OpenConsole 實價未驗證)", cost, r.App.Rates.Source)
+	return fmt.Sprintf("est. cost: ~$%.4f (rates: %s; %s)", cost, r.App.Rates.Source, label)
 }
 
 // Handle runs one input line. It returns true when the UI should quit.
