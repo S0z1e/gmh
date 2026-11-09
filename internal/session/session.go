@@ -61,7 +61,8 @@ func Dir() string {
 }
 
 func New(id string) (*Store, error) {
-	if id == "" {
+	auto := id == ""
+	if auto {
 		id = time.Now().Format("20060102-150405")
 	}
 	dir := Dir()
@@ -69,6 +70,19 @@ func New(id string) (*Store, error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, id+".jsonl")
+	if auto {
+		// Two sessions started in the same second (or a new_session
+		// right after startup) must not share one file: suffix
+		// until the path is free. An explicit id is never suffixed:
+		// --resume needs the exact file.
+		for i := 1; ; i++ {
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				break
+			}
+			id = fmt.Sprintf("%s-%d", time.Now().Format("20060102-150405"), i)
+			path = filepath.Join(dir, id+".jsonl")
+		}
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err

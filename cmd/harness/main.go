@@ -15,6 +15,7 @@ import (
 
 	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
+	"minimalharness/internal/rpc"
 	"minimalharness/internal/uimode"
 )
 
@@ -33,13 +34,19 @@ func main() {
 		deny      = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1; -p always denies)")
 		bashTO    = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 60, or env OPENAI_BASH_TIMEOUT_SECONDS)")
 		bgThresh  = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 10s default, 0 = never)")
+		rpcMode   = flag.Bool("rpc", false, "RPC mode: JSONL over stdin/stdout for a GUI (see README); stdout carries protocol data only")
 	)
 	flag.Parse()
 
+	if *rpcMode && *printMode != "" {
+		fatal(fmt.Errorf("--rpc conflicts with -p"))
+	}
+
 	// UI selection happens before setup: the TUI is a separate binary
 	// (harness-tui) so the plain CLI never imports Bubble Tea.
-	// -p print mode is always plain and ignores --ui.
-	if *printMode == "" {
+	// -p print mode is always plain and ignores --ui; --rpc is a
+	// machine frontend, not a terminal one, and skips this too.
+	if *printMode == "" && !*rpcMode {
 		uiMode, err := uimode.Decide(*ui, uimode.IsTTY(os.Stdout))
 		if err != nil {
 			fatal(err)
@@ -73,6 +80,23 @@ func main() {
 		fatal(err)
 	}
 	defer a.Store.Close()
+
+	runner := &app.Runner{App: a, Print: func(format string, args ...any) {
+		fmt.Printf(format+"\n", args...)
+	}}
+
+	// RPC mode: the server owns the event stream and the approval
+	// bridge; usage lines and diagnostics go to stderr so stdout
+	// stays pure JSONL. Nothing is printed here at all.
+	if *rpcMode {
+		runner.Print = func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, format+"\n", args...)
+		}
+		if err := rpc.Run(a, runner, os.Stdin, os.Stdout); err != nil {
+			fatal(err)
+		}
+		return
+	}
 
 	if a.ResumedMessage != "" {
 		fmt.Println(a.ResumedMessage)
@@ -110,10 +134,6 @@ func main() {
 
 	ctx := context.Background()
 	fmt.Printf("harness v1  api=%s  model=%s  root=%s  mode=%s  session=%s\n", a.Cfg.Client.API, a.Cfg.Client.Model, a.Root, a.Cfg.Mode, a.Store.ID)
-
-	runner := &app.Runner{App: a, Print: func(format string, args ...any) {
-		fmt.Printf(format+"\n", args...)
-	}}
 
 	if *printMode != "" {
 		runner.Handle(ctx, *printMode)

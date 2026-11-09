@@ -197,7 +197,31 @@ func Setup(p Params) (*App, error) {
 	return a, nil
 }
 
-// Runner executes one line at a time: a task, or a slash command.
+// NewSession closes the current session store and starts a fresh one,
+// resetting history. The executor's audit closure is re-pointed at
+// the new store; a background job finishing mid-swap can still audit
+// to the old session's sidecar. The runner's totals are reset by
+// ResetSession, not here.
+func (a *App) NewSession() (*session.Store, error) {
+	store, err := session.New("")
+	if err != nil {
+		return nil, err
+	}
+	old := a.Store
+	a.Store = store
+	a.History = nil
+	if a.Cfg != nil {
+		a.Cfg.Session = store
+		if a.Cfg.Exec != nil {
+			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
+		}
+	}
+	if old != nil {
+		_ = old.Close()
+	}
+	return store, nil
+}
+
 // Print is the line printer (plain: fmt.Printf; TUI: sent as a message
 // so it stays ordered with the model's own scrollback prints).
 // Session totals accumulate across turns. Cost is estimated only when
@@ -210,7 +234,25 @@ type Runner struct {
 	// Turns counts completed agent turns (slash commands excluded),
 	// for the TUI meta line.
 	Turns int
-	Print func(format string, args ...any)
+	// LastErr is the error of the most recent turn (nil on success).
+	// The RPC server reads it to report a turn's outcome; the plain
+	// CLI and TUI already print the error through Print.
+	LastErr error
+	Print   func(format string, args ...any)
+}
+
+// ResetSession starts a fresh session and zeroes the runner's
+// totals. It returns the new session id.
+func (r *Runner) ResetSession() (string, error) {
+	store, err := r.App.NewSession()
+	if err != nil {
+		return "", err
+	}
+	r.SessionUsage = llm.Usage{}
+	r.SessionCost = 0
+	r.Turns = 0
+	r.LastErr = nil
+	return store.ID, nil
 }
 
 // costLine renders the estimate suffix for a usage line, or the
@@ -292,6 +334,9 @@ func (r *Runner) printJobs() {
 }
 
 func (r *Runner) runOnce(ctx context.Context, task string) {
+	// A run that never reaches the loop (e.g. /skill: with an unknown
+	// name) must not leave a stale error behind for the next reader.
+	r.LastErr = nil
 	// /skill:<name> loads the full skill text into the next turn.
 	if strings.HasPrefix(task, "/skill:") {
 		name := strings.TrimPrefix(task, "/skill:")
@@ -326,6 +371,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	_ = r.App.Store.Append(userMsg)
 	r.Turns++
 	_, usage, err := r.App.Cfg.Run(ctx, r.App.History)
+	r.LastErr = err
 	if err != nil {
 		r.Print("\n[error] %v", err)
 	}
