@@ -75,10 +75,20 @@ type Usage struct {
 }
 
 type chatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Tools    []ToolDef `json:"tools,omitempty"`
-	Stream   bool      `json:"stream"`
+	Model         string         `json:"model"`
+	Messages      []Message      `json:"messages"`
+	Tools         []ToolDef      `json:"tools,omitempty"`
+	Stream        bool           `json:"stream"`
+	StreamOptions *streamOptions `json:"stream_options,omitempty"`
+}
+
+// streamOptions requests token usage in the final SSE chunk. Without
+// include_usage, a spec-compliant provider (e.g. Intern-Discovery)
+// sends no usage object at all in a streaming Chat Completions
+// response, and the turn reports 0 tokens. Providers that include
+// usage by default (e.g. OpenConsole/deepseek) are unaffected.
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // streamChunk is the wire shape for one Chat Completions SSE delta.
@@ -292,7 +302,7 @@ func (c *Client) Stream(ctx context.Context, messages []Message, tools []ToolDef
 }
 
 func (c *Client) streamChat(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage)) error {
-	body, err := json.Marshal(chatRequest{Model: c.Model, Messages: messages, Tools: tools, Stream: true})
+	body, err := json.Marshal(chatRequest{Model: c.Model, Messages: messages, Tools: tools, Stream: true, StreamOptions: &streamOptions{IncludeUsage: true}})
 	if err != nil {
 		return err
 	}

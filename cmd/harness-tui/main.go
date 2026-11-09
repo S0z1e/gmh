@@ -56,17 +56,18 @@ func main() {
 	}
 	defer a.Store.Close()
 
-	// Header lines: the first line is the title (the model bolds it),
-	// the rest is session meta (the model dims it). The model prints
-	// the block once at startup via Init, so it stays at the top of
-	// the scrollback instead of sitting in the live region after
-	// every turn.
-	info := fmt.Sprintf("harness · %s · %s\nroot %s · session %s · mode %s\nType a task, /skill:<name>, /usage, /jobs, /clear, /compact, or /quit. Ctrl-C quits.", a.Cfg.Client.API, a.Cfg.Client.Model, a.Root, a.Store.ID, a.Cfg.Mode)
+	// Header lines, opencode-mini style: a one-line mark plus the
+	// session meta, both muted apart from the bold name and the plain
+	// model. The model prints the block once at startup via Init, so
+	// it stays at the top of the scrollback instead of sitting in the
+	// live region after every turn. The help line lives in the input
+	// placeholder now, not in the header.
+	info := fmt.Sprintf("▪ harness · %s · %s\nroot %s · session %s · mode %s", a.Cfg.Client.API, a.Cfg.Client.Model, a.Root, a.Store.ID, a.Cfg.Mode)
 	if a.ResumedMessage != "" {
 		info += "\n" + a.ResumedMessage
 	}
 	lines := make(chan string, 16)
-	m := tui.NewModel(info)
+	m := tui.NewModel(info).WithMeta(a.Cfg.Mode, a.Cfg.Client.API, a.Cfg.Client.Model)
 	// Set OnSubmit BEFORE NewProgram: the program holds its own copy of
 	// the model, so fields set afterwards on this copy would never fire.
 	m.OnSubmit = func(line string) { lines <- line }

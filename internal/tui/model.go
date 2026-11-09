@@ -3,32 +3,69 @@
 // Inline-first: finished turns are committed to scrollback with
 // tea.Println, only the live region (streaming text + current tool +
 // input line) is repainted.
+//
+// Look: opencode's visual language (restyled 2026-11-09 from the
+// research in ~/workspace/research_notes/opencode-tui-look-20261109/):
+// near-black palette, one peach accent, user turns as raised panels
+// with a peach left edge, assistant text indented 3 spaces with a
+// small markdown subset, tools as muted icon rows, bash output as a
+// collapsed raised block, and the input as a raised box with a heavy
+// left border and a model line. opencode itself ships this inline form
+// (opencode mini), so the look needs no alt-screen.
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"minimalharness/internal/agent"
 )
 
-// Styles are restrained and functional: meta information recedes,
-// actions and warnings stand out. No gradients, no decoration for
-// its own sake — the TUI is a work surface, not a poster.
+// Palette — opencode's default dark theme
+// (packages/tui/src/theme/assets/v2/opencode.json). Hex colours,
+// rendered directly by lipgloss on truecolor terminals.
 var (
+	colorRaised = lipgloss.Color("#141414") // user panels, input box, tool blocks
+	colorBorder = lipgloss.Color("#484848") // left-edge borders
+	colorPeach  = lipgloss.Color("#fab283") // interactive accent
+	colorPurple = lipgloss.Color("#9d7cd8") // headings, keywords
+	colorQuote  = lipgloss.Color("#e5c07b") // blockquotes, emphasis
+
+	styleBase    = lipgloss.NewStyle().Foreground(lipgloss.Color("#eeeeee"))
+	styleMuted   = lipgloss.NewStyle().Foreground(lipgloss.Color("#808080"))
 	styleTitle   = lipgloss.NewStyle().Bold(true)
-	styleDim     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	stylePrompt  = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
-	styleTool    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	styleUsage   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	styleError   = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
-	styleNotice  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	styleApprove = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
-	styleDeny    = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	stylePeach   = lipgloss.NewStyle().Foreground(colorPeach)
+	stylePurple  = lipgloss.NewStyle().Foreground(colorPurple).Bold(true)
+	styleBold    = lipgloss.NewStyle().Bold(true)
+	styleCode    = lipgloss.NewStyle().Foreground(lipgloss.Color("#7fd88f"))
+	styleCodeBlk = lipgloss.NewStyle().Foreground(lipgloss.Color("#7fd88f")).Background(colorRaised)
+	styleQuote   = lipgloss.NewStyle().Foreground(colorQuote)
+	styleError   = lipgloss.NewStyle().Foreground(lipgloss.Color("#e06c75")).Bold(true)
+	styleWarning = lipgloss.NewStyle().Foreground(lipgloss.Color("#f5a742"))
+	styleSuccess = lipgloss.NewStyle().Foreground(lipgloss.Color("#7fd88f"))
+	styleSelect  = lipgloss.NewStyle().Background(lipgloss.Color("#5c9cf5")).Foreground(lipgloss.Color("#0a0a0a")).Bold(true)
 )
+
+// spinnerFrames is opencode's braille spinner (80 ms per frame).
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func spinnerGlyph(frame int) string {
+	return spinnerFrames[frame%len(spinnerFrames)]
+}
+
+type spinnerTickMsg struct{}
+
+func spinnerTick() tea.Cmd {
+	return tea.Tick(80*time.Millisecond, func(time.Time) tea.Msg { return spinnerTickMsg{} })
+}
 
 // EventMsg wraps one agent event as a Bubble Tea message.
 type EventMsg struct {
@@ -58,9 +95,13 @@ type Model struct {
 	live   string // streamed text of the current turn (a string, not a
 	// strings.Builder: Update copies the model by value, and a
 	// copied non-zero Builder panics on the next WriteString)
-	liveTool string // tool currently running, "" when idle
-	working  bool
-	width    int
+	liveTool     string // tool currently running, "" when idle
+	liveToolArgs string // JSON args of the running tool (ToolEnd
+	// carries no args, so the summary is built from these)
+	working      bool
+	width        int
+	spinnerFrame int
+	spinning     bool // a spinner tick loop is running
 	// approval is non-nil while the agent waits for a y/n answer.
 	approval *ApprovalRequest
 	// pendingReply is a finished turn's text, waiting to be committed
@@ -73,6 +114,12 @@ type Model struct {
 	// exactly this way before this field existed.
 	pendingReply string
 
+	// Meta for the composer line under the input (mode · model · api).
+	// Set by WithMeta; empty in tests, which then show no meta line.
+	metaMode  string
+	metaModel string
+	metaAPI   string
+
 	// OnSubmit is called with the submitted line on Enter. The caller
 	// runs the task and feeds agent events back via program.Send.
 	OnSubmit func(string)
@@ -80,6 +127,16 @@ type Model struct {
 
 func NewModel(info string) Model {
 	return Model{info: info}
+}
+
+// WithMeta records the mode, model and API for the composer meta line.
+// Call it before NewProgram: the program holds its own copy of the
+// model, so fields set afterwards on this copy would never show.
+func (m Model) WithMeta(mode, api, model string) Model {
+	m.metaMode = mode
+	m.metaAPI = api
+	m.metaModel = model
+	return m
 }
 
 // Init prints the header once, into the scrollback, and never again:
@@ -94,17 +151,41 @@ func (m Model) Init() tea.Cmd {
 	return tea.Println(m.header())
 }
 
-// header styles the info block: the first line (title) bold, the rest
-// dim — the session meta should recede behind the work.
+// header styles the info block: the title line gets the opencode-mini
+// treatment (muted mark and separators, bold "harness", plain model
+// name); the rest is muted session meta.
 func (m Model) header() string {
 	lines := strings.Split(strings.TrimRight(m.info, "\n"), "\n")
 	if len(lines) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString(styleTitle.Render(lines[0]))
+	b.WriteString(headerLine(lines[0]))
 	for _, l := range lines[1:] {
-		b.WriteString("\n" + styleDim.Render(l))
+		b.WriteString("\n" + styleMuted.Render(l))
+	}
+	return b.String()
+}
+
+// headerLine styles one title line of the form
+// "▪ harness · api · model" (or the older "harness · api · model").
+func headerLine(line string) string {
+	parts := strings.Split(line, " · ")
+	var b strings.Builder
+	for i, p := range parts {
+		if i > 0 {
+			b.WriteString(styleMuted.Render(" · "))
+		}
+		switch {
+		case p == "▪":
+			b.WriteString(styleMuted.Render(p))
+		case p == "harness":
+			b.WriteString(styleTitle.Render(p))
+		case i == len(parts)-1:
+			b.WriteString(styleBase.Render(p))
+		default:
+			b.WriteString(styleMuted.Render(p))
+		}
 	}
 	return b.String()
 }
@@ -118,15 +199,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg.Key())
 	case tea.KeyReleaseMsg:
 		return m, nil // ignore releases; presses already handled
+	case spinnerTickMsg:
+		if m.working && m.live == "" {
+			m.spinnerFrame++
+			return m, spinnerTick()
+		}
+		m.spinning = false
+		return m, nil
 	case EventMsg:
 		return m.handleEvent(msg.Event)
 	case PrintMsg:
 		// The finished turn's reply, if any, goes out in the same
 		// print as the runner's text — one Println, so the two can
-		// never swap order (see pendingReply). The reply stays
-		// plain; the runner's part keeps its own styling.
+		// never swap order (see pendingReply). The reply is rendered
+		// (indent + markdown); the runner's part keeps its own styling.
 		if m.pendingReply != "" {
-			text := m.pendingReply + "\n" + stylePrint(msg.Text)
+			text := renderText(m.pendingReply) + "\n" + stylePrint(msg.Text)
 			m.pendingReply = ""
 			return m, tea.Println(text)
 		}
@@ -164,7 +252,26 @@ func (m Model) handleKey(k tea.Key) (tea.Model, tea.Cmd) {
 		if m.OnSubmit != nil {
 			m.OnSubmit(line)
 		}
-		return m, nil
+		if strings.TrimSpace(line) == "" {
+			return m, nil
+		}
+		// Echo the submitted turn as a raised user panel (opencode's
+		// user-message panel), printed by the model at submit time —
+		// before any agent event for this turn exists, so the ordering
+		// guarantees are unaffected.
+		echo := tea.Println(userPanel(line, m.width))
+		// Slash commands never run the agent loop (and /compact runs
+		// the LLM without emitting events), so only a real task starts
+		// the thinking spinner. Done/Error always clear working.
+		if strings.HasPrefix(line, "/") {
+			return m, echo
+		}
+		m.working = true
+		if m.spinning {
+			return m, echo
+		}
+		m.spinning = true
+		return m, tea.Batch(echo, spinnerTick())
 	case tea.KeyBackspace:
 		if m.cursor > 0 {
 			m.input = append(m.input[:m.cursor-1], m.input[m.cursor:]...)
@@ -202,15 +309,29 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 			m.pendingReply = ""
 			m.live += ev.Text
 			m.working = true
-			return m, tea.Println(reply)
+			return m, tea.Println(renderText(reply))
 		}
 		m.live += ev.Text
 		m.working = true
 	case agent.EventToolStart:
 		m.liveTool = ev.ToolName
+		m.liveToolArgs = ev.ToolArgs
 		m.working = true
 	case agent.EventToolEnd:
+		name, args := m.liveTool, m.liveToolArgs
+		if name == "" {
+			name = ev.ToolName
+		}
 		m.liveTool = ""
+		m.liveToolArgs = ""
+		// A backgrounded bash also gets a ToolEnd, with the
+		// "still running" observation — its notice was already
+		// printed by the ToolBackgrounded event, so print nothing
+		// here or the job would be announced twice.
+		if name == "bash" && strings.Contains(ev.ToolOutput, "still running in the background") {
+			return m, nil
+		}
+		return m, tea.Println(toolEndBlock(name, args, ev.ToolOutput, ev.ToolErr))
 	case agent.EventStepUsage:
 		// Usage lines are printed by the runner via PrintMsg, through
 		// the same queue, so they land after the reply text.
@@ -218,14 +339,25 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		// The tool keeps running as a job; it no longer blocks the
 		// live region. Tell the scrollback, like a finished turn.
 		m.liveTool = ""
-		return m, tea.Println(styleNotice.Render(fmt.Sprintf("… bash running in background (%s)", ev.JobID)))
+		m.liveToolArgs = ""
+		cmd := ""
+		if ev.ToolArgs != "" {
+			cmd = toolSummary("bash", ev.ToolArgs)
+		}
+		if strings.HasPrefix(cmd, "$ ") {
+			cmd = cmd[2:]
+		}
+		if cmd != "" {
+			return m, tea.Println(styleWarning.Render("… ") + styleBase.Render("bash "+cmd) + "  " + badgeStyle.Render("Background"))
+		}
+		return m, tea.Println(styleWarning.Render(fmt.Sprintf("… bash running in background (%s)", ev.JobID)))
 	case agent.EventBackgroundWait:
-		return m, tea.Println(styleNotice.Render(fmt.Sprintf("waiting for background jobs: %s", ev.Text)))
+		return m, tea.Println(styleWarning.Render(fmt.Sprintf("waiting for background jobs: %s", ev.Text)))
 	case agent.EventToolBackgroundDone:
 		if ev.ToolErr != nil {
-			return m, tea.Println(styleError.Render(fmt.Sprintf("background job %s finished with error: %v", ev.JobID, ev.ToolErr)))
+			return m, tea.Println(styleError.Render(fmt.Sprintf("✗ background job %s finished with error: %v", ev.JobID, ev.ToolErr)))
 		}
-		return m, tea.Println(styleNotice.Render(fmt.Sprintf("background job %s finished", ev.JobID)))
+		return m, tea.Println(styleSuccess.Render(fmt.Sprintf("✓ background job %s finished", ev.JobID)))
 	case agent.EventDone:
 		// Do not print the reply here: hold it as pendingReply and
 		// let the runner's next print (the usage lines) carry it out
@@ -234,58 +366,408 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.pendingReply = strings.TrimRight(m.live, "\n")
 		m.live = ""
 		m.liveTool = ""
+		m.liveToolArgs = ""
 		m.working = false
 	case agent.EventError:
 		m.liveTool = ""
+		m.liveToolArgs = ""
 		m.working = false
 		// The error line itself is printed by the runner.
+	}
+	// (Re)start the spinner while a turn runs with no text yet and
+	// no tick loop is alive — e.g. the next turn after a textless one.
+	if m.working && m.live == "" && !m.spinning {
+		m.spinning = true
+		return m, spinnerTick()
 	}
 	return m, nil
 }
 
-// stylePrint colours runner output for the scrollback: usage and
-// compaction notes recede, errors stand out, everything else is plain.
-// The runner's prints often start with a blank line ("\n[usage] …",
-// "\n[error] …"), so the prefix check runs on the text with leading
-// newlines stripped — otherwise nothing here would ever match.
-func stylePrint(s string) string {
-	trimmed := strings.TrimLeft(s, "\n")
-	switch {
-	case strings.HasPrefix(trimmed, "[usage]"), strings.HasPrefix(trimmed, "[compact]"):
-		return styleUsage.Render(s)
-	case strings.HasPrefix(trimmed, "[error]"):
-		return styleError.Render(s)
-	default:
+// badgeStyle is the muted-on-raised "Background" badge.
+var badgeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#808080")).Background(colorRaised)
+
+// toolEndBlock renders a finished tool call for the scrollback. Bash
+// gets a raised block with the command and the output tail; every
+// other tool gets one muted row with a ✓/✗ icon. A denial (the loop
+// reports it as an observation starting "User denied") is a muted
+// row with a "(denied)" suffix, never a green tick. All of it sits
+// under the 3-space gutter, like the assistant text.
+func toolEndBlock(name, argsJSON, output string, toolErr error) string {
+	summary := toolSummary(name, argsJSON)
+	if name == "bash" {
+		return indentBlock(bashBlock(summary, output, toolErr != nil))
+	}
+	if strings.HasPrefix(output, "User denied") {
+		return "   " + styleMuted.Render("✗ "+summary+" (denied)")
+	}
+	if toolErr != nil {
+		row := styleError.Render("✗ " + summary)
+		// The expanded error below the row, like opencode.
+		errLines, _ := collapseOutput(output)
+		if len(errLines) > 0 {
+			var b strings.Builder
+			b.WriteString("   " + row)
+			for _, l := range errLines {
+				b.WriteString("\n     " + styleError.Render(l))
+			}
+			return b.String()
+		}
+		return "   " + row
+	}
+	return "   " + styleSuccess.Render("✓") + " " + styleMuted.Render(summary)
+}
+
+// indentBlock prefixes every line of a rendered block with the
+// 3-space gutter.
+func indentBlock(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = "   " + l
+	}
+	return strings.Join(lines, "\n")
+}
+
+// bashBlock renders a finished bash call as a raised block: the
+// command line, then the output tail (at most 10 lines) with an
+// "(N earlier lines)" label when truncated. On error the command
+// line goes error red and the output stays muted.
+func bashBlock(summary, output string, failed bool) string {
+	lines, cut := collapseOutput(output)
+	var b strings.Builder
+	cmdLine := summary // toolSummary already returns "$ <command>"
+	if failed {
+		b.WriteString(styleError.Render(cmdLine))
+	} else {
+		b.WriteString(styleBase.Render(cmdLine))
+	}
+	for _, l := range lines {
+		b.WriteString("\n" + styleMuted.Render(l))
+	}
+	if cut > 0 {
+		b.WriteString("\n" + styleMuted.Render(fmt.Sprintf("(%d earlier lines)", cut)))
+	}
+	return bashBlockStyle.Render(b.String())
+}
+
+var bashBlockStyle = lipgloss.NewStyle().
+	Border(lipgloss.Border{Left: "┃"}, false, false, false, true).
+	BorderForeground(colorBorder).
+	Background(colorRaised).
+	Padding(0, 1)
+
+// collapseOutput keeps the tail of a tool output: at most 10 lines,
+// with the number of lines cut off the head. Each line is capped at
+// 200 runes, so one huge line cannot flood the scrollback.
+func collapseOutput(out string) (lines []string, cut int) {
+	out = strings.TrimRight(out, "\n")
+	if out == "" {
+		return nil, 0
+	}
+	all := strings.Split(out, "\n")
+	if len(all) > 10 {
+		cut = len(all) - 10
+		all = all[len(all)-10:]
+	}
+	for _, l := range all {
+		lines = append(lines, truncateRunes(l, 200))
+	}
+	return lines, cut
+}
+
+// truncateRunes caps s at n runes, marking the cut with "…".
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
+	return string(r[:n-1]) + "…"
+}
+
+// toolPendingLabel is the running row's label for a tool — opencode's
+// literal pending phrases.
+func toolPendingLabel(name string) string {
+	switch name {
+	case "read":
+		return "Reading file…"
+	case "write":
+		return "Preparing write…"
+	case "edit":
+		return "Preparing edit…"
+	case "grep":
+		return "Searching content…"
+	case "glob":
+		return "Finding files…"
+	case "bash":
+		return "Running command…"
+	case "load_skill":
+		return "Loading skill…"
+	default:
+		return name + "…"
+	}
+}
+
+// toolSummary builds the one-line summary for a finished tool call
+// from its JSON args. Match counts for grep/glob are not in the event,
+// so no "(N matches)" suffix in phase 1 — counts are never invented.
+// Falls back to the tool name when the args do not parse.
+func toolSummary(name, argsJSON string) string {
+	var args map[string]json.RawMessage
+	if json.Unmarshal([]byte(argsJSON), &args) == nil {
+		str := func(k string) string {
+			var s string
+			if raw, ok := args[k]; ok {
+				_ = json.Unmarshal(raw, &s)
+			}
+			return s
+		}
+		switch name {
+		case "read":
+			if p := str("path"); p != "" {
+				return "Read " + p
+			}
+		case "write":
+			if p := str("path"); p != "" {
+				return "Write " + p
+			}
+		case "edit":
+			if p := str("path"); p != "" {
+				return "Edit " + p
+			}
+		case "grep":
+			if p := str("pattern"); p != "" {
+				if d := str("path"); d != "" {
+					return fmt.Sprintf("Grep %q in %s", p, d)
+				}
+				return fmt.Sprintf("Grep %q", p)
+			}
+		case "glob":
+			if p := str("pattern"); p != "" {
+				return fmt.Sprintf("Glob %q", p)
+			}
+		case "bash":
+			if c := str("command"); c != "" {
+				return "$ " + c
+			}
+		case "load_skill":
+			if n := str("name"); n != "" {
+				return "Load skill " + n
+			}
+		}
+	}
+	return name
+}
+
+// toolIcon is the per-tool icon for the approval dialog.
+func toolIcon(name string) string {
+	switch name {
+	case "read":
+		return "→"
+	case "write", "edit":
+		return "←"
+	case "grep", "glob":
+		return "✱"
+	case "bash":
+		return "│"
+	default:
+		return "→"
+	}
+}
+
+// stylePrint colours runner output for the scrollback. opencode shows
+// no brackets in the timeline: usage lines become one muted line with
+// "·" separators and thousands separators, errors become "✗ <text>".
+// The runner's prints often start with a blank line ("\n[usage] …",
+// "\n[error] …"), so the prefix check runs per line after stripping
+// leading newlines — otherwise nothing here would ever match. Plain
+// mode keeps the brackets; only the TUI strips them.
+func stylePrint(s string) string {
+	lead := s[:len(s)-len(strings.TrimLeft(s, "\n"))]
+	rest := strings.TrimLeft(s, "\n")
+	lines := strings.Split(rest, "\n")
+	for i, l := range lines {
+		lines[i] = stylePrintLine(l)
+	}
+	return lead + strings.Join(lines, "\n")
+}
+
+func stylePrintLine(l string) string {
+	switch {
+	case strings.HasPrefix(l, "[usage]"):
+		return styleMuted.Render("   " + formatUsage(l))
+	case strings.HasPrefix(l, "[compact]"):
+		return styleMuted.Render("   " + strings.TrimPrefix(l, "[compact] "))
+	case strings.HasPrefix(l, "[error]"):
+		return styleError.Render("   ✗ " + strings.TrimPrefix(l, "[error] "))
+	default:
+		return l
+	}
+}
+
+var usageRe = regexp.MustCompile(`^(turn|session): prompt=(\d+) \(cached=(\d+)\) completion=(\d+) total=(\d+)`)
+
+// formatUsage restyles one runner usage line:
+// "[usage] turn: prompt=3922 (cached=1920) completion=215 total=4137
+//
+//	| est. cost: ~$0.0007 (rates: …)" becomes
+//
+// "turn · prompt 3,922 (cached 1,920) · completion 215 · total 4,137
+//
+//	· est. cost: ~$0.0007 (rates: …)". The cost/fee suffix is kept
+//
+// verbatim (the rate source label must survive); an unrecognised
+// shape is returned unchanged apart from the stripped prefix.
+func formatUsage(line string) string {
+	rest := strings.TrimPrefix(line, "[usage] ")
+	head, tail := rest, ""
+	if i := strings.Index(rest, " | "); i >= 0 {
+		head, tail = rest[:i], rest[i+3:]
+	}
+	m := usageRe.FindStringSubmatch(head)
+	if m == nil {
+		return rest
+	}
+	nums := func(s string) string {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return s
+		}
+		return formatInt(n)
+	}
+	out := fmt.Sprintf("%s · prompt %s (cached %s) · completion %s · total %s",
+		m[1], nums(m[2]), nums(m[3]), nums(m[4]), nums(m[5]))
+	if tail != "" {
+		out += " · " + tail
+	}
+	return out
+}
+
+// formatInt renders n with thousands separators (3,922).
+func formatInt(n int) string {
+	s := strconv.Itoa(n)
+	neg := strings.HasPrefix(s, "-")
+	if neg {
+		s = s[1:]
+	}
+	var b strings.Builder
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(c)
+	}
+	if neg {
+		return "-" + b.String()
+	}
+	return b.String()
 }
 
 // View renders only the live region: the streaming text with the
 // current tool, and the input line (or the approval dialog, which
 // replaces the input line while it is pending). The header was
 // printed once at startup (see Init); finished turns are already in
-// scrollback via tea.Println.
+// scrollback via tea.Println. The cursor is placed explicitly on the
+// input line, because the meta line sits below it.
 func (m Model) View() tea.View {
-	var b strings.Builder
-	if m.working || m.live != "" {
-		b.WriteString(m.live)
-		if m.liveTool != "" {
-			b.WriteString("\n" + styleTool.Render("▶ "+m.liveTool+"…"))
-		}
-		b.WriteString("\n")
+	var liveLines []string
+	if m.live != "" {
+		liveLines = append(liveLines, strings.Split(renderText(m.live), "\n")...)
 	}
+	if m.liveTool != "" {
+		liveLines = append(liveLines, "   "+styleMuted.Render(spinnerGlyph(m.spinnerFrame))+" "+styleMuted.Render(toolPendingLabel(m.liveTool)))
+	} else if m.working && m.live == "" {
+		liveLines = append(liveLines, "   "+styleWarning.Render(spinnerGlyph(m.spinnerFrame))+" "+styleWarning.Render("Thinking…"))
+	}
+	var lines []string
+	lines = append(lines, liveLines...)
 	if m.approval != nil {
-		b.WriteString(m.approvalBox())
+		lines = append(lines, m.approvalBox())
 	} else {
-		b.WriteString(stylePrompt.Render("❯ ") + string(m.input))
+		lines = append(lines, m.inputLine())
+		if meta := m.metaLine(); meta != "" {
+			lines = append(lines, meta)
+		}
 	}
-	return tea.NewView(b.String())
+	v := tea.NewView(strings.Join(lines, "\n"))
+	if m.approval == nil {
+		// Cursor on the input line, after the typed prefix. The "┃ "
+		// prefix is 2 cells; the prefix width is measured in display
+		// cells, not runes (CJK input is 2 cells per rune).
+		x := 2 + ansi.StringWidth(string(m.input[:m.cursor]))
+		v.Cursor = tea.NewCursor(x, len(liveLines))
+	}
+	return v
 }
 
-// approvalBox renders the pending approval as a dialog: an amber
-// rounded border, a bold title, the prompt, and y in green / n in
-// red. It stays inline-first (no alt-screen overlay); lipgloss only
-// styles the text, it does not take over the screen.
+// inputLine renders the composer: a heavy left border (peach, dimmed
+// to the border colour while a turn runs), the typed text or the
+// placeholder, on the raised background.
+func (m Model) inputLine() string {
+	barColor := colorPeach
+	if m.working {
+		barColor = colorBorder
+	}
+	bar := lipgloss.NewStyle().Foreground(barColor).Render("┃")
+	text := string(m.input)
+	var rendered string
+	if text == "" {
+		rendered = styleMuted.Render(placeholderText(m.width))
+	} else {
+		rendered = styleBase.Render(text)
+	}
+	st := lipgloss.NewStyle().Background(colorRaised)
+	if m.width > 0 {
+		st = st.Width(m.width)
+	}
+	return st.Render(bar + " " + rendered)
+}
+
+// placeholderText is the empty-input hint; it replaces the startup
+// help line. Truncated to the terminal width when known.
+func placeholderText(width int) string {
+	const ph = "Ask anything…  /skill:<name> /usage /jobs /clear /compact /quit"
+	if width <= 2 {
+		return ph
+	}
+	avail := width - 2 // the "┃ " prefix
+	return truncateRunes(ph, avail)
+}
+
+// metaLine is the composer meta line under the input:
+// "mode · model · api" (mode peach, model base, api muted). Empty
+// when the meta was never set (tests).
+func (m Model) metaLine() string {
+	if m.metaMode == "" && m.metaModel == "" && m.metaAPI == "" {
+		return ""
+	}
+	line := stylePeach.Render(m.metaMode) + styleMuted.Render(" · ") +
+		styleBase.Render(m.metaModel) + styleMuted.Render(" · ") +
+		styleMuted.Render(m.metaAPI)
+	st := lipgloss.NewStyle().Background(colorRaised)
+	if m.width > 0 {
+		st = st.Width(m.width)
+	}
+	return st.Render("  " + line)
+}
+
+// userPanel renders a submitted user turn as a raised panel with a
+// peach left edge, for the scrollback.
+func userPanel(line string, width int) string {
+	st := lipgloss.NewStyle().
+		Border(lipgloss.Border{Left: "┃"}, false, false, false, true).
+		BorderForeground(colorPeach).
+		Foreground(lipgloss.Color("#eeeeee")).
+		Background(colorRaised).
+		Padding(0, 1)
+	if width > 0 {
+		st = st.Width(width)
+	}
+	return st.Render(line)
+}
+
+// approvalBox renders the pending approval as opencode's permission
+// panel: a full-width block with a peach left border (not a box), a
+// warning "△ Approval required" header, the tool line, the raw detail,
+// and the option row. It stays inline-first (no alt-screen overlay).
 func (m Model) approvalBox() string {
 	width := 60
 	if m.width > 8 && m.width-4 < width {
@@ -294,20 +776,66 @@ func (m Model) approvalBox() string {
 	if width < 20 {
 		width = 20
 	}
-	// Inner width: the border (2) and padding (2) come off the total.
-	inner := width - 4
-	if inner < 10 {
-		inner = 10
+	// lipgloss Width() is the TOTAL block width; the text area
+	// inside is the left border (1) plus the left+right padding
+	// (2+2) narrower. Wrap and right-align against that text width,
+	// or the option row wraps (a row exactly text-wide already
+	// pushes its last word onto the next line).
+	textWidth := width - 5
+	if textWidth < 10 {
+		textWidth = 10
 	}
-	lines := wrapText(m.approval.Prompt, inner)
-	body := styleTitle.Render("Approval") + "\n" + strings.Join(lines, "\n") + "\n" +
-		styleApprove.Render("[y] approve") + "   " + styleDeny.Render("[n] deny")
+	tool, summary, detail := parseApprovalPrompt(m.approval.Prompt)
+	header := styleWarning.Render("△") + " " + styleTitle.Render("Approval required")
+	toolLine := "  " + styleMuted.Render(toolIcon(tool)) + " " + styleBase.Render(summary)
+	detailLines := wrapText(detail, textWidth)
+	// Option row: the selected option has a solid blue background
+	// (the colour the opencode screenshots show for the focused
+	// button); the hint sits at the right edge.
+	options := styleSelect.Render("[y] Allow once") + "   " + styleMuted.Render("[n] Deny")
+	hint := "esc = deny"
+	// Keep the row a touch short of the edge: a row exactly
+	// text-wide wraps in lipgloss (the last word lands on the next
+	// line).
+	optsLen := len([]rune("[y] Allow once")) + 3 + len([]rune("[n] Deny"))
+	gap := textWidth - optsLen - len([]rune(hint)) - 2
+	if gap < 3 {
+		gap = 3
+	}
+	optionRow := options + strings.Repeat(" ", gap) + styleMuted.Render(hint)
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteString("\n" + toolLine)
+	for _, l := range detailLines {
+		b.WriteString("\n" + styleMuted.Render(l))
+	}
+	b.WriteString("\n" + optionRow)
 	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("214")).
-		Padding(0, 1).
-		Width(inner).
-		Render(body)
+		Border(lipgloss.Border{Left: "┃"}, false, false, false, true).
+		BorderForeground(colorPeach).
+		Background(colorRaised).
+		Padding(1, 2).
+		Width(width).
+		Render(b.String())
+}
+
+// parseApprovalPrompt splits an approval prompt "Run <tool> <json>?"
+// into the tool name, a one-line summary and the detail (the raw
+// JSON). It falls back to the raw prompt when the shape is
+// unexpected, so the dialog never hides what it is asking about.
+func parseApprovalPrompt(prompt string) (tool, summary, detail string) {
+	rest := strings.TrimSuffix(strings.TrimPrefix(prompt, "Run "), "?")
+	i := strings.Index(rest, " ")
+	if i < 0 {
+		return "", prompt, prompt
+	}
+	tool = rest[:i]
+	detail = rest[i+1:]
+	summary = toolSummary(tool, detail)
+	if summary == tool {
+		summary = prompt
+	}
+	return tool, summary, detail
 }
 
 // wrapText word-wraps s at width runes.
