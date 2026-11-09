@@ -1,8 +1,84 @@
 package skills
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestLoadListsReferences(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".agents", "skills", "demo")
+	if err := os.MkdirAll(filepath.Join(dir, "references"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: demo\ndescription: A demo skill.\n---\n# Demo\nBody here.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "references", "api.md"), []byte("API details.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "references", "examples.md"), []byte("Examples.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	found := Discover(root)
+	if len(found) != 1 {
+		t.Fatalf("discovered %d skills, want 1", len(found))
+	}
+	sk := found[0]
+	loaded, err := sk.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(loaded, "Body here.") {
+		t.Fatalf("Load() missing body: %q", loaded)
+	}
+	if !strings.Contains(loaded, "api.md") || !strings.Contains(loaded, "examples.md") {
+		t.Fatalf("Load() missing references footer: %q", loaded)
+	}
+	if strings.Contains(loaded, "API details.") {
+		t.Fatal("Load() must not inline reference contents")
+	}
+	refs, err := sk.References()
+	if err != nil || len(refs) != 2 || refs[0].Name != "api.md" || refs[1].Name != "examples.md" {
+		t.Fatalf("References() = %v, err = %v", refs, err)
+	}
+	// Load one reference file.
+	content, err := sk.LoadReference("api.md")
+	if err != nil || content != "API details.\n" {
+		t.Fatalf("LoadReference(api.md) = %q, err = %v", content, err)
+	}
+	// Traversal and absolute paths are refused.
+	for _, bad := range []string{"../SKILL.md", "../../etc/passwd", "/etc/passwd", "sub/../../SKILL.md"} {
+		if _, err := sk.LoadReference(bad); err == nil {
+			t.Fatalf("LoadReference(%q) should refuse", bad)
+		}
+	}
+	// Unknown reference.
+	if _, err := sk.LoadReference("missing.md"); err == nil {
+		t.Fatal("LoadReference(missing.md) should error")
+	}
+}
+
+func TestLoadWithoutReferences(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".agents", "skills", "plain")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("# Plain\nJust body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sk := Discover(root)[0]
+	loaded, err := sk.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(loaded, "References") {
+		t.Fatalf("Load() should not add a footer without references/: %q", loaded)
+	}
+}
 
 func TestMatchKeywords(t *testing.T) {
 	skills := []Skill{{Name: "demo"}, {Name: "code-review"}}

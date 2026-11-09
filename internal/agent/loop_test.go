@@ -137,6 +137,59 @@ func TestRunLoadSkillTool(t *testing.T) {
 	}
 }
 
+// The model can load one reference file on demand; the reference
+// content reaches it as a tool result on the next call.
+func TestRunLoadSkillReference(t *testing.T) {
+	root := t.TempDir()
+	skillDir := filepath.Join(root, ".agents", "skills", "demo")
+	if err := os.MkdirAll(filepath.Join(skillDir, "references"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: demo\ndescription: A demo skill.\n---\n# Demo\nSee references/api.md.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "references", "api.md"), []byte("REF-BODY-789\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var calls int32
+	var secondBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"load_skill\",\"arguments\":\"{\\\"name\\\":\\\"demo\\\",\\\"reference\\\":\\\"api.md\\\"}\"}}]}}]}\n\n")
+			fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		secondBody = string(body)
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":3,\"total_tokens\":23}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &Config{
+		Client:   &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
+		Exec:     &tools.Executor{Root: root},
+		Tools:    ToolDefs(),
+		System:   "test system",
+		Mode:     "auto",
+		MaxSteps: 5,
+	}
+	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "do the demo thing"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "done" {
+		t.Fatalf("final text = %q, want %q", text, "done")
+	}
+	if !strings.Contains(secondBody, "REF-BODY-789") {
+		t.Fatalf("second request did not contain the reference content: %s", secondBody)
+	}
+}
+
 // A denied tool call still emits tool start/end so renderers stay in sync.
 func TestRunEmitsEventsForDeniedToolCall(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

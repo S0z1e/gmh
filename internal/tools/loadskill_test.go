@@ -44,3 +44,42 @@ func TestLoadSkillDispatch(t *testing.T) {
 		t.Fatal("empty skill name should error")
 	}
 }
+
+func TestLoadSkillReference(t *testing.T) {
+	root := t.TempDir()
+	writeSkill(t, root, "demo", "---\nname: demo\ndescription: A demo skill.\n---\n# Demo\nDo the demo thing.\n")
+	refDir := filepath.Join(root, ".agents", "skills", "demo", "references")
+	if err := os.MkdirAll(refDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(refDir, "api.md"), []byte("REF-MARKER-456\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e := &Executor{Root: root}
+	// Loading the skill lists the reference but does not inline it.
+	out, err := e.Dispatch(context.Background(), "load_skill", `{"name":"demo"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "api.md") {
+		t.Fatalf("load_skill output should list references: %q", out)
+	}
+	if strings.Contains(out, "REF-MARKER-456") {
+		t.Fatal("load_skill must not inline reference contents")
+	}
+	// Loading one reference returns its content.
+	out, err = e.Dispatch(context.Background(), "load_skill", `{"name":"demo","reference":"api.md"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "REF-MARKER-456\n" {
+		t.Fatalf("load_skill reference = %q, want the file content", out)
+	}
+	// Unknown reference and traversal are refused.
+	if _, err := e.Dispatch(context.Background(), "load_skill", `{"name":"demo","reference":"nope.md"}`); err == nil {
+		t.Fatal("unknown reference should error")
+	}
+	if _, err := e.Dispatch(context.Background(), "load_skill", `{"name":"demo","reference":"../SKILL.md"}`); err == nil {
+		t.Fatal("traversal reference should error")
+	}
+}

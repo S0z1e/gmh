@@ -231,33 +231,47 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (string,
 	}
 }
 
-// LoadSkillArgs names one skill to load.
+// LoadSkillArgs names one skill to load, and optionally one file from
+// its references/ directory.
 type LoadSkillArgs struct {
-	Name string `json:"name"`
+	Name      string `json:"name"`
+	Reference string `json:"reference,omitempty"`
 }
 
-// LoadSkill returns the full SKILL.md body for a skill by name.
-// Read-only: it never writes, so it needs no approval. The name match
-// is exact first, then case-insensitive.
+// LoadSkill returns the SKILL.md body for a skill by name (plus a footer
+// listing its references/), or the content of one references/ file when
+// Reference is set. Read-only: it never writes, so it needs no approval.
+// The name match is exact first, then case-insensitive.
 func (e *Executor) LoadSkill(a LoadSkillArgs) (string, error) {
 	name := strings.TrimSpace(a.Name)
 	if name == "" {
 		return "", fmt.Errorf("load_skill needs a skill name")
 	}
 	found := skills.Discover(e.Root)
-	for _, sk := range found {
+	var match *skills.Skill
+	for i, sk := range found {
 		if sk.Name == name {
-			return sk.Body()
+			match = &found[i]
+			break
 		}
 	}
-	for _, sk := range found {
-		if strings.EqualFold(sk.Name, name) {
-			return sk.Body()
+	if match == nil {
+		for i, sk := range found {
+			if strings.EqualFold(sk.Name, name) {
+				match = &found[i]
+				break
+			}
 		}
 	}
-	var names []string
-	for _, sk := range found {
-		names = append(names, sk.Name)
+	if match == nil {
+		var names []string
+		for _, sk := range found {
+			names = append(names, sk.Name)
+		}
+		return "", fmt.Errorf("unknown skill %q (available: %s)", name, strings.Join(names, ", "))
 	}
-	return "", fmt.Errorf("unknown skill %q (available: %s)", name, strings.Join(names, ", "))
+	if strings.TrimSpace(a.Reference) != "" {
+		return match.LoadReference(a.Reference)
+	}
+	return match.Load()
 }

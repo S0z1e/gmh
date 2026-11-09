@@ -91,6 +91,84 @@ func (s Skill) Body() (string, error) {
 	return string(data), nil
 }
 
+// Load returns the SKILL.md body plus, when the skill has a references/
+// directory, a footer listing its files. Reference files themselves are
+// NOT loaded here — they load on demand via LoadReference, so a big
+// skill stays cheap until its details are actually needed.
+func (s Skill) Load() (string, error) {
+	body, err := s.Body()
+	if err != nil {
+		return "", err
+	}
+	refs, err := s.References()
+	if err != nil || len(refs) == 0 {
+		return body, nil
+	}
+	var b strings.Builder
+	b.WriteString(body)
+	if !strings.HasSuffix(body, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("\nReferences (load one with load_skill {name, reference}):\n")
+	for _, r := range refs {
+		fmt.Fprintf(&b, "- %s (%d bytes)\n", r.Name, r.Size)
+	}
+	return b.String(), nil
+}
+
+// Reference is one file under a skill's references/ directory.
+type Reference struct {
+	Name string
+	Size int64
+}
+
+// References lists the files in <skill dir>/references/, sorted by name.
+// An absent directory is not an error: it just means no references.
+func (s Skill) References() ([]Reference, error) {
+	dir := filepath.Join(filepath.Dir(s.Path), "references")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []Reference
+	for _, en := range entries {
+		if en.IsDir() {
+			continue
+		}
+		info, err := en.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, Reference{Name: en.Name(), Size: info.Size()})
+	}
+	return out, nil
+}
+
+// LoadReference reads one file from the skill's references/ directory.
+// The path is jailed to that directory: absolute paths and ".." escapes
+// are refused.
+func (s Skill) LoadReference(rel string) (string, error) {
+	if rel == "" {
+		return "", fmt.Errorf("load_skill needs a reference file name")
+	}
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("reference must be a relative path: %s", rel)
+	}
+	base := filepath.Join(filepath.Dir(s.Path), "references")
+	clean := filepath.Join(base, filepath.Clean(rel))
+	if rel2, err := filepath.Rel(base, clean); err != nil || rel2 == ".." || strings.HasPrefix(rel2, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("reference outside references/: %s", rel)
+	}
+	data, err := os.ReadFile(clean)
+	if err != nil {
+		return "", fmt.Errorf("cannot read reference %q: %w", rel, err)
+	}
+	return string(data), nil
+}
+
 // Listing renders the compact listing injected into the system prompt.
 func Listing(skills []Skill) string {
 	if len(skills) == 0 {

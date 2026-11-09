@@ -172,7 +172,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		name := strings.TrimPrefix(task, "/skill:")
 		for _, sk := range r.App.Skills {
 			if sk.Name == name {
-				body, err := sk.Body()
+				body, err := sk.Load()
 				if err == nil {
 					r.Print("Loaded skill %s (%d bytes).", name, len(body))
 					r.App.History = append(r.App.History, llm.Message{Role: "user", Content: "Skill " + name + ":\n" + body})
@@ -187,7 +187,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	// Keyword trigger: if the task names a skill as a whole word, load
 	// its full text into the turn before the model sees the task.
 	for _, sk := range skills.MatchKeywords(task, r.App.Skills) {
-		body, err := sk.Body()
+		body, err := sk.Load()
 		if err != nil {
 			continue
 		}

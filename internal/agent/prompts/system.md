@@ -7,7 +7,7 @@ Tools you can use: read, write, edit, bash, grep, glob, load_skill.
 - bash: run a shell command with a timeout. Never run destructive commands without approval.
 - grep: search file contents with a regex. Use this instead of bash grep/rg.
 - glob: list files matching a glob pattern. Use this instead of bash find/ls to discover files.
-- load_skill: load the full text of an available skill by name. When a task matches a skill listed below, call load_skill first and follow its instructions instead of guessing.
+- load_skill: load the full text of an available skill by name. When a task matches a skill listed below, call load_skill first and follow its instructions instead of guessing. If the skill lists reference files and you need one, load just that file with load_skill {name, reference} instead of guessing its contents.
 
 Rules:
 - Be concise. Explain what you changed and how to verify it.
