@@ -56,11 +56,14 @@ func main() {
 	}
 	defer a.Store.Close()
 
-	// Header lines go into the model's initial view: prog.Println before
-	// prog.Run() would block forever (the event loop hasn't started).
-	info := fmt.Sprintf("harness-tui  api=%s  model=%s  root=%s  mode=%s  session=%s\nType a task, /skill:<name>, /usage, /jobs, /clear, /compact, or /quit. Ctrl-C quits.", a.Cfg.Client.API, a.Cfg.Client.Model, a.Root, a.Cfg.Mode, a.Store.ID)
+	// Header lines: the first line is the title (the model bolds it),
+	// the rest is session meta (the model dims it). The model prints
+	// the block once at startup via Init, so it stays at the top of
+	// the scrollback instead of sitting in the live region after
+	// every turn.
+	info := fmt.Sprintf("harness · %s · %s\nroot %s · session %s · mode %s\nType a task, /skill:<name>, /usage, /jobs, /clear, /compact, or /quit. Ctrl-C quits.", a.Cfg.Client.API, a.Cfg.Client.Model, a.Root, a.Store.ID, a.Cfg.Mode)
 	if a.ResumedMessage != "" {
-		info = a.ResumedMessage + "\n" + info
+		info += "\n" + a.ResumedMessage
 	}
 	lines := make(chan string, 16)
 	m := tui.NewModel(info)

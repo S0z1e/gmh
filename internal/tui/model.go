@@ -10,8 +10,24 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"minimalharness/internal/agent"
+)
+
+// Styles are restrained and functional: meta information recedes,
+// actions and warnings stand out. No gradients, no decoration for
+// its own sake — the TUI is a work surface, not a poster.
+var (
+	styleTitle   = lipgloss.NewStyle().Bold(true)
+	styleDim     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	stylePrompt  = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+	styleTool    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	styleUsage   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	styleError   = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	styleNotice  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	styleApprove = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+	styleDeny    = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 )
 
 // EventMsg wraps one agent event as a Bubble Tea message.
@@ -36,15 +52,26 @@ type PrintMsg struct {
 
 // Model is the TUI state.
 type Model struct {
-	info     string // e.g. resumed-session message, shown once at the top
-	input    []rune
-	cursor   int
-	live     strings.Builder // streamed text of the current turn
-	liveTool string          // tool currently running, "" when idle
+	info   string // header block, printed once at startup (see Init)
+	input  []rune
+	cursor int
+	live   string // streamed text of the current turn (a string, not a
+	// strings.Builder: Update copies the model by value, and a
+	// copied non-zero Builder panics on the next WriteString)
+	liveTool string // tool currently running, "" when idle
 	working  bool
 	width    int
 	// approval is non-nil while the agent waits for a y/n answer.
 	approval *ApprovalRequest
+	// pendingReply is a finished turn's text, waiting to be committed
+	// to the scrollback together with the runner's next print (usually
+	// the usage lines). It exists because two separate tea.Println
+	// commands can execute out of order — each command runs in its
+	// own goroutine (Bubble Tea v2.1.1 handleCommands) — so the reply
+	// and the usage lines must travel as ONE print, or the usage can
+	// land above the reply. Verified live: the ordering test failed
+	// exactly this way before this field existed.
+	pendingReply string
 
 	// OnSubmit is called with the submitted line on Enter. The caller
 	// runs the task and feeds agent events back via program.Send.
@@ -55,8 +82,31 @@ func NewModel(info string) Model {
 	return Model{info: info}
 }
 
+// Init prints the header once, into the scrollback, and never again:
+// the header is session meta, not part of the live region, so it must
+// not sit at the bottom after every turn. (Printing it here is safe —
+// Init commands run inside the event loop, unlike prog.Println
+// before prog.Run(), which deadlocks.)
 func (m Model) Init() tea.Cmd {
-	return nil
+	if m.info == "" {
+		return nil
+	}
+	return tea.Println(m.header())
+}
+
+// header styles the info block: the first line (title) bold, the rest
+// dim — the session meta should recede behind the work.
+func (m Model) header() string {
+	lines := strings.Split(strings.TrimRight(m.info, "\n"), "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(styleTitle.Render(lines[0]))
+	for _, l := range lines[1:] {
+		b.WriteString("\n" + styleDim.Render(l))
+	}
+	return b.String()
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -71,7 +121,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case EventMsg:
 		return m.handleEvent(msg.Event)
 	case PrintMsg:
-		return m, tea.Println(msg.Text)
+		// The finished turn's reply, if any, goes out in the same
+		// print as the runner's text — one Println, so the two can
+		// never swap order (see pendingReply). The reply stays
+		// plain; the runner's part keeps its own styling.
+		if m.pendingReply != "" {
+			text := m.pendingReply + "\n" + stylePrint(msg.Text)
+			m.pendingReply = ""
+			return m, tea.Println(text)
+		}
+		return m, tea.Println(stylePrint(msg.Text))
 	case ApprovalMsg:
 		m.approval = msg.Request
 		return m, nil
@@ -135,7 +194,17 @@ func (m Model) handleKey(k tea.Key) (tea.Model, tea.Cmd) {
 func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	switch ev.Kind {
 	case agent.EventTextDelta:
-		m.live.WriteString(ev.Text)
+		// A new turn starting with a reply still pending (no runner
+		// print followed the last turn): commit the reply on its own
+		// first, so it is never lost behind the new turn.
+		if m.pendingReply != "" {
+			reply := m.pendingReply
+			m.pendingReply = ""
+			m.live += ev.Text
+			m.working = true
+			return m, tea.Println(reply)
+		}
+		m.live += ev.Text
 		m.working = true
 	case agent.EventToolStart:
 		m.liveTool = ev.ToolName
@@ -149,22 +218,23 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		// The tool keeps running as a job; it no longer blocks the
 		// live region. Tell the scrollback, like a finished turn.
 		m.liveTool = ""
-		return m, tea.Println(fmt.Sprintf("… bash running in background (%s)", ev.JobID))
+		return m, tea.Println(styleNotice.Render(fmt.Sprintf("… bash running in background (%s)", ev.JobID)))
 	case agent.EventBackgroundWait:
-		return m, tea.Println(fmt.Sprintf("waiting for background jobs: %s", ev.Text))
+		return m, tea.Println(styleNotice.Render(fmt.Sprintf("waiting for background jobs: %s", ev.Text)))
 	case agent.EventToolBackgroundDone:
 		if ev.ToolErr != nil {
-			return m, tea.Println(fmt.Sprintf("background job %s finished with error: %v", ev.JobID, ev.ToolErr))
+			return m, tea.Println(styleError.Render(fmt.Sprintf("background job %s finished with error: %v", ev.JobID, ev.ToolErr)))
 		}
-		return m, tea.Println(fmt.Sprintf("background job %s finished", ev.JobID))
+		return m, tea.Println(styleNotice.Render(fmt.Sprintf("background job %s finished", ev.JobID)))
 	case agent.EventDone:
-		text := strings.TrimRight(m.live.String(), "\n")
-		m.live.Reset()
+		// Do not print the reply here: hold it as pendingReply and
+		// let the runner's next print (the usage lines) carry it out
+		// in the same Println. Two separate Println commands can
+		// swap order; one print cannot.
+		m.pendingReply = strings.TrimRight(m.live, "\n")
+		m.live = ""
 		m.liveTool = ""
 		m.working = false
-		if text != "" {
-			return m, tea.Println(text)
-		}
 	case agent.EventError:
 		m.liveTool = ""
 		m.working = false
@@ -173,33 +243,49 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// View renders only the live region: the info line, the streaming text
-// with the current tool, and the input line (or the approval dialog,
-// which replaces the input line while it is pending). Finished turns
-// are already in scrollback via tea.Println.
+// stylePrint colours runner output for the scrollback: usage and
+// compaction notes recede, errors stand out, everything else is plain.
+// The runner's prints often start with a blank line ("\n[usage] …",
+// "\n[error] …"), so the prefix check runs on the text with leading
+// newlines stripped — otherwise nothing here would ever match.
+func stylePrint(s string) string {
+	trimmed := strings.TrimLeft(s, "\n")
+	switch {
+	case strings.HasPrefix(trimmed, "[usage]"), strings.HasPrefix(trimmed, "[compact]"):
+		return styleUsage.Render(s)
+	case strings.HasPrefix(trimmed, "[error]"):
+		return styleError.Render(s)
+	default:
+		return s
+	}
+}
+
+// View renders only the live region: the streaming text with the
+// current tool, and the input line (or the approval dialog, which
+// replaces the input line while it is pending). The header was
+// printed once at startup (see Init); finished turns are already in
+// scrollback via tea.Println.
 func (m Model) View() tea.View {
 	var b strings.Builder
-	if m.info != "" {
-		b.WriteString(m.info + "\n")
-	}
-	if m.working || m.live.Len() > 0 {
-		b.WriteString(m.live.String())
+	if m.working || m.live != "" {
+		b.WriteString(m.live)
 		if m.liveTool != "" {
-			b.WriteString("\n▶ " + m.liveTool + "…")
+			b.WriteString("\n" + styleTool.Render("▶ "+m.liveTool+"…"))
 		}
 		b.WriteString("\n")
 	}
 	if m.approval != nil {
 		b.WriteString(m.approvalBox())
 	} else {
-		b.WriteString("> " + string(m.input))
+		b.WriteString(stylePrompt.Render("❯ ") + string(m.input))
 	}
 	return tea.NewView(b.String())
 }
 
-// approvalBox renders the pending approval as a simple bordered box.
-// (Plain box-drawing, no lipgloss: the dialog is inline-first, not an
-// alt-screen overlay.)
+// approvalBox renders the pending approval as a dialog: an amber
+// rounded border, a bold title, the prompt, and y in green / n in
+// red. It stays inline-first (no alt-screen overlay); lipgloss only
+// styles the text, it does not take over the screen.
 func (m Model) approvalBox() string {
 	width := 60
 	if m.width > 8 && m.width-4 < width {
@@ -208,15 +294,20 @@ func (m Model) approvalBox() string {
 	if width < 20 {
 		width = 20
 	}
-	lines := wrapText(m.approval.Prompt, width)
-	lines = append(lines, "[y] approve   [n] deny")
-	var b strings.Builder
-	b.WriteString("┌─ Approval " + strings.Repeat("─", max(0, width-12)) + "┐\n")
-	for _, l := range lines {
-		b.WriteString("│ " + l + strings.Repeat(" ", max(0, width-len(l)-1)) + "│\n")
+	// Inner width: the border (2) and padding (2) come off the total.
+	inner := width - 4
+	if inner < 10 {
+		inner = 10
 	}
-	b.WriteString("└" + strings.Repeat("─", width+1) + "┘")
-	return b.String()
+	lines := wrapText(m.approval.Prompt, inner)
+	body := styleTitle.Render("Approval") + "\n" + strings.Join(lines, "\n") + "\n" +
+		styleApprove.Render("[y] approve") + "   " + styleDeny.Render("[n] deny")
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("214")).
+		Padding(0, 1).
+		Width(inner).
+		Render(body)
 }
 
 // wrapText word-wraps s at width runes.
@@ -240,11 +331,4 @@ func wrapText(s string, width int) []string {
 		lines = append(lines, cur)
 	}
 	return lines
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

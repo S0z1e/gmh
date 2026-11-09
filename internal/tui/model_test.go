@@ -6,9 +6,17 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"minimalharness/internal/agent"
 )
+
+// stripANSI removes SGR escape sequences so assertions can match the
+// visible text of a styled view (the styled prompt "❯ " is split by
+// a reset code, so the literal "❯ hi" never appears in raw output).
+func stripANSI(s string) string {
+	return ansi.Strip(s)
+}
 
 func apply(t *testing.T, m Model, msg tea.Msg) Model {
 	t.Helper()
@@ -58,6 +66,74 @@ func TestPrintMsgOrderedAfterDoneText(t *testing.T) {
 		if iReply < 0 || iUsage < 0 || iReply > iUsage {
 			t.Fatalf("iteration %d: reply at %d, usage at %d in %q", i, iReply, iUsage, s)
 		}
+	}
+}
+
+// The header is printed once at startup (Init) and is not part of
+// the live region: it must not sit in the view after every turn.
+func TestModelHeaderPrintsOnceNotInView(t *testing.T) {
+	m := NewModel("harness · chat · model\nroot /tmp/x · session s1")
+	if m.Init() == nil {
+		t.Fatal("Init should return a print command when info is set")
+	}
+	if got := m.View().Content; strings.Contains(got, "harness") || strings.Contains(got, "root /tmp/x") {
+		t.Fatalf("header must not be in the live view, got %q", got)
+	}
+	if m := NewModel(""); m.Init() != nil {
+		t.Fatal("Init should return nil when info is empty")
+	}
+}
+
+// Usage lines are dimmed, errors stand out — the literal text must
+// survive the styling so the ordering test can still find it.
+func TestStylePrintKeepsLiteralText(t *testing.T) {
+	if got := stylePrint("[usage] turn: prompt=1"); !strings.Contains(got, "[usage] turn: prompt=1") {
+		t.Fatalf("usage text lost in styling: %q", got)
+	}
+	if got := stylePrint("[error] step 1: boom"); !strings.Contains(got, "[error] step 1: boom") {
+		t.Fatalf("error text lost in styling: %q", got)
+	}
+	// The runner's prints start with a blank line: "\n[usage] …" and
+	// "\n[error] …" must still match, and actually get styled.
+	if got := stylePrint("\n[usage] turn: prompt=1"); got == "\n[usage] turn: prompt=1" {
+		t.Fatalf("usage with leading newline was not styled: %q", got)
+	}
+	if got := stylePrint("\n[error] boom"); got == "\n[error] boom" {
+		t.Fatalf("error with leading newline was not styled: %q", got)
+	}
+	if got := stylePrint("plain notice"); got != "plain notice" {
+		t.Fatalf("plain text must pass through unstyled, got %q", got)
+	}
+}
+
+// Streaming must survive many text deltas through a real program:
+// the live text used to be a strings.Builder, which panics ("illegal
+// use of non-zero Builder copied by value") on the second write after
+// Bubble Tea copies the model — a real multi-chunk reply killed the
+// program mid-turn. It is a plain string now.
+func TestModelStreamsManyDeltas(t *testing.T) {
+	var out syncBuffer
+	prog := tea.NewProgram(NewModel(""), tea.WithInput(strings.NewReader("")), tea.WithOutput(&out))
+	done := make(chan struct{})
+	go func() {
+		_, _ = prog.Run()
+		close(done)
+	}()
+	for _, d := range []string{"one ", "two ", "three ", "four ", "five"} {
+		prog.Send(EventMsg{Event: agent.Event{Kind: agent.EventTextDelta, Text: d}})
+	}
+	prog.Send(EventMsg{Event: agent.Event{Kind: agent.EventDone, Text: "one two three four five"}})
+	prog.Send(PrintMsg{Text: "[usage] turn: prompt=1"})
+	time.Sleep(300 * time.Millisecond)
+	prog.Quit()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("program did not quit")
+	}
+	s := out.String()
+	if !strings.Contains(s, "one two three four five") {
+		t.Fatalf("streamed text missing from output: %q", s)
 	}
 }
 
@@ -114,14 +190,28 @@ func TestModelFlushesLiveOnDone(t *testing.T) {
 	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventTextDelta, Text: "done text"}})
 	next, cmd := m.Update(EventMsg{Event: agent.Event{Kind: agent.EventDone, Text: "done text"}})
 	m = next.(Model)
-	if cmd == nil {
-		t.Fatal("Done should return a tea.Println command to commit the text to scrollback")
+	// Done holds the reply as pendingReply instead of printing it:
+	// the runner's next print carries it out in the same Println,
+	// so the reply and the usage lines can never swap order.
+	if cmd != nil {
+		t.Fatal("Done should not print on its own; the reply waits for the next print")
+	}
+	if m.pendingReply != "done text" {
+		t.Fatalf("pendingReply = %q, want %q", m.pendingReply, "done text")
 	}
 	if m.working {
 		t.Fatal("model should be idle after Done")
 	}
 	if got := m.View().Content; strings.Contains(got, "done text") {
 		t.Fatalf("live region should be cleared after Done, got %q", got)
+	}
+	// The next print flushes the reply together with its own text.
+	next, cmd = m.Update(PrintMsg{Text: "[usage] turn: prompt=1"})
+	if cmd == nil {
+		t.Fatal("PrintMsg should return a print command")
+	}
+	if next.(Model).pendingReply != "" {
+		t.Fatal("pendingReply should clear after the print")
 	}
 }
 
@@ -144,14 +234,14 @@ func TestModelEnterSubmitsAndClearsInput(t *testing.T) {
 	for _, r := range "hi" {
 		m = apply(t, m, tea.KeyPressMsg{Text: string(r), Code: r})
 	}
-	if got := m.View().Content; !strings.Contains(got, "> hi") {
-		t.Fatalf("input line = %q, want '> hi'", got)
+	if got := stripANSI(m.View().Content); !strings.Contains(got, "❯ hi") {
+		t.Fatalf("input line = %q, want '❯ hi'", got)
 	}
 	m = apply(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 	if len(submitted) != 1 || submitted[0] != "hi" {
 		t.Fatalf("submitted = %v, want [hi]", submitted)
 	}
-	if got := m.View().Content; strings.Contains(got, "> hi") {
+	if got := stripANSI(m.View().Content); strings.Contains(got, "❯ hi") {
 		t.Fatalf("input should clear after Enter, got %q", got)
 	}
 }
@@ -162,8 +252,8 @@ func TestModelBackspaceAndCursor(t *testing.T) {
 		m = apply(t, m, tea.KeyPressMsg{Text: string(r), Code: r})
 	}
 	m = apply(t, m, tea.KeyPressMsg{Code: tea.KeyBackspace})
-	if got := m.View().Content; !strings.Contains(got, "> a") || strings.Contains(got, "> ab") {
-		t.Fatalf("after backspace input = %q, want '> a'", got)
+	if got := stripANSI(m.View().Content); !strings.Contains(got, "❯ a") || strings.Contains(got, "❯ ab") {
+		t.Fatalf("after backspace input = %q, want '❯ a'", got)
 	}
 }
 
@@ -178,9 +268,13 @@ func TestModelApprovalDialogReplacesInput(t *testing.T) {
 	if !strings.Contains(view, "[y] approve") || !strings.Contains(view, "[n] deny") {
 		t.Fatalf("dialog missing y/n hints: %q", view)
 	}
+	// Rounded lipgloss border, not the old square box-drawing.
+	if !strings.Contains(view, "╭") || !strings.Contains(view, "╰") {
+		t.Fatalf("dialog should have a rounded border: %q", view)
+	}
 	// Typing while the dialog is up must not reach the input line.
 	m = apply(t, m, tea.KeyPressMsg{Text: "z", Code: 'z'})
-	if strings.Contains(m.View().Content, "> z") {
+	if strings.Contains(stripANSI(m.View().Content), "❯ z") {
 		t.Fatal("input should be ignored while approval is pending")
 	}
 }
