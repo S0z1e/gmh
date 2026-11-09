@@ -207,7 +207,10 @@ type Runner struct {
 	App          *App
 	SessionUsage llm.Usage
 	SessionCost  float64 // USD estimate, accumulated per turn
-	Print        func(format string, args ...any)
+	// Turns counts completed agent turns (slash commands excluded),
+	// for the TUI meta line.
+	Turns int
+	Print func(format string, args ...any)
 }
 
 // costLine renders the estimate suffix for a usage line, or the
@@ -321,6 +324,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	userMsg := llm.Message{Role: "user", Content: task}
 	r.App.History = append(r.App.History, userMsg)
 	_ = r.App.Store.Append(userMsg)
+	r.Turns++
 	_, usage, err := r.App.Cfg.Run(ctx, r.App.History)
 	if err != nil {
 		r.Print("\n[error] %v", err)

@@ -29,30 +29,16 @@ import (
 	"minimalharness/internal/agent"
 )
 
-// Palette — opencode's default dark theme
-// (packages/tui/src/theme/assets/v2/opencode.json). Hex colours,
-// rendered directly by lipgloss on truecolor terminals.
-var (
-	colorRaised = lipgloss.Color("#141414") // user panels, input box, tool blocks
-	colorBorder = lipgloss.Color("#484848") // left-edge borders
-	colorPeach  = lipgloss.Color("#fab283") // interactive accent
-	colorPurple = lipgloss.Color("#9d7cd8") // headings, keywords
-	colorQuote  = lipgloss.Color("#e5c07b") // blockquotes, emphasis
+// Palette and styles live in theme.go: one Theme struct, rebuilt by
+// SetTheme. Everything below renders through those package-level
+// styles, so a theme switch is one call at startup.
 
-	styleBase    = lipgloss.NewStyle().Foreground(lipgloss.Color("#eeeeee"))
-	styleMuted   = lipgloss.NewStyle().Foreground(lipgloss.Color("#808080"))
-	styleTitle   = lipgloss.NewStyle().Bold(true)
-	stylePeach   = lipgloss.NewStyle().Foreground(colorPeach)
-	stylePurple  = lipgloss.NewStyle().Foreground(colorPurple).Bold(true)
-	styleBold    = lipgloss.NewStyle().Bold(true)
-	styleCode    = lipgloss.NewStyle().Foreground(lipgloss.Color("#7fd88f"))
-	styleCodeBlk = lipgloss.NewStyle().Foreground(lipgloss.Color("#7fd88f")).Background(colorRaised)
-	styleQuote   = lipgloss.NewStyle().Foreground(colorQuote)
-	styleError   = lipgloss.NewStyle().Foreground(lipgloss.Color("#e06c75")).Bold(true)
-	styleWarning = lipgloss.NewStyle().Foreground(lipgloss.Color("#f5a742"))
-	styleSuccess = lipgloss.NewStyle().Foreground(lipgloss.Color("#7fd88f"))
-	styleSelect  = lipgloss.NewStyle().Background(lipgloss.Color("#5c9cf5")).Foreground(lipgloss.Color("#0a0a0a")).Bold(true)
-)
+// spinnerDelay is how long a turn must run with no text before the
+// Thinking row appears (Claude Code waits 2s; our turns are shorter,
+// so 300ms). Short turns never flash a spinner at all — that flash
+// was the turn-end flicker: a fast turn showed Thinking for one frame
+// and it was gone by the next repaint.
+const spinnerDelay = 300 * time.Millisecond
 
 // spinnerFrames is opencode's braille spinner (80 ms per frame).
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -98,7 +84,10 @@ type Model struct {
 	liveTool     string // tool currently running, "" when idle
 	liveToolArgs string // JSON args of the running tool (ToolEnd
 	// carries no args, so the summary is built from these)
-	working      bool
+	working bool
+	// workingSince is when the current turn started working; the
+	// Thinking row only shows once spinnerDelay has passed.
+	workingSince time.Time
 	width        int
 	spinnerFrame int
 	spinning     bool // a spinner tick loop is running
@@ -119,6 +108,13 @@ type Model struct {
 	metaMode  string
 	metaModel string
 	metaAPI   string
+	// metaBranch is the workspace's git branch ("" when the root is
+	// not a git checkout), set by WithBranch.
+	metaBranch string
+	// sessionTokens/turnCount accumulate across turns, fed by
+	// MetaUpdateMsg from the runner; shown on the meta line's right.
+	sessionTokens int
+	turnCount     int
 
 	// OnSubmit is called with the submitted line on Enter. The caller
 	// runs the task and feeds agent events back via program.Send.
@@ -137,6 +133,30 @@ func (m Model) WithMeta(mode, api, model string) Model {
 	m.metaAPI = api
 	m.metaModel = model
 	return m
+}
+
+// WithBranch records the workspace's git branch for the meta line.
+// Call it before NewProgram, like WithMeta.
+func (m Model) WithBranch(branch string) Model {
+	m.metaBranch = branch
+	return m
+}
+
+// MetaUpdateMsg carries the session totals after a turn, so the meta
+// line can show tokens and turns without the runner knowing the TUI.
+type MetaUpdateMsg struct {
+	Tokens int
+	Turns  int
+}
+
+// markWorking starts a turn: working becomes true, and workingSince
+// records when, so the Thinking row can wait out spinnerDelay. A
+// turn that is already working keeps its original start time.
+func (m *Model) markWorking() {
+	if !m.working {
+		m.workingSince = time.Now()
+	}
+	m.working = true
 }
 
 // Init prints the header once, into the scrollback, and never again:
@@ -222,6 +242,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ApprovalMsg:
 		m.approval = msg.Request
 		return m, nil
+	case MetaUpdateMsg:
+		m.sessionTokens = msg.Tokens
+		m.turnCount = msg.Turns
+		return m, nil
 	}
 	return m, nil
 }
@@ -266,7 +290,7 @@ func (m Model) handleKey(k tea.Key) (tea.Model, tea.Cmd) {
 		if strings.HasPrefix(line, "/") {
 			return m, echo
 		}
-		m.working = true
+		m.markWorking()
 		if m.spinning {
 			return m, echo
 		}
@@ -308,15 +332,15 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 			reply := m.pendingReply
 			m.pendingReply = ""
 			m.live += ev.Text
-			m.working = true
+			m.markWorking()
 			return m, tea.Println(renderText(reply))
 		}
 		m.live += ev.Text
-		m.working = true
+		m.markWorking()
 	case agent.EventToolStart:
 		m.liveTool = ev.ToolName
 		m.liveToolArgs = ev.ToolArgs
-		m.working = true
+		m.markWorking()
 	case agent.EventToolEnd:
 		name, args := m.liveTool, m.liveToolArgs
 		if name == "" {
@@ -368,10 +392,12 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.liveTool = ""
 		m.liveToolArgs = ""
 		m.working = false
+		m.workingSince = time.Time{}
 	case agent.EventError:
 		m.liveTool = ""
 		m.liveToolArgs = ""
 		m.working = false
+		m.workingSince = time.Time{}
 		// The error line itself is printed by the runner.
 	}
 	// (Re)start the spinner while a turn runs with no text yet and
@@ -382,9 +408,6 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	}
 	return m, nil
 }
-
-// badgeStyle is the muted-on-raised "Background" badge.
-var badgeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#808080")).Background(colorRaised)
 
 // toolEndBlock renders a finished tool call for the scrollback. Bash
 // gets a raised block with the command and the output tail; every
@@ -428,17 +451,30 @@ func indentBlock(s string) string {
 }
 
 // bashBlock renders a finished bash call as a raised block: the
-// command line, then the output tail (at most 10 lines) with an
-// "(N earlier lines)" label when truncated. On error the command
-// line goes error red and the output stays muted.
+// command sits in the top border (btop's ┤title├), then the output
+// tail (at most 10 lines) with an "(N earlier lines)" label when
+// truncated. On error the title goes error red and the output stays
+// muted.
 func bashBlock(summary, output string, failed bool) string {
 	lines, cut := collapseOutput(output)
+	// Title in the border: ┤ $ <command> ├, padded with ─ to the
+	// widest output line so the block reads as one framed box. The
+	// command is capped so one long line cannot stretch the block.
+	title := "┤ " + truncateRunes(summary, 80) + " ├"
+	width := ansi.StringWidth(title)
+	for _, l := range lines {
+		if w := ansi.StringWidth(l); w > width {
+			width = w
+		}
+	}
+	if pad := width - ansi.StringWidth(title); pad > 0 {
+		title += strings.Repeat("─", pad)
+	}
 	var b strings.Builder
-	cmdLine := summary // toolSummary already returns "$ <command>"
 	if failed {
-		b.WriteString(styleError.Render(cmdLine))
+		b.WriteString(styleError.Render(title))
 	} else {
-		b.WriteString(styleBase.Render(cmdLine))
+		b.WriteString(styleBase.Render(title))
 	}
 	for _, l := range lines {
 		b.WriteString("\n" + styleMuted.Render(l))
@@ -448,12 +484,6 @@ func bashBlock(summary, output string, failed bool) string {
 	}
 	return bashBlockStyle.Render(b.String())
 }
-
-var bashBlockStyle = lipgloss.NewStyle().
-	Border(lipgloss.Border{Left: "┃"}, false, false, false, true).
-	BorderForeground(colorBorder).
-	Background(colorRaised).
-	Padding(0, 1)
 
 // collapseOutput keeps the tail of a tool output: at most 10 lines,
 // with the number of lines cut off the head. Each line is capped at
@@ -483,23 +513,69 @@ func truncateRunes(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
+// showThinking reports whether the Thinking row may appear yet: only
+// once the turn has been working for spinnerDelay. A zero start time
+// (a model built by hand in tests, with working set directly) counts
+// as elapsed, so old tests keep their meaning.
+func (m Model) showThinking() bool {
+	return m.workingSince.IsZero() || time.Since(m.workingSince) >= spinnerDelay
+}
+
 // toolPendingLabel is the running row's label for a tool — opencode's
-// literal pending phrases.
-func toolPendingLabel(name string) string {
+// literal pending phrases, with the concrete object (Claude Code's
+// getActivityDescription): "Reading src/foo.ts…" instead of a bare
+// "Reading file…". Args that do not parse fall back to the generic
+// phrase, so a label is never empty.
+func toolPendingLabel(name, argsJSON string) string {
+	var args map[string]json.RawMessage
+	str := func(k string) string { return "" }
+	if json.Unmarshal([]byte(argsJSON), &args) == nil {
+		str = func(k string) string {
+			var s string
+			if raw, ok := args[k]; ok {
+				_ = json.Unmarshal(raw, &s)
+			}
+			return s
+		}
+	}
 	switch name {
 	case "read":
+		if p := str("path"); p != "" {
+			return "Reading " + p + "…"
+		}
 		return "Reading file…"
 	case "write":
+		if p := str("path"); p != "" {
+			return "Preparing write " + p + "…"
+		}
 		return "Preparing write…"
 	case "edit":
+		if p := str("path"); p != "" {
+			return "Preparing edit " + p + "…"
+		}
 		return "Preparing edit…"
 	case "grep":
+		if p := str("pattern"); p != "" {
+			if d := str("path"); d != "" {
+				return fmt.Sprintf("Searching %q in %s…", p, d)
+			}
+			return fmt.Sprintf("Searching %q…", p)
+		}
 		return "Searching content…"
 	case "glob":
+		if p := str("pattern"); p != "" {
+			return fmt.Sprintf("Finding %q…", p)
+		}
 		return "Finding files…"
 	case "bash":
+		if c := str("command"); c != "" {
+			return "Running " + truncateRunes(c, 60) + "…"
+		}
 		return "Running command…"
 	case "load_skill":
+		if n := str("name"); n != "" {
+			return "Loading skill " + n + "…"
+		}
 		return "Loading skill…"
 	default:
 		return name + "…"
@@ -673,8 +749,8 @@ func (m Model) View() tea.View {
 		liveLines = append(liveLines, strings.Split(renderText(m.live), "\n")...)
 	}
 	if m.liveTool != "" {
-		liveLines = append(liveLines, "   "+styleMuted.Render(spinnerGlyph(m.spinnerFrame))+" "+styleMuted.Render(toolPendingLabel(m.liveTool)))
-	} else if m.working && m.live == "" {
+		liveLines = append(liveLines, "   "+styleMuted.Render(spinnerGlyph(m.spinnerFrame))+" "+styleMuted.Render(toolPendingLabel(m.liveTool, m.liveToolArgs)))
+	} else if m.working && m.live == "" && m.showThinking() {
 		liveLines = append(liveLines, "   "+styleWarning.Render(spinnerGlyph(m.spinnerFrame))+" "+styleWarning.Render("Thinking…"))
 	}
 	var lines []string
@@ -714,7 +790,7 @@ func (m Model) inputLine() string {
 	} else {
 		rendered = styleBase.Render(text)
 	}
-	st := lipgloss.NewStyle().Background(colorRaised)
+	st := raisedBackground(lipgloss.NewStyle())
 	if m.width > 0 {
 		st = st.Width(m.width)
 	}
@@ -732,32 +808,63 @@ func placeholderText(width int) string {
 	return truncateRunes(ph, avail)
 }
 
-// metaLine is the composer meta line under the input:
-// "mode · model · api" (mode peach, model base, api muted). Empty
-// when the meta was never set (tests).
+// metaLine is the composer meta line under the input, split
+// left/right like a statusline (helix): left is the mode chip (dark
+// text on the accent colour, yazi's mode chip) · model · api; right,
+// when known, is the git branch and the session totals (turns ·
+// tokens). Empty when the meta was never set (tests).
 func (m Model) metaLine() string {
 	if m.metaMode == "" && m.metaModel == "" && m.metaAPI == "" {
 		return ""
 	}
-	line := stylePeach.Render(m.metaMode) + styleMuted.Render(" · ") +
+	left := styleModeChip.Render(m.metaMode) + styleMuted.Render(" · ") +
 		styleBase.Render(m.metaModel) + styleMuted.Render(" · ") +
 		styleMuted.Render(m.metaAPI)
-	st := lipgloss.NewStyle().Background(colorRaised)
+	var right string
+	if m.metaBranch != "" {
+		right = styleMuted.Render(m.metaBranch)
+	}
+	if m.turnCount > 0 || m.sessionTokens > 0 {
+		turnWord := "turns"
+		if m.turnCount == 1 {
+			turnWord = "turn"
+		}
+		totals := fmt.Sprintf("%d %s · %s tokens", m.turnCount, turnWord, formatInt(m.sessionTokens))
+		if right != "" {
+			right += styleMuted.Render(" · ") + styleMuted.Render(totals)
+		} else {
+			right = styleMuted.Render(totals)
+		}
+	}
+	line := "  " + left
+	if right != "" {
+		// Right-align when the width is known and everything fits;
+		// otherwise fall back to joining with a separator.
+		gap := 0
+		if m.width > 0 {
+			gap = m.width - 2 - ansi.StringWidth(left) - ansi.StringWidth(right)
+		}
+		if gap >= 2 {
+			line += strings.Repeat(" ", gap) + right
+		} else {
+			line += styleMuted.Render(" · ") + right
+		}
+	}
+	st := raisedBackground(lipgloss.NewStyle())
 	if m.width > 0 {
 		st = st.Width(m.width)
 	}
-	return st.Render("  " + line)
+	return st.Render(line)
 }
 
 // userPanel renders a submitted user turn as a raised panel with a
 // peach left edge, for the scrollback.
 func userPanel(line string, width int) string {
-	st := lipgloss.NewStyle().
+	st := raisedBackground(lipgloss.NewStyle().
 		Border(lipgloss.Border{Left: "┃"}, false, false, false, true).
 		BorderForeground(colorPeach).
 		Foreground(lipgloss.Color("#eeeeee")).
-		Background(colorRaised).
-		Padding(0, 1)
+		Padding(0, 1))
 	if width > 0 {
 		st = st.Width(width)
 	}
@@ -810,13 +917,12 @@ func (m Model) approvalBox() string {
 		b.WriteString("\n" + styleMuted.Render(l))
 	}
 	b.WriteString("\n" + optionRow)
-	return lipgloss.NewStyle().
+	st := raisedBackground(lipgloss.NewStyle().
 		Border(lipgloss.Border{Left: "┃"}, false, false, false, true).
 		BorderForeground(colorPeach).
-		Background(colorRaised).
 		Padding(1, 2).
-		Width(width).
-		Render(b.String())
+		Width(width))
+	return st.Render(b.String())
 }
 
 // parseApprovalPrompt splits an approval prompt "Run <tool> <json>?"

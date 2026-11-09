@@ -7,6 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -67,7 +69,10 @@ func main() {
 		info += "\n" + a.ResumedMessage
 	}
 	lines := make(chan string, 16)
-	m := tui.NewModel(info).WithMeta(a.Cfg.Mode, a.Cfg.Client.API, a.Cfg.Client.Model)
+	// Theme: HARNESS_TUI_THEME picks default, terminal (no painted
+	// background) or catppuccin-mocha; anything else is the default.
+	tui.SetTheme(tui.ThemeByName(os.Getenv("HARNESS_TUI_THEME")))
+	m := tui.NewModel(info).WithMeta(a.Cfg.Mode, a.Cfg.Client.API, a.Cfg.Client.Model).WithBranch(gitBranch(a.Root))
 	// Set OnSubmit BEFORE NewProgram: the program holds its own copy of
 	// the model, so fields set afterwards on this copy would never fire.
 	m.OnSubmit = func(line string) { lines <- line }
@@ -94,7 +99,10 @@ func main() {
 	ctx := context.Background()
 	go func() {
 		for line := range lines {
-			if runner.Handle(ctx, line) {
+			quit := runner.Handle(ctx, line)
+			// Session totals for the meta line's right side.
+			prog.Send(tui.MetaUpdateMsg{Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns})
+			if quit {
 				prog.Quit()
 				return
 			}
@@ -104,6 +112,23 @@ func main() {
 	if _, err := prog.Run(); err != nil {
 		fatal(err)
 	}
+}
+
+// gitBranch reads the current branch of the git checkout at root,
+// or "" when root is not a checkout (or HEAD is detached, where the
+// branch has no name to show). It reads .git/HEAD directly: no
+// subprocess, no dependency on git being installed.
+func gitBranch(root string) string {
+	b, err := os.ReadFile(filepath.Join(root, ".git", "HEAD"))
+	if err != nil {
+		return ""
+	}
+	head := strings.TrimSpace(string(b))
+	const prefix = "ref: refs/heads/"
+	if strings.HasPrefix(head, prefix) {
+		return strings.TrimPrefix(head, prefix)
+	}
+	return ""
 }
 
 func fatal(err error) {

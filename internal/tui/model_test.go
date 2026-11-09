@@ -238,12 +238,12 @@ func TestModelFlushesLiveOnDone(t *testing.T) {
 func TestModelShowsCurrentTool(t *testing.T) {
 	m := NewModel("")
 	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventToolStart, ToolName: "grep", ToolArgs: `{"pattern":"TODO"}`}})
-	// The running row shows the tool's pending label, not the name.
-	if got := m.View().Content; !strings.Contains(got, "Searching content") {
+	// The running row shows the tool's pending label, naming the object.
+	if got := m.View().Content; !strings.Contains(got, `Searching "TODO"`) {
 		t.Fatalf("live region should show the running tool, got %q", got)
 	}
 	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventToolEnd, ToolName: "grep"}})
-	if got := m.View().Content; strings.Contains(got, "Searching content") {
+	if got := m.View().Content; strings.Contains(got, `Searching "TODO"`) {
 		t.Fatalf("tool should clear after ToolEnd, got %q", got)
 	}
 }
@@ -269,13 +269,17 @@ func TestModelEnterSubmitsAndClearsInput(t *testing.T) {
 	if got := stripANSI(m.View().Content); strings.Contains(got, "┃ hi") {
 		t.Fatalf("input should clear after Enter, got %q", got)
 	}
-	// A submitted task starts the turn: the live region shows the
-	// thinking spinner until the first event arrives.
+	// A submitted task starts the turn; the Thinking row waits out
+	// the spinner delay, so it is absent at first and appears later.
 	if !m.working {
 		t.Fatal("model should be working after submitting a task")
 	}
+	if got := stripANSI(m.View().Content); strings.Contains(got, "Thinking") {
+		t.Fatalf("live region should not show Thinking yet, got %q", got)
+	}
+	m.workingSince = m.workingSince.Add(-2 * spinnerDelay)
 	if got := stripANSI(m.View().Content); !strings.Contains(got, "Thinking") {
-		t.Fatalf("live region should show Thinking, got %q", got)
+		t.Fatalf("live region should show Thinking after the delay, got %q", got)
 	}
 	// A bare Enter echoes nothing and starts no turn.
 	m2 := NewModel("")
@@ -441,12 +445,32 @@ func TestToolSummary(t *testing.T) {
 
 func TestToolPendingLabels(t *testing.T) {
 	for _, name := range []string{"read", "write", "edit", "grep", "glob", "bash", "load_skill"} {
-		if got := toolPendingLabel(name); got == "" || got == name {
-			t.Errorf("toolPendingLabel(%q) = %q", name, got)
+		if got := toolPendingLabel(name, ""); got == "" || got == name {
+			t.Errorf("toolPendingLabel(%q, \"\") = %q", name, got)
 		}
 	}
-	if got := toolPendingLabel("weird"); got != "weird…" {
+	if got := toolPendingLabel("weird", ""); got != "weird…" {
 		t.Errorf("toolPendingLabel(weird) = %q, want %q", got, "weird…")
+	}
+	// With args the label names the concrete object.
+	cases := []struct {
+		name, args, want string
+	}{
+		{"read", `{"path":"src/foo.ts"}`, "Reading src/foo.ts…"},
+		{"write", `{"path":"u.txt","content":"x"}`, "Preparing write u.txt…"},
+		{"edit", `{"path":"a.go"}`, "Preparing edit a.go…"},
+		{"grep", `{"pattern":"TODO","path":"."}`, `Searching "TODO" in .…`},
+		{"grep", `{"pattern":"TODO"}`, `Searching "TODO"…`},
+		{"glob", `{"pattern":"*.go"}`, `Finding "*.go"…`},
+		{"bash", `{"command":"ls -la"}`, "Running ls -la…"},
+		{"load_skill", `{"name":"review"}`, "Loading skill review…"},
+		{"read", `not json`, "Reading file…"},
+		{"read", `{}`, "Reading file…"},
+	}
+	for _, tc := range cases {
+		if got := toolPendingLabel(tc.name, tc.args); got != tc.want {
+			t.Errorf("toolPendingLabel(%q, %q) = %q, want %q", tc.name, tc.args, got, tc.want)
+		}
 	}
 }
 
@@ -492,9 +516,9 @@ func TestToolEndBlock(t *testing.T) {
 	if got != "   ✗ Write x.txt (denied)" {
 		t.Fatalf("denied row = %q", got)
 	}
-	// Bash: a block with the command and the output tail.
+	// Bash: a block with the command in the top border and the output tail.
 	got = stripANSI(toolEndBlock("bash", `{"command":"echo hi"}`, "hi\n", nil))
-	if !strings.Contains(got, "$ echo hi") || !strings.Contains(got, "hi") {
+	if !strings.Contains(got, "┤ $ echo hi ├") || !strings.Contains(got, "hi") {
 		t.Fatalf("bash block = %q", got)
 	}
 	var b strings.Builder
@@ -533,23 +557,31 @@ func TestSpinnerTickCycle(t *testing.T) {
 	if !m.working {
 		t.Fatal("should be working after submitting a task")
 	}
-	// The spinner advances on each tick while the turn runs with no text.
+	// The spinner advances on each tick while the turn runs with no text,
+	// but the Thinking row waits out the delay: a fresh turn shows no
+	// spinner at all, so short turns never flash one.
 	f0 := m.spinnerFrame
 	m = apply(t, m, spinnerTickMsg{})
 	if m.spinnerFrame == f0 {
 		t.Fatal("spinner frame should advance on a tick")
 	}
+	if got := stripANSI(m.View().Content); strings.Contains(got, "Thinking") {
+		t.Fatalf("fresh turn should not show Thinking yet, got %q", got)
+	}
+	// Once the delay has passed, the row appears.
+	m.workingSince = m.workingSince.Add(-2 * spinnerDelay)
 	if got := stripANSI(m.View().Content); !strings.Contains(got, "Thinking") {
-		t.Fatalf("view should show Thinking, got %q", got)
+		t.Fatalf("view should show Thinking after the delay, got %q", got)
 	}
 	// The first text delta replaces the spinner with the text.
 	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventTextDelta, Text: "hello"}})
 	if got := stripANSI(m.View().Content); !strings.Contains(got, "hello") || strings.Contains(got, "Thinking") {
 		t.Fatalf("view after text delta = %q", got)
 	}
-	// A tool start shows the running row with its pending label.
+	// A tool start shows the running row with its pending label,
+	// naming the concrete object.
 	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventToolStart, ToolName: "read", ToolArgs: `{"path":"t.txt"}`}})
-	if got := stripANSI(m.View().Content); !strings.Contains(got, "Reading file") {
+	if got := stripANSI(m.View().Content); !strings.Contains(got, "Reading t.txt") {
 		t.Fatalf("view during tool = %q", got)
 	}
 	// Tool end prints the finished row and clears the tool.
@@ -566,5 +598,45 @@ func TestUserPanel(t *testing.T) {
 	got := stripANSI(userPanel("read t.txt then write it", 0))
 	if !strings.Contains(got, "┃") || !strings.Contains(got, "read t.txt then write it") {
 		t.Fatalf("user panel = %q", got)
+	}
+}
+
+func TestSpinnerDelay(t *testing.T) {
+	m := NewModel("")
+	m.working = true
+	m.live = ""
+	// Just started: no Thinking row, however many ticks fire.
+	m.workingSince = time.Now()
+	if got := stripANSI(m.View().Content); strings.Contains(got, "Thinking") {
+		t.Fatalf("fresh turn should not show Thinking, got %q", got)
+	}
+	// Past the delay: the row appears.
+	m.workingSince = time.Now().Add(-2 * spinnerDelay)
+	if got := stripANSI(m.View().Content); !strings.Contains(got, "Thinking") {
+		t.Fatalf("view after the delay should show Thinking, got %q", got)
+	}
+	// Done clears it: working false means no Thinking whatever the clock says.
+	m.working = false
+	m.workingSince = time.Time{}
+	if got := stripANSI(m.View().Content); strings.Contains(got, "Thinking") {
+		t.Fatalf("idle view should not show Thinking, got %q", got)
+	}
+}
+
+func TestMetaLineRight(t *testing.T) {
+	m := NewModel("").WithMeta("auto", "chat", "mock").WithBranch("main")
+	if got := stripANSI(m.metaLine()); !strings.Contains(got, "main") {
+		t.Fatalf("meta line should show the branch, got %q", got)
+	}
+	m = apply(t, m, MetaUpdateMsg{Tokens: 12345, Turns: 3})
+	got := stripANSI(m.metaLine())
+	if !strings.Contains(got, "main") || !strings.Contains(got, "3 turns") || !strings.Contains(got, "12,345 tokens") {
+		t.Fatalf("meta line with totals = %q", got)
+	}
+	// MetaUpdateMsg alone does not create a meta line: the mode/model/api
+	// still gate it.
+	m2 := apply(t, NewModel(""), MetaUpdateMsg{Tokens: 1, Turns: 1})
+	if m2.metaLine() != "" {
+		t.Fatalf("meta line without meta = %q", m2.metaLine())
 	}
 }
