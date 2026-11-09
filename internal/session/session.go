@@ -56,10 +56,38 @@ func (s *Store) Append(m llm.Message) error {
 // the last marker is kept in the file but never reloaded by Load.
 const clearMarkerRole = "__clear__"
 
+// compactMarkerRole marks a /compact point. Load returns only the summary
+// message written after it (plus later messages).
+const compactMarkerRole = "__compact__"
+
 // Clear records a clear point in the session file. The caller also drops
 // its in-memory history; Load after this returns only later messages.
 func (s *Store) Clear() error {
 	return s.Append(llm.Message{Role: clearMarkerRole})
+}
+
+// MarkCompact records a compaction point: a marker followed by the summary
+// as a user message, which becomes the new context on Load.
+func (s *Store) MarkCompact(summary string) error {
+	if err := s.Append(llm.Message{Role: compactMarkerRole}); err != nil {
+		return err
+	}
+	return s.Append(llm.Message{Role: "user", Content: "Previous conversation summary:\n" + summary})
+}
+
+// ArchiveCopy copies the current session file to a new file in the same
+// directory and returns its path. Used before compaction so the original
+// transcript is kept separately.
+func (s *Store) ArchiveCopy(name string) (string, error) {
+	data, err := os.ReadFile(s.Path)
+	if err != nil {
+		return "", err
+	}
+	dst := filepath.Join(Dir(), name+".jsonl")
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		return "", err
+	}
+	return dst, nil
 }
 
 func (s *Store) Close() error { return s.file.Close() }
@@ -86,8 +114,9 @@ func Load(id string) ([]llm.Message, error) {
 		if err := json.Unmarshal(line, &m); err != nil {
 			continue
 		}
-		if m.Role == clearMarkerRole {
-			// /clear point: forget everything before it (file keeps it).
+		if m.Role == clearMarkerRole || m.Role == compactMarkerRole {
+			// /clear or /compact point: forget everything before it
+			// (file keeps it).
 			msgs = nil
 			continue
 		}

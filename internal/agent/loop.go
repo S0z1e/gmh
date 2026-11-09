@@ -25,6 +25,11 @@ type Config struct {
 	Session  *session.Store
 	OnText   func(string)
 	Ask      func(prompt string) (bool, error) // nil = use stdin prompt
+
+	// LastPromptTokens is the prompt-token count of the most recent LLM
+	// call in the last Run: the current context size, since history is
+	// resent in full each time. Used for the compaction trigger.
+	LastPromptTokens int
 }
 
 func ToolDefs() []llm.ToolDef {
@@ -83,6 +88,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		if err != nil {
 			return lastText, total, fmt.Errorf("step %d: %w", step+1, err)
 		}
+		c.LastPromptTokens = usage.PromptTokens
 		total.Add(usage)
 		if c.OnText != nil && assistant.Content != "" {
 			// Stream already printed deltas; print a newline separator.

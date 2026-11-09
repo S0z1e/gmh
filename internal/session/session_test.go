@@ -1,6 +1,8 @@
 package session
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"minimalharness/internal/llm"
@@ -49,6 +51,57 @@ func TestLoadWithoutClearReturnsAll(t *testing.T) {
 	}
 	if len(msgs) != 2 {
 		t.Fatalf("Load = %d messages, want 2", len(msgs))
+	}
+}
+
+func TestMarkCompactKeepsOnlySummaryOnLoad(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := New("test-compact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	_ = store.Append(llm.Message{Role: "user", Content: "old task"})
+	_ = store.Append(llm.Message{Role: "assistant", Content: "old answer"})
+	if err := store.MarkCompact("1. Task summary — did the old task"); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Append(llm.Message{Role: "user", Content: "new task"})
+	msgs, err := Load("test-compact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("Load = %d messages, want 2 (summary + new task)", len(msgs))
+	}
+	if !strings.Contains(msgs[0].Content, "1. Task summary") {
+		t.Fatalf("first message should be the summary, got: %q", msgs[0].Content)
+	}
+	if msgs[1].Content != "new task" {
+		t.Fatalf("second message = %q, want 'new task'", msgs[1].Content)
+	}
+}
+
+func TestArchiveCopyKeepsOriginal(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := New("test-archive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	_ = store.Append(llm.Message{Role: "user", Content: "original"})
+	// Flush by closing, then reopen through ArchiveCopy's read.
+	store.Close()
+	path, err := store.ArchiveCopy("test-archive-pre-compact-000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "original") {
+		t.Fatalf("archive missing original content: %s", data)
 	}
 }
 
