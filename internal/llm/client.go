@@ -61,6 +61,14 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// CachedTokens is filled from whichever field the provider returns:
+	// top-level cached_tokens, prompt_cache_hit_tokens, or
+	// prompt_tokens_details.cached_tokens. See Usage.normalize.
+	CachedTokens         int `json:"cached_tokens"`
+	PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+	PromptTokensDetails  struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 }
 
 type chatRequest struct {
@@ -108,9 +116,12 @@ type responsesRequest struct {
 }
 
 type responsesUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	InputTokens        int `json:"input_tokens"`
+	OutputTokens       int `json:"output_tokens"`
+	TotalTokens        int `json:"total_tokens"`
+	InputTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
 }
 
 // responsesEvent is the common envelope for Responses SSE events.
@@ -270,6 +281,7 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 		}
 		if chunk.Usage.TotalTokens != 0 {
 			usage = chunk.Usage
+			usage.normalize()
 		}
 		for _, ch := range chunk.Choices {
 			if ch.Delta.Content != "" {
@@ -511,7 +523,7 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 			}
 			u := ev.Response.Usage
 			if u.TotalTokens != 0 {
-				usage = Usage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens}
+				usage = Usage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens, CachedTokens: u.InputTokensDetails.CachedTokens}
 			}
 		}
 	}

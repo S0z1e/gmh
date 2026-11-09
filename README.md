@@ -2,6 +2,7 @@
 
 A minimal, Pi-light coding agent harness in Go. Stdlib only, zero dependencies.
 OpenAI-compatible chat completions + SSE streaming. Six tools: read, write, edit, bash, grep, glob.
+Usage is shown per turn and per session (prompt, cached, completion, total tokens); no fee is estimated — OpenConsole's real price is unverified.
 
 ## Layout
 

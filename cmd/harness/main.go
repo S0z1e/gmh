@@ -102,6 +102,14 @@ func main() {
 	ctx := context.Background()
 	fmt.Printf("harness v1  api=%s  model=%s  root=%s  mode=%s  session=%s\n", apiMode, mdl, absRoot, *mode, store.ID)
 
+	// Session totals accumulate across turns (REPL) as well as within one
+	// -p run. Fee is never estimated: OpenConsole's real price is unverified.
+	var sessionUsage llm.Usage
+	printUsage := func(turn llm.Usage) {
+		fmt.Printf("\n[usage] turn: %s\n", turn)
+		fmt.Printf("[usage] session: %s | fee: OpenConsole 實價未驗證\n", sessionUsage)
+	}
+
 	runOnce := func(task string) {
 		task = strings.TrimSpace(task)
 		if task == "" {
@@ -137,7 +145,8 @@ func main() {
 			history = msgs
 		}
 		_ = text
-		fmt.Printf("\n[usage] prompt=%d completion=%d total=%d\n", usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens)
+		sessionUsage.Add(usage)
+		printUsage(usage)
 	}
 
 	if *printMode != "" {
@@ -146,7 +155,7 @@ func main() {
 	}
 
 	// REPL
-	fmt.Println("Type a task, /skill:<name> to load a skill, or /quit to exit.")
+	fmt.Println("Type a task, /skill:<name> to load a skill, /usage for session totals, or /quit to exit.")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for {
@@ -157,6 +166,10 @@ func main() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "/quit" || line == "/exit" {
 			break
+		}
+		if line == "/usage" {
+			fmt.Printf("[usage] session: %s | fee: OpenConsole 實價未驗證\n", sessionUsage)
+			continue
 		}
 		runOnce(line)
 	}

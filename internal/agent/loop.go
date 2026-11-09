@@ -80,9 +80,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		if err != nil {
 			return lastText, total, fmt.Errorf("step %d: %w", step+1, err)
 		}
-		total.PromptTokens += usage.PromptTokens
-		total.CompletionTokens += usage.CompletionTokens
-		total.TotalTokens += usage.TotalTokens
+		total.Add(usage)
 		if c.OnText != nil && assistant.Content != "" {
 			// Stream already printed deltas; print a newline separator.
 			fmt.Println()
