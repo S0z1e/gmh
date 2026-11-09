@@ -1,7 +1,7 @@
 # minimal-harness v1
 
 A minimal, Pi-light coding agent harness in Go. Stdlib only, zero dependencies.
-OpenAI-compatible chat completions + SSE streaming. Four tools only: read, write, edit, bash.
+OpenAI-compatible chat completions + SSE streaming. Five tools: read, write, edit, bash, grep.
 
 ## Layout
 
@@ -10,6 +10,7 @@ cmd/harness/main.go      // CLI: -p print mode, REPL, --resume, -mode suggest/au
 internal/llm/client.go   // OpenAI-compatible client, streaming, tool-call accumulation
 internal/agent/loop.go   // single loop: LLM -> tool -> observe -> repeat
 internal/tools/tools.go  // read/write/edit/bash, workspace-root jail, timeout
+internal/tools/grep.go   // grep tool (ripgrep backend, grep -r fallback, match cap + truncation)
 internal/session/session.go // JSONL append + resume
 internal/skills/skills.go  // .agents/skills/*/SKILL.md discovery, listing only
 internal/agent/prompts/system.md // lightweight system prompt, embedded

@@ -205,6 +205,12 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (string,
 			return "", fmt.Errorf("bad bash args: %w", err)
 		}
 		return e.Bash(ctx, a)
+	case "grep":
+		var a GrepArgs
+		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+			return "", fmt.Errorf("bad grep args: %w", err)
+		}
+		return e.Grep(ctx, a)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
