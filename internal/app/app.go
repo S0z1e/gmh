@@ -36,6 +36,9 @@ type App struct {
 	Skills       []skills.Skill
 	ContextLimit int
 	Root         string
+	// Rates configures cost estimates (zero = unconfigured: no estimate
+	// is shown, only the "real price unverified" label).
+	Rates llm.Rates
 	// ResumedMessage is non-empty when --resume loaded a session.
 	ResumedMessage string
 }
@@ -125,17 +128,35 @@ func Setup(p Params) (*App, error) {
 		contextLimit = agent.DefaultContextLimit
 	}
 	a.ContextLimit = contextLimit
+
+	rates, err := llm.RatesFromEnv()
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	a.Rates = rates
 	return a, nil
 }
 
 // Runner executes one line at a time: a task, or a slash command.
 // Print is the line printer (plain: fmt.Printf; TUI: program.Println).
-// Session totals accumulate across turns; no fee is ever estimated
-// (OpenConsole's real price is unverified).
+// Session totals accumulate across turns. Cost is estimated only when
+// rates are configured (App.Rates); the estimate is always labelled
+// with its source, and OpenConsole's real price stays unverified.
 type Runner struct {
 	App          *App
 	SessionUsage llm.Usage
+	SessionCost  float64 // USD estimate, accumulated per turn
 	Print        func(format string, args ...any)
+}
+
+// costLine renders the estimate suffix for a usage line, or the
+// unverified label when no rates are configured.
+func (r *Runner) costLine(cost float64) string {
+	if !r.App.Rates.Configured {
+		return "fee: OpenConsole 實價未驗證"
+	}
+	return fmt.Sprintf("est. cost: ~$%.4f (rates: %s; OpenConsole 實價未驗證)", cost, r.App.Rates.Source)
 }
 
 // Handle runs one input line. It returns true when the UI should quit.
@@ -148,7 +169,7 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 	case "/quit", "/exit":
 		return true
 	case "/usage":
-		r.Print("[usage] session: %s | fee: OpenConsole 實價未驗證", r.SessionUsage)
+		r.Print("[usage] session: %s | %s", r.SessionUsage, r.costLine(r.SessionCost))
 		return false
 	case "/clear":
 		if err := r.App.Store.Clear(); err != nil {
@@ -209,8 +230,14 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		r.App.History = msgs
 	}
 	r.SessionUsage.Add(usage)
-	r.Print("\n[usage] turn: %s", usage)
-	r.Print("[usage] session: %s | fee: OpenConsole 實價未驗證", r.SessionUsage)
+	turnCost := r.App.Rates.Cost(usage, time.Now())
+	r.SessionCost += turnCost
+	if r.App.Rates.Configured {
+		r.Print("\n[usage] turn: %s | est. cost: ~$%.4f", usage, turnCost)
+	} else {
+		r.Print("\n[usage] turn: %s", usage)
+	}
+	r.Print("[usage] session: %s | %s", r.SessionUsage, r.costLine(r.SessionCost))
 	// Auto-compact when the last call's context hit 70% of the window.
 	if agent.ShouldCompact(r.App.Cfg.LastPromptTokens, r.App.ContextLimit) {
 		r.Print("[compact] context at %d tokens (limit %d), compacting…", r.App.Cfg.LastPromptTokens, r.App.ContextLimit)
@@ -244,5 +271,6 @@ func (r *Runner) doCompact(ctx context.Context) {
 		r.App.History = msgs
 	}
 	r.SessionUsage.Add(cUsage)
+	r.SessionCost += r.App.Rates.Cost(cUsage, time.Now())
 	r.Print("[compact] %d tokens used for the summary; history replaced by summary (%d chars). Original transcript saved to %s", cUsage.TotalTokens, len(summary), archivePath)
 }

@@ -141,6 +141,78 @@ func TestRunnerKeywordTriggerLoadsSkill(t *testing.T) {
 	}
 }
 
+// Cost estimates appear only when rates are configured, labelled with
+// the rate source, and the session cost accumulates across turns.
+func TestRunnerCostEstimate(t *testing.T) {
+	srv := mockServer(t)
+	defer srv.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	t.Setenv("OPENAI_PRICE_INPUT_PER_MTOK", "1000")
+	t.Setenv("OPENAI_PRICE_OUTPUT_PER_MTOK", "2000")
+	t.Setenv("OPENAI_PRICE_SOURCE", "test rates")
+	root := t.TempDir()
+	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	if !a.Rates.Configured {
+		t.Fatal("rates should be configured from env")
+	}
+	var printed []string
+	r := &Runner{App: a, Print: func(format string, args ...any) {
+		printed = append(printed, fmt.Sprintf(format, args...))
+	}}
+	r.Handle(context.Background(), "say hi")
+	// Mock usage is prompt 10 / completion 5: (10*1000 + 5*2000)/1e6 = $0.02.
+	joined := strings.Join(printed, "\n")
+	if !strings.Contains(joined, "est. cost: ~$0.0200") {
+		t.Fatalf("turn cost not printed: %v", printed)
+	}
+	if !strings.Contains(joined, "rates: test rates") {
+		t.Fatalf("rate source not labelled: %v", printed)
+	}
+	if !strings.Contains(joined, "OpenConsole 實價未驗證") {
+		t.Fatalf("unverified label missing: %v", printed)
+	}
+	if r.SessionCost != 0.02 {
+		t.Fatalf("session cost = %v, want 0.02", r.SessionCost)
+	}
+	r.Handle(context.Background(), "say hi again")
+	if r.SessionCost != 0.04 {
+		t.Fatalf("session cost after 2 turns = %v, want 0.04", r.SessionCost)
+	}
+}
+
+// Without rates, no estimate appears — only the unverified label.
+func TestRunnerNoCostWithoutRates(t *testing.T) {
+	srv := mockServer(t)
+	defer srv.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	root := t.TempDir()
+	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	var printed []string
+	r := &Runner{App: a, Print: func(format string, args ...any) {
+		printed = append(printed, fmt.Sprintf(format, args...))
+	}}
+	r.Handle(context.Background(), "say hi")
+	joined := strings.Join(printed, "\n")
+	if strings.Contains(joined, "est. cost") {
+		t.Fatalf("no estimate should appear without rates: %v", printed)
+	}
+	if !strings.Contains(joined, "fee: OpenConsole 實價未驗證") {
+		t.Fatalf("unverified label missing: %v", printed)
+	}
+}
+
 func TestRunnerHandleQuit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("OPENAI_API_KEY", "test-key")

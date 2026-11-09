@@ -2,7 +2,7 @@
 
 A minimal, Pi-light coding agent harness in Go. Stdlib only, zero dependencies.
 OpenAI-compatible chat completions + SSE streaming. Six tools: read, write, edit, bash, grep, glob.
-Usage is shown per turn and per session (prompt, cached, completion, total tokens); no fee is estimated — OpenConsole's real price is unverified.
+Usage is shown per turn and per session (prompt, cached, completion, total tokens). Token counts always come from the API's returned usage — the harness never estimates tokens locally (no local tokenizer; tiktoken would undercount non-OpenAI models by ~15–20%). Cost is estimated only when you set rates: `OPENAI_PRICE_INPUT_PER_MTOK`, `OPENAI_PRICE_OUTPUT_PER_MTOK`, `OPENAI_PRICE_CACHED_PER_MTOK` (USD per 1M tokens), plus `_PEAK_` variants and `OPENAI_PRICE_SOURCE` to label where the rates came from. Peak hours are Mon–Fri 01:00–04:00 and 06:00–10:00 UTC; without peak rates the off-peak rates apply. Every estimate is labelled with its source and "OpenConsole 實價未驗證"; without rates, no estimate is shown.
 
 ## Layout
 
