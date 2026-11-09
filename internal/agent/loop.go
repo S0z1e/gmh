@@ -23,13 +23,21 @@ type Config struct {
 	Mode     string // "suggest" (ask) or "auto" (no ask)
 	MaxSteps int
 	Session  *session.Store
-	OnText   func(string)
-	Ask      func(prompt string) (bool, error) // nil = use stdin prompt
+	// OnEvent receives every loop event; the caller renders them.
+	// (There is no OnText: streamed text arrives as TextDelta events.)
+	OnEvent func(Event)
+	Ask     func(prompt string) (bool, error) // nil = use stdin prompt
 
 	// LastPromptTokens is the prompt-token count of the most recent LLM
 	// call in the last Run: the current context size, since history is
 	// resent in full each time. Used for the compaction trigger.
 	LastPromptTokens int
+}
+
+func (c *Config) emit(e Event) {
+	if c.OnEvent != nil {
+		c.OnEvent(e)
+	}
 }
 
 func ToolDefs() []llm.ToolDef {
@@ -81,37 +89,42 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		// Send the truncated view to the LLM; the full history stays
 		// in msgs and in the session file.
 		apiMsgs := truncateToolResults(msgs, 2, 2000, 32*1024)
-		err := c.Client.Stream(ctx, apiMsgs, c.Tools, c.OnText, func(m llm.Message, u llm.Usage) {
+		err := c.Client.Stream(ctx, apiMsgs, c.Tools, func(s string) {
+			c.emit(Event{Kind: EventTextDelta, Text: s})
+		}, func(m llm.Message, u llm.Usage) {
 			assistant = m
 			usage = u
 		})
 		if err != nil {
-			return lastText, total, fmt.Errorf("step %d: %w", step+1, err)
+			wrapped := fmt.Errorf("step %d: %w", step+1, err)
+			c.emit(Event{Kind: EventError, Err: wrapped})
+			return lastText, total, wrapped
 		}
 		c.LastPromptTokens = usage.PromptTokens
 		total.Add(usage)
-		if c.OnText != nil && assistant.Content != "" {
-			// Stream already printed deltas; print a newline separator.
-			fmt.Println()
-		}
+		c.emit(Event{Kind: EventStepUsage, Usage: usage})
 		lastText = assistant.Content
 		msgs = append(msgs, assistant)
 		if c.Session != nil {
 			_ = c.Session.Append(assistant)
 		}
 		if len(assistant.ToolCalls) == 0 {
+			c.emit(Event{Kind: EventDone, Text: lastText, Usage: total})
 			return lastText, total, nil
 		}
 		// Execute tool calls in order. (Parallel batches are v0.2; serial
 		// avoids two tools writing the same file at once.)
 		for _, tc := range assistant.ToolCalls {
+			c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments})
 			if c.needsApproval(tc.Function.Name) {
 				ok, err := c.ask(fmt.Sprintf("Run %s %s?", tc.Function.Name, truncate(tc.Function.Arguments, 200)))
 				if err != nil {
+					c.emit(Event{Kind: EventError, Err: err})
 					return lastText, total, err
 				}
 				if !ok {
 					obs := "User denied this tool call. Do not retry it; explain and propose an alternative."
+					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs})
 					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 					if c.Session != nil {
 						_ = c.Session.Append(msgs[len(msgs)-1])
@@ -125,13 +138,16 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				// Tool errors are observations, not fatal errors.
 				obs = fmt.Sprintf("Error: %v\nOutput:\n%s", err, out)
 			}
+			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err})
 			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 			if c.Session != nil {
 				_ = c.Session.Append(msgs[len(msgs)-1])
 			}
 		}
 	}
-	return lastText, total, fmt.Errorf("step cap reached (%d); the task was not finished", steps)
+	capped := fmt.Errorf("step cap reached (%d); the task was not finished", steps)
+	c.emit(Event{Kind: EventError, Err: capped})
+	return lastText, total, capped
 }
 
 func truncate(s string, n int) string {

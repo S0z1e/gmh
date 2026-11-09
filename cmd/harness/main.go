@@ -89,6 +89,24 @@ func main() {
 	skillList := skills.Discover(absRoot)
 	system := agent.SystemPrompt + skills.Listing(skillList)
 
+	// Plain renderer: the CLI is one consumer of the loop's event stream.
+	// It prints streamed text as it arrives and ends the line at the next
+	// boundary event (tool call, usage, done, error) — the same output
+	// shape as before the event seam.
+	var textPending bool
+	plainRenderer := func(ev agent.Event) {
+		switch ev.Kind {
+		case agent.EventTextDelta:
+			fmt.Print(ev.Text)
+			textPending = true
+		default:
+			if textPending {
+				fmt.Println()
+				textPending = false
+			}
+		}
+	}
+
 	cfg := &agent.Config{
 		Client:   &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl, API: apiMode},
 		Exec:     &tools.Executor{Root: absRoot},
@@ -97,7 +115,7 @@ func main() {
 		Mode:     *mode,
 		MaxSteps: *maxSteps,
 		Session:  store,
-		OnText:   func(s string) { fmt.Print(s) },
+		OnEvent:  plainRenderer,
 	}
 	_ = store // kept for clarity; cfg.Session owns it
 
