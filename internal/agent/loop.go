@@ -73,7 +73,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 	for step := 0; step < steps; step++ {
 		var assistant llm.Message
 		var usage llm.Usage
-		err := c.Client.Stream(ctx, msgs, c.Tools, c.OnText, func(m llm.Message, u llm.Usage) {
+		// Send the truncated view to the LLM; the full history stays
+		// in msgs and in the session file.
+		apiMsgs := truncateToolResults(msgs, 2, 2000, 32*1024)
+		err := c.Client.Stream(ctx, apiMsgs, c.Tools, c.OnText, func(m llm.Message, u llm.Usage) {
 			assistant = m
 			usage = u
 		})
