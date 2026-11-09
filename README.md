@@ -51,3 +51,8 @@ Notes:
 - REPL commands: `/usage` shows session token totals, `/clear` drops the conversation context (a marker is written to the session file; `--resume` starts from the clear point, older messages stay in the file).
 - Compaction: `/compact` summarises the conversation into a 6-section brief and replaces history with it; the original transcript is saved to `<session>-pre-compact-<time>.jsonl`. It also triggers automatically when the last call's context reaches 70% of the window (`-context-limit`, default 1048576 for deepseek-v4.1-flash).
 - Events: the agent loop emits an event stream (`text_delta`, `step_usage`, `tool_start`, `tool_end`, `done`, `error`); the CLI is one renderer of it, a future TUI will be another. The loop never imports UI code.
+- TUI (Bubble Tea v2, inline-first): a separate binary so `-p` / the plain CLI never import it:
+  ```
+  go run ./cmd/harness-tui -root /path/to/project
+  ```
+  Finished turns are committed to scrollback with `tea.Println`; only the live region (streaming text, current tool, input line) repaints. The agent loop runs in a goroutine and feeds events into the program. Until the approval dialog lands (P1-3c), the TUI refuses `-mode suggest` — use `-mode auto`. Bubble Tea v2.1.1 is confined to `internal/tui` + `cmd/harness-tui`; `internal/agent`, `internal/llm`, `internal/tools`, `internal/session`, `internal/skills`, `internal/app` and `cmd/harness` stay stdlib-only (verified with `go list -deps`).
