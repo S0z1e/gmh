@@ -46,8 +46,8 @@ jobs:
             goarch=${target#*/}
             ext=""
             [ "$goos" = windows ] && ext=".exe"
-            GOOS=$goos GOARCH=$goarch go build -o "dist/harness-$goos-$goarch$ext" ./cmd/harness
-            GOOS=$goos GOARCH=$goarch go build -o "dist/harness-tui-$goos-$goarch$ext" ./cmd/harness-tui
+            GOOS=$goos GOARCH=$goarch go build -ldflags "-s -w" -o "dist/harness-$goos-$goarch$ext" ./cmd/harness
+            GOOS=$goos GOARCH=$goarch go build -ldflags "-s -w" -o "dist/harness-tui-$goos-$goarch$ext" ./cmd/harness-tui
           done
           ls -la dist/
 
