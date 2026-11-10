@@ -61,6 +61,12 @@ type Executor struct {
 	// LookupIP resolves hosts for webfetch's SSRF check (nil = the
 	// system resolver). Tests inject a fake.
 	LookupIP func(ctx context.Context, host string) ([]net.IP, error)
+	// Plugins runs plugin-registered tools (nil = no plugins loaded).
+	// The interface keeps this package free of the moejs dependency:
+	// app.Setup sets it to the loaded *plugins.Registry. A plugin
+	// tool needs no approval: it runs JS only, inside its runtime,
+	// with its file access jailed to its own data dir.
+	Plugins PluginRunner
 
 	jobsMu sync.Mutex
 	jobs   *JobRegistry
@@ -298,6 +304,13 @@ func diffDetail(oldText, newText string) string {
 	return capDetail(strings.TrimRight(b.String(), "\n"))
 }
 
+// PluginRunner runs plugin-registered tools. The plugins package
+// implements it; the tools package only knows this interface.
+type PluginRunner interface {
+	Has(name string) bool
+	Call(ctx context.Context, name, argsJSON string) (string, error)
+}
+
 // Dispatch runs a tool call by name and returns the observation.
 // A read of an image file (png, jpg, gif, webp) returns the image
 // alongside its marker text instead of the file's bytes as text.
@@ -387,6 +400,10 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (ToolRes
 		out, err := e.Webfetch(ctx, a)
 		return ToolResult{Text: out}, err
 	default:
+		if e.Plugins != nil && e.Plugins.Has(name) {
+			out, err := e.Plugins.Call(ctx, name, argsJSON)
+			return ToolResult{Text: out}, err
+		}
 		return ToolResult{}, fmt.Errorf("unknown tool: %s", name)
 	}
 }

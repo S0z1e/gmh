@@ -153,10 +153,57 @@ internal/session/session.go // JSONL append + resume
 internal/session/manage.go // session list, rename, id validation
 internal/config/config.go   // JSON config file: providers, models, merge (stdlib only)
 internal/skills/skills.go  // .agents/skills/*/SKILL.md discovery, listing only
+internal/plugins/plugins.go  // plugin discovery, registry, JS handler calls (moejs)
+internal/plugins/host.go  // the `harness` host API: registerTool/log, jailed store
 internal/rpc/server.go     // RPC mode: JSONL over stdio for a GUI (see below)
 internal/rpc/protocol.go   // RPC request/response/event JSON types
 internal/agent/prompts/system.md // lightweight system prompt, embedded
 ```
+
+## Plugins (JavaScript, via moejs)
+
+Plugins extend the agent with new tools written in JavaScript (or
+TypeScript, types stripped). One directory per plugin under
+`.agents/plugins/<name>/`, with a `plugin.json` and one entry file:
+
+```json
+{"name": "todo", "description": "A personal todo list.", "version": "1.0.0", "entry": "todo.js"}
+```
+
+The entry registers tools at its top level through the `harness`
+global; the model then sees them like the eight built-ins:
+
+```js
+harness.registerTool("todo_add", "Add a todo item.", {
+  type: "object",
+  properties: { text: { type: "string" } },
+  required: ["text"],
+}, (args) => {
+  // ...return the observation as a string
+});
+```
+
+Host API: `harness.registerTool(name, description, parameters,
+handler)`; `harness.log(...)` (one line on stderr);
+`harness.readFile(path)` / `harness.writeFile(path, content)` — a
+file store jailed to the plugin's own data dir,
+`.agents/plugins/<name>/data/` (paths must stay inside it;
+`../escape` and absolute paths are refused, and plugins cannot see
+each other's data). No bash, no network, no arbitrary filesystem in
+Phase 1.
+
+A plugin tool runs JS only, inside its own runtime (16 MiB memory
+limit, 10 s call timeout with interrupt — a timed-out or
+memory-limited call leaves the runtime usable for the next call),
+so it needs no approval in suggest mode. A bad plugin is skipped
+with a warning on stderr and never fails startup; a missing
+plugins directory loads nothing, no error. Kill switch:
+`HARNESS_PLUGINS=0` (or `false`) disables plugin loading entirely.
+
+Cost: moejs is the one non-stdlib dependency outside the TUI, and it
+adds ~8 MB to the stripped binary (core harness ~8 MB → ~16 MB).
+The shipped pilot is `.agents/plugins/todo/` — `todo_add` /
+`todo_list` / `todo_done`, state in its `data/todos.json`.
 
 ## Run
 

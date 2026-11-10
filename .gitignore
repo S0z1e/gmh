@@ -1,3 +1,4 @@
 .env
 harness
 /tmp/
+.agents/plugins/*/data/

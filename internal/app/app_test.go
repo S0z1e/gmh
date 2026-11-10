@@ -746,6 +746,47 @@ func TestSetupLoadsProjectContext(t *testing.T) {
 	}
 }
 
+// Setup loads plugins from the project root: the registry lands on
+// the app, the plugin tools join the model's tool list, and the
+// executor dispatches plugin calls to the JS handler.
+func TestSetupLoadsPlugins(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	root := t.TempDir()
+	writeMockProvider(t, root)
+	plugDir := filepath.Join(root, ".agents", "plugins", "echo")
+	if err := os.MkdirAll(plugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plugDir, "plugin.json"), []byte(`{"name": "echo", "description": "Echo plugin.", "version": "0.1.0", "entry": "echo.js"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plugDir, "echo.js"), []byte(`harness.registerTool("echo", "Echo back the message.", {type: "object", properties: {msg: {type: "string"}}, required: ["msg"]}, (args) => "echo:" + args.msg);`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	if a.Plugins == nil || !a.Plugins.Has("echo") {
+		t.Fatalf("app plugins = %v, want the echo plugin", a.Plugins)
+	}
+	found := false
+	for _, d := range a.Cfg.Tools {
+		if d.Function.Name == "echo" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("config tools = %v, want echo", a.Cfg.Tools)
+	}
+	res, err := a.Cfg.Exec.Dispatch(context.Background(), "echo", `{"msg":"wired"}`)
+	if err != nil || res.Text != "echo:wired" {
+		t.Fatalf("dispatch echo = %q, %v", res.Text, err)
+	}
+}
+
 // /sessions lists, /resume switches, /rename moves (current and other).
 func TestSessionsCommand(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())

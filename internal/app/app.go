@@ -16,6 +16,7 @@ import (
 	"minimalharness/internal/agent"
 	"minimalharness/internal/config"
 	"minimalharness/internal/llm"
+	"minimalharness/internal/plugins"
 	"minimalharness/internal/session"
 	"minimalharness/internal/skills"
 	"minimalharness/internal/tools"
@@ -89,6 +90,10 @@ type App struct {
 	// message and clears the list; the images then live in history
 	// and are resent on later calls, like any message.
 	PendingImages []llm.Image
+	// Plugins is the loaded plugin registry (nil = none loaded).
+	// Kept so later commands can list plugins; the executor holds
+	// the same registry for dispatch.
+	Plugins *plugins.Registry
 }
 
 // Setup builds the client, session and agent config. The caller sets
@@ -224,7 +229,16 @@ func Setup(p Params) (*App, error) {
 	a.Skills = skillList
 	system := agent.SystemPrompt + agent.ProjectContext(absRoot) + skills.Listing(skillList)
 
-	executor := &tools.Executor{Root: absRoot, ImageInput: slices.Contains(mdl.Input, "image")}
+	// Plugins: a bad plugin is skipped with a warning on stderr; it
+	// never fails Setup. Disabled with HARNESS_PLUGINS=0.
+	pluginReg, pluginErrs := plugins.Load(absRoot)
+	for _, err := range pluginErrs {
+		fmt.Fprintf(os.Stderr, "warning: plugin: %v\n", err)
+	}
+	a.Plugins = pluginReg
+	pluginTools := pluginReg.ToolDefs()
+
+	executor := &tools.Executor{Root: absRoot, ImageInput: slices.Contains(mdl.Input, "image"), Plugins: pluginReg}
 	if p.BashTimeoutSeconds > 0 {
 		executor.BashTimeout = time.Duration(p.BashTimeoutSeconds) * time.Second
 	} else if v := os.Getenv("OPENAI_BASH_TIMEOUT_SECONDS"); v != "" {
@@ -337,7 +351,7 @@ func Setup(p Params) (*App, error) {
 	a.Cfg = &agent.Config{
 		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort},
 		Exec:                executor,
-		Tools:               agent.ToolDefs(),
+		Tools:               append(agent.ToolDefs(), pluginTools...),
 		System:              system,
 		Mode:                mode,
 		MaxSteps:            p.MaxSteps,

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"minimalharness/internal/llm"
+	"minimalharness/internal/plugins"
 	"minimalharness/internal/session"
 	"minimalharness/internal/tools"
 )
@@ -141,6 +142,64 @@ func TestRunLoadSkillTool(t *testing.T) {
 	}
 	if !strings.Contains(secondBody, "MARKER-BODY-123") {
 		t.Fatalf("second request did not contain the skill body: %s", secondBody)
+	}
+}
+
+// A plugin tool behaves like a built-in from the loop's point of
+// view: the fake LLM calls it, the JS handler runs, and its result
+// reaches the model as a tool observation on the next call.
+func TestRunPluginTool(t *testing.T) {
+	root := t.TempDir()
+	plugDir := filepath.Join(root, ".agents", "plugins", "echo")
+	if err := os.MkdirAll(plugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plugDir, "plugin.json"), []byte(`{"name": "echo", "description": "Echo plugin.", "version": "0.1.0", "entry": "echo.js"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plugDir, "echo.js"), []byte(`harness.registerTool("echo", "Echo back the message.", {type: "object", properties: {msg: {type: "string"}}, required: ["msg"]}, (args) => "echo:" + args.msg);`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg, errs := plugins.Load(root)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	var calls int32
+	var secondBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"echo\",\"arguments\":\"{\\\"msg\\\":\\\"hello\\\"}\"}}]}}]}\n\n")
+			fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		secondBody = string(body)
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":3,\"total_tokens\":23}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &Config{
+		Client:   &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
+		Exec:     &tools.Executor{Root: root, Plugins: reg},
+		Tools:    append(ToolDefs(), reg.ToolDefs()...),
+		System:   "test system",
+		Mode:     "auto",
+		MaxSteps: 5,
+	}
+	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "echo hello"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "done" {
+		t.Fatalf("final text = %q, want %q", text, "done")
+	}
+	if !strings.Contains(secondBody, "echo:hello") {
+		t.Fatalf("second request did not contain the plugin tool result: %s", secondBody)
 	}
 }
 
