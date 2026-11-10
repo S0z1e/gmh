@@ -144,9 +144,13 @@ func (m Model) WithBranch(branch string) Model {
 
 // MetaUpdateMsg carries the session totals after a turn, so the meta
 // line can show tokens and turns without the runner knowing the TUI.
+// Model/API name the current model after a /model switch; empty means
+// unchanged.
 type MetaUpdateMsg struct {
 	Tokens int
 	Turns  int
+	Model  string
+	API    string
 }
 
 // markWorking starts a turn: working becomes true, and workingSince
@@ -245,6 +249,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case MetaUpdateMsg:
 		m.sessionTokens = msg.Tokens
 		m.turnCount = msg.Turns
+		if msg.Model != "" {
+			m.metaModel = msg.Model
+		}
+		if msg.API != "" {
+			m.metaAPI = msg.API
+		}
 		return m, nil
 	}
 	return m, nil

@@ -55,6 +55,14 @@ type anthropicContentBlock struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   string          `json:"content,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
+	// Source carries an image block's base64 payload.
+	Source *anthropicImageSource `json:"source,omitempty"`
+}
+
+type anthropicImageSource struct {
+	Type      string `json:"type"` // "base64"
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
 }
 
 type anthropicMessage struct {
@@ -123,6 +131,16 @@ func toAnthropicMessages(messages []Message) (string, []anthropicMessage) {
 				system = append(system, m.Content)
 			}
 		case "user":
+			// Images first, then the text: the same order as the
+			// direct probe that verified Agents-A1 image input.
+			for _, img := range imageParts(m) {
+				appendBlock("user", anthropicContentBlock{
+					Type: "image",
+					Source: &anthropicImageSource{
+						Type: "base64", MediaType: img.MediaType, Data: img.Data,
+					},
+				})
+			}
 			if m.Content != "" {
 				appendBlock("user", anthropicContentBlock{Type: "text", Text: m.Content})
 			}

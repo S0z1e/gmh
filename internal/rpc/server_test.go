@@ -2,8 +2,11 @@ package rpc
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -190,7 +193,8 @@ func setupTestApp(t *testing.T, mode string, steps []fakeStep) (*app.App, *app.R
 	}
 	// The harness requires a configured provider: point a mock
 	// provider at the fake server. Env still wins for the key.
-	cfg := fmt.Sprintf(`{"providers": {"mock": {"baseUrl": %q, "api": "chat", "model": "mock"}}}`, srv.URL+"/v1")
+	// The mock model declares image input so attach_image works.
+	cfg := fmt.Sprintf(`{"providers": {"mock": {"baseUrl": %q, "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}, {"id": "mock2", "api": "openai-responses"}]}}}`, srv.URL+"/v1")
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -462,6 +466,106 @@ func TestQueuedPrompt(t *testing.T) {
 	second := d.waitFor("agent_settled", 10*time.Second)
 	if second["text"] == nil || !strings.Contains(second["text"].(string), "second") {
 		t.Fatalf("second settled text = %v", second["text"])
+	}
+	d.quit(t)
+}
+
+// attach_image queues an image for the next turn; a missing file is
+// an error response, and the image rides on the prompt after it.
+func TestAttachImage(t *testing.T) {
+	a, runner, root := setupTestApp(t, "auto", []fakeStep{{kind: "text", text: "Done."}})
+	// Tiny valid PNG in the workspace root.
+	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "pic.png"), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+
+	// Missing file: an error response, nothing queued.
+	d.send(map[string]any{"id": "a1", "type": "attach_image", "path": "gone.png"})
+	resp := d.waitFor("error", 5*time.Second)
+	if resp["id"] != "a1" {
+		t.Fatalf("missing-file attach = %v, want an error response for a1", resp)
+	}
+	if len(a.PendingImages) != 0 {
+		t.Fatal("failed attach must not queue")
+	}
+
+	// Real file: attached, with its media type and size.
+	d.send(map[string]any{"id": "a2", "type": "attach_image", "path": "pic.png"})
+	resp = d.waitFor("response", 5*time.Second)
+	if resp["type"] != "response" {
+		t.Fatalf("attach = %v, want a response", resp)
+	}
+	data, _ := resp["data"].(map[string]any)
+	if data["attached"] != true || data["media_type"] != "image/png" {
+		t.Fatalf("attach data = %v", data)
+	}
+	if len(a.PendingImages) != 1 {
+		t.Fatalf("pending = %d, want 1", len(a.PendingImages))
+	}
+
+	// The next prompt consumes the attachment and settles.
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "describe the image"})
+	d.waitFor("response", 5*time.Second)
+	settled := d.waitFor("agent_settled", 10*time.Second)
+	if settled["error"] != nil {
+		t.Fatalf("settled with error: %v", settled["error"])
+	}
+	if len(a.PendingImages) != 0 {
+		t.Fatal("pending images should clear after the turn")
+	}
+	d.quit(t)
+}
+
+// set_model switches the model mid-session: the response names the
+// new provider/model/api, get_state shows it at once, the "/model"
+// slash form works the same, and a turn still runs afterwards.
+func TestSetModel(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{{kind: "text", text: "Done."}})
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+
+	d.send(map[string]any{"id": "m0", "type": "set_model", "model": "nope"})
+	resp := d.waitFor("error", 5*time.Second)
+	if resp["id"] != "m0" {
+		t.Fatalf("unknown set_model = %v, want an error for m0", resp)
+	}
+	if a.Model.ID != "mock" {
+		t.Fatal("failed set_model moved the model")
+	}
+
+	d.send(map[string]any{"id": "m1", "type": "set_model", "model": "mock2"})
+	resp = d.waitFor("response", 5*time.Second)
+	data, _ := resp["data"].(map[string]any)
+	if data["provider"] != "mock" || data["model"] != "mock2" || data["api"] != "responses" {
+		t.Fatalf("set_model data = %v", data)
+	}
+	d.send(map[string]any{"id": "s1", "type": "get_state"})
+	resp = d.waitFor("response", 5*time.Second)
+	data, _ = resp["data"].(map[string]any)
+	if data["model"] != "mock2" || data["api"] != "responses" {
+		t.Fatalf("get_state after switch = %v", data)
+	}
+
+	// The "/model mock" slash form switches back.
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "/model mock"})
+	resp = d.waitFor("response", 5*time.Second)
+	data, _ = resp["data"].(map[string]any)
+	if data["model"] != "mock" || data["api"] != "chat" {
+		t.Fatalf("slash /model data = %v", data)
+	}
+
+	d.send(map[string]any{"id": "p2", "type": "prompt", "message": "Say hi"})
+	d.waitFor("response", 5*time.Second)
+	settled := d.waitFor("agent_settled", 10*time.Second)
+	if settled["error"] != nil {
+		t.Fatalf("turn after switch settled with error: %v", settled["error"])
 	}
 	d.quit(t)
 }

@@ -1,8 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -493,5 +496,73 @@ func TestRunEmitsEventsForDeniedToolCall(t *testing.T) {
 	}
 	if !sawApproval {
 		t.Fatalf("denied tool call missing approval event: %+v", events)
+	}
+}
+
+// A read of an image file attaches the image to the next LLM call as
+// a user message (tool messages cannot carry images), and the session
+// file stores the path, never the bytes.
+func TestRunReadImageAttachesToNextCall(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "pic.png"), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.New("img-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var calls int32
+	var secondBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"path\":\"pic.png\"}"}}]}}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		secondBody = string(body)
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"seen it"}}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &Config{
+		Client:   &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
+		Exec:     &tools.Executor{Root: root, ImageInput: true},
+		Tools:    ToolDefs(),
+		System:   "test system",
+		Mode:     "auto",
+		MaxSteps: 5,
+		Session:  store,
+	}
+	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "look at pic.png"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "seen it" {
+		t.Fatalf("final text = %q", text)
+	}
+	if !strings.Contains(secondBody, "image_url") || !strings.Contains(secondBody, "data:image/png;base64,") {
+		t.Fatalf("second request has no image part: %s", secondBody)
+	}
+	data, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "data:image/png") {
+		t.Fatal("session file must not carry image bytes")
+	}
+	if !strings.Contains(string(data), `"path":"pic.png"`) {
+		t.Fatalf("session file must record the image path: %s", data)
 	}
 }

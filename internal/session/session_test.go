@@ -155,3 +155,40 @@ func TestClearThenDanglingToolCallDropped(t *testing.T) {
 		t.Fatalf("Load = %+v, want only 'after'", msgs)
 	}
 }
+
+// An image message round-trips through the file with its path and
+// media type, but the bytes never land in the file.
+func TestImageMessageStoresPathOnly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := New("test-image")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	msg := llm.Message{
+		Role:    "user",
+		Content: "Image attached: pic.png (2x2, 100 bytes).",
+		Images:  []llm.Image{{Path: "pic.png", MediaType: "image/png", Data: "aGVsbG8=", Width: 2, Height: 2, Bytes: 100}},
+	}
+	if err := store.Append(msg); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "aGVsbG8=") {
+		t.Fatal("session file must not carry image bytes")
+	}
+	msgs, err := Load("test-image")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || len(msgs[0].Images) != 1 {
+		t.Fatalf("loaded = %+v", msgs)
+	}
+	img := msgs[0].Images[0]
+	if img.Path != "pic.png" || img.MediaType != "image/png" || img.Data != "" || img.Width != 2 {
+		t.Fatalf("loaded image = %+v", img)
+	}
+}

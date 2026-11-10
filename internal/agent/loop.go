@@ -49,7 +49,7 @@ func (c *Config) emit(e Event) {
 
 func ToolDefs() []llm.ToolDef {
 	return []llm.ToolDef{
-		llm.Tool("read", "Read a file (with offset/limit) or list a directory.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}`),
+		llm.Tool("read", "Read a file (with offset/limit) or list a directory. Image files (png, jpg, gif, webp) are returned as an image you can see, not as text — use read to look at a screenshot or photo.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}`),
 		llm.Tool("write", "Create a NEW file. Fails if the file exists; use edit then.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}`),
 		llm.Tool("edit", "Replace exact oldText (must match once) with newText in an existing file.", `{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["path","oldText","newText"]}`),
 		llm.Tool("bash", "Run a shell command in the workspace root. Timeout in seconds, default 60, max 300.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]}`),
@@ -290,6 +290,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 			}
 			var obs string
 			var err error
+			var res tools.ToolResult
 			if tc.Function.Name == "bash" {
 				var job *tools.Job
 				obs, job = c.execBash(ctx, tc)
@@ -297,18 +298,31 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 					pending = append(pending, pendingJob{callID: tc.ID, job: job})
 				}
 			} else {
-				out, dispatchErr := c.Exec.Dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
-				obs = out
+				var dispatchErr error
+				res, dispatchErr = c.Exec.Dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+				obs = res.Text
 				err = dispatchErr
 				if err != nil {
 					// Tool errors are observations, not fatal errors.
-					obs = fmt.Sprintf("Error: %v\nOutput:\n%s", err, out)
+					obs = fmt.Sprintf("Error: %v\nOutput:\n%s", err, res.Text)
 				}
 			}
 			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err})
 			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 			if c.Session != nil {
 				_ = c.Session.Append(msgs[len(msgs)-1])
+			}
+			// A read image comes back with its bytes: attach them as
+			// a user message right after the tool result, so the next
+			// LLM call sees the image. Tool messages cannot carry
+			// images in any of the three APIs, and the image must be
+			// in the history before the next call, not after it.
+			if err == nil && len(res.Images) > 0 {
+				imgMsg := llm.Message{Role: "user", Content: llm.ImageText(res.Images), Images: res.Images}
+				msgs = append(msgs, imgMsg)
+				if c.Session != nil {
+					_ = c.Session.Append(imgMsg)
+				}
 			}
 		}
 	}

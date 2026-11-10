@@ -640,3 +640,20 @@ func TestMetaLineRight(t *testing.T) {
 		t.Fatalf("meta line without meta = %q", m2.metaLine())
 	}
 }
+
+// A MetaUpdateMsg carrying a model/api renames the meta line's model
+// (a /model switch); an update without them leaves it alone.
+func TestMetaUpdateSetsModel(t *testing.T) {
+	m := NewModel("").WithMeta("auto", "chat", "mock")
+	m = apply(t, m, MetaUpdateMsg{Tokens: 10, Turns: 1, Model: "mock2", API: "responses"})
+	if m.metaModel != "mock2" || m.metaAPI != "responses" {
+		t.Fatalf("meta after update = %s/%s", m.metaModel, m.metaAPI)
+	}
+	if got := stripANSI(m.metaLine()); !strings.Contains(got, "mock2") || !strings.Contains(got, "responses") {
+		t.Fatalf("meta line after switch = %q", got)
+	}
+	m = apply(t, m, MetaUpdateMsg{Tokens: 20, Turns: 2})
+	if m.metaModel != "mock2" || m.metaAPI != "responses" {
+		t.Fatalf("empty update moved meta to %s/%s", m.metaModel, m.metaAPI)
+	}
+}

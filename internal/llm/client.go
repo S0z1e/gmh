@@ -29,6 +29,10 @@ type Message struct {
 	Content    string     `json:"content,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
+	// Images are attached images (user messages only). The session
+	// file stores their path and media type, never the bytes; the
+	// bytes are re-read from disk on --resume.
+	Images []Image `json:"images,omitempty"`
 }
 
 type ToolCall struct {
@@ -75,11 +79,11 @@ type Usage struct {
 }
 
 type chatRequest struct {
-	Model         string         `json:"model"`
-	Messages      []Message      `json:"messages"`
-	Tools         []ToolDef      `json:"tools,omitempty"`
-	Stream        bool           `json:"stream"`
-	StreamOptions *streamOptions `json:"stream_options,omitempty"`
+	Model         string            `json:"model"`
+	Messages      []chatWireMessage `json:"messages"`
+	Tools         []ToolDef         `json:"tools,omitempty"`
+	Stream        bool              `json:"stream"`
+	StreamOptions *streamOptions    `json:"stream_options,omitempty"`
 	// MaxTokens caps the reply (max_tokens). 0 omits the field.
 	MaxTokens *int `json:"max_tokens,omitempty"`
 }
@@ -351,7 +355,7 @@ func mergeSamplingParams(body []byte, params map[string]any) ([]byte, error) {
 }
 
 func (c *Client) streamChat(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage)) error {
-	req := chatRequest{Model: c.Model, Messages: messages, Tools: tools, Stream: true, StreamOptions: &streamOptions{IncludeUsage: true}}
+	req := chatRequest{Model: c.Model, Messages: toChatWireMessages(messages), Tools: tools, Stream: true, StreamOptions: &streamOptions{IncludeUsage: true}}
 	if c.MaxTokens > 0 {
 		req.MaxTokens = &c.MaxTokens
 	}
@@ -459,11 +463,24 @@ func toResponsesInput(messages []Message) (string, []any) {
 		case "system":
 			instructions = append(instructions, m.Content)
 		case "user":
-			input = append(input, map[string]any{
-				"role": "user",
-				"content": []any{map[string]any{
+			var parts []any
+			if m.Content != "" {
+				parts = append(parts, map[string]any{
 					"type": "input_text", "text": m.Content,
-				}},
+				})
+			}
+			for _, img := range imageParts(m) {
+				parts = append(parts, map[string]any{
+					"type": "input_image", "image_url": img.DataURL(),
+				})
+			}
+			if len(parts) == 0 {
+				parts = append(parts, map[string]any{
+					"type": "input_text", "text": "",
+				})
+			}
+			input = append(input, map[string]any{
+				"role": "user", "content": parts,
 			})
 		case "assistant":
 			if m.Content != "" {

@@ -173,7 +173,7 @@ func (s *Server) handleLine(line string) {
 		s.handleQuery(req)
 	case "prompt":
 		s.handlePrompt(req)
-	case "clear", "compact", "new_session", "skill", "quit", "clear_queue":
+	case "clear", "compact", "new_session", "skill", "quit", "clear_queue", "attach_image", "set_model":
 		s.enqueue(req, workControl)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown request type %q", req.Type))
@@ -193,6 +193,13 @@ func (s *Server) handlePrompt(req Request) {
 	}
 	if typ, arg := slashRequest(req.Message); typ != "" {
 		ctrl := Request{ID: req.ID, Type: typ, Name: arg}
+		if typ == "attach_image" {
+			ctrl = Request{ID: req.ID, Type: typ, Path: arg}
+		}
+		if typ == "set_model" {
+			prov, mdl := app.SplitModelArg(arg)
+			ctrl = Request{ID: req.ID, Type: typ, Provider: prov, Model: mdl}
+		}
 		if typ == "usage" || typ == "jobs" {
 			// Read-only: answer at once, like the request of the same name.
 			s.handleQuery(ctrl)
@@ -222,6 +229,10 @@ func slashRequest(line string) (typ, arg string) {
 		return "compact", ""
 	case strings.HasPrefix(line, "/skill:"):
 		return "skill", strings.TrimPrefix(line, "/skill:")
+	case line == "/image" || strings.HasPrefix(line, "/image "):
+		return "attach_image", strings.TrimSpace(strings.TrimPrefix(line, "/image"))
+	case line == "/model" || strings.HasPrefix(line, "/model "):
+		return "set_model", strings.TrimSpace(strings.TrimPrefix(line, "/model"))
 	default:
 		return "", ""
 	}
@@ -530,6 +541,23 @@ func (s *Server) doControl(req Request) {
 		}
 		s.runner.Handle(ctx, "/skill:"+req.Name)
 		s.respond(req, map[string]any{"loaded": true, "bytes": len(body)}, nil)
+	case "attach_image":
+		img, err := s.app.AttachImage(req.Path)
+		if err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		s.respond(req, map[string]any{
+			"attached": true, "path": img.Path, "media_type": img.MediaType,
+			"bytes": img.Bytes, "width": img.Width, "height": img.Height,
+		}, nil)
+	case "set_model":
+		provName, modelID, api, err := s.app.SwitchModel(req.Provider, req.Model)
+		if err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		s.respond(req, map[string]any{"provider": provName, "model": modelID, "api": api}, nil)
 	case "quit":
 		s.respond(req, map[string]any{"ok": true}, nil)
 		s.shutdown()

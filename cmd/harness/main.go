@@ -37,7 +37,9 @@ func main() {
 		bashTO    = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 60, or env OPENAI_BASH_TIMEOUT_SECONDS)")
 		bgThresh  = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 10s default, 0 = never)")
 		rpcMode   = flag.Bool("rpc", false, "RPC mode: JSONL over stdin/stdout for a GUI (see README); stdout carries protocol data only")
+		images    stringList
 	)
+	flag.Var(&images, "image", "attach an image file to the first turn (repeatable; png, jpg, gif, webp; the model must declare image input)")
 	flag.Parse()
 
 	if *rpcMode && *printMode != "" {
@@ -54,7 +56,7 @@ func main() {
 			fatal(err)
 		}
 		if uiMode == "tui" {
-			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh); err != nil {
+			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, images); err != nil {
 				fmt.Fprintf(os.Stderr, "harness: TUI unavailable (%v); continuing in plain mode.\n", err)
 			}
 			// execTUI replaces this process on success; reaching here
@@ -79,6 +81,7 @@ func main() {
 		BashTimeoutSeconds:         *bashTO,
 		BackgroundThresholdSeconds: *bgThresh,
 		DisableBackground:          *printMode != "",
+		Images:                     images,
 	})
 	if err != nil {
 		fatal(err)
@@ -145,7 +148,7 @@ func main() {
 	}
 
 	// REPL
-	fmt.Println("Type a task, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /clear to drop context, /compact to summarise context, or /quit to exit.")
+	fmt.Println("Type a task, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /clear to drop context, /compact to summarise context, or /quit to exit.")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for {
@@ -162,7 +165,7 @@ func main() {
 // execTUI replaces this process with the sibling harness-tui binary,
 // passing the same flags through. It returns only if the sibling cannot
 // be started (then the caller falls back to plain mode).
-func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int) error {
+func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, images []string) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -187,7 +190,19 @@ func execTUI(root, mode, model, api, provider, config string, maxSteps int, resu
 		"-bash-timeout", strconv.Itoa(bashTO),
 		"-bg-threshold", strconv.Itoa(bgThresh),
 	}
+	for _, img := range images {
+		args = append(args, "-image", img)
+	}
 	return syscall.Exec(sibling, args, os.Environ())
+}
+
+// stringList is a repeatable -image flag: each occurrence appends one path.
+type stringList []string
+
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
+	return nil
 }
 
 func fatal(err error) {

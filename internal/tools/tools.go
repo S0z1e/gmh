@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"minimalharness/internal/llm"
 	"minimalharness/internal/skills"
 )
 
@@ -39,6 +40,11 @@ type Executor struct {
 	// Audit receives one entry per bash execution and denylist denial
 	// (nil = no audit). Approval decisions are audited by the loop.
 	Audit func(AuditEntry)
+	// ImageInput is set from the selected model's config input: true
+	// only when the model declares "image". LoadImage and image
+	// reads refuse when it is false, so a text-only model never
+	// receives image bytes it cannot use.
+	ImageInput bool
 
 	jobsMu sync.Mutex
 	jobs   *JobRegistry
@@ -222,53 +228,92 @@ func (e *Executor) Bash(ctx context.Context, a BashArgs) (string, error) {
 	}
 }
 
-// Dispatch runs a tool call by name and returns the observation string.
-func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (string, error) {
+// ToolResult is one tool call's observation. Images is set only by
+// read on an image file: the text is the marker, and the loop
+// attaches the image itself to the next request as a user message
+// (tool messages cannot carry images in any of the three APIs).
+type ToolResult struct {
+	Text   string
+	Images []llm.Image
+}
+
+// Dispatch runs a tool call by name and returns the observation.
+// A read of an image file (png, jpg, gif, webp) returns the image
+// alongside its marker text instead of the file's bytes as text.
+func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (ToolResult, error) {
 	switch name {
 	case "read":
 		var a ReadArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return "", fmt.Errorf("bad read args: %w", err)
+			return ToolResult{}, fmt.Errorf("bad read args: %w", err)
 		}
-		return e.Read(a)
+		if _, ok := MediaTypeForPath(a.Path); ok {
+			// The model chose the path, so the workspace jail
+			// still applies here (unlike -image, which the user
+			// named themselves). Resolve first, then load.
+			if !e.ImageInput {
+				return ToolResult{}, fmt.Errorf("image input is not enabled for this model: add \"image\" to the model's input in the config file")
+			}
+			mt, _ := MediaTypeForPath(a.Path)
+			p, err := e.resolve(a.Path)
+			if err != nil {
+				return ToolResult{}, err
+			}
+			img, err := e.loadImageFile(p, a.Path, mt)
+			if err != nil {
+				return ToolResult{}, err
+			}
+			return ToolResult{
+				Text:   fmt.Sprintf("Image %s — attached as an image below.", img.Describe()),
+				Images: []llm.Image{img},
+			}, nil
+		}
+		out, err := e.Read(a)
+		return ToolResult{Text: out}, err
 	case "write":
 		var a WriteArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return "", fmt.Errorf("bad write args: %w", err)
+			return ToolResult{}, fmt.Errorf("bad write args: %w", err)
 		}
-		return e.Write(a)
+		out, err := e.Write(a)
+		return ToolResult{Text: out}, err
 	case "edit":
 		var a EditArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return "", fmt.Errorf("bad edit args: %w", err)
+			return ToolResult{}, fmt.Errorf("bad edit args: %w", err)
 		}
-		return e.Edit(a)
+		out, err := e.Edit(a)
+		return ToolResult{Text: out}, err
 	case "bash":
 		var a BashArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return "", fmt.Errorf("bad bash args: %w", err)
+			return ToolResult{}, fmt.Errorf("bad bash args: %w", err)
 		}
-		return e.Bash(ctx, a)
+		out, err := e.Bash(ctx, a)
+		return ToolResult{Text: out}, err
 	case "grep":
 		var a GrepArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return "", fmt.Errorf("bad grep args: %w", err)
+			return ToolResult{}, fmt.Errorf("bad grep args: %w", err)
 		}
-		return e.Grep(ctx, a)
+		out, err := e.Grep(ctx, a)
+		return ToolResult{Text: out}, err
 	case "glob":
 		var a GlobArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return "", fmt.Errorf("bad glob args: %w", err)
+			return ToolResult{}, fmt.Errorf("bad glob args: %w", err)
 		}
-		return e.Glob(ctx, a)
+		out, err := e.Glob(ctx, a)
+		return ToolResult{Text: out}, err
 	case "load_skill":
 		var a LoadSkillArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return "", fmt.Errorf("bad load_skill args: %w", err)
+			return ToolResult{}, fmt.Errorf("bad load_skill args: %w", err)
 		}
-		return e.LoadSkill(a)
+		out, err := e.LoadSkill(a)
+		return ToolResult{Text: out}, err
 	default:
-		return "", fmt.Errorf("unknown tool: %s", name)
+		return ToolResult{}, fmt.Errorf("unknown tool: %s", name)
 	}
 }
 

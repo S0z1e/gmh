@@ -1,8 +1,12 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/png"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -444,5 +448,276 @@ func TestRunnerHandleQuit(t *testing.T) {
 	}
 	if r.Handle(context.Background(), "hello") {
 		t.Fatal("a task should not quit")
+	}
+}
+
+// writeTestPNG writes a tiny valid PNG to root.
+func writeTestPNG(t *testing.T, root, name string) {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, name), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Images: -image loads at Setup, /image queues for the next turn and
+// rides on the task message, and a bad path fails Setup.
+func TestImageAttachAndSend(t *testing.T) {
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi there\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	root := t.TempDir()
+	cfg := `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}]}}}`
+	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPNG(t, root, "pic.png")
+
+	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5, Images: []string{"pic.png"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	if len(a.PendingImages) != 1 || a.PendingImages[0].MediaType != "image/png" {
+		t.Fatalf("pending = %+v", a.PendingImages)
+	}
+	var printed []string
+	r := &Runner{App: a, Print: func(format string, args ...any) {
+		printed = append(printed, fmt.Sprintf(format, args...))
+	}}
+	if quit := r.Handle(context.Background(), "describe the image"); quit {
+		t.Fatal("task should not quit")
+	}
+	if len(a.PendingImages) != 0 {
+		t.Fatal("pending images should clear after the turn")
+	}
+	if len(bodies) != 1 || !strings.Contains(bodies[0], "image_url") || !strings.Contains(bodies[0], "data:image/png;base64,") {
+		t.Fatalf("request body has no image part: %v", bodies)
+	}
+	// /image queues for the next turn.
+	if quit := r.Handle(context.Background(), "/image pic.png"); quit {
+		t.Fatal("/image should not quit")
+	}
+	if len(a.PendingImages) != 1 {
+		t.Fatalf("pending after /image = %d, want 1", len(a.PendingImages))
+	}
+	if !strings.Contains(strings.Join(printed, "\n"), "Attached pic.png") {
+		t.Fatalf("no attach confirmation: %v", printed)
+	}
+	if quit := r.Handle(context.Background(), "again"); quit {
+		t.Fatal("task should not quit")
+	}
+	if len(bodies) != 2 || !strings.Contains(bodies[1], "image_url") {
+		t.Fatalf("second request has no image part: %v", bodies)
+	}
+	// /image with no argument lists pending (none left).
+	printed = nil
+	r.Handle(context.Background(), "/image")
+	if !strings.Contains(strings.Join(printed, "\n"), "No images attached") {
+		t.Fatalf("/image with no arg = %v", printed)
+	}
+	// A bad -image path fails Setup.
+	if _, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5, Images: []string{"gone.png"}}); err == nil {
+		t.Fatal("missing -image file should fail setup")
+	}
+}
+
+// A model whose input is text-only refuses images, at Setup and at
+// /image, with an error that says what to change.
+func TestImageRefusedWithoutInput(t *testing.T) {
+	srv := mockServer(t)
+	defer srv.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	root := t.TempDir()
+	writeMockProvider(t, root)
+	writeTestPNG(t, root, "pic.png")
+
+	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	var printed []string
+	r := &Runner{App: a, Print: func(format string, args ...any) {
+		printed = append(printed, fmt.Sprintf(format, args...))
+	}}
+	r.Handle(context.Background(), "/image pic.png")
+	if len(a.PendingImages) != 0 {
+		t.Fatal("refused image must not queue")
+	}
+	if !strings.Contains(strings.Join(printed, "\n"), "image input is not enabled") {
+		t.Fatalf("/image refusal = %v", printed)
+	}
+	if _, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5, Images: []string{"pic.png"}}); err == nil || !strings.Contains(err.Error(), "image input is not enabled") {
+		t.Fatalf("-image setup err = %v, want the image-input hint", err)
+	}
+}
+
+// Two providers with distinct models, apis and limits, for /model.
+func writeSwitchConfig(t *testing.T, root string) {
+	t.Helper()
+	cfg := `{
+		"defaultProvider": "prov-a",
+		"defaultModel": "a1",
+		"providers": {
+			"prov-a": {
+				"baseUrl": "http://127.0.0.1:11/v1", "api": "chat", "apiKey": "$KEY_A",
+				"models": [
+					{"id": "a1", "contextWindow": 1000, "maxTokens": 100, "input": ["text"]},
+					{"id": "a2", "api": "anthropic-messages", "contextWindow": 2000, "maxTokens": 200, "input": ["text", "image"]}
+				]
+			},
+			"prov-b": {
+				"baseUrl": "http://127.0.0.1:12/v1", "api": "openai-responses", "apiKey": "$KEY_B",
+				"models": [{"id": "b1", "contextWindow": 3000, "maxTokens": 300}]
+			},
+			"prov-nokey": {
+				"baseUrl": "http://127.0.0.1:13/v1", "api": "chat", "apiKey": "$KEY_MISSING",
+				"models": [{"id": "n1"}]
+			}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSwitchModel(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KEY_A", "key-a")
+	t.Setenv("KEY_B", "key-b")
+	root := t.TempDir()
+	writeSwitchConfig(t, root)
+	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	if a.Model.ID != "a1" || a.Cfg.Client.API != "chat" || a.ContextLimit != 1000 {
+		t.Fatalf("initial model = %s/%s limit %d", a.Model.ID, a.Cfg.Client.API, a.ContextLimit)
+	}
+	// Same provider, different api: the client is rebuilt, the
+	// context limit and image-input flag follow the new model.
+	prov, model, api, err := a.SwitchModel("", "a2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prov != "prov-a" || model != "a2" || api != "anthropic" {
+		t.Fatalf("switch = %s/%s/%s", prov, model, api)
+	}
+	if a.Cfg.Client.Model != "a2" || a.Cfg.Client.API != "anthropic" || a.Cfg.Client.MaxTokens != 200 {
+		t.Fatalf("client = %+v", a.Cfg.Client)
+	}
+	if a.ContextLimit != 2000 || !a.Cfg.Exec.ImageInput {
+		t.Fatalf("limit = %d, imageInput = %v", a.ContextLimit, a.Cfg.Exec.ImageInput)
+	}
+	// Another provider by name: base URL and key follow it.
+	prov, model, api, err = a.SwitchModel("prov-b", "b1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prov != "prov-b" || model != "b1" || api != "responses" {
+		t.Fatalf("switch = %s/%s/%s", prov, model, api)
+	}
+	if a.Cfg.Client.BaseURL != "http://127.0.0.1:12/v1" || a.Cfg.Client.APIKey != "key-b" {
+		t.Fatalf("client = %+v", a.Cfg.Client)
+	}
+	if a.ContextLimit != 3000 || a.Cfg.Exec.ImageInput {
+		t.Fatalf("limit = %d, imageInput = %v", a.ContextLimit, a.Cfg.Exec.ImageInput)
+	}
+	// A bare model id finds its provider (current provider does not
+	// have it, prov-a does).
+	prov, model, api, err = a.SwitchModel("", "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prov != "prov-a" || model != "a1" || api != "chat" {
+		t.Fatalf("bare-name switch = %s/%s/%s", prov, model, api)
+	}
+	// Errors leave the current model untouched.
+	if _, _, _, err := a.SwitchModel("", "nope"); err == nil || !strings.Contains(err.Error(), "unknown model") {
+		t.Fatalf("unknown model err = %v", err)
+	}
+	if _, _, _, err := a.SwitchModel("nope", "a1"); err == nil || !strings.Contains(err.Error(), "unknown provider") {
+		t.Fatalf("unknown provider err = %v", err)
+	}
+	if _, _, _, err := a.SwitchModel("prov-nokey", "n1"); err == nil || !strings.Contains(err.Error(), "KEY_MISSING") {
+		t.Fatalf("missing key err = %v", err)
+	}
+	if a.Model.ID != "a1" || a.Provider != "prov-a" {
+		t.Fatalf("failed switches moved the model to %s/%s", a.Provider, a.Model.ID)
+	}
+	// FindModel: current provider first, then the rest.
+	if p, ok := a.FindModel("b1"); !ok || p != "prov-b" {
+		t.Fatalf("FindModel(b1) = %q %v", p, ok)
+	}
+	if p, ok := a.FindModel("a2"); !ok || p != "prov-a" {
+		t.Fatalf("FindModel(a2) = %q %v", p, ok)
+	}
+	if _, ok := a.FindModel("nope"); ok {
+		t.Fatal("FindModel should fail for an unknown id")
+	}
+}
+
+// /model lists, switches by provider/model and by bare name, and
+// refuses unknown models without moving.
+func TestModelCommand(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KEY_A", "key-a")
+	t.Setenv("KEY_B", "key-b")
+	root := t.TempDir()
+	writeSwitchConfig(t, root)
+	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	var printed []string
+	r := &Runner{App: a, Print: func(format string, args ...any) {
+		printed = append(printed, fmt.Sprintf(format, args...))
+	}}
+	r.Handle(context.Background(), "/model")
+	joined := strings.Join(printed, "\n")
+	for _, want := range []string{"* prov-a/a1 (chat)", "prov-a/a2 (anthropic)", "prov-b/b1 (responses)", "Usage: /model"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("/model list = %v, want %q", printed, want)
+		}
+	}
+	printed = nil
+	r.Handle(context.Background(), "/model prov-a/a2")
+	if a.Model.ID != "a2" || a.Cfg.Client.API != "anthropic" {
+		t.Fatalf("after /model, model = %s/%s", a.Model.ID, a.Cfg.Client.API)
+	}
+	if !strings.Contains(strings.Join(printed, "\n"), "Switched to prov-a/a2 (anthropic)") {
+		t.Fatalf("switch confirmation = %v", printed)
+	}
+	printed = nil
+	r.Handle(context.Background(), "/model b1")
+	if a.Model.ID != "b1" || a.Provider != "prov-b" {
+		t.Fatalf("bare /model b1 = %s/%s", a.Provider, a.Model.ID)
+	}
+	printed = nil
+	r.Handle(context.Background(), "/model nope")
+	if a.Model.ID != "b1" {
+		t.Fatal("failed /model moved the model")
+	}
+	if !strings.Contains(strings.Join(printed, "\n"), "[error]") {
+		t.Fatalf("bad /model = %v, want an error line", printed)
 	}
 }

@@ -17,12 +17,20 @@ import (
 type Request struct {
 	ID string `json:"id,omitempty"`
 	// Type is one of: prompt, approval_response, abort, clear_queue,
-	// get_state, new_session, clear, compact, usage, jobs, skill, quit.
+	// get_state, new_session, clear, compact, usage, jobs, skill,
+	// quit, attach_image, set_model.
 	Type string `json:"type"`
 	// Message is the task for prompt.
 	Message string `json:"message,omitempty"`
 	// Name is the skill name for skill.
 	Name string `json:"name,omitempty"`
+	// Path is the image file for attach_image.
+	Path string `json:"path,omitempty"`
+	// Model and Provider select a model for set_model: "provider/model"
+	// arrives split (see slashRequest); a bare model id searches the
+	// current provider first, then the rest.
+	Model    string `json:"model,omitempty"`
+	Provider string `json:"provider,omitempty"`
 	// ApprovalID names the approval_request being answered, for
 	// approval_response. It is separate from ID, which correlates
 	// the response to this request.

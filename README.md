@@ -90,11 +90,35 @@ delivered to the session before the error is reported, capped at
 32 KiB head+tail; quitting with jobs running warns that they are
 abandoned (their child processes keep running, orphaned).
 
+## Images
+
+The harness can send images to a model that declares image input
+(`"input": ["text", "image"]` in the config). Three ways in:
+- `-image <path>` (repeatable) attaches images to the first turn,
+  in `-p` or the REPL.
+- `/image <path>` in the REPL attaches to your next message
+  (`/image` alone lists what is attached).
+- The model itself can `read` an image file (png, jpg, gif, webp):
+  the read returns a marker, and the image is attached to the next
+  request as a user message (tool messages cannot carry images in
+  any of the three APIs).
+
+The model receives the image in its own format: chat gets an
+`image_url` data URI, Responses gets `input_image`, Anthropic gets a
+base64 image block. One image is capped at 10 MiB, ten per message.
+Sessions store the image path, never the bytes; on `--resume` the
+bytes are re-read from disk, so a deleted file leaves only the marker
+text. A model without `"image"` in its `input` refuses the attach
+with an error that says what to add. The GUI route is the RPC
+`attach_image` request (see below).
+
 ## Layout
 
 ```
 cmd/harness/main.go      // CLI: -p print mode, REPL, --resume, -mode suggest/auto
 internal/llm/client.go   // OpenAI-compatible client, streaming, tool-call accumulation
+internal/llm/image.go    // Image type + wire parts for chat/anthropic/responses
+internal/tools/image.go  // LoadImage: workspace jail, type/size caps, dimensions
 internal/agent/loop.go   // single loop: LLM -> tool -> observe -> repeat
 internal/tools/tools.go  // read/write/edit/bash, workspace-root jail, timeout
 internal/tools/grep.go   // grep tool (ripgrep backend, grep -r fallback, match cap + truncation)
@@ -154,7 +178,12 @@ internal/agent/prompts/system.md // lightweight system prompt, embedded
 - REPL commands: `/usage` shows session token totals, `/clear` drops
   the conversation context (a marker is written to the session file;
   `--resume` starts from the clear point, older messages stay in the
-  file).
+  file). `/model` lists the configured models; `/model <provider>/<model>`
+  (or a bare model id) switches model mid-session — the client is
+  rebuilt from that model's config (api, baseUrl, maxTokens,
+  contextWindow, image input) and history replays through the new
+  API on the next turn. The switch lasts for the session only; it
+  does not rewrite the config file.
 - Compaction: `/compact` summarises the conversation into a 6-section
   brief and replaces history with it; the original transcript is
   saved to `<session>-pre-compact-<time>.jsonl`. It also triggers
@@ -228,7 +257,8 @@ Two files, merged field by field (project wins where it sets a value):
       "api": "anthropic-messages",
       "apiKey": "$DISCOVERY_API_KEY",
       "models": [
-        {"id": "Agents-A1", "reasoning": true, "contextWindow": 256000, "maxTokens": 16384},
+        {"id": "Agents-A1", "reasoning": true, "contextWindow": 256000, "maxTokens": 16384,
+         "input": ["text", "image"]},
         {"id": "deepseek-v4-flash-0731", "api": "openai-completions"}
       ]
     }
@@ -336,6 +366,8 @@ echoed in the response):
   suffix, so a new session never reopens the old file.
 - `clear` / `compact` → `{"ok":true}` (same as the REPL commands).
 - `skill` `{"name":"..."}` → `{"loaded":true,"bytes":N}`.
+- `attach_image` `{"path":"..."}` → `{"attached":true,"path":"...","media_type":"...","bytes":N,"width":W,"height":H}`. Queues the image for the next turn, like `/image` in the REPL (same caps, same model-input check).
+- `set_model` `{"provider":"...","model":"..."}` (either may be omitted: no provider keeps the current one, no model takes the provider default; a bare `model` searches the current provider first, then the rest) → `{"provider":"...","model":"...","api":"..."}`. Same switch as `/model` in the REPL; `get_state` reports the new model and api at once.
 - `quit` → `{"ok":true}`, then the process exits 0. It waits for the
   current turn; send `abort` first to quit at once. Closing stdin
   shuts down the same way (orderly, like Pi's Stop).

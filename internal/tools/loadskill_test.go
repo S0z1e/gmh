@@ -27,8 +27,8 @@ func TestLoadSkillDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "Do the demo thing.") {
-		t.Fatalf("load_skill output = %q, want the skill body", out)
+	if !strings.Contains(out.Text, "Do the demo thing.") {
+		t.Fatalf("load_skill output = %q, want the skill body", out.Text)
 	}
 	// Case-insensitive name.
 	if _, err := e.Dispatch(context.Background(), "load_skill", `{"name":"DEMO"}`); err != nil {
@@ -61,10 +61,10 @@ func TestLoadSkillReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "api.md") {
-		t.Fatalf("load_skill output should list references: %q", out)
+	if !strings.Contains(out.Text, "api.md") {
+		t.Fatalf("load_skill output should list references: %q", out.Text)
 	}
-	if strings.Contains(out, "REF-MARKER-456") {
+	if strings.Contains(out.Text, "REF-MARKER-456") {
 		t.Fatal("load_skill must not inline reference contents")
 	}
 	// Loading one reference returns its content.
@@ -72,8 +72,8 @@ func TestLoadSkillReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out != "REF-MARKER-456\n" {
-		t.Fatalf("load_skill reference = %q, want the file content", out)
+	if out.Text != "REF-MARKER-456\n" {
+		t.Fatalf("load_skill reference = %q, want the file content", out.Text)
 	}
 	// Unknown reference and traversal are refused.
 	if _, err := e.Dispatch(context.Background(), "load_skill", `{"name":"demo","reference":"nope.md"}`); err == nil {

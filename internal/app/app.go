@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -48,6 +49,10 @@ type Params struct {
 	// DisableBackground turns backgrounding off entirely. -p print
 	// mode sets it: a one-shot run stays synchronous.
 	DisableBackground bool
+	// Images are image files attached to the first turn (-image flag,
+	// repeatable). They are loaded in Setup and fail the run when a
+	// file is missing, too big, or the model has no image input.
+	Images []string
 }
 
 type App struct {
@@ -60,6 +65,11 @@ type App struct {
 	// Model is the resolved model entry (Pi shape): id, api, baseUrl,
 	// contextWindow, maxTokens, samplingParams, headers, input, cost.
 	Model config.Model
+	// Config is the loaded config file, kept so /model can re-resolve
+	// a different provider or model mid-session. Provider is the
+	// current provider's name ("" before Setup).
+	Config   *config.File
+	Provider string
 	// Rates configures cost estimates (zero = unconfigured: no estimate
 	// is shown, only the "real price unverified" label).
 	Rates llm.Rates
@@ -68,6 +78,11 @@ type App struct {
 	// TUITheme is the resolved TUI theme name: HARNESS_TUI_THEME,
 	// else the config file, else "" (the default theme).
 	TUITheme string
+	// PendingImages are images attached for the next turn (/image,
+	// -image, RPC attach_image). runOnce moves them onto the task
+	// message and clears the list; the images then live in history
+	// and are resent on later calls, like any message.
+	PendingImages []llm.Image
 }
 
 // Setup builds the client, session and agent config. The caller sets
@@ -203,7 +218,7 @@ func Setup(p Params) (*App, error) {
 	a.Skills = skillList
 	system := agent.SystemPrompt + skills.Listing(skillList)
 
-	executor := &tools.Executor{Root: absRoot}
+	executor := &tools.Executor{Root: absRoot, ImageInput: slices.Contains(mdl.Input, "image")}
 	if p.BashTimeoutSeconds > 0 {
 		executor.BashTimeout = time.Duration(p.BashTimeoutSeconds) * time.Second
 	} else if v := os.Getenv("OPENAI_BASH_TIMEOUT_SECONDS"); v != "" {
@@ -289,6 +304,8 @@ func Setup(p Params) (*App, error) {
 	}
 
 	a.Model = mdl
+	a.Config = cfg
+	a.Provider = provName
 	a.Cfg = &agent.Config{
 		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers},
 		Exec:                executor,
@@ -328,7 +345,225 @@ func Setup(p Params) (*App, error) {
 		return nil, err
 	}
 	a.Rates = rates
+
+	// Images stored in a resumed session carry only paths; re-read
+	// their bytes now, while the executor exists.
+	a.hydrateImages(a.History)
+	// -image attachments fail the run when a file cannot be loaded.
+	for _, p := range p.Images {
+		if _, err := a.AttachImage(p); err != nil {
+			store.Close()
+			return nil, fmt.Errorf("-image %s: %w", p, err)
+		}
+	}
 	return a, nil
+}
+
+// AttachImage loads one image file and queues it for the next turn.
+// At most MaxImagesPerMessage wait for a turn.
+func (a *App) AttachImage(path string) (llm.Image, error) {
+	if len(a.PendingImages) >= tools.MaxImagesPerMessage {
+		return llm.Image{}, fmt.Errorf("at most %d images per message", tools.MaxImagesPerMessage)
+	}
+	img, err := a.Cfg.Exec.LoadImage(path)
+	if err != nil {
+		return llm.Image{}, err
+	}
+	a.PendingImages = append(a.PendingImages, img)
+	return img, nil
+}
+
+// hydrateImages re-reads the bytes of every image in msgs whose
+// session file stored only the path (Data is never written to the
+// file). Images whose file is gone stay in history as text only:
+// the marker line says an image was there, and the payload builders
+// skip images with no bytes.
+func (a *App) hydrateImages(msgs []llm.Message) {
+	for i := range msgs {
+		for j := range msgs[i].Images {
+			img := &msgs[i].Images[j]
+			if img.Data != "" || img.Path == "" {
+				continue
+			}
+			if loaded, err := a.Cfg.Exec.LoadImage(img.Path); err == nil {
+				*img = loaded
+			}
+		}
+	}
+}
+
+// SplitModelArg parses a /model argument: "provider/model" or a bare
+// model id (the provider is resolved by FindModel, current first).
+func SplitModelArg(arg string) (provider, model string) {
+	if p, m, ok := strings.Cut(arg, "/"); ok {
+		return p, m
+	}
+	return "", arg
+}
+
+// FindModel locates a bare model id across providers: the current
+// provider first, then the rest in config order. A provider claims
+// an id only when it lists it (flat model or models entry); a
+// provider with no models claims nothing.
+func (a *App) FindModel(modelID string) (string, bool) {
+	if a.Config == nil || modelID == "" {
+		return "", false
+	}
+	names := []string{}
+	if a.Provider != "" {
+		names = append(names, a.Provider)
+	}
+	for _, n := range a.Config.ProviderNames() {
+		if n != a.Provider {
+			names = append(names, n)
+		}
+	}
+	for _, n := range names {
+		prov, ok := a.Config.Select(n)
+		if !ok {
+			continue
+		}
+		if prov.Model == modelID {
+			return n, true
+		}
+		for _, m := range prov.Models {
+			if m.ID == modelID {
+				return n, true
+			}
+		}
+	}
+	return "", false
+}
+
+// SwitchModel rebuilds the client for another provider/model
+// mid-session, Pi-style (/model). History is kept: it is stored
+// API-agnostic and replayed through the new model's API on the next
+// turn, like a --resume across providers. Only the model, client,
+// context limit and image-input flag change; session, skills and
+// history are untouched. Precedence differs from Setup on purpose:
+// there are no startup flags here, so the api comes from the model
+// entry (falling back to the current api when the entry declares
+// none), baseUrl from OPENAI_BASE_URL or the entry, maxTokens from
+// ANTHROPIC_MAX_TOKENS or the entry, and the context limit from
+// OPENAI_CONTEXT_LIMIT or the entry. It returns the resolved
+// provider, model id and api shape.
+func (a *App) SwitchModel(provider, model string) (provName, modelID, api string, err error) {
+	if a.Config == nil || a.Cfg == nil {
+		return "", "", "", fmt.Errorf("no config loaded")
+	}
+	cfg := a.Config
+	if provider == "" {
+		provider = a.Provider
+	}
+	prov, ok := cfg.Select(provider)
+	if !ok {
+		return "", "", "", fmt.Errorf("unknown provider %q (configured: %s)", provider, strings.Join(cfg.ProviderNames(), ", "))
+	}
+	provName = cfg.SelectedName(provider)
+	if provName == "" {
+		provName = provider
+	}
+	if model == "" && provName == cfg.DefaultProvider {
+		model = cfg.DefaultModel
+	}
+	mdl, ok := prov.ResolveModel(model)
+	if !ok && model != "" {
+		// A bare model id with no provider named: look across
+		// providers (current first) before giving up, so /model
+		// <model> and RPC set_model behave the same.
+		if p, found := a.FindModel(model); found && p != provName {
+			prov, _ = cfg.Select(p)
+			provName = cfg.SelectedName(p)
+			if provName == "" {
+				provName = p
+			}
+			mdl, ok = prov.ResolveModel(model)
+		}
+	}
+	if !ok {
+		return "", "", "", fmt.Errorf("unknown model %q for provider %q (models: %s)", model, provName, modelIDs(prov))
+	}
+	if mdl.ID == "" {
+		return "", "", "", fmt.Errorf("provider %q: no model configured (set \"model\" or add a \"models\" entry)", provName)
+	}
+	// API key: the provider's apiKey "$NAME" reference wins, else
+	// OPENAI_API_KEY. A literal key never lives in the file.
+	apiKey := ""
+	if prov.APIKey != "" {
+		k, err := config.ResolveAPIKey(prov.APIKey)
+		if err != nil {
+			return "", "", "", err
+		}
+		apiKey = k
+	} else {
+		apiKey = os.Getenv("OPENAI_API_KEY")
+	}
+	if apiKey == "" {
+		return "", "", "", fmt.Errorf("missing API key: set OPENAI_API_KEY, or set apiKey: \"$NAME\" for provider %q in the config file", provName)
+	}
+	apiMode := a.Cfg.Client.API
+	if mdl.API != "" {
+		m, err := config.NormalizeAPI(mdl.API)
+		if err != nil {
+			return "", "", "", fmt.Errorf("invalid api for model %q: %w", mdl.ID, err)
+		}
+		apiMode = m
+	}
+	baseURL := os.Getenv("OPENAI_BASE_URL")
+	if baseURL == "" {
+		baseURL = mdl.BaseURL
+	}
+	if baseURL == "" {
+		return "", "", "", fmt.Errorf("provider %q: baseUrl is required", provName)
+	}
+	maxTokens := 0
+	if v := os.Getenv("ANTHROPIC_MAX_TOKENS"); v != "" {
+		fmt.Sscanf(v, "%d", &maxTokens)
+	} else if mdl.MaxTokens != nil {
+		maxTokens = *mdl.MaxTokens
+	} else if cfg.AnthropicMaxTokens != nil {
+		maxTokens = *cfg.AnthropicMaxTokens
+	}
+	if maxTokens <= 0 {
+		maxTokens = config.DefaultMaxTokens
+	}
+	var headers map[string]string
+	merged := map[string]string{}
+	for k, v := range prov.Headers {
+		merged[k] = v
+	}
+	for k, v := range mdl.Headers {
+		merged[k] = v
+	}
+	if len(merged) > 0 {
+		headers = make(map[string]string, len(merged))
+		for k, v := range merged {
+			rv, err := config.ResolveValue(v)
+			if err != nil {
+				return "", "", "", err
+			}
+			headers[k] = rv
+		}
+	}
+	contextLimit := 0
+	if v := os.Getenv("OPENAI_CONTEXT_LIMIT"); v != "" {
+		fmt.Sscanf(v, "%d", &contextLimit)
+	}
+	if contextLimit <= 0 && mdl.ContextWindow != nil {
+		contextLimit = *mdl.ContextWindow
+	}
+	if contextLimit <= 0 && cfg.ContextLimit != nil {
+		contextLimit = *cfg.ContextLimit
+	}
+	if contextLimit <= 0 {
+		contextLimit = config.DefaultContextWindow
+	}
+	a.Cfg.Client = &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers}
+	a.Cfg.Exec.ImageInput = slices.Contains(mdl.Input, "image")
+	a.Model = mdl
+	a.Provider = provName
+	a.ContextLimit = contextLimit
+	return provName, mdl.ID, apiMode, nil
 }
 
 // modelIDs lists a provider's model ids for error messages: the
@@ -420,6 +655,41 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 	if line == "" {
 		return false
 	}
+	if line == "/image" || strings.HasPrefix(line, "/image ") {
+		arg := strings.TrimSpace(strings.TrimPrefix(line, "/image"))
+		if arg == "" {
+			if len(r.App.PendingImages) == 0 {
+				r.Print("No images attached. Usage: /image <path> (png, jpg, gif, webp).")
+				return false
+			}
+			for _, img := range r.App.PendingImages {
+				r.Print("Attached: %s", img.Describe())
+			}
+			return false
+		}
+		img, err := r.App.AttachImage(arg)
+		if err != nil {
+			r.Print("[error] %v", err)
+			return false
+		}
+		r.Print("Attached %s — will be sent with your next message.", img.Describe())
+		return false
+	}
+	if line == "/model" || strings.HasPrefix(line, "/model ") {
+		arg := strings.TrimSpace(strings.TrimPrefix(line, "/model"))
+		if arg == "" {
+			r.printModels()
+			return false
+		}
+		provider, model := SplitModelArg(arg)
+		provName, modelID, api, err := r.App.SwitchModel(provider, model)
+		if err != nil {
+			r.Print("[error] %v", err)
+			return false
+		}
+		r.Print("Switched to %s/%s (%s). Context window %d tokens; history replays through the new API.", provName, modelID, api, r.App.ContextLimit)
+		return false
+	}
 	switch line {
 	case "/quit", "/exit":
 		// Quitting abandons running background jobs (their child
@@ -454,6 +724,38 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 	}
 	r.runOnce(ctx, line)
 	return false
+}
+
+// printModels lists every configured model, current one marked *.
+func (r *Runner) printModels() {
+	a := r.App
+	if a.Config == nil {
+		r.Print("No config loaded.")
+		return
+	}
+	r.Print("Models (current marked *):")
+	for _, name := range a.Config.ProviderNames() {
+		prov, ok := a.Config.Select(name)
+		if !ok {
+			continue
+		}
+		ids := []string{}
+		if prov.Model != "" {
+			ids = append(ids, prov.Model)
+		}
+		for _, m := range prov.Models {
+			ids = append(ids, m.ID)
+		}
+		for _, id := range ids {
+			mdl, _ := prov.ResolveModel(id)
+			mark := " "
+			if name == a.Provider && id == a.Model.ID {
+				mark = "*"
+			}
+			r.Print("%s %s/%s (%s)", mark, name, id, mdl.API)
+		}
+	}
+	r.Print("Usage: /model <provider>/<model> or /model <model>")
 }
 
 // printJobs lists the background bash jobs of this process, oldest
@@ -514,6 +816,13 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		_ = r.App.Store.Append(skillMsg)
 	}
 	userMsg := llm.Message{Role: "user", Content: task}
+	// Images attached for this turn (-image, /image, RPC) ride on
+	// the task message itself, then clear: they live in history
+	// from here and are resent on later calls like any message.
+	if len(r.App.PendingImages) > 0 {
+		userMsg.Images = r.App.PendingImages
+		r.App.PendingImages = nil
+	}
 	r.App.History = append(r.App.History, userMsg)
 	_ = r.App.Store.Append(userMsg)
 	r.Turns++
@@ -523,8 +832,10 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		r.Print("\n[error] %v", err)
 	}
 	// Keep the returned history in sync: Run used its own copy.
-	// Re-load the session file to recover tool messages.
+	// Re-load the session file to recover tool messages. Images in
+	// the file carry paths only; re-read their bytes here.
 	if msgs, err := session.Load(r.App.Store.ID); err == nil {
+		r.App.hydrateImages(msgs)
 		r.App.History = msgs
 	}
 	r.SessionUsage.Add(usage)

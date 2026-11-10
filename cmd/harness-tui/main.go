@@ -33,7 +33,9 @@ func main() {
 		deny      = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1)")
 		bashTO    = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 60, or env OPENAI_BASH_TIMEOUT_SECONDS)")
 		bgThresh  = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 10s default, 0 = never)")
+		images    stringList
 	)
+	flag.Var(&images, "image", "attach an image file to the first turn (repeatable; png, jpg, gif, webp; the model must declare image input)")
 	flag.Parse()
 
 	// The TUI needs a real terminal. When stdout is piped, say so
@@ -56,6 +58,7 @@ func main() {
 		DenyInsteadOfPrompt:        *deny,
 		BashTimeoutSeconds:         *bashTO,
 		BackgroundThresholdSeconds: *bgThresh,
+		Images:                     images,
 	})
 	if err != nil {
 		fatal(err)
@@ -105,8 +108,9 @@ func main() {
 	go func() {
 		for line := range lines {
 			quit := runner.Handle(ctx, line)
-			// Session totals for the meta line's right side.
-			prog.Send(tui.MetaUpdateMsg{Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns})
+			// Session totals for the meta line's right side, plus
+			// the current model/api so a /model switch shows up.
+			prog.Send(tui.MetaUpdateMsg{Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns, Model: a.Model.ID, API: a.Cfg.Client.API})
 			if quit {
 				prog.Quit()
 				return
@@ -139,4 +143,13 @@ func gitBranch(root string) string {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "harness-tui:", err)
 	os.Exit(1)
+}
+
+// stringList is a repeatable -image flag: each occurrence appends one path.
+type stringList []string
+
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
+	return nil
 }
