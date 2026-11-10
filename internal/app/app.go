@@ -216,7 +216,7 @@ func Setup(p Params) (*App, error) {
 
 	skillList := skills.Discover(absRoot)
 	a.Skills = skillList
-	system := agent.SystemPrompt + skills.Listing(skillList)
+	system := agent.SystemPrompt + agent.ProjectContext(absRoot) + skills.Listing(skillList)
 
 	executor := &tools.Executor{Root: absRoot, ImageInput: slices.Contains(mdl.Input, "image")}
 	if p.BashTimeoutSeconds > 0 {

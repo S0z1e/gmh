@@ -721,3 +721,22 @@ func TestModelCommand(t *testing.T) {
 		t.Fatalf("bad /model = %v, want an error line", printed)
 	}
 }
+
+// Setup loads AGENTS.md from the root into the system prompt.
+func TestSetupLoadsProjectContext(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	root := t.TempDir()
+	writeMockProvider(t, root)
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("Project codename: ZEBRA-7.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	if !strings.Contains(a.Cfg.System, "ZEBRA-7") {
+		t.Fatalf("system prompt = %q, want the AGENTS.md content", a.Cfg.System)
+	}
+}

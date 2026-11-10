@@ -174,6 +174,11 @@ internal/agent/prompts/system.md // lightweight system prompt, embedded
   them in a footer, and the model loads one with
   `load_skill {name, reference}` (paths are jailed to that skill's
   `references/`).
+- Project context: `AGENTS.md` and `CLAUDE.md` in the workspace root
+  (and ancestors up to `$HOME`) are loaded once at startup into the
+  system prompt, each capped at 8 KiB, with a git snapshot (branch,
+  working-tree status, recent commits) added the same way. Editing a
+  context file mid-session needs a restart.
 - Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`.
 - REPL commands: `/usage` shows session token totals, `/clear` drops
   the conversation context (a marker is written to the session file;
