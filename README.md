@@ -57,16 +57,27 @@ What is enforced:
 - Every approval decision, every bash run (with exit code), and every
   denial is written to `<session>-audit.jsonl` next to the session
   transcript, for later review.
+- `--sandbox` (also `HARNESS_SANDBOX=1` or config `sandbox`) runs bash
+  calls under bwrap (bubblewrap, Linux only): the filesystem outside
+  the workspace is hidden behind a fresh tmpfs root, then only /usr
+  and /etc come back (read-only), plus /proc, /dev, a fresh /tmp and
+  the workspace itself (read-write, HOME set to it). A sandboxed bash
+  cannot write outside the root; the network is NOT blocked, and each
+  call gets a fresh /tmp. Setup fails fast when bwrap is missing or
+  cannot create a sandbox here (unprivileged user namespaces
+  disabled). read/write/edit run in-process and are jailed by the
+  harness itself, not by bwrap.
 
 What is NOT promised (residual risk — run on disposable copies or in
 a container):
 - The denylist is pattern matching over the command text; it can be
   bypassed with variables, quoting, or indirection.
-- Bash is only started in the root — once a bash call is approved it
-  can `cd` out and write anywhere, including paths the write/edit
-  tools refuse. Denying write/edit does not stop bash from writing.
-- There is no OS sandbox (no bwrap / sandbox-exec); the denylist and
-  jail are harm reduction, not isolation.
+- Without `--sandbox`, bash is only started in the root — once a bash
+  call is approved it can `cd` out and write anywhere, including
+  paths the write/edit tools refuse. Denying write/edit does not stop
+  bash from writing.
+- There is no OS sandbox by default; the denylist and jail are harm
+  reduction, not isolation. `--sandbox` adds one for bash only.
 
 ## Background bash (long commands don't block the loop)
 
@@ -121,9 +132,10 @@ internal/llm/image.go    // Image type + wire parts for chat/anthropic/responses
 internal/tools/image.go  // LoadImage: workspace jail, type/size caps, dimensions
 internal/agent/loop.go   // single loop: LLM -> tool -> observe -> repeat
 internal/tools/tools.go  // read/write/edit/bash, workspace-root jail, timeout
+internal/tools/sandbox.go  // --sandbox: bwrap invocation + probe
 internal/tools/webfetch.go  // webfetch tool: http(s) fetch, HTML to text, 64 KiB cap
-internal/tools/grep.go   // grep tool (ripgrep backend, grep -r fallback, match cap + truncation)
-internal/tools/glob.go   // glob tool (rg --files backend, WalkDir fallback, limit + truncation)
+internal/tools/grep.go   // grep tool (ripgrep backend, grep -r fallback, match cap + truncation, match count)
+internal/tools/glob.go   // glob tool (rg --files backend, WalkDir fallback, limit + truncation, file count)
 internal/session/session.go // JSONL append + resume
 internal/session/manage.go // session list, rename, id validation
 internal/config/config.go   // JSON config file: providers, models, merge (stdlib only)
@@ -222,7 +234,11 @@ turns are raised panels with a peach `┃` left border; assistant text
 is markdown-rendered and indented; tool rows are muted
 (`✓ Read t.txt`, `✗ Write u.txt`); bash shows a raised block with the
 command in the top border (`┤ $ <cmd> ├`) and an output tail (≤10
-lines). While working, a braille spinner shows the pending tool label
+lines). Write and edit show what actually landed in a raised block
+below the row — the written content for write, a red/green `-`/`+`
+diff of the replaced lines for edit (first 20 lines). Grep and glob
+report their count on the row (`Grep "TODO" in . (3 matches)`);
+the count comes from the tool, never invented. While working, a braille spinner shows the pending tool label
 in plain words (`Reading src/foo.ts…`), or `Thinking…` — but only
 after the turn has run 300 ms with no text, so short turns never
 flash a spinner. Usage lines stay in the timeline with thousands
@@ -393,8 +409,9 @@ Events (stdout):
 - `step_usage` `{"usage":{"prompt":N,"cached":N,"completion":N,"total":N}}` — per LLM call.
 - `tool_start` `{"tool":"read","args":{...}}` — args as parsed JSON
   (the raw string when unparseable).
-- `tool_end` `{"tool":"...","output":"...","truncated":bool,"error":null|"..."}` — output capped at 32 KiB head+tail, like the loop's
-  truncation for the LLM view.
+- `tool_end` `{"tool":"...","output":"...","truncated":bool,"error":null|"...","detail":"...","count":N}` — output capped at 32 KiB head+tail, like the loop's
+  truncation for the LLM view. `detail` carries the write content / edit diff (display-only, never sent to the model); `count` is the
+  grep/glob match count (omitted when 0).
 - `tool_backgrounded` / `background_wait` / `tool_background_done` —
   the background bash events, the same shapes as the CLI's scrollback
   notices.

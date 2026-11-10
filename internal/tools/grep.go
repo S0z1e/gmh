@@ -39,9 +39,9 @@ type grepHit struct {
 // Grep searches for Pattern under Path using ripgrep when available,
 // falling back to grep -r with a warning when rg is missing.
 // Results are capped; truncation is always reported, never silent.
-func (e *Executor) Grep(ctx context.Context, a GrepArgs) (string, error) {
+func (e *Executor) Grep(ctx context.Context, a GrepArgs) (string, int, error) {
 	if strings.TrimSpace(a.Pattern) == "" {
-		return "", fmt.Errorf("grep: empty pattern")
+		return "", 0, fmt.Errorf("grep: empty pattern")
 	}
 	root := a.Path
 	if root == "" {
@@ -49,7 +49,7 @@ func (e *Executor) Grep(ctx context.Context, a GrepArgs) (string, error) {
 	}
 	dir, err := e.resolve(root)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	maxMatches := a.MaxMatches
 	if maxMatches <= 0 {
@@ -69,11 +69,11 @@ func (e *Executor) Grep(ctx context.Context, a GrepArgs) (string, error) {
 	if _, err := exec.LookPath("rg"); err == nil {
 		return e.grepRg(ctx, dir, a, maxMatches, ctxLines)
 	}
-	out, err := e.grepFallback(ctx, dir, a, maxMatches, ctxLines)
-	return "warning: ripgrep (rg) not found, fell back to grep -r\n" + out, err
+	out, n, err := e.grepFallback(ctx, dir, a, maxMatches, ctxLines)
+	return "warning: ripgrep (rg) not found, fell back to grep -r\n" + out, n, err
 }
 
-func (e *Executor) grepRg(ctx context.Context, dir string, a GrepArgs, maxMatches, ctxLines int) (string, error) {
+func (e *Executor) grepRg(ctx context.Context, dir string, a GrepArgs, maxMatches, ctxLines int) (string, int, error) {
 	args := []string{"--json", "--line-number", "--no-heading"}
 	if ctxLines > 0 {
 		args = append(args, "-C", fmt.Sprint(ctxLines))
@@ -93,10 +93,10 @@ func (e *Executor) grepRg(ctx context.Context, dir string, a GrepArgs, maxMatche
 	cmd.Dir = e.Root
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if err := cmd.Start(); err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	var hits []grepHit
@@ -150,23 +150,23 @@ func (e *Executor) grepRg(ctx context.Context, dir string, a GrepArgs, maxMatche
 	// rg exits 1 when there are no matches; that is not an error here.
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 && total == 0 {
-			return "no matches for " + a.Pattern, nil
+			return "no matches for " + a.Pattern, 0, nil
 		}
 		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("grep timed out after 30s")
+			return "", 0, fmt.Errorf("grep timed out after 30s")
 		}
 		// Any other exit is still reported, with whatever was found.
 		if total == 0 {
-			return "", fmt.Errorf("rg failed: %w", err)
+			return "", 0, fmt.Errorf("rg failed: %w", err)
 		}
 	}
 	if total == 0 {
-		return "no matches for " + a.Pattern, nil
+		return "no matches for " + a.Pattern, 0, nil
 	}
-	return formatGrepHits(hits, total, maxMatches), nil
+	return formatGrepHits(hits, total, maxMatches), total, nil
 }
 
-func (e *Executor) grepFallback(ctx context.Context, dir string, a GrepArgs, maxMatches, ctxLines int) (string, error) {
+func (e *Executor) grepFallback(ctx context.Context, dir string, a GrepArgs, maxMatches, ctxLines int) (string, int, error) {
 	args := []string{"-rn", "--exclude-dir=.git", "--exclude-dir=node_modules"}
 	if ctxLines > 0 {
 		args = append(args, "-C", fmt.Sprint(ctxLines))
@@ -183,17 +183,17 @@ func (e *Executor) grepFallback(ctx context.Context, dir string, a GrepArgs, max
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return "no matches for " + a.Pattern, nil
+			return "no matches for " + a.Pattern, 0, nil
 		}
 		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("grep timed out after 30s")
+			return "", 0, fmt.Errorf("grep timed out after 30s")
 		}
-		return "", fmt.Errorf("grep failed: %w", err)
+		return "", 0, fmt.Errorf("grep failed: %w", err)
 	}
 	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
 	total := len(lines)
 	if total == 1 && lines[0] == "" {
-		return "no matches for " + a.Pattern, nil
+		return "no matches for " + a.Pattern, 0, nil
 	}
 	var hits []grepHit
 	for _, l := range lines {
@@ -213,7 +213,7 @@ func (e *Executor) grepFallback(ctx context.Context, dir string, a GrepArgs, max
 	if len(hits) > maxMatches {
 		hits = hits[:maxMatches]
 	}
-	return formatGrepHits(hits, total, maxMatches), nil
+	return formatGrepHits(hits, total, maxMatches), total, nil
 }
 
 func formatGrepHits(hits []grepHit, total, maxMatches int) string {

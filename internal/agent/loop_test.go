@@ -571,6 +571,72 @@ func TestRunReadImageAttachesToNextCall(t *testing.T) {
 
 // webfetch runs in the loop like any read-only tool: the fetched text
 // comes back as a tool result for the next call.
+func TestRunToolEndCarriesDetailAndCount(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package main\n// TODO: one\n// TODO: two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.New("detail-count-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := atomic.AddInt32(&calls, 1)
+		var argsJSON []byte
+		var name string
+		switch n {
+		case 1:
+			name = "write"
+			argsJSON, _ = json.Marshal(map[string]string{"path": "u.txt", "content": "theta\n"})
+		case 2:
+			name = "grep"
+			argsJSON, _ = json.Marshal(map[string]string{"pattern": "TODO"})
+		default:
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"done"}}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		fmt.Fprintf(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_%d","function":{"name":%q,"arguments":%s}}]}}]}`+"\n\n", n, name, strconv.Quote(string(argsJSON)))
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	var events []Event
+	cfg := &Config{
+		Client:   &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
+		Exec:     &tools.Executor{Root: root},
+		Tools:    ToolDefs(),
+		System:   "test system",
+		Mode:     "auto",
+		MaxSteps: 5,
+		Session:  store,
+		OnEvent:  func(e Event) { events = append(events, e) },
+	}
+	if _, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "write u.txt then grep TODO"}}); err != nil {
+		t.Fatal(err)
+	}
+	var ends []Event
+	for _, e := range events {
+		if e.Kind == EventToolEnd {
+			ends = append(ends, e)
+		}
+	}
+	if len(ends) != 2 {
+		t.Fatalf("tool_end events = %d, want 2", len(ends))
+	}
+	if ends[0].ToolDetail != "theta\n" {
+		t.Fatalf("write ToolDetail = %q, want the written content", ends[0].ToolDetail)
+	}
+	if ends[1].ToolCount != 2 {
+		t.Fatalf("grep ToolCount = %d, want 2", ends[1].ToolCount)
+	}
+}
+
 func TestRunWebfetch(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()

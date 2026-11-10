@@ -28,7 +28,7 @@ func setupGrepRoot(t *testing.T) *Executor {
 
 func TestGrepFindsMatchesAcrossFiles(t *testing.T) {
 	ex := setupGrepRoot(t)
-	out, err := ex.Grep(context.Background(), GrepArgs{Pattern: "TODO"})
+	out, _, err := ex.Grep(context.Background(), GrepArgs{Pattern: "TODO"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestGrepFindsMatchesAcrossFiles(t *testing.T) {
 
 func TestGrepIncludeFiltersByGlob(t *testing.T) {
 	ex := setupGrepRoot(t)
-	out, err := ex.Grep(context.Background(), GrepArgs{Pattern: "TODO", Include: "*.go"})
+	out, _, err := ex.Grep(context.Background(), GrepArgs{Pattern: "TODO", Include: "*.go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestGrepIncludeFiltersByGlob(t *testing.T) {
 
 func TestGrepCapMarksTruncation(t *testing.T) {
 	ex := setupGrepRoot(t)
-	out, err := ex.Grep(context.Background(), GrepArgs{Pattern: "TODO", MaxMatches: 1})
+	out, _, err := ex.Grep(context.Background(), GrepArgs{Pattern: "TODO", MaxMatches: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,9 +62,28 @@ func TestGrepCapMarksTruncation(t *testing.T) {
 	}
 }
 
+func TestGrepCountIsTotal(t *testing.T) {
+	ex := setupGrepRoot(t)
+	// Capped to 1 shown match, the count is still the total found.
+	_, n, err := ex.Grep(context.Background(), GrepArgs{Pattern: "TODO", MaxMatches: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("count = %d, want 3", n)
+	}
+	_, n, err = ex.Grep(context.Background(), GrepArgs{Pattern: "zzz-no-such-string"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("no-match count = %d, want 0", n)
+	}
+}
+
 func TestGrepNoMatches(t *testing.T) {
 	ex := setupGrepRoot(t)
-	out, err := ex.Grep(context.Background(), GrepArgs{Pattern: "zzz-no-such-string"})
+	out, _, err := ex.Grep(context.Background(), GrepArgs{Pattern: "zzz-no-such-string"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +94,7 @@ func TestGrepNoMatches(t *testing.T) {
 
 func TestGrepStaysInsideRoot(t *testing.T) {
 	ex := setupGrepRoot(t)
-	_, err := ex.Grep(context.Background(), GrepArgs{Pattern: "TODO", Path: ".."})
+	_, _, err := ex.Grep(context.Background(), GrepArgs{Pattern: "TODO", Path: ".."})
 	if err == nil {
 		t.Fatal("expected error for path outside root")
 	}

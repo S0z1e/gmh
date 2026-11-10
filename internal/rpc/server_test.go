@@ -230,6 +230,35 @@ func (d *driver) quit(t *testing.T) {
 	}
 }
 
+func TestToolEndCarriesDetailAndCount(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{
+		{kind: "tool", tool: "grep", args: map[string]any{"pattern": "theta"}},
+		{kind: "tool", tool: "write", args: map[string]any{"path": "u.txt", "content": "theta\n"}},
+		{kind: "text", text: "Done."},
+	})
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "grep theta then write it to u.txt"})
+	d.waitFor("response", 5*time.Second)
+	d.waitFor("turn_started", 5*time.Second)
+	if ev := d.waitFor("tool_start", 5*time.Second); ev["tool"] != "grep" {
+		t.Fatalf("first tool = %v, want grep", ev["tool"])
+	}
+	if ev := d.waitFor("tool_end", 5*time.Second); ev["count"] != float64(1) {
+		t.Fatalf("grep tool_end count = %v, want 1", ev["count"])
+	}
+	if ev := d.waitFor("tool_start", 5*time.Second); ev["tool"] != "write" {
+		t.Fatalf("second tool = %v, want write", ev["tool"])
+	}
+	if ev := d.waitFor("tool_end", 5*time.Second); ev["detail"] != "theta\n" {
+		t.Fatalf("write tool_end detail = %v, want the written content", ev["detail"])
+	}
+	if settled := d.waitFor("agent_settled", 10*time.Second); settled["error"] != nil {
+		t.Fatalf("settled with error: %v", settled["error"])
+	}
+	d.quit(t)
+}
+
 func TestBasicTurnAuto(t *testing.T) {
 	a, runner, root := setupTestApp(t, "auto", []fakeStep{
 		{kind: "tool", tool: "read", args: map[string]any{"path": "t.txt"}},

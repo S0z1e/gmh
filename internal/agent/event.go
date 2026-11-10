@@ -47,6 +47,14 @@ type Event struct {
 	// prefix when ToolErr is set).
 	ToolOutput string
 	ToolErr    error
+	// ToolDetail is display-only content for ToolEnd (never sent to
+	// the model): write carries the written content, edit a -/+ diff
+	// of the replaced lines. Empty for other tools.
+	ToolDetail string
+	// ToolCount is the number of matches (grep) or files (glob)
+	// found, for ToolEnd. Only those two tools set it; other tools
+	// leave it 0.
+	ToolCount int
 	// JobID names the background job for the background events.
 	JobID string
 	// Usage is the per-call usage for StepUsage, the turn total for Done.

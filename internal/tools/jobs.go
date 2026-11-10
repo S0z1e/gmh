@@ -161,12 +161,24 @@ func (e *Executor) ForgetJob(j *Job) { e.registry().forget(j) }
 // returns the (capped) combined output, exit code and error. A timeout
 // is reported as a *timeoutError; a non-zero exit as an error wrapped
 // with "exit: ". Shared by Bash and BashBackground so both audit the
-// same outcomes.
-func runBashCmd(ctx context.Context, dir, command string, timeout time.Duration) (string, int, error) {
+// same outcomes. With Sandbox on, the command runs under bwrap (see
+// sandbox.go); killing the bwrap process kills the sandbox too
+// (--die-with-parent).
+func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration) (string, int, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", "-c", command)
-	cmd.Dir = dir
+	var cmd *exec.Cmd
+	if e.Sandbox {
+		bwrap := e.BwrapPath
+		if bwrap == "" {
+			bwrap = "bwrap"
+		}
+		args := append(sandboxArgs(e.Root), "--", "bash", "-c", command)
+		cmd = exec.CommandContext(ctx, bwrap, args...)
+	} else {
+		cmd = exec.CommandContext(ctx, "bash", "-c", command)
+		cmd.Dir = e.Root
+	}
 	out, err := cmd.CombinedOutput()
 	s := truncate(string(out), MaxOutBytes)
 	exitCode := -1
@@ -197,7 +209,7 @@ func (e *Executor) BashBackground(ctx context.Context, a BashArgs) (*Job, error)
 	job := &Job{Command: a.Command, Started: time.Now(), done: make(chan struct{})}
 	e.registry().add(job)
 	go func() {
-		out, exitCode, err := runBashCmd(ctx, e.Root, a.Command, timeout)
+		out, exitCode, err := e.runBashCmd(ctx, a.Command, timeout)
 		var te *timeoutError
 		switch {
 		case errors.As(err, &te):

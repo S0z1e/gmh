@@ -826,3 +826,64 @@ func TestSessionsCommand(t *testing.T) {
 		t.Fatalf("/sessions after rename = %v", printed)
 	}
 }
+
+// --sandbox: missing bwrap fails Setup; a working bwrap (here a stub
+// that exits 0 for the probe) enables it, via flag, env or config.
+func TestSetupSandbox(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	root := t.TempDir()
+	writeMockProvider(t, root)
+
+	// (a) No bwrap on PATH: Setup fails fast.
+	emptyDir := t.TempDir()
+	t.Setenv("PATH", emptyDir)
+	if _, err := Setup(Params{Root: root, MaxSteps: 5, Sandbox: true}); err == nil || !strings.Contains(err.Error(), "bwrap") {
+		t.Fatalf("sandbox without bwrap err = %v", err)
+	}
+
+	// (b) A bwrap stub on PATH: flag enables the sandbox.
+	binDir := t.TempDir()
+	stub := filepath.Join(binDir, "bwrap")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	a, err := Setup(Params{Root: root, MaxSteps: 5, Sandbox: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.Cfg.Exec.Sandbox || a.Cfg.Exec.BwrapPath != stub {
+		t.Fatalf("sandbox not enabled: %+v", a.Cfg.Exec)
+	}
+	a.Store.Close()
+
+	// (c) Config sandbox:true enables it without the flag.
+	cfg := `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "model": "mock"}}, "sandbox": true}`
+	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err = Setup(Params{Root: root, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.Cfg.Exec.Sandbox {
+		t.Fatal("config sandbox:true did not enable the sandbox")
+	}
+	a.Store.Close()
+
+	// (d) Env HARNESS_SANDBOX=1 enables it too.
+	cfg = `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "model": "mock"}}}`
+	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HARNESS_SANDBOX", "1")
+	a, err = Setup(Params{Root: root, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.Cfg.Exec.Sandbox {
+		t.Fatal("HARNESS_SANDBOX=1 did not enable the sandbox")
+	}
+	a.Store.Close()
+}

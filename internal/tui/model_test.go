@@ -502,22 +502,22 @@ func TestCollapseOutput(t *testing.T) {
 
 func TestToolEndBlock(t *testing.T) {
 	// Success: green tick, muted summary, 3-space gutter.
-	got := stripANSI(toolEndBlock("read", `{"path":"t.txt"}`, "1\tomega\n", nil))
+	got := stripANSI(toolEndBlock("read", `{"path":"t.txt"}`, "1\tomega\n", "", 0, nil))
 	if got != "   ✓ Read t.txt" {
 		t.Fatalf("success row = %q", got)
 	}
 	// Failure: red cross plus the error text below.
-	got = stripANSI(toolEndBlock("read", `{"path":"t.txt"}`, "Error: file not found", errTest))
+	got = stripANSI(toolEndBlock("read", `{"path":"t.txt"}`, "Error: file not found", "", 0, errTest))
 	if !strings.Contains(got, "✗ Read t.txt") || !strings.Contains(got, "Error: file not found") {
 		t.Fatalf("failure row = %q", got)
 	}
 	// Denied: muted cross with "(denied)", never a green tick.
-	got = stripANSI(toolEndBlock("write", `{"path":"x.txt"}`, "User denied this tool call. Do not retry it.", nil))
+	got = stripANSI(toolEndBlock("write", `{"path":"x.txt"}`, "User denied this tool call. Do not retry it.", "", 0, nil))
 	if got != "   ✗ Write x.txt (denied)" {
 		t.Fatalf("denied row = %q", got)
 	}
 	// Bash: a block with the command in the top border and the output tail.
-	got = stripANSI(toolEndBlock("bash", `{"command":"echo hi"}`, "hi\n", nil))
+	got = stripANSI(toolEndBlock("bash", `{"command":"echo hi"}`, "hi\n", "", 0, nil))
 	if !strings.Contains(got, "┤ $ echo hi ├") || !strings.Contains(got, "hi") {
 		t.Fatalf("bash block = %q", got)
 	}
@@ -525,9 +525,41 @@ func TestToolEndBlock(t *testing.T) {
 	for i := 1; i <= 12; i++ {
 		b.WriteString("out " + strconv.Itoa(i) + "\n")
 	}
-	got = stripANSI(toolEndBlock("bash", `{"command":"seq 12"}`, b.String(), nil))
+	got = stripANSI(toolEndBlock("bash", `{"command":"seq 12"}`, b.String(), "", 0, nil))
 	if !strings.Contains(got, "(2 earlier lines)") || !strings.Contains(got, "out 12") || strings.Contains(got, "out 1\n") {
 		t.Fatalf("bash block collapse = %q", got)
+	}
+	// Write with detail: the written content in a block below the row.
+	got = stripANSI(toolEndBlock("write", `{"path":"x.txt"}`, "wrote x.txt", "hello\nworld\n", 0, nil))
+	if !strings.Contains(got, "✓ Write x.txt") || !strings.Contains(got, "hello") || !strings.Contains(got, "world") {
+		t.Fatalf("write detail block = %q", got)
+	}
+	// Edit with detail: a -/+ diff below the row.
+	got = stripANSI(toolEndBlock("edit", `{"path":"x.txt"}`, "edited x.txt", "− alpha\n+ beta\n", 0, nil))
+	if !strings.Contains(got, "✓ Edit x.txt") || !strings.Contains(got, "− alpha") || !strings.Contains(got, "+ beta") {
+		t.Fatalf("edit diff block = %q", got)
+	}
+	// Grep/glob: the count rides on the row, singular and plural.
+	got = stripANSI(toolEndBlock("grep", `{"pattern":"TODO","path":"."}`, "a.go:1: TODO\n", "", 3, nil))
+	if got != "   ✓ Grep \"TODO\" in . (3 matches)" {
+		t.Fatalf("grep count row = %q", got)
+	}
+	got = stripANSI(toolEndBlock("grep", `{"pattern":"TODO","path":"."}`, "a.go:1: TODO\n", "", 1, nil))
+	if !strings.Contains(got, "(1 match)") || strings.Contains(got, "matches)") {
+		t.Fatalf("grep singular row = %q", got)
+	}
+	got = stripANSI(toolEndBlock("glob", `{"pattern":"*.go"}`, "no files match *.go", "", 0, nil))
+	if !strings.Contains(got, "(0 matches)") {
+		t.Fatalf("glob zero row = %q", got)
+	}
+	// A long detail is capped at the head with a "(N more lines)" label.
+	var long strings.Builder
+	for i := 1; i <= 25; i++ {
+		long.WriteString("line " + strconv.Itoa(i) + "\n")
+	}
+	got = stripANSI(toolEndBlock("write", `{"path":"x.txt"}`, "wrote x.txt", long.String(), 0, nil))
+	if !strings.Contains(got, "line 20") || strings.Contains(got, "line 21\n") || !strings.Contains(got, "(5 more lines)") {
+		t.Fatalf("detail cap = %q", got)
 	}
 }
 

@@ -365,7 +365,7 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		if name == "bash" && strings.Contains(ev.ToolOutput, "still running in the background") {
 			return m, nil
 		}
-		return m, tea.Println(toolEndBlock(name, args, ev.ToolOutput, ev.ToolErr))
+		return m, tea.Println(toolEndBlock(name, args, ev.ToolOutput, ev.ToolDetail, ev.ToolCount, ev.ToolErr))
 	case agent.EventStepUsage:
 		// Usage lines are printed by the runner via PrintMsg, through
 		// the same queue, so they land after the reply text.
@@ -425,7 +425,7 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 // reports it as an observation starting "User denied") is a muted
 // row with a "(denied)" suffix, never a green tick. All of it sits
 // under the 3-space gutter, like the assistant text.
-func toolEndBlock(name, argsJSON, output string, toolErr error) string {
+func toolEndBlock(name, argsJSON, output, detail string, count int, toolErr error) string {
 	summary := toolSummary(name, argsJSON)
 	if name == "bash" {
 		return indentBlock(bashBlock(summary, output, toolErr != nil))
@@ -447,7 +447,60 @@ func toolEndBlock(name, argsJSON, output string, toolErr error) string {
 		}
 		return "   " + row
 	}
-	return "   " + styleSuccess.Render("✓") + " " + styleMuted.Render(summary)
+	// grep/glob report how many matches they found — the count
+	// comes from the tool, never invented here.
+	if (name == "grep" || name == "glob") && count >= 0 {
+		if count == 1 {
+			summary += " (1 match)"
+		} else {
+			summary += fmt.Sprintf(" (%d matches)", count)
+		}
+	}
+	row := "   " + styleSuccess.Render("✓") + " " + styleMuted.Render(summary)
+	if detail == "" {
+		return row
+	}
+	// write/edit show what actually landed: the written content, or
+	// a -/+ diff of the replaced lines, in a raised block below the
+	// row — opencode's write/edit blocks, inline.
+	return row + "\n" + indentBlock(detailBlock(detail, name == "edit"))
+}
+
+// maxDetailLines caps a detail block: the head is what matters (the
+// written content, the changed lines), the rest is one label.
+const maxDetailLines = 20
+
+// detailBlock renders display-only tool detail as a raised block.
+// Diff lines ("− " removed, "+ " added) take the semantic colours;
+// plain content lines render as a code block.
+func detailBlock(detail string, isDiff bool) string {
+	all := strings.Split(strings.TrimRight(detail, "\n"), "\n")
+	cut := 0
+	if len(all) > maxDetailLines {
+		cut = len(all) - maxDetailLines
+		all = all[:maxDetailLines]
+	}
+	var b strings.Builder
+	for i, l := range all {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		l = truncateRunes(l, 200)
+		switch {
+		case isDiff && strings.HasPrefix(l, "− "):
+			b.WriteString(styleError.Render(l))
+		case isDiff && strings.HasPrefix(l, "+ "):
+			b.WriteString(styleSuccess.Render(l))
+		case isDiff:
+			b.WriteString(styleMuted.Render(l))
+		default:
+			b.WriteString(styleCodeBlk.Render(" " + l))
+		}
+	}
+	if cut > 0 {
+		b.WriteString("\n" + styleMuted.Render(fmt.Sprintf("(%d more lines)", cut)))
+	}
+	return bashBlockStyle.Render(b.String())
 }
 
 // indentBlock prefixes every line of a rendered block with the

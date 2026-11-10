@@ -308,7 +308,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 					obs = fmt.Sprintf("Error: %v\nOutput:\n%s", err, res.Text)
 				}
 			}
-			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err})
+			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count})
 			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 			if c.Session != nil {
 				_ = c.Session.Append(msgs[len(msgs)-1])

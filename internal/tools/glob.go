@@ -28,9 +28,9 @@ type GlobArgs struct {
 // Glob lists files matching Pattern under Path, respecting .gitignore
 // (via ripgrep when available). Results are sorted and capped;
 // truncation is always reported, never silent.
-func (e *Executor) Glob(ctx context.Context, a GlobArgs) (string, error) {
+func (e *Executor) Glob(ctx context.Context, a GlobArgs) (string, int, error) {
 	if strings.TrimSpace(a.Pattern) == "" {
-		return "", fmt.Errorf("glob: empty pattern")
+		return "", 0, fmt.Errorf("glob: empty pattern")
 	}
 	root := a.Path
 	if root == "" {
@@ -38,7 +38,7 @@ func (e *Executor) Glob(ctx context.Context, a GlobArgs) (string, error) {
 	}
 	dir, err := e.resolve(root)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	limit := a.Limit
 	if limit <= 0 {
@@ -51,21 +51,21 @@ func (e *Executor) Glob(ctx context.Context, a GlobArgs) (string, error) {
 	if _, err := exec.LookPath("rg"); err == nil {
 		return e.globRg(ctx, dir, a.Pattern, limit)
 	}
-	out, err := e.globWalk(dir, a.Pattern, limit)
-	return "warning: ripgrep (rg) not found, fell back to directory walk\n" + out, err
+	out, n, err := e.globWalk(dir, a.Pattern, limit)
+	return "warning: ripgrep (rg) not found, fell back to directory walk\n" + out, n, err
 }
 
-func (e *Executor) globRg(ctx context.Context, dir, pattern string, limit int) (string, error) {
+func (e *Executor) globRg(ctx context.Context, dir, pattern string, limit int) (string, int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "rg", "--files", "-g", pattern, "--", dir)
 	cmd.Dir = e.Root
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if err := cmd.Start(); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	var paths []string
 	scanner := bufio.NewScanner(stdout)
@@ -83,22 +83,22 @@ func (e *Executor) globRg(ctx context.Context, dir, pattern string, limit int) (
 	}
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 && len(paths) == 0 {
-			return "no files match " + pattern, nil
+			return "no files match " + pattern, 0, nil
 		}
 		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("glob timed out after 30s")
+			return "", 0, fmt.Errorf("glob timed out after 30s")
 		}
 		if len(paths) == 0 {
-			return "", fmt.Errorf("rg --files failed: %w", err)
+			return "", 0, fmt.Errorf("rg --files failed: %w", err)
 		}
 	}
 	sort.Strings(paths)
-	return formatGlobPaths(paths, limit, pattern), nil
+	return formatGlobPaths(paths, limit, pattern), len(paths), nil
 }
 
 // globWalk is the stdlib fallback: walk the tree, match each relative
 // path against the pattern segment by segment, skipping hidden dirs.
-func (e *Executor) globWalk(dir, pattern string, limit int) (string, error) {
+func (e *Executor) globWalk(dir, pattern string, limit int) (string, int, error) {
 	var paths []string
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -121,13 +121,13 @@ func (e *Executor) globWalk(dir, pattern string, limit int) (string, error) {
 		return nil
 	})
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if len(paths) == 0 {
-		return "no files match " + pattern, nil
+		return "no files match " + pattern, 0, nil
 	}
 	sort.Strings(paths)
-	return formatGlobPaths(paths, limit, pattern), nil
+	return formatGlobPaths(paths, limit, pattern), len(paths), nil
 }
 
 // matchGlob matches a slash-separated path against a glob pattern where

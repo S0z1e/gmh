@@ -436,6 +436,12 @@ func (s *Server) onEvent(ev agent.Event) {
 		if ev.ToolErr != nil {
 			e.Error = ev.ToolErr.Error()
 		}
+		if ev.ToolDetail != "" {
+			e.Detail = ev.ToolDetail
+		}
+		if ev.ToolName == "grep" || ev.ToolName == "glob" {
+			e.Count = ev.ToolCount
+		}
 		s.writeEvent(e)
 	case agent.EventToolBackgrounded:
 		s.writeEvent(Event{Type: "tool_backgrounded", Tool: ev.ToolName, Args: parseToolArgs(ev.ToolArgs), Job: ev.JobID})

@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -39,6 +40,11 @@ type Params struct {
 	// DenyInsteadOfPrompt refuses approvals without asking. -p print
 	// mode sets it; the flag and OPENAI_DENY_INSTEAD_OF_PROMPT do too.
 	DenyInsteadOfPrompt bool
+	// Sandbox runs bash calls under bwrap (opt-in): the workspace
+	// root is the only writable directory. The flag, HARNESS_SANDBOX
+	// or the config sandbox field turn it on; Setup fails fast when
+	// bwrap is missing or cannot create a sandbox here.
+	Sandbox bool
 	// BashTimeoutSeconds overrides the default 60s bash timeout
 	// (0 = default, or OPENAI_BASH_TIMEOUT_SECONDS).
 	BashTimeoutSeconds int
@@ -258,6 +264,28 @@ func Setup(p Params) (*App, error) {
 		bgThreshold = 0
 	}
 	executor.BackgroundThreshold = bgThreshold
+
+	// Sandbox: flag wins, else env, else config. bwrap is located and
+	// probed now so a broken sandbox fails at startup, not on the
+	// first bash call.
+	sandbox := p.Sandbox
+	if v := os.Getenv("HARNESS_SANDBOX"); v == "1" || strings.EqualFold(v, "true") {
+		sandbox = true
+	}
+	if cfg.Sandbox != nil && *cfg.Sandbox {
+		sandbox = true
+	}
+	if sandbox {
+		bwrap, err := exec.LookPath("bwrap")
+		if err != nil {
+			return nil, fmt.Errorf("--sandbox needs bwrap installed (bubblewrap), not found on PATH: %w", err)
+		}
+		if err := tools.ProbeSandbox(bwrap); err != nil {
+			return nil, err
+		}
+		executor.Sandbox = true
+		executor.BwrapPath = bwrap
+	}
 
 	deny := p.DenyInsteadOfPrompt
 	if v := os.Getenv("OPENAI_DENY_INSTEAD_OF_PROMPT"); v == "1" || strings.EqualFold(v, "true") {

@@ -46,6 +46,12 @@ type Executor struct {
 	// reads refuse when it is false, so a text-only model never
 	// receives image bytes it cannot use.
 	ImageInput bool
+	// Sandbox runs bash calls under bwrap (opt-in, --sandbox): the
+	// workspace root is the only writable directory. BwrapPath names
+	// the bwrap binary ("" = "bwrap" on PATH; Setup resolves it and
+	// probes that a sandbox can actually be created).
+	Sandbox   bool
+	BwrapPath string
 	// WebfetchTimeout bounds one webfetch call (0 = the 30s default).
 	WebfetchTimeout time.Duration
 	// HTTPClient is the client webfetch uses (nil = a default client
@@ -219,7 +225,7 @@ func (e *Executor) Bash(ctx context.Context, a BashArgs) (string, error) {
 		return "", fmt.Errorf("denied by policy: %s (this is harm reduction, not a sandbox — see README)", reason)
 	}
 	timeout := e.bashTimeout(a)
-	s, exitCode, err := runBashCmd(ctx, e.Root, a.Command, timeout)
+	s, exitCode, err := e.runBashCmd(ctx, a.Command, timeout)
 	var te *timeoutError
 	switch {
 	case errors.As(err, &te):
@@ -238,9 +244,43 @@ func (e *Executor) Bash(ctx context.Context, a BashArgs) (string, error) {
 // read on an image file: the text is the marker, and the loop
 // attaches the image itself to the next request as a user message
 // (tool messages cannot carry images in any of the three APIs).
+// Detail is display-only content for the timeline (never sent to the
+// model): write carries the written content, edit a -/+ diff of the
+// replaced lines. Count is the number of matches (grep) or files
+// (glob) found; only those two tools set it, and the TUI reads it
+// only for them.
 type ToolResult struct {
 	Text   string
 	Images []llm.Image
+	Detail string
+	Count  int
+}
+
+// maxDetailChars caps display-only detail: a huge write must not
+// bloat the event stream (the model never sees it, but the TUI and
+// the RPC client do).
+const maxDetailChars = 4096
+
+// capDetail truncates display detail with a marker.
+func capDetail(s string) string {
+	if len([]rune(s)) <= maxDetailChars {
+		return s
+	}
+	return string([]rune(s)[:maxDetailChars]) + "\n[… truncated: detail continues, first 4 KiB shown]"
+}
+
+// diffDetail renders an edit as a small -/+ diff: the removed lines,
+// then the added lines. No context lines — the replaced block is
+// the whole change.
+func diffDetail(oldText, newText string) string {
+	var b strings.Builder
+	for _, l := range strings.Split(strings.TrimRight(oldText, "\n"), "\n") {
+		b.WriteString("− " + l + "\n")
+	}
+	for _, l := range strings.Split(strings.TrimRight(newText, "\n"), "\n") {
+		b.WriteString("+ " + l + "\n")
+	}
+	return capDetail(strings.TrimRight(b.String(), "\n"))
 }
 
 // Dispatch runs a tool call by name and returns the observation.
@@ -282,14 +322,20 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (ToolRes
 			return ToolResult{}, fmt.Errorf("bad write args: %w", err)
 		}
 		out, err := e.Write(a)
-		return ToolResult{Text: out}, err
+		if err != nil {
+			return ToolResult{Text: out}, err
+		}
+		return ToolResult{Text: out, Detail: capDetail(a.Content)}, nil
 	case "edit":
 		var a EditArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 			return ToolResult{}, fmt.Errorf("bad edit args: %w", err)
 		}
 		out, err := e.Edit(a)
-		return ToolResult{Text: out}, err
+		if err != nil {
+			return ToolResult{Text: out}, err
+		}
+		return ToolResult{Text: out, Detail: diffDetail(a.OldText, a.NewText)}, nil
 	case "bash":
 		var a BashArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
@@ -302,15 +348,15 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (ToolRes
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 			return ToolResult{}, fmt.Errorf("bad grep args: %w", err)
 		}
-		out, err := e.Grep(ctx, a)
-		return ToolResult{Text: out}, err
+		out, n, err := e.Grep(ctx, a)
+		return ToolResult{Text: out, Count: n}, err
 	case "glob":
 		var a GlobArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 			return ToolResult{}, fmt.Errorf("bad glob args: %w", err)
 		}
-		out, err := e.Glob(ctx, a)
-		return ToolResult{Text: out}, err
+		out, n, err := e.Glob(ctx, a)
+		return ToolResult{Text: out, Count: n}, err
 	case "load_skill":
 		var a LoadSkillArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {

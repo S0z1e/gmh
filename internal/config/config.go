@@ -156,6 +156,7 @@ type File struct {
 	BashTimeoutSeconds  *int   `json:"bashTimeoutSeconds"`
 	BgThresholdSeconds  *int   `json:"bgThresholdSeconds"`
 	DenyInsteadOfPrompt *bool  `json:"denyInsteadOfPrompt"`
+	Sandbox             *bool  `json:"sandbox"`
 	ContextLimit        *int   `json:"contextLimit"`
 	AnthropicMaxTokens  *int   `json:"anthropicMaxTokens"`
 	TUITheme            string `json:"tuiTheme"`
@@ -276,6 +277,9 @@ func Merge(dst, src *File) {
 	}
 	if src.DenyInsteadOfPrompt != nil {
 		dst.DenyInsteadOfPrompt = src.DenyInsteadOfPrompt
+	}
+	if src.Sandbox != nil {
+		dst.Sandbox = src.Sandbox
 	}
 	if src.ContextLimit != nil {
 		dst.ContextLimit = src.ContextLimit

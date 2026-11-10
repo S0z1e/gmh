@@ -25,7 +25,7 @@ func setupGlobRoot(t *testing.T) *Executor {
 
 func TestGlobDoubleStar(t *testing.T) {
 	ex := setupGlobRoot(t)
-	out, err := ex.Glob(context.Background(), GlobArgs{Pattern: "**/*.go"})
+	out, _, err := ex.Glob(context.Background(), GlobArgs{Pattern: "**/*.go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestGlobDoubleStar(t *testing.T) {
 func TestGlobNoSlashMatchesAnyDepth(t *testing.T) {
 	// "*.go" (no slash) matches the basename at any depth, like rg -g.
 	ex := setupGlobRoot(t)
-	out, err := ex.Glob(context.Background(), GlobArgs{Pattern: "*.go"})
+	out, _, err := ex.Glob(context.Background(), GlobArgs{Pattern: "*.go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestGlobNoSlashMatchesAnyDepth(t *testing.T) {
 
 func TestGlobSingleDirSegment(t *testing.T) {
 	ex := setupGlobRoot(t)
-	out, err := ex.Glob(context.Background(), GlobArgs{Pattern: "sub/*.go"})
+	out, _, err := ex.Glob(context.Background(), GlobArgs{Pattern: "sub/*.go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestGlobSingleDirSegment(t *testing.T) {
 
 func TestGlobLimitMarksTruncation(t *testing.T) {
 	ex := setupGlobRoot(t)
-	out, err := ex.Glob(context.Background(), GlobArgs{Pattern: "**/*", Limit: 2})
+	out, _, err := ex.Glob(context.Background(), GlobArgs{Pattern: "**/*", Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,9 +78,28 @@ func TestGlobLimitMarksTruncation(t *testing.T) {
 	}
 }
 
+func TestGlobCountIsTotal(t *testing.T) {
+	ex := setupGlobRoot(t)
+	// Capped to 2 shown files, the count is still the total found.
+	_, n, err := ex.Glob(context.Background(), GlobArgs{Pattern: "**/*", Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Fatalf("count = %d, want 5", n)
+	}
+	_, n, err = ex.Glob(context.Background(), GlobArgs{Pattern: "**/*.rs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("no-match count = %d, want 0", n)
+	}
+}
+
 func TestGlobNoMatches(t *testing.T) {
 	ex := setupGlobRoot(t)
-	out, err := ex.Glob(context.Background(), GlobArgs{Pattern: "**/*.rs"})
+	out, _, err := ex.Glob(context.Background(), GlobArgs{Pattern: "**/*.rs"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +110,7 @@ func TestGlobNoMatches(t *testing.T) {
 
 func TestGlobStaysInsideRoot(t *testing.T) {
 	ex := setupGlobRoot(t)
-	_, err := ex.Glob(context.Background(), GlobArgs{Pattern: "**/*.go", Path: ".."})
+	_, _, err := ex.Glob(context.Background(), GlobArgs{Pattern: "**/*.go", Path: ".."})
 	if err == nil {
 		t.Fatal("expected error for path outside root")
 	}
