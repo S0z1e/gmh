@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/png"
@@ -11,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -564,5 +566,60 @@ func TestRunReadImageAttachesToNextCall(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"path":"pic.png"`) {
 		t.Fatalf("session file must record the image path: %s", data)
+	}
+}
+
+// webfetch runs in the loop like any read-only tool: the fetched text
+// comes back as a tool result for the next call.
+func TestRunWebfetch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	content := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><body><h1>Example Domain</h1><p>For use in examples.</p></body></html>`)
+	}))
+	defer content.Close()
+	store, err := session.New("webfetch-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var calls int32
+	var secondBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			argsJSON, _ := json.Marshal(map[string]string{"url": content.URL})
+			fmt.Fprintf(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"webfetch","arguments":%s}}]}}]}`+"\n\n", strconv.Quote(string(argsJSON)))
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		secondBody = string(body)
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"it says Example Domain"}}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &Config{
+		Client:   &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
+		Exec:     &tools.Executor{Root: root, HTTPClient: &http.Client{Transport: &http.Transport{Proxy: nil}}},
+		Tools:    ToolDefs(),
+		System:   "test system",
+		Mode:     "auto",
+		MaxSteps: 5,
+		Session:  store,
+	}
+	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "fetch the example page"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "it says Example Domain" {
+		t.Fatalf("final text = %q", text)
+	}
+	if !strings.Contains(secondBody, "Example Domain") || !strings.Contains(secondBody, "For use in examples.") {
+		t.Fatalf("second request has no fetched text: %s", secondBody)
 	}
 }

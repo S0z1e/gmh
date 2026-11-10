@@ -587,6 +587,11 @@ func toolPendingLabel(name, argsJSON string) string {
 			return "Loading skill " + n + "…"
 		}
 		return "Loading skill…"
+	case "webfetch":
+		if u := str("url"); u != "" {
+			return "Fetching " + u + "…"
+		}
+		return "Fetching page…"
 	default:
 		return name + "…"
 	}
@@ -638,6 +643,10 @@ func toolSummary(name, argsJSON string) string {
 			if n := str("name"); n != "" {
 				return "Load skill " + n
 			}
+		case "webfetch":
+			if u := str("url"); u != "" {
+				return "Fetch " + u
+			}
 		}
 	}
 	return name
@@ -652,6 +661,8 @@ func toolIcon(name string) string {
 		return "←"
 	case "grep", "glob":
 		return "✱"
+	case "webfetch":
+		return "%"
 	case "bash":
 		return "│"
 	default:

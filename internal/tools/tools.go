@@ -1,5 +1,5 @@
 // Package tools provides the tools: read, write, edit, bash, grep, glob,
-// load_skill. All paths are jailed to the workspace root. bash runs with
+// load_skill, webfetch. All paths are jailed to the workspace root. bash runs with
 // a timeout.
 package tools
 
@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,6 +46,11 @@ type Executor struct {
 	// reads refuse when it is false, so a text-only model never
 	// receives image bytes it cannot use.
 	ImageInput bool
+	// WebfetchTimeout bounds one webfetch call (0 = the 30s default).
+	WebfetchTimeout time.Duration
+	// HTTPClient is the client webfetch uses (nil = a default client
+	// with the same timeout). Tests set it to reach a local server.
+	HTTPClient *http.Client
 
 	jobsMu sync.Mutex
 	jobs   *JobRegistry
@@ -311,6 +317,13 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (ToolRes
 			return ToolResult{}, fmt.Errorf("bad load_skill args: %w", err)
 		}
 		out, err := e.LoadSkill(a)
+		return ToolResult{Text: out}, err
+	case "webfetch":
+		var a WebfetchArgs
+		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+			return ToolResult{}, fmt.Errorf("bad webfetch args: %w", err)
+		}
+		out, err := e.Webfetch(ctx, a)
 		return ToolResult{Text: out}, err
 	default:
 		return ToolResult{}, fmt.Errorf("unknown tool: %s", name)

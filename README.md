@@ -2,8 +2,8 @@
 
 A minimal, Pi-light coding agent harness in Go. The core (CLI, agent
 loop, tools, sessions, config, RPC) is stdlib-only; the TUI binary
-adds Bubble Tea v2 + lipgloss v2. Seven tools: read, write, edit,
-bash, grep, glob, `load_skill`. Usage is shown per turn and per
+adds Bubble Tea v2 + lipgloss v2. Eight tools: read, write, edit,
+bash, grep, glob, `load_skill`, `webfetch`. Usage is shown per turn and per
 session (prompt, cached, completion, total tokens), always from the
 API's returned usage — never estimated locally (no local tokenizer).
 Cost is estimated only when you set rates:
@@ -121,6 +121,7 @@ internal/llm/image.go    // Image type + wire parts for chat/anthropic/responses
 internal/tools/image.go  // LoadImage: workspace jail, type/size caps, dimensions
 internal/agent/loop.go   // single loop: LLM -> tool -> observe -> repeat
 internal/tools/tools.go  // read/write/edit/bash, workspace-root jail, timeout
+internal/tools/webfetch.go  // webfetch tool: http(s) fetch, HTML to text, 64 KiB cap
 internal/tools/grep.go   // grep tool (ripgrep backend, grep -r fallback, match cap + truncation)
 internal/tools/glob.go   // glob tool (rg --files backend, WalkDir fallback, limit + truncation)
 internal/session/session.go // JSONL append + resume
