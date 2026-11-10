@@ -21,9 +21,11 @@ import (
 func main() {
 	var (
 		root      = flag.String("root", ".", "workspace root")
-		mode      = flag.String("mode", "suggest", "suggest (ask in a y/n dialog) or auto")
-		model     = flag.String("model", "", "model (default OPENAI_MODEL or deepseek-v4.1-flash)")
-		api       = flag.String("api", "", "chat, responses or anthropic (default OPENAI_API_MODE or chat)")
+		mode      = flag.String("mode", "", "suggest (ask in a y/n dialog) or auto (default config or suggest)")
+		model     = flag.String("model", "", "model (default OPENAI_MODEL, config, or deepseek-v4.1-flash)")
+		api       = flag.String("api", "", "chat, responses or anthropic (default OPENAI_API_MODE, config, or chat)")
+		provider  = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
+		config    = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
 		maxSteps  = flag.Int("max-steps", 50, "max agent steps")
 		resume    = flag.String("resume", "", "resume session id")
 		sessionID = flag.String("session", "", "session id (default: timestamp)")
@@ -45,6 +47,8 @@ func main() {
 		Mode:                       *mode,
 		Model:                      *model,
 		API:                        *api,
+		Provider:                   *provider,
+		ConfigPath:                 *config,
 		MaxSteps:                   *maxSteps,
 		ContextLimit:               *ctxLimit,
 		Resume:                     *resume,
@@ -71,7 +75,8 @@ func main() {
 	lines := make(chan string, 16)
 	// Theme: HARNESS_TUI_THEME picks default, terminal (no painted
 	// background) or catppuccin-mocha; anything else is the default.
-	tui.SetTheme(tui.ThemeByName(os.Getenv("HARNESS_TUI_THEME")))
+	// Setup already resolved env > config for this.
+	tui.SetTheme(tui.ThemeByName(a.TUITheme))
 	m := tui.NewModel(info).WithMeta(a.Cfg.Mode, a.Cfg.Client.API, a.Cfg.Client.Model).WithBranch(gitBranch(a.Root))
 	// Set OnSubmit BEFORE NewProgram: the program holds its own copy of
 	// the model, so fields set afterwards on this copy would never fire.

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"minimalharness/internal/agent"
+	"minimalharness/internal/config"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
 	"minimalharness/internal/skills"
@@ -27,6 +28,13 @@ type Params struct {
 	ContextLimit int
 	Resume       string
 	SessionID    string
+	// Provider selects a provider entry from the config file
+	// (defaultProvider when empty).
+	Provider string
+	// ConfigPath names one config file explicitly. Empty means
+	// auto-discover: ~/.minimal-harness/config.json, then
+	// <root>/.harness.json on top of it.
+	ConfigPath string
 	// DenyInsteadOfPrompt refuses approvals without asking. -p print
 	// mode sets it; the flag and OPENAI_DENY_INSTEAD_OF_PROMPT do too.
 	DenyInsteadOfPrompt bool
@@ -54,6 +62,9 @@ type App struct {
 	Rates llm.Rates
 	// ResumedMessage is non-empty when --resume loaded a session.
 	ResumedMessage string
+	// TUITheme is the resolved TUI theme name: HARNESS_TUI_THEME,
+	// else the config file, else "" (the default theme).
+	TUITheme string
 }
 
 // Setup builds the client, session and agent config. The caller sets
@@ -67,7 +78,35 @@ func Setup(p Params) (*App, error) {
 		return nil, fmt.Errorf("root not found: %s", absRoot)
 	}
 
+	// Config: flag > env > project file > global file > built-in
+	// default. A bad config file fails fast, before any session
+	// is created. The API key is never read from a file.
+	var cfg *config.File
+	if p.ConfigPath != "" {
+		var err error
+		cfg, err = config.LoadExplicit(p.ConfigPath)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		var err error
+		cfg, err = config.LoadFor(absRoot)
+		if err != nil {
+			return nil, err
+		}
+	}
+	prov, ok := cfg.Select(p.Provider)
+	if !ok {
+		return nil, fmt.Errorf("unknown provider %q (configured: %s)", p.Provider, strings.Join(cfg.ProviderNames(), ", "))
+	}
+
 	baseURL := os.Getenv("OPENAI_BASE_URL")
+	if baseURL == "" {
+		baseURL = prov.BaseURL
+	}
+	if baseURL == "" {
+		baseURL = cfg.BaseURL
+	}
 	if baseURL == "" {
 		baseURL = "https://www.openconsole.cn/v1"
 	}
@@ -80,11 +119,23 @@ func Setup(p Params) (*App, error) {
 		mdl = os.Getenv("OPENAI_MODEL")
 	}
 	if mdl == "" {
+		mdl = prov.Model
+	}
+	if mdl == "" {
+		mdl = cfg.Model
+	}
+	if mdl == "" {
 		mdl = "deepseek-v4.1-flash"
 	}
 	apiMode := p.API
 	if apiMode == "" {
 		apiMode = os.Getenv("OPENAI_API_MODE")
+	}
+	if apiMode == "" {
+		apiMode = prov.API
+	}
+	if apiMode == "" {
+		apiMode = cfg.API
 	}
 	if apiMode == "" {
 		apiMode = "chat"
@@ -93,6 +144,9 @@ func Setup(p Params) (*App, error) {
 		return nil, fmt.Errorf("invalid -api %q: use chat, responses or anthropic", apiMode)
 	}
 	mode := p.Mode
+	if mode == "" {
+		mode = cfg.Mode
+	}
 	if mode == "" {
 		mode = "suggest"
 	}
@@ -129,6 +183,8 @@ func Setup(p Params) (*App, error) {
 		if _, err := fmt.Sscanf(v, "%d", &secs); err == nil && secs > 0 {
 			executor.BashTimeout = time.Duration(secs) * time.Second
 		}
+	} else if cfg.BashTimeoutSeconds != nil {
+		executor.BashTimeout = time.Duration(*cfg.BashTimeoutSeconds) * time.Second
 	}
 	executor.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 
@@ -148,6 +204,12 @@ func Setup(p Params) (*App, error) {
 				bgThreshold = time.Duration(secs) * time.Second
 			}
 		}
+	} else if cfg.BgThresholdSeconds != nil {
+		if *cfg.BgThresholdSeconds == 0 {
+			bgThreshold = 0
+		} else {
+			bgThreshold = time.Duration(*cfg.BgThresholdSeconds) * time.Second
+		}
 	}
 	if p.DisableBackground {
 		bgThreshold = 0
@@ -158,12 +220,17 @@ func Setup(p Params) (*App, error) {
 	if v := os.Getenv("OPENAI_DENY_INSTEAD_OF_PROMPT"); v == "1" || strings.EqualFold(v, "true") {
 		deny = true
 	}
+	if cfg.DenyInsteadOfPrompt != nil && *cfg.DenyInsteadOfPrompt {
+		deny = true
+	}
 
 	// Anthropic requires max_tokens per response; the OpenAI modes
-	// set none. Default 8192, or ANTHROPIC_MAX_TOKENS.
+	// set none. Default 8192, or ANTHROPIC_MAX_TOKENS, or the config.
 	maxTokens := 0
 	if v := os.Getenv("ANTHROPIC_MAX_TOKENS"); v != "" {
 		fmt.Sscanf(v, "%d", &maxTokens)
+	} else if cfg.AnthropicMaxTokens != nil {
+		maxTokens = *cfg.AnthropicMaxTokens
 	}
 
 	a.Cfg = &agent.Config{
@@ -183,10 +250,18 @@ func Setup(p Params) (*App, error) {
 			fmt.Sscanf(v, "%d", &contextLimit)
 		}
 	}
+	if contextLimit <= 0 && cfg.ContextLimit != nil {
+		contextLimit = *cfg.ContextLimit
+	}
 	if contextLimit <= 0 {
 		contextLimit = agent.DefaultContextLimit
 	}
 	a.ContextLimit = contextLimit
+
+	a.TUITheme = os.Getenv("HARNESS_TUI_THEME")
+	if a.TUITheme == "" {
+		a.TUITheme = cfg.TUITheme
+	}
 
 	rates, err := llm.RatesFromEnv()
 	if err != nil {

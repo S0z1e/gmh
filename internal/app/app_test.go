@@ -24,6 +24,67 @@ func mockServer(t *testing.T) *httptest.Server {
 	}))
 }
 
+func TestSetupResolvesConfigFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	root := t.TempDir()
+	cfg := `{
+		"defaultProvider": "discovery",
+		"providers": {
+			"openconsole": {"baseUrl": "https://www.openconsole.cn/v1", "api": "chat", "model": "deepseek-v4.1-flash"},
+			"discovery": {"baseUrl": "https://discovery-api.intern-ai.org.cn/v1", "api": "anthropic", "model": "Agents-A1"}
+		},
+		"mode": "auto",
+		"contextLimit": 12345,
+		"tuiTheme": "terminal"
+	}`
+	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	if a.Cfg.Client.BaseURL != "https://discovery-api.intern-ai.org.cn/v1" {
+		t.Fatalf("baseURL = %q", a.Cfg.Client.BaseURL)
+	}
+	if a.Cfg.Client.Model != "Agents-A1" || a.Cfg.Client.API != "anthropic" {
+		t.Fatalf("client = api %q model %q", a.Cfg.Client.API, a.Cfg.Client.Model)
+	}
+	if a.Cfg.Mode != "auto" {
+		t.Fatalf("mode = %q", a.Cfg.Mode)
+	}
+	if a.ContextLimit != 12345 {
+		t.Fatalf("contextLimit = %d", a.ContextLimit)
+	}
+	if a.TUITheme != "terminal" {
+		t.Fatalf("tuiTheme = %q", a.TUITheme)
+	}
+	// -provider picks another entry; env still wins over the file.
+	a2, err := Setup(Params{Root: root, MaxSteps: 5, Provider: "openconsole"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a2.Store.Close()
+	if a2.Cfg.Client.Model != "deepseek-v4.1-flash" || a2.Cfg.Client.API != "chat" {
+		t.Fatalf("provider openconsole = api %q model %q", a2.Cfg.Client.API, a2.Cfg.Client.Model)
+	}
+	t.Setenv("OPENAI_MODEL", "env-model")
+	a3, err := Setup(Params{Root: root, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a3.Store.Close()
+	if a3.Cfg.Client.Model != "env-model" {
+		t.Fatalf("env should win over config, model = %q", a3.Cfg.Client.Model)
+	}
+	// Unknown provider is a setup error.
+	if _, err := Setup(Params{Root: root, MaxSteps: 5, Provider: "ghost"}); err == nil {
+		t.Fatal("unknown provider should fail setup")
+	}
+}
+
 func TestRunnerHandleTaskAndUsage(t *testing.T) {
 	srv := mockServer(t)
 	defer srv.Close()

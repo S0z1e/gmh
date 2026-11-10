@@ -23,9 +23,11 @@ func main() {
 	var (
 		printMode = flag.String("p", "", "print mode: run one task and exit")
 		root      = flag.String("root", ".", "workspace root")
-		mode      = flag.String("mode", "suggest", "suggest (ask) or auto")
-		model     = flag.String("model", "", "model (default OPENAI_MODEL or deepseek-v4.1-flash)")
-		api       = flag.String("api", "", "chat, responses or anthropic (default OPENAI_API_MODE or chat)")
+		mode      = flag.String("mode", "", "suggest (ask) or auto (default config or suggest)")
+		model     = flag.String("model", "", "model (default OPENAI_MODEL, config, or deepseek-v4.1-flash)")
+		api       = flag.String("api", "", "chat, responses or anthropic (default OPENAI_API_MODE, config, or chat)")
+		provider  = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
+		config    = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
 		maxSteps  = flag.Int("max-steps", 50, "max agent steps")
 		resume    = flag.String("resume", "", "resume session id")
 		sessionID = flag.String("session", "", "session id (default: timestamp)")
@@ -52,7 +54,7 @@ func main() {
 			fatal(err)
 		}
 		if uiMode == "tui" {
-			if err := execTUI(*root, *mode, *model, *api, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh); err != nil {
+			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh); err != nil {
 				fmt.Fprintf(os.Stderr, "harness: TUI unavailable (%v); continuing in plain mode.\n", err)
 			}
 			// execTUI replaces this process on success; reaching here
@@ -67,6 +69,8 @@ func main() {
 		Mode:                       *mode,
 		Model:                      *model,
 		API:                        *api,
+		Provider:                   *provider,
+		ConfigPath:                 *config,
 		MaxSteps:                   *maxSteps,
 		ContextLimit:               *ctxLimit,
 		Resume:                     *resume,
@@ -158,7 +162,7 @@ func main() {
 // execTUI replaces this process with the sibling harness-tui binary,
 // passing the same flags through. It returns only if the sibling cannot
 // be started (then the caller falls back to plain mode).
-func execTUI(root, mode, model, api string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int) error {
+func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -173,6 +177,8 @@ func execTUI(root, mode, model, api string, maxSteps int, resume, sessionID stri
 		"-mode", mode,
 		"-model", model,
 		"-api", api,
+		"-provider", provider,
+		"-config", config,
 		"-max-steps", strconv.Itoa(maxSteps),
 		"-resume", resume,
 		"-session", sessionID,
