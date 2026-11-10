@@ -37,8 +37,8 @@ import (
 )
 
 // defaultAnthropicMaxTokens is the per-response output budget.
-// Anthropic requires max_tokens; the OpenAI modes set none.
-const defaultAnthropicMaxTokens = 8192
+// Anthropic requires max_tokens; Pi's default is 16384.
+const defaultAnthropicMaxTokens = 16384
 
 type anthropicTool struct {
 	Name        string          `json:"name"`

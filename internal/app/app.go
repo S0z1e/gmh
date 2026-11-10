@@ -57,6 +57,9 @@ type App struct {
 	Skills       []skills.Skill
 	ContextLimit int
 	Root         string
+	// Model is the resolved model entry (Pi shape): id, api, baseUrl,
+	// contextWindow, maxTokens, samplingParams, headers, input, cost.
+	Model config.Model
 	// Rates configures cost estimates (zero = unconfigured: no estimate
 	// is shown, only the "real price unverified" label).
 	Rates llm.Rates
@@ -99,49 +102,74 @@ func Setup(p Params) (*App, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown provider %q (configured: %s)", p.Provider, strings.Join(cfg.ProviderNames(), ", "))
 	}
+	provName := cfg.SelectedName(p.Provider)
+	if provName == "" {
+		provName = "default"
+	}
+
+	// A provider must be configured by the user: there is no
+	// built-in default provider any more.
+	if !cfg.HasProviders() {
+		global, _ := config.GlobalPath()
+		return nil, fmt.Errorf("no providers configured: add a provider to %s (global) or %s (project)", global, config.ProjectPath(absRoot))
+	}
+
+	// API key: the provider's apiKey "$NAME" reference wins, else
+	// OPENAI_API_KEY. A literal key never lives in the file.
+	apiKey := ""
+	if prov.APIKey != "" {
+		k, err := config.ResolveAPIKey(prov.APIKey)
+		if err != nil {
+			return nil, err
+		}
+		apiKey = k
+	} else {
+		apiKey = os.Getenv("OPENAI_API_KEY")
+	}
+	if apiKey == "" {
+		return nil, fmt.Errorf("missing API key: set OPENAI_API_KEY, or set apiKey: \"$NAME\" for provider %q in the config file", provName)
+	}
+
+	// Model: flag > env > defaultModel (when the selected provider
+	// is the default one) > provider default > first models entry.
+	modelID := p.Model
+	if modelID == "" {
+		modelID = os.Getenv("OPENAI_MODEL")
+	}
+	if modelID == "" && (p.Provider == "" || p.Provider == cfg.DefaultProvider) {
+		modelID = cfg.DefaultModel
+	}
+	mdl, ok := prov.ResolveModel(modelID)
+	if !ok {
+		return nil, fmt.Errorf("unknown model %q for provider %q (models: %s)", modelID, provName, modelIDs(prov))
+	}
+	if mdl.ID == "" {
+		return nil, fmt.Errorf("provider %q: no model configured (set \"model\" or add a \"models\" entry)", provName)
+	}
+
+	// API shape: flag > env > model/provider. A provider needs an
+	// api at provider or model level (Pi); there is no silent default.
+	rawAPI := p.API
+	if rawAPI == "" {
+		rawAPI = os.Getenv("OPENAI_API_MODE")
+	}
+	if rawAPI == "" {
+		rawAPI = mdl.API
+	}
+	if rawAPI == "" {
+		return nil, fmt.Errorf("provider %q: api is required (chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages)", provName)
+	}
+	apiMode, err := config.NormalizeAPI(rawAPI)
+	if err != nil {
+		return nil, fmt.Errorf("invalid -api: %w", err)
+	}
 
 	baseURL := os.Getenv("OPENAI_BASE_URL")
 	if baseURL == "" {
-		baseURL = prov.BaseURL
+		baseURL = mdl.BaseURL
 	}
 	if baseURL == "" {
-		baseURL = cfg.BaseURL
-	}
-	if baseURL == "" {
-		baseURL = "https://www.openconsole.cn/v1"
-	}
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		return nil, fmt.Errorf("missing OPENAI_API_KEY in environment")
-	}
-	mdl := p.Model
-	if mdl == "" {
-		mdl = os.Getenv("OPENAI_MODEL")
-	}
-	if mdl == "" {
-		mdl = prov.Model
-	}
-	if mdl == "" {
-		mdl = cfg.Model
-	}
-	if mdl == "" {
-		mdl = "deepseek-v4.1-flash"
-	}
-	apiMode := p.API
-	if apiMode == "" {
-		apiMode = os.Getenv("OPENAI_API_MODE")
-	}
-	if apiMode == "" {
-		apiMode = prov.API
-	}
-	if apiMode == "" {
-		apiMode = cfg.API
-	}
-	if apiMode == "" {
-		apiMode = "chat"
-	}
-	if apiMode != "chat" && apiMode != "responses" && apiMode != "anthropic" {
-		return nil, fmt.Errorf("invalid -api %q: use chat, responses or anthropic", apiMode)
+		return nil, fmt.Errorf("provider %q: baseUrl is required", provName)
 	}
 	mode := p.Mode
 	if mode == "" {
@@ -224,17 +252,45 @@ func Setup(p Params) (*App, error) {
 		deny = true
 	}
 
-	// Anthropic requires max_tokens per response; the OpenAI modes
-	// set none. Default 8192, or ANTHROPIC_MAX_TOKENS, or the config.
+	// MaxTokens: env > model > config > Pi default 16384. All three
+	// modes send it now: chat as max_tokens, responses as
+	// max_output_tokens, anthropic as max_tokens.
 	maxTokens := 0
 	if v := os.Getenv("ANTHROPIC_MAX_TOKENS"); v != "" {
 		fmt.Sscanf(v, "%d", &maxTokens)
+	} else if mdl.MaxTokens != nil {
+		maxTokens = *mdl.MaxTokens
 	} else if cfg.AnthropicMaxTokens != nil {
 		maxTokens = *cfg.AnthropicMaxTokens
 	}
+	if maxTokens <= 0 {
+		maxTokens = config.DefaultMaxTokens
+	}
 
+	// Headers: provider headers, model headers on top. A "$NAME"
+	// value reads the environment; literals pass through.
+	var headers map[string]string
+	merged := map[string]string{}
+	for k, v := range prov.Headers {
+		merged[k] = v
+	}
+	for k, v := range mdl.Headers {
+		merged[k] = v
+	}
+	if len(merged) > 0 {
+		headers = make(map[string]string, len(merged))
+		for k, v := range merged {
+			rv, err := config.ResolveValue(v)
+			if err != nil {
+				return nil, err
+			}
+			headers[k] = rv
+		}
+	}
+
+	a.Model = mdl
 	a.Cfg = &agent.Config{
-		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl, API: apiMode, MaxTokens: maxTokens},
+		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers},
 		Exec:                executor,
 		Tools:               agent.ToolDefs(),
 		System:              system,
@@ -250,11 +306,14 @@ func Setup(p Params) (*App, error) {
 			fmt.Sscanf(v, "%d", &contextLimit)
 		}
 	}
+	if contextLimit <= 0 && mdl.ContextWindow != nil {
+		contextLimit = *mdl.ContextWindow
+	}
 	if contextLimit <= 0 && cfg.ContextLimit != nil {
 		contextLimit = *cfg.ContextLimit
 	}
 	if contextLimit <= 0 {
-		contextLimit = agent.DefaultContextLimit
+		contextLimit = config.DefaultContextWindow
 	}
 	a.ContextLimit = contextLimit
 
@@ -270,6 +329,19 @@ func Setup(p Params) (*App, error) {
 	}
 	a.Rates = rates
 	return a, nil
+}
+
+// modelIDs lists a provider's model ids for error messages: the
+// flat model first, then the models entries.
+func modelIDs(p config.Provider) string {
+	ids := []string{}
+	if p.Model != "" {
+		ids = append(ids, p.Model)
+	}
+	for _, m := range p.Models {
+		ids = append(ids, m.ID)
+	}
+	return strings.Join(ids, ", ")
 }
 
 // NewSession closes the current session store and starts a fresh one,

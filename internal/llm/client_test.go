@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -109,5 +110,68 @@ func TestEndpointNormalisation(t *testing.T) {
 		if got := c.endpoint(); got != want {
 			t.Errorf("endpoint(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// SamplingParams merge into the Chat Completions request body,
+// Pi-style; structural keys must never be overridden by them.
+func TestStreamChatMergesSamplingParamsAndMaxTokens(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	c := &Client{
+		BaseURL: srv.URL, APIKey: "test-key", Model: "test-model",
+		MaxTokens:      16384,
+		SamplingParams: map[string]any{"temperature": 0.7, "top_p": 0.95, "model": "evil", "max_tokens": 1},
+	}
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+		t.Fatal(err)
+	}
+	if body["temperature"] != 0.7 || body["top_p"] != 0.95 {
+		t.Fatalf("sampling params missing: %+v", body)
+	}
+	if body["max_tokens"] != float64(16384) {
+		t.Fatalf("max_tokens = %v, want 16384", body["max_tokens"])
+	}
+	if body["model"] != "test-model" {
+		t.Fatalf("model = %v, samplingParams must not override it", body["model"])
+	}
+}
+
+// Config headers are sent; auth and framing headers are never taken
+// from the config, or a stray Authorization would replace the real key.
+func TestStreamChatSendsConfigHeaders(t *testing.T) {
+	var gotCustom, gotAuth, gotKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCustom = r.Header.Get("X-Custom")
+		gotAuth = r.Header.Get("Authorization")
+		gotKey = r.Header.Get("X-Api-Key")
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	c := &Client{
+		BaseURL: srv.URL, APIKey: "test-key", Model: "test-model",
+		Headers: map[string]string{"X-Custom": "yes", "Authorization": "Bearer evil", "X-Api-Key": "bad"},
+	}
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+		t.Fatal(err)
+	}
+	if gotCustom != "yes" {
+		t.Fatalf("X-Custom = %q, want yes", gotCustom)
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Fatalf("Authorization = %q, want Bearer test-key", gotAuth)
+	}
+	if gotKey != "" {
+		t.Fatalf("X-Api-Key = %q, want empty", gotKey)
 	}
 }

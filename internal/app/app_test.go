@@ -85,6 +85,107 @@ func TestSetupResolvesConfigFile(t *testing.T) {
 	}
 }
 
+// The Pi-shaped models array: per-model api/contextWindow/maxTokens,
+// apiKey "$NAME" resolution, headers, and the Pi defaults when a
+// model omits a value.
+func TestSetupResolvesModelsArray(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "fallback-key")
+	t.Setenv("DISC_TEST_KEY", "disc-key")
+	t.Setenv("MODEL_HDR", "model-hdr")
+	root := t.TempDir()
+	cfg := `{
+		"defaultProvider": "discovery",
+		"defaultModel": "Agents-A1",
+		"providers": {
+			"discovery": {
+				"baseUrl": "https://discovery-api.intern-ai.org.cn/v1",
+				"api": "anthropic-messages",
+				"apiKey": "$DISC_TEST_KEY",
+				"headers": {"X-Prov": "d1"},
+				"models": [
+					{"id": "Agents-A1", "reasoning": true, "contextWindow": 1000000, "maxTokens": 16384, "samplingParams": {"temperature": 0.7}, "headers": {"X-Model": "$MODEL_HDR"}},
+					{"id": "deepseek-v4-flash-0731", "api": "openai-completions", "contextWindow": 256000, "maxTokens": 8192}
+				]
+			},
+			"openconsole": {"baseUrl": "https://www.openconsole.cn/v1", "api": "chat", "model": "deepseek-v4.1-flash"}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Default: the defaultModel entry, Pi spelling normalised.
+	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	c := a.Cfg.Client
+	if c.BaseURL != "https://discovery-api.intern-ai.org.cn/v1" || c.Model != "Agents-A1" || c.API != "anthropic" {
+		t.Fatalf("client = base %q api %q model %q", c.BaseURL, c.API, c.Model)
+	}
+	if c.APIKey != "disc-key" {
+		t.Fatalf("apiKey = %q, want the $DISC_TEST_KEY value", c.APIKey)
+	}
+	if a.ContextLimit != 1000000 {
+		t.Fatalf("contextLimit = %d, want the model contextWindow", a.ContextLimit)
+	}
+	if c.MaxTokens != 16384 {
+		t.Fatalf("maxTokens = %d, want 16384", c.MaxTokens)
+	}
+	if c.Headers["X-Prov"] != "d1" || c.Headers["X-Model"] != "model-hdr" {
+		t.Fatalf("headers = %v", c.Headers)
+	}
+	if c.SamplingParams["temperature"] != 0.7 {
+		t.Fatalf("samplingParams = %v", c.SamplingParams)
+	}
+	if !a.Model.Reasoning || len(a.Model.Input) != 1 || a.Model.Input[0] != "text" {
+		t.Fatalf("resolved model = %+v", a.Model)
+	}
+	// Second model on the same provider overrides the api.
+	a2, err := Setup(Params{Root: root, MaxSteps: 5, Model: "deepseek-v4-flash-0731"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a2.Store.Close()
+	if a2.Cfg.Client.API != "chat" || a2.ContextLimit != 256000 || a2.Cfg.Client.MaxTokens != 8192 {
+		t.Fatalf("second model: api %q contextLimit %d maxTokens %d", a2.Cfg.Client.API, a2.ContextLimit, a2.Cfg.Client.MaxTokens)
+	}
+	// A provider without an apiKey ref falls back to OPENAI_API_KEY,
+	// and a model that omits limits gets the Pi defaults.
+	a3, err := Setup(Params{Root: root, MaxSteps: 5, Provider: "openconsole"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a3.Store.Close()
+	if a3.Cfg.Client.APIKey != "fallback-key" || a3.Cfg.Client.Model != "deepseek-v4.1-flash" {
+		t.Fatalf("openconsole: key %q model %q", a3.Cfg.Client.APIKey, a3.Cfg.Client.Model)
+	}
+	if a3.ContextLimit != 128000 || a3.Cfg.Client.MaxTokens != 16384 {
+		t.Fatalf("Pi defaults: contextLimit %d maxTokens %d", a3.ContextLimit, a3.Cfg.Client.MaxTokens)
+	}
+	// Unknown model id on a provider with a list is a setup error.
+	if _, err := Setup(Params{Root: root, MaxSteps: 5, Model: "ghost"}); err == nil {
+		t.Fatal("unknown model should fail setup")
+	}
+	// No config at all is a setup error now: providers must be
+	// configured by the user, there is no built-in default.
+	empty := t.TempDir()
+	if _, err := Setup(Params{Root: empty, MaxSteps: 5}); err == nil || !strings.Contains(err.Error(), "no providers configured") {
+		t.Fatalf("no-config setup err = %v, want no-providers-configured", err)
+	}
+}
+
+// writeMockProvider gives a test root a configured provider, now that
+// Setup requires one. OPENAI_BASE_URL still wins for the actual calls.
+func writeMockProvider(t *testing.T, root string) {
+	t.Helper()
+	cfg := `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "model": "mock"}}}`
+	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunnerHandleTaskAndUsage(t *testing.T) {
 	srv := mockServer(t)
 	defer srv.Close()
@@ -92,6 +193,7 @@ func TestRunnerHandleTaskAndUsage(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	t.Setenv("OPENAI_BASE_URL", srv.URL)
 	root := t.TempDir()
+	writeMockProvider(t, root)
 	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
@@ -131,6 +233,7 @@ func TestRunnerHandleClear(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	t.Setenv("OPENAI_BASE_URL", srv.URL)
 	root := t.TempDir()
+	writeMockProvider(t, root)
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -161,6 +264,7 @@ func TestRunnerKeywordTriggerLoadsSkill(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	t.Setenv("OPENAI_BASE_URL", srv.URL)
 	root := t.TempDir()
+	writeMockProvider(t, root)
 	skillDir := filepath.Join(root, ".agents", "skills", "greeter")
 	if err := os.MkdirAll(skillDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -215,6 +319,7 @@ func TestRunnerCostEstimate(t *testing.T) {
 	t.Setenv("OPENAI_PRICE_OUTPUT_PER_MTOK", "2000")
 	t.Setenv("OPENAI_PRICE_SOURCE", "test rates")
 	root := t.TempDir()
+	writeMockProvider(t, root)
 	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
@@ -256,6 +361,7 @@ func TestRunnerNoCostWithoutRates(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	t.Setenv("OPENAI_BASE_URL", srv.URL)
 	root := t.TempDir()
+	writeMockProvider(t, root)
 	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
@@ -283,6 +389,7 @@ func TestRunnerJobsCommand(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	root := t.TempDir()
+	writeMockProvider(t, root)
 	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
@@ -324,7 +431,9 @@ func TestRunnerJobsCommand(t *testing.T) {
 func TestRunnerHandleQuit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("OPENAI_API_KEY", "test-key")
-	a, err := Setup(Params{Root: t.TempDir(), Mode: "auto"})
+	root := t.TempDir()
+	writeMockProvider(t, root)
+	a, err := Setup(Params{Root: root, Mode: "auto"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -80,6 +80,8 @@ type chatRequest struct {
 	Tools         []ToolDef      `json:"tools,omitempty"`
 	Stream        bool           `json:"stream"`
 	StreamOptions *streamOptions `json:"stream_options,omitempty"`
+	// MaxTokens caps the reply (max_tokens). 0 omits the field.
+	MaxTokens *int `json:"max_tokens,omitempty"`
 }
 
 // streamOptions requests token usage in the final SSE chunk. Without
@@ -126,6 +128,8 @@ type responsesRequest struct {
 	Tools        []responsesTool `json:"tools,omitempty"`
 	Stream       bool            `json:"stream"`
 	Store        bool            `json:"store"` // false: stateless, we resend full input (JSONL is the store)
+	// MaxOutputTokens caps the reply. 0 omits the field.
+	MaxOutputTokens *int `json:"max_output_tokens,omitempty"`
 }
 
 type responsesUsage struct {
@@ -174,11 +178,21 @@ type Client struct {
 	APIKey  string
 	Model   string
 	API     string // "chat" (default), "responses" or "anthropic"
-	// MaxTokens is the Anthropic per-response output budget.
-	// 0 = defaultAnthropicMaxTokens. Ignored by the OpenAI modes,
-	// which set no max_tokens.
+	// MaxTokens is the per-response output budget, sent by all three
+	// modes (chat: max_tokens, responses: max_output_tokens,
+	// anthropic: max_tokens). 0 = defaultAnthropicMaxTokens.
 	MaxTokens int
-	HTTP      *http.Client
+	// SamplingParams (e.g. temperature, top_p) is merged into every
+	// request body of the two OpenAI modes, Pi-style. Anthropic
+	// ignores it: Pi applies samplingParams only to OpenAI-compatible
+	// APIs. Structural keys (model, messages, tools, stream, ...) are
+	// never overridden by it.
+	SamplingParams map[string]any
+	// Headers are extra request headers from the config file
+	// (provider + model). Authorization, Content-Type, Accept and
+	// x-api-key are never taken from here: auth is the client's job.
+	Headers map[string]string
+	HTTP    *http.Client
 }
 
 // Mode returns the normalised API mode.
@@ -247,6 +261,9 @@ func (c *Client) doPost(ctx context.Context, body []byte) (*http.Response, error
 // withBearer sets the Authorization header; the Anthropic mode
 // passes false for api.anthropic.com, which reads x-api-key instead
 // (and must not receive a Bearer header alongside it).
+// Config headers (Client.Headers) are sent too, except auth and
+// framing headers, which this function owns; the per-call headers
+// win over config headers.
 func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[string]string, withBearer bool) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(), bytes.NewReader(body))
 	if err != nil {
@@ -255,6 +272,13 @@ func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[str
 	req.Header.Set("Content-Type", "application/json")
 	if withBearer {
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	}
+	for k, v := range c.Headers {
+		switch strings.ToLower(k) {
+		case "authorization", "content-type", "accept", "x-api-key":
+			continue
+		}
+		req.Header.Set(k, v)
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -301,8 +325,41 @@ func (c *Client) Stream(ctx context.Context, messages []Message, tools []ToolDef
 	return c.streamChat(ctx, messages, tools, onText, onDone)
 }
 
+// mergeSamplingParams merges free-form sampling parameters
+// (temperature, top_p, ...) into an already-marshalled request body,
+// Pi-style. Structural keys are never overridden: a sampling param
+// must not rewrite the model, the messages, the tools, or the
+// streaming/max-token fields the client itself controls.
+func mergeSamplingParams(body []byte, params map[string]any) ([]byte, error) {
+	if len(params) == 0 {
+		return body, nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+	for k, v := range params {
+		switch strings.ToLower(k) {
+		case "model", "messages", "tools", "tool_choice", "stream",
+			"stream_options", "max_tokens", "max_completion_tokens",
+			"max_output_tokens", "input", "instructions", "store", "system":
+			continue
+		}
+		m[k] = v
+	}
+	return json.Marshal(m)
+}
+
 func (c *Client) streamChat(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage)) error {
-	body, err := json.Marshal(chatRequest{Model: c.Model, Messages: messages, Tools: tools, Stream: true, StreamOptions: &streamOptions{IncludeUsage: true}})
+	req := chatRequest{Model: c.Model, Messages: messages, Tools: tools, Stream: true, StreamOptions: &streamOptions{IncludeUsage: true}}
+	if c.MaxTokens > 0 {
+		req.MaxTokens = &c.MaxTokens
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	body, err = mergeSamplingParams(body, c.SamplingParams)
 	if err != nil {
 		return err
 	}
@@ -436,6 +493,14 @@ func toResponsesInput(messages []Message) (string, []any) {
 	return strings.Join(instructions, "\n"), input
 }
 
+// maxOutputTokensPtr returns nil for 0 so the field is omitted.
+func maxOutputTokensPtr(n int) *int {
+	if n <= 0 {
+		return nil
+	}
+	return &n
+}
+
 func (c *Client) streamResponses(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage)) error {
 	instructions, input := toResponsesInput(messages)
 	var rtools []responsesTool
@@ -450,7 +515,12 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 	body, err := json.Marshal(responsesRequest{
 		Model: c.Model, Instructions: instructions, Input: input,
 		Tools: rtools, Stream: true, Store: false,
+		MaxOutputTokens: maxOutputTokensPtr(c.MaxTokens),
 	})
+	if err != nil {
+		return err
+	}
+	body, err = mergeSamplingParams(body, c.SamplingParams)
 	if err != nil {
 		return err
 	}

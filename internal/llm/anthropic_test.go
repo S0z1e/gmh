@@ -159,8 +159,8 @@ func TestAnthropicStreamTextAndThinking(t *testing.T) {
 	if gotVersion != "2023-06-01" {
 		t.Fatalf("anthropic-version = %q", gotVersion)
 	}
-	if gotBody["model"] != "test-model" || gotBody["max_tokens"] != float64(8192) || gotBody["stream"] != true {
-		t.Fatalf("body = %+v, want model test-model, max_tokens 8192, stream true", gotBody)
+	if gotBody["model"] != "test-model" || gotBody["max_tokens"] != float64(16384) || gotBody["stream"] != true {
+		t.Fatalf("body = %+v, want model test-model, max_tokens 16384, stream true", gotBody)
 	}
 	if gotBody["system"] != "sys" {
 		t.Fatalf("system = %v", gotBody["system"])
@@ -290,5 +290,34 @@ func TestAnthropicEndpointNormalisation(t *testing.T) {
 	}
 	if c := (&Client{BaseURL: "https://example.com/v1"}); c.ProviderName() != "example.com" {
 		t.Errorf("ProviderName() = %q, want example.com", c.ProviderName())
+	}
+}
+
+// SamplingParams apply only to OpenAI-compatible APIs (Pi rule):
+// the Anthropic body must not carry them.
+func TestAnthropicIgnoresSamplingParams(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":1,\"cache_read_input_tokens\":0,\"output_tokens\":0}}}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer srv.Close()
+
+	c := &Client{
+		BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "anthropic",
+		SamplingParams: map[string]any{"temperature": 0.7},
+	}
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["temperature"]; ok {
+		t.Fatalf("temperature must not be sent to Anthropic: %+v", body)
+	}
+	if body["max_tokens"] != float64(16384) {
+		t.Fatalf("max_tokens = %v, want 16384", body["max_tokens"])
 	}
 }

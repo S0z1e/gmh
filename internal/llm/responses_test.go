@@ -2,7 +2,9 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -185,5 +187,35 @@ func TestEndpointNormalisationBothModes(t *testing.T) {
 	c := &Client{BaseURL: "https://www.openconsole.cn"}
 	if c.Mode() != "chat" {
 		t.Errorf("default mode = %q, want chat", c.Mode())
+	}
+}
+
+// SamplingParams and max_output_tokens merge into the Responses
+// request body too.
+func TestResponsesMergesSamplingParamsAndMaxOutputTokens(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	c := &Client{
+		BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "responses",
+		MaxTokens:      16384,
+		SamplingParams: map[string]any{"temperature": 0.7},
+	}
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+		t.Fatal(err)
+	}
+	if body["temperature"] != 0.7 {
+		t.Fatalf("temperature missing: %+v", body)
+	}
+	if body["max_output_tokens"] != float64(16384) {
+		t.Fatalf("max_output_tokens = %v, want 16384", body["max_output_tokens"])
 	}
 }

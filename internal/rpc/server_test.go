@@ -183,13 +183,18 @@ func setupTestApp(t *testing.T, mode string, steps []fakeStep) (*app.App, *app.R
 	t.Helper()
 	srv := httptest.NewServer(fakeHandler(t, steps))
 	t.Cleanup(srv.Close)
-	t.Setenv("OPENAI_BASE_URL", srv.URL+"/v1")
-	t.Setenv("OPENAI_API_KEY", "test")
-	t.Setenv("OPENAI_MODEL", "mock")
+	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "t.txt"), []byte("theta\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The harness requires a configured provider: point a mock
+	// provider at the fake server. Env still wins for the key.
+	cfg := fmt.Sprintf(`{"providers": {"mock": {"baseUrl": %q, "api": "chat", "model": "mock"}}}`, srv.URL+"/v1")
+	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPENAI_API_KEY", "test")
 	a, err := app.Setup(app.Params{
 		Root: root, Mode: mode, MaxSteps: 10,
 		BackgroundThresholdSeconds: 0, DisableBackground: true,

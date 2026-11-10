@@ -69,7 +69,7 @@ Notes:
 - The API key is read only from the environment. Never commit it, never put it in a file.
 - `OPENAI_BASE_URL` may be given with or without a trailing `/v1`; the client normalises it.
 - `-api chat` uses `POST /v1/chat/completions` (messages, `tool_calls[]`); `-api responses` uses `POST /v1/responses` (instructions + input items, `function_call` / `function_call_output`, `store: false` — stateless, JSONL is the store). Not every provider/model supports Responses; if OpenConsole rejects it, the error is returned verbatim.
-- `-api anthropic` uses `POST /v1/messages` (system string + messages with `tool_use` / `tool_result` content blocks). The same base URL works: `.../v1` normalises to `.../v1/messages`. Auth is picked by host: `api.anthropic.com` gets `x-api-key` only; every other host (including Discovery) gets Bearer only — sending both breaks Discovery, which prefers `x-api-key` and then rejects the unexchanged surrogate (verified live 2026-11-09). History is translated at call time, so sessions stay in the shared format and replay across modes; consecutive same-role messages merge into one (Anthropic requires strict user/assistant alternation), and an empty tool result replays as `(no output)`. Thinking blocks are skipped like `reasoning_content` in chat mode. Anthropic requires `max_tokens` per response: default 8192, or `ANTHROPIC_MAX_TOKENS`. Verified live 2026-11-09 against Discovery `Agents-A1`: 4-turn REPL (read → write, read-back → write, empty-output bash, follow-up question answered from history) plus a `--resume` run that answered from the earlier calls — tool_use/tool_result pairing and the empty-result placeholder both replay cleanly. The fee label names the provider from the base URL (`Discovery 實價未驗證` on Discovery, `OpenConsole 實價未驗證` on OpenConsole) instead of hardcoding OpenConsole.
+- `-api anthropic` uses `POST /v1/messages` (system string + messages with `tool_use` / `tool_result` content blocks). The same base URL works: `.../v1` normalises to `.../v1/messages`. Auth is picked by host: `api.anthropic.com` gets `x-api-key` only; every other host (including Discovery) gets Bearer only — sending both breaks Discovery, which prefers `x-api-key` and then rejects the unexchanged surrogate (verified live 2026-11-09). History is translated at call time, so sessions stay in the shared format and replay across modes; consecutive same-role messages merge into one (Anthropic requires strict user/assistant alternation), and an empty tool result replays as `(no output)`. Thinking blocks are skipped like `reasoning_content` in chat mode. Anthropic requires `max_tokens` per response: default 16384 (Pi's default), or `ANTHROPIC_MAX_TOKENS`. Verified live 2026-11-09 against Discovery `Agents-A1`: 4-turn REPL (read → write, read-back → write, empty-output bash, follow-up question answered from history) plus a `--resume` run that answered from the earlier calls — tool_use/tool_result pairing and the empty-result placeholder both replay cleanly. The fee label names the provider from the base URL (`Discovery 實價未驗證` on Discovery, `OpenConsole 實價未驗證` on OpenConsole) instead of hardcoding OpenConsole.
 - End-to-end with the vault credential: `scripts/run_with_vault_key.py` fetches an `hsurr:` surrogate from authd and passes it to the harness as `OPENAI_API_KEY` in the child process only, never printing or storing it. Verified 2026-11-09: chat mode listed, wrote and verified `hello.txt` (6 bytes, usage total 4655); responses mode read, wrote and verified `count.txt` (usage total 3591). Both sessions are in `~/.minimal-harness/sessions/`.
 - Responses API live compatibility, verified 2026-11-09 against OpenConsole `deepseek-v4.1-flash` (P2-7): multi-turn tool loop (read → write → read-back, `summary.txt` exact), fragmented tool-call arguments (raw SSE showed one call split into 8 tiny deltas; a 15-line `write` call landed correctly), two tool calls in one turn, prompt caching (`input_tokens_details.cached_tokens` present — 128 on a replayed call, 6528 in one harness turn — and the cost line prints in responses mode), session resume with replayed `function_call` + `function_call_output` pairs (the model answered from the earlier calls, nothing dropped), and error shapes (bad model → HTTP 403 `{"error":{"message":"当前模型不可用…","code":"model_unavailable"}}`, surfaced verbatim as `LLM API 403 Forbidden: …`). No reasoning events are sent by this model, so there is nothing to surface or drop. No code fix was needed; the regression tests added in `internal/llm/responses_test.go` lock in the verified behaviour (two calls in one turn, denied-call replay pairing, cached-token mapping).
 - Stream integrity: a chat stream that ends without `[DONE]`, a Responses stream without `response.completed`, or an Anthropic stream without `message_stop`, is an error, not a silently truncated reply. (OpenConsole's Responses stream sends `response.completed` and no `[DONE]` — verified live 2026-11-09.) A Responses `response.completed` that lists only some of the calls the stream carried no longer drops the rest: the missing ones are merged from the accumulated fragments. Chat streams request `stream_options: {"include_usage": true}` — without it a spec-compliant provider sends no usage object at all and the turn reports 0 tokens (found live 2026-11-09: Discovery's chat stream carried no `usage` until the flag was added; OpenConsole/deepseek includes it by default, which had masked the gap).
@@ -77,7 +77,7 @@ Notes:
 - Skills: put `SKILL.md` files under `.agents/skills/<name>/` in the project, or `~/.config/minimal-harness/skills/`. Only name + description are loaded at startup; the full text loads on demand three ways: the user types `/skill:<name>`, the task names a skill as a whole word (auto-loaded before the turn), or the model calls the `load_skill` tool when a task matches a skill. A skill's `references/` files are never loaded up front: `load_skill` lists them in a footer, and the model loads one with `load_skill {name, reference}` (paths are jailed to that skill's `references/`).
 - Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`.
 - REPL commands: `/usage` shows session token totals, `/clear` drops the conversation context (a marker is written to the session file; `--resume` starts from the clear point, older messages stay in the file).
-- Compaction: `/compact` summarises the conversation into a 6-section brief and replaces history with it; the original transcript is saved to `<session>-pre-compact-<time>.jsonl`. It also triggers automatically when the last call's context reaches 70% of the window (`-context-limit`, default 1048576 for deepseek-v4.1-flash).
+- Compaction: `/compact` summarises the conversation into a 6-section brief and replaces history with it; the original transcript is saved to `<session>-pre-compact-<time>.jsonl`. It also triggers automatically when the last call's context reaches 70% of the window (`-context-limit`, default: the model's `contextWindow`, else 128000).
 - Events: the agent loop emits an event stream (`text_delta`, `step_usage`, `tool_start`, `tool_end`, `done`, `error`); the CLI is one renderer of it, the TUI and the RPC server are two more. The loop never imports UI code.
 - UI selection (`--ui auto|plain|tui`, default `auto`): precedence is flag > `NO_COLOR` (non-empty) > `TERM=dumb` > TTY. On a terminal, `auto` opens the TUI; piped, `NO_COLOR`, or `TERM=dumb` means plain. `-p` is always plain and ignores `--ui`. `harness --ui tui` without a terminal falls back to plain with a warning. The TUI is a separate binary (`harness-tui` next to `harness`); `harness` re-execs it when the TUI is selected, so `-p` / the plain CLI never import Bubble Tea.
 - TUI (Bubble Tea v2, inline-first): a separate binary so `-p` / the plain CLI never import it:
@@ -89,9 +89,9 @@ Notes:
 
 ## Configuration file (JSON, Pi-style)
 
-Model setup lives in a JSON file instead of a dozen exports, like Pi's
-`~/.pi/agent/settings.json` + `models.json` split. Two files, merged
-field by field (project wins where it sets a value):
+Model setup lives in a JSON file instead of a dozen exports, following
+Pi's `models.json` shape (see pi.dev/docs/latest/models-configuration).
+Two files, merged field by field (project wins where it sets a value):
 
 - global: `~/.minimal-harness/config.json`
 - project: `<root>/.harness.json`
@@ -99,45 +99,96 @@ field by field (project wins where it sets a value):
 ```json
 {
   "defaultProvider": "discovery",
+  "defaultModel": "Agents-A1",
   "providers": {
-    "openconsole": {"baseUrl": "https://www.openconsole.cn/v1", "api": "chat", "model": "deepseek-v4.1-flash"},
-    "discovery": {"baseUrl": "https://discovery-api.intern-ai.org.cn/v1", "api": "anthropic", "model": "Agents-A1"}
+    "openconsole": {
+      "baseUrl": "https://www.openconsole.cn/v1",
+      "api": "openai-completions",
+      "apiKey": "$OPENAI_API_KEY",
+      "models": [
+        {"id": "deepseek-v4.1-flash", "contextWindow": 1000000, "maxTokens": 16384,
+         "input": ["text", "image"],
+         "cost": {"input": 0.2, "output": 0.8, "cacheRead": 0.05, "cacheWrite": 0.2},
+         "samplingParams": {"temperature": 0.7}}
+      ]
+    },
+    "discovery": {
+      "baseUrl": "https://discovery-api.intern-ai.org.cn/v1",
+      "api": "anthropic-messages",
+      "apiKey": "$DISCOVERY_API_KEY",
+      "models": [
+        {"id": "Agents-A1", "reasoning": true, "maxTokens": 16384},
+        {"id": "deepseek-v4-flash-0731", "api": "openai-completions"}
+      ]
+    }
   }
 }
 ```
 
-With that file in place, `harness` needs nothing but the key — no
-`OPENAI_BASE_URL` / `OPENAI_MODEL` / `OPENAI_API_MODE` exports. Switch
-providers without editing the file: `harness -provider openconsole`.
-Point at one file explicitly: `harness -config /path/to/config.json`.
-The top-level `baseUrl` / `api` / `model` fields are a shorthand for a
-single provider without the `providers` map; a selected provider entry
-wins over them.
+A provider must be configured by the user — there is no built-in
+default provider. With no config file, or a config with no provider,
+setup fails with "no providers configured". A new provider needs a
+`baseUrl` and an `api` at provider or model level.
 
-Everything the file can hold (all optional): `defaultProvider`,
-`providers` (each: `baseUrl`, `api` `chat|responses|anthropic`,
-`model`), `mode` (`suggest|auto`), `bashTimeoutSeconds`,
-`bgThresholdSeconds` (`0` disables backgrounding),
-`denyInsteadOfPrompt`, `contextLimit`, `anthropicMaxTokens`,
-`tuiTheme` (`default|terminal|catppuccin-mocha`). Precedence is
-flag > environment variable > project file > global file > built-in
+Each `models` entry's only required field is `id`. The rest is
+optional, with Pi defaults: `contextWindow` 128000 (drives the
+compact trigger), `maxTokens` 16384, `reasoning` false,
+`input` `["text"]`. The rest has no default: `name`, `api` and
+`baseUrl` (override the provider's), `samplingParams`, `headers`.
+`api` accepts Pi spellings and the harness short names:
+`openai-completions` = `chat`, `openai-responses` = `responses`,
+`anthropic-messages` = `anthropic`; `google-generative-ai` is
+rejected — the harness has no client for it.
+
+`apiKey` is a `"$NAME"` / `"${NAME}"` environment reference only: a
+literal key in the file is refused, and `!command` is not supported.
+When a provider sets no `apiKey`, `OPENAI_API_KEY` is used.
+`headers` (provider and per-model, model wins) accept the same
+`$NAME` references; auth headers are never taken from them.
+
+`samplingParams` (e.g. `temperature`, `top_p`) is merged into every
+request body of the two OpenAI modes only — Pi's rule; Anthropic
+ignores it. Structural keys (`model`, `messages`, `tools`, `stream`,
+`max_tokens`, …) are never overridden by it. `maxTokens` is sent by
+all three modes (chat: `max_tokens`, responses: `max_output_tokens`,
+anthropic: `max_tokens`). `cost` (USD per million tokens, all four
+rates required when present, plus optional `tiers`) is parsed and
+stored only — the cost estimate still comes from the `OPENAI_PRICE_*`
+environment rates. `input` is stored only: the harness is text-only
+for now, so a model can declare `["text", "image"]` but no image is
+sent yet.
+
+Merge rules: a project file's `models` list replaces the provider's
+whole list (Pi-style); a `baseUrl`/`headers`-only override keeps the
+provider's models. Values are validated on the merged result, not
+per file. Unknown fields are rejected, so a typo fails fast. A
+`"$schema"` key is accepted and ignored. The top-level `baseUrl` /
+`api` / `model` fields are a shorthand for a single provider without
+the `providers` map. Other top-level knobs: `mode`
+(`suggest|auto`), `bashTimeoutSeconds`, `bgThresholdSeconds` (`0`
+disables backgrounding), `denyInsteadOfPrompt`, `contextLimit`,
+`anthropicMaxTokens`, `tuiTheme`
+(`default|terminal|catppuccin-mocha`). Precedence is flag >
+environment variable > model value > project file > global file > Pi
 default, so existing flag/env usage keeps working unchanged.
 
-The API key is never in the file: a config containing `apiKey` is
-refused outright. Unknown fields are rejected too, so a typo fails
-fast instead of silently doing nothing. A missing file is fine — the
-harness runs exactly as before with no config at all.
+With that file in place, `harness` needs nothing but the keys — no
+`OPENAI_BASE_URL` / `OPENAI_MODEL` / `OPENAI_API_MODE` exports.
+Switch providers without editing the file:
+`harness -provider openconsole`. Switch models:
+`harness -model deepseek-v4-flash-0731`. Point at one file
+explicitly: `harness -config /path/to/config.json`.
 
-Verified live 2026-11-10: with only `OPENAI_API_KEY` in the
-environment, the default provider (Discovery, Anthropic, Agents-A1)
-read and wrote a file (usage total 4172); `-provider openconsole`
-switched to chat/deepseek-v4.1-flash with no file edit (usage total
-6558); a project `.harness.json` with only
-`{"defaultProvider": "openconsole"}` overrode the global default
-(usage total 2342). A validation bug found by that last run — the
-project file was rejected for naming a provider only the global file
-defines — is fixed: values are validated on the merged result, not
-per file.
+Verified live 2026-11-10 (config v2, only the two keys in env):
+Discovery default (Agents-A1, anthropic-messages) read t.txt and
+wrote w.txt (usage total 3010); `-provider openconsole` switched to
+chat/deepseek-v4.1-flash with `max_tokens` 16384 and temperature 0.7
+merged into the request (usage total 8202) — OpenConsole accepts
+`max_tokens`; `-model deepseek-v4-flash-0731` switched models on the
+same provider and overrode the api to chat (u.txt written); a model
+with `contextWindow` 1500 compacted at 1217 tokens, proving the
+per-model window drives the trigger; with no config file the harness
+exits 1 with "no providers configured".
 
 ## RPC mode (JSONL over stdio, for a GUI)
 
