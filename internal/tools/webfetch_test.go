@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // noProxyClient reaches httptest servers directly, ignoring the VM's
@@ -26,7 +29,8 @@ func TestWebfetchHTML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Example Domain", "This domain is for use in examples & docs."} {
+	// Default format is Markdown: the heading survives as "# ...".
+	for _, want := range []string{"# Example Domain", "This domain is for use in examples & docs."} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("html fetch = %q, want %q", out, want)
 		}
@@ -35,6 +39,25 @@ func TestWebfetchHTML(t *testing.T) {
 		if strings.Contains(out, nope) {
 			t.Fatalf("html fetch = %q, must not contain %q", out, nope)
 		}
+	}
+}
+
+func TestWebfetchFormatText(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<h1>Example Domain</h1><p>plain words</p>`)
+	}))
+	defer srv.Close()
+	e := &Executor{Root: t.TempDir(), HTTPClient: noProxyClient()}
+	out, err := e.Webfetch(context.Background(), WebfetchArgs{URL: srv.URL, Format: "text"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "Example Domain\n\nplain words" {
+		t.Fatalf("text fetch = %q", out)
+	}
+	if _, err := e.Webfetch(context.Background(), WebfetchArgs{URL: srv.URL, Format: "yaml"}); err == nil {
+		t.Fatal("unknown format should error")
 	}
 }
 
@@ -108,6 +131,9 @@ func TestWebfetchErrors(t *testing.T) {
 }
 
 func TestWebfetchCapsOversize(t *testing.T) {
+	// 100 KiB of plain text is no longer cut at the 64 KiB fetch
+	// cap: the cap now applies after conversion, as 30k-character
+	// pages, and offset reads on through the rest.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprint(w, strings.Repeat("a", 100<<10))
@@ -118,8 +144,147 @@ func TestWebfetchCapsOversize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) > MaxWebfetchBytes+100 || !strings.Contains(out, "[truncated") {
-		t.Fatalf("oversize fetch len = %d, want the cap + marker", len(out))
+	if !strings.Contains(out, "[showing characters 0-30000 of 102400; use offset=30000 to read on]") {
+		t.Fatalf("oversize fetch = %q..., want the paging footer", out[:120])
+	}
+	if got := len([]rune(out)); got > MaxWebfetchPageChars+200 {
+		t.Fatalf("oversize fetch len = %d, want one page + footer", got)
+	}
+}
+
+func TestWebfetchPaging(t *testing.T) {
+	body := strings.Repeat("0123456789", 7000) // 70,000 chars
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, body)
+	}))
+	defer srv.Close()
+	e := &Executor{Root: t.TempDir(), HTTPClient: noProxyClient()}
+	strip := func(s string) string {
+		if i := strings.Index(s, "\n[showing"); i >= 0 {
+			return s[:i]
+		}
+		return s
+	}
+	var got strings.Builder
+	for _, off := range []int{0, 30000, 60000} {
+		out, err := e.Webfetch(context.Background(), WebfetchArgs{URL: srv.URL, Offset: off})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got.WriteString(strip(out))
+	}
+	if got.String() != body {
+		t.Fatalf("paged fetch reassembled %d chars, want %d", got.Len(), len(body))
+	}
+	if _, err := e.Webfetch(context.Background(), WebfetchArgs{URL: srv.URL, Offset: 70000}); err == nil || !strings.Contains(err.Error(), "past the end") {
+		t.Fatalf("offset past end err = %v", err)
+	}
+	if _, err := e.Webfetch(context.Background(), WebfetchArgs{URL: srv.URL, Offset: -1}); err == nil {
+		t.Fatal("negative offset should error")
+	}
+}
+
+func TestWebfetchFetchCap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, strings.Repeat("a", MaxWebfetchBytes+1024))
+	}))
+	defer srv.Close()
+	e := &Executor{Root: t.TempDir(), HTTPClient: noProxyClient()}
+	out, err := e.Webfetch(context.Background(), WebfetchArgs{URL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "[truncated: fetched page exceeded 5 MiB") {
+		t.Fatalf("fetch-cap fetch = %q..., want the fetch truncation marker", out[len(out)-200:])
+	}
+}
+
+func TestWebfetchCache(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "cached body")
+	}))
+	defer srv.Close()
+	e := &Executor{Root: t.TempDir(), HTTPClient: noProxyClient()}
+	for i := 0; i < 2; i++ {
+		out, err := e.Webfetch(context.Background(), WebfetchArgs{URL: srv.URL})
+		if err != nil || out != "cached body" {
+			t.Fatalf("fetch %d = %q, err %v", i, out, err)
+		}
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("server hits = %d, want 1 (second fetch is cached)", hits.Load())
+	}
+	// A different format is a different cache entry.
+	if _, err := e.Webfetch(context.Background(), WebfetchArgs{URL: srv.URL, Format: "text"}); err != nil {
+		t.Fatal(err)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("server hits = %d, want 2 after a format=text fetch", hits.Load())
+	}
+	// The cache is per-executor: a new executor re-downloads.
+	e2 := &Executor{Root: t.TempDir(), HTTPClient: noProxyClient()}
+	if _, err := e2.Webfetch(context.Background(), WebfetchArgs{URL: srv.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if hits.Load() != 3 {
+		t.Fatalf("server hits = %d, want 3 after a new executor fetches", hits.Load())
+	}
+}
+
+func TestWebfetchCrossHostRedirect(t *testing.T) {
+	var targetHits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		fmt.Fprint(w, "secret target")
+	}))
+	defer target.Close()
+	// Redirect to the same port on a different hostname: localhost
+	// vs the 127.0.0.1 the test server listens on.
+	u, _ := url.Parse(target.URL)
+	redirectTo := "http://localhost:" + u.Port() + "/target"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectTo, http.StatusFound)
+	}))
+	defer srv.Close()
+	e := &Executor{Root: t.TempDir(), HTTPClient: noProxyClient()}
+	out, err := e.Webfetch(context.Background(), WebfetchArgs{URL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Redirect to "+redirectTo+" not followed") {
+		t.Fatalf("cross-host redirect = %q, want the not-followed report", out)
+	}
+	if targetHits.Load() != 0 {
+		t.Fatalf("redirect target was hit %d times, want 0", targetHits.Load())
+	}
+}
+
+func TestWebfetchRefusesMetadataIP(t *testing.T) {
+	e := &Executor{Root: t.TempDir(), HTTPClient: noProxyClient()}
+	// The metadata endpoint must be refused before any network use:
+	// no server is listening there, so any other error would mean
+	// the check did not run.
+	_, err := e.Webfetch(context.Background(), WebfetchArgs{URL: "http://169.254.169.254/latest/meta-data/"})
+	if err == nil || !strings.Contains(err.Error(), "non-public address") {
+		t.Fatalf("metadata fetch err = %v, want a non-public-address refusal", err)
+	}
+}
+
+func TestWebfetchTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(3 * time.Second)
+		fmt.Fprint(w, "too slow")
+	}))
+	defer srv.Close()
+	e := &Executor{Root: t.TempDir(), HTTPClient: noProxyClient()}
+	_, err := e.Webfetch(context.Background(), WebfetchArgs{URL: srv.URL, Timeout: 1})
+	if err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatalf("slow fetch err = %v, want a deadline error", err)
 	}
 }
 

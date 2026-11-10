@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -57,9 +58,23 @@ type Executor struct {
 	// HTTPClient is the client webfetch uses (nil = a default client
 	// with the same timeout). Tests set it to reach a local server.
 	HTTPClient *http.Client
+	// LookupIP resolves hosts for webfetch's SSRF check (nil = the
+	// system resolver). Tests inject a fake.
+	LookupIP func(ctx context.Context, host string) ([]net.IP, error)
 
 	jobsMu sync.Mutex
 	jobs   *JobRegistry
+
+	cacheOnce  sync.Once
+	fetchCache *webfetchCache
+}
+
+// webfetchCache returns the executor's page cache, creating it on
+// first use. The cache is per-executor (per run), never shared
+// between tests or runs.
+func (e *Executor) webfetchCache() *webfetchCache {
+	e.cacheOnce.Do(func() { e.fetchCache = &webfetchCache{entries: map[string]*webfetchCacheEntry{}} })
+	return e.fetchCache
 }
 
 func (e *Executor) audit(entry AuditEntry) {

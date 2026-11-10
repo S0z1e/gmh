@@ -57,6 +57,12 @@ What is enforced:
 - Every approval decision, every bash run (with exit code), and every
   denial is written to `<session>-audit.jsonl` next to the session
   transcript, for later review.
+- webfetch refuses private, loopback (except localhost, kept for the
+  user's own dev servers), link-local and cloud-metadata addresses
+  before any network use, and never follows a redirect to another
+  host — it reports the target instead. It returns Markdown by
+  default, in 30,000-character pages (`offset` pages on), and caches
+  a fetched page for 15 minutes.
 - `--sandbox` (also `HARNESS_SANDBOX=1` or config `sandbox`) runs bash
   calls under bwrap (bubblewrap, Linux only): the filesystem outside
   the workspace is hidden behind a fresh tmpfs root, then only /usr
@@ -133,7 +139,9 @@ internal/tools/image.go  // LoadImage: workspace jail, type/size caps, dimension
 internal/agent/loop.go   // single loop: LLM -> tool -> observe -> repeat
 internal/tools/tools.go  // read/write/edit/bash, workspace-root jail, timeout
 internal/tools/sandbox.go  // --sandbox: bwrap invocation + probe
-internal/tools/webfetch.go  // webfetch tool: http(s) fetch, HTML to text, 64 KiB cap
+internal/tools/webfetch.go  // webfetch tool: http(s) fetch, HTML to Markdown, 30k-char pages, 15-min cache
+internal/tools/html2md.go   // hand-written stdlib HTML to Markdown (tokenizer + rule table, no new dep)
+internal/tools/ssrf.go      // webfetch SSRF guard: public-IP check, cross-host redirect refusal
 internal/tools/grep.go   // grep tool (ripgrep backend, grep -r fallback, match cap + truncation, match count)
 internal/tools/glob.go   // glob tool (rg --files backend, WalkDir fallback, limit + truncation, file count)
 internal/session/session.go // JSONL append + resume
