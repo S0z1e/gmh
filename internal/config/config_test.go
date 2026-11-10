@@ -247,6 +247,38 @@ func TestMergeModelsReplacesList(t *testing.T) {
 	}
 }
 
+func TestEffortResolveAndNormalize(t *testing.T) {
+	p := write(t, t.TempDir(), "c.json", `{
+		"providers": {
+			"discovery": {
+				"baseUrl": "https://example.com",
+				"models": [
+					{"id": "a", "effort": "High"},
+					{"id": "b", "effort": "low"},
+					{"id": "c"}
+				]
+			}
+		}
+	}`)
+	f, err := LoadExplicit(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov := f.Providers["discovery"]
+	m, _ := prov.ResolveModel("a")
+	if m.Effort != "high" {
+		t.Fatalf("effort = %q, want high (normalised to lowercase)", m.Effort)
+	}
+	m, _ = prov.ResolveModel("b")
+	if m.Effort != "low" {
+		t.Fatalf("effort = %q, want low", m.Effort)
+	}
+	m, _ = prov.ResolveModel("c")
+	if m.Effort != "" {
+		t.Fatalf("effort = %q, want empty", m.Effort)
+	}
+}
+
 func TestValidateModelsAndCost(t *testing.T) {
 	bad := []string{
 		// Model without an id.
@@ -258,6 +290,8 @@ func TestValidateModelsAndCost(t *testing.T) {
 		`{"providers": {"x": {"baseUrl": "https://example.com", "models": [{"id": "m", "maxTokens": -5}]}}}`,
 		// Bad input modality.
 		`{"providers": {"x": {"baseUrl": "https://example.com", "models": [{"id": "m", "input": ["audio"]}]}}}`,
+		// Bad effort level.
+		`{"providers": {"x": {"baseUrl": "https://example.com", "models": [{"id": "m", "effort": "ultra"}]}}}`,
 		// Cost with a missing rate.
 		`{"providers": {"x": {"baseUrl": "https://example.com", "models": [{"id": "m", "cost": {"input": 0.2, "output": 0.8, "cacheRead": 0.05}}]}}}`,
 		// Cost with a negative rate.

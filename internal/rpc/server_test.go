@@ -103,7 +103,15 @@ type driver struct {
 	t      *testing.T
 	inW    *io.PipeWriter
 	events chan map[string]any
-	done   chan error
+	// pending holds events a waitFor read ahead of the wait that
+	// asked for them. The server's reader goroutine (responses)
+	// and agent goroutine (turn events) write protocol lines
+	// concurrently, so a prompt's response and its turn_started can
+	// arrive in either order — and dropping the early one strands
+	// the later wait for it until it times out. A wait must never
+	// lose an event it did not ask for.
+	pending []map[string]any
+	done    chan error
 }
 
 func startDriver(t *testing.T, a *app.App, runner *app.Runner) *driver {
@@ -168,11 +176,25 @@ func (d *driver) next(timeout time.Duration) map[string]any {
 	}
 }
 
-// waitFor drains events until one of the given type arrives.
+// waitFor drains events until one of the given type arrives. Events
+// of other types are kept in d.pending for a later wait instead of
+// dropped: the server's reader goroutine (responses) and agent
+// goroutine (turn events) write concurrently, so a prompt's
+// response and its turn_started arrive in either order, and
+// dropping the early one strands the wait for it. The backlog is
+// searched for the wanted type first, so a wait never spins on an
+// event it does not want; the backlog stays FIFO, so the order
+// tests assert on (first tool, first settled) is preserved.
 func (d *driver) waitFor(typ string, timeout time.Duration) map[string]any {
 	d.t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
+		for i, rec := range d.pending {
+			if rec["type"] == typ {
+				d.pending = append(d.pending[:i], d.pending[i+1:]...)
+				return rec
+			}
+		}
 		rest := time.Until(deadline)
 		if rest <= 0 {
 			d.t.Fatalf("timed out waiting for event type %q", typ)
@@ -181,6 +203,7 @@ func (d *driver) waitFor(typ string, timeout time.Duration) map[string]any {
 		if rec["type"] == typ {
 			return rec
 		}
+		d.pending = append(d.pending, rec)
 	}
 }
 
@@ -227,6 +250,34 @@ func (d *driver) quit(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not exit after quit")
+	}
+}
+
+// The driver must not lose an event that arrives before the wait
+// asking for it: the server's reader and agent goroutines write
+// concurrently, so a prompt's turn_started can precede its
+// response, and the response wait must keep it for the
+// turn_started wait instead of dropping it. Same-type events still
+// come back in arrival order.
+func TestWaitForReplaysEarlyEvents(t *testing.T) {
+	d := &driver{t: t, events: make(chan map[string]any, 10), done: make(chan error, 1)}
+	d.events <- map[string]any{"type": "turn_started", "text": "task"}
+	d.events <- map[string]any{"type": "response", "id": "p1"}
+	resp := d.waitFor("response", 5*time.Second)
+	if resp["id"] != "p1" {
+		t.Fatalf("response = %v, want id p1", resp)
+	}
+	ev := d.waitFor("turn_started", 5*time.Second)
+	if ev["text"] != "task" {
+		t.Fatalf("turn_started = %v, want the early event replayed", ev)
+	}
+	d.events <- map[string]any{"type": "tool_start", "tool": "read"}
+	d.events <- map[string]any{"type": "tool_start", "tool": "write"}
+	if ev := d.waitFor("tool_start", 5*time.Second); ev["tool"] != "read" {
+		t.Fatalf("first tool_start = %v, want read", ev["tool"])
+	}
+	if ev := d.waitFor("tool_start", 5*time.Second); ev["tool"] != "write" {
+		t.Fatalf("second tool_start = %v, want write", ev["tool"])
 	}
 }
 

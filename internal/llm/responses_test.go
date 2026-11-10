@@ -219,3 +219,33 @@ func TestResponsesMergesSamplingParamsAndMaxOutputTokens(t *testing.T) {
 		t.Fatalf("max_output_tokens = %v, want 16384", body["max_output_tokens"])
 	}
 }
+
+func TestResponsesSendsReasoningEffort(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}\n\n")
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "responses", Effort: "medium"}
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, ok := body["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "medium" {
+		t.Fatalf("reasoning = %v, want {effort: medium}: %+v", body["reasoning"], body)
+	}
+
+	// Unset effort omits the field entirely.
+	body = nil
+	c.Effort = ""
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["reasoning"]; ok {
+		t.Fatalf("reasoning must be absent without effort: %+v", body)
+	}
+}

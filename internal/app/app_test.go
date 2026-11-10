@@ -110,7 +110,7 @@ func TestSetupResolvesModelsArray(t *testing.T) {
 				"apiKey": "$DISC_TEST_KEY",
 				"headers": {"X-Prov": "d1"},
 				"models": [
-					{"id": "Agents-A1", "reasoning": true, "contextWindow": 1000000, "maxTokens": 16384, "samplingParams": {"temperature": 0.7}, "headers": {"X-Model": "$MODEL_HDR"}},
+					{"id": "Agents-A1", "reasoning": true, "effort": "high", "contextWindow": 1000000, "maxTokens": 16384, "samplingParams": {"temperature": 0.7}, "headers": {"X-Model": "$MODEL_HDR"}},
 					{"id": "deepseek-v4-flash-0731", "api": "openai-completions", "contextWindow": 256000, "maxTokens": 8192}
 				]
 			},
@@ -144,6 +144,9 @@ func TestSetupResolvesModelsArray(t *testing.T) {
 	}
 	if c.SamplingParams["temperature"] != 0.7 {
 		t.Fatalf("samplingParams = %v", c.SamplingParams)
+	}
+	if c.Effort != "high" || a.Model.Effort != "high" {
+		t.Fatalf("effort = client %q model %q, want high", c.Effort, a.Model.Effort)
 	}
 	if !a.Model.Reasoning || len(a.Model.Input) != 1 || a.Model.Input[0] != "text" {
 		t.Fatalf("resolved model = %+v", a.Model)

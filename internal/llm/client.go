@@ -86,6 +86,9 @@ type chatRequest struct {
 	StreamOptions *streamOptions    `json:"stream_options,omitempty"`
 	// MaxTokens caps the reply (max_tokens). 0 omits the field.
 	MaxTokens *int `json:"max_tokens,omitempty"`
+	// ReasoningEffort is how hard a reasoning model thinks
+	// (low/medium/high). Empty omits the field.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 // streamOptions requests token usage in the final SSE chunk. Without
@@ -134,6 +137,15 @@ type responsesRequest struct {
 	Store        bool            `json:"store"` // false: stateless, we resend full input (JSONL is the store)
 	// MaxOutputTokens caps the reply. 0 omits the field.
 	MaxOutputTokens *int `json:"max_output_tokens,omitempty"`
+	// Reasoning carries the effort level for a reasoning model.
+	// Nil omits the field.
+	Reasoning *reasoningParams `json:"reasoning,omitempty"`
+}
+
+// reasoningParams is the Responses API's reasoning object: only
+// the effort level, nothing else.
+type reasoningParams struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type responsesUsage struct {
@@ -192,6 +204,13 @@ type Client struct {
 	// APIs. Structural keys (model, messages, tools, stream, ...) are
 	// never overridden by it.
 	SamplingParams map[string]any
+	// Effort is how hard a reasoning model thinks: low, medium or
+	// high ("": the provider default). Chat sends it as
+	// reasoning_effort, responses as reasoning.effort, anthropic as
+	// a thinking budget derived from MaxTokens (see
+	// effortThinkingBudget). A model that does not reason ignores
+	// it.
+	Effort string
 	// Headers are extra request headers from the config file
 	// (provider + model). Authorization, Content-Type, Accept and
 	// x-api-key are never taken from here: auth is the client's job.
@@ -354,10 +373,22 @@ func mergeSamplingParams(body []byte, params map[string]any) ([]byte, error) {
 	return json.Marshal(m)
 }
 
+// reasoningForEffort builds the Responses API's reasoning object
+// for an effort level, or nil when no effort is set.
+func reasoningForEffort(effort string) *reasoningParams {
+	if effort == "" {
+		return nil
+	}
+	return &reasoningParams{Effort: effort}
+}
+
 func (c *Client) streamChat(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage)) error {
 	req := chatRequest{Model: c.Model, Messages: toChatWireMessages(messages), Tools: tools, Stream: true, StreamOptions: &streamOptions{IncludeUsage: true}}
 	if c.MaxTokens > 0 {
 		req.MaxTokens = &c.MaxTokens
+	}
+	if c.Effort != "" {
+		req.ReasoningEffort = c.Effort
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -533,6 +564,7 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 		Model: c.Model, Instructions: instructions, Input: input,
 		Tools: rtools, Stream: true, Store: false,
 		MaxOutputTokens: maxOutputTokensPtr(c.MaxTokens),
+		Reasoning:       reasoningForEffort(c.Effort),
 	})
 	if err != nil {
 		return err

@@ -86,6 +86,15 @@ type Server struct {
 	mu    sync.Mutex // guards out + state
 	state serverState
 
+	// outstanding counts prompts the reader has enqueued but the
+	// agent has not settled yet (running or still queued). The reader
+	// increments it on a successful prompt enqueue and the agent
+	// decrements it when the turn settles, when clear_queue drops the
+	// prompt, or when shutdown drops it. disposition() reads it, so a
+	// prompt's started/queued answer never depends on the agent
+	// goroutine having been scheduled yet (see handlePrompt).
+	outstanding int
+
 	work   chan workItem
 	workMu sync.Mutex // serialises enqueue vs close(work)
 	closed bool
@@ -218,8 +227,20 @@ func (s *Server) handlePrompt(req Request) {
 		s.enqueue(ctrl, workControl)
 		return
 	}
+	// Snapshot the disposition before enqueueing, then count this
+	// prompt as outstanding on a successful enqueue. The snapshot is
+	// exact because outstanding already counts every prompt enqueued
+	// ahead of this one: the reader maintains it synchronously, so it
+	// never depends on the agent goroutine having been scheduled to
+	// pick the previous prompt up (a turn already running is counted
+	// even before its turn_started event). Snapshot after the enqueue
+	// would be wrong both ways: the agent may not have set streaming
+	// yet (this prompt reads "queued") or may already have (it reads
+	// "started" for a turn that did start at once).
+	disposition := s.disposition()
 	if s.enqueue(req, workPrompt) {
-		s.respond(req, map[string]any{"disposition": s.disposition()}, nil)
+		s.addOutstanding(1)
+		s.respond(req, map[string]any{"disposition": disposition}, nil)
 	}
 }
 
@@ -256,12 +277,22 @@ func slashRequest(line string) (typ, arg string) {
 
 func (s *Server) disposition() string {
 	s.mu.Lock()
-	streaming := s.state.streaming
+	outstanding := s.outstanding
 	s.mu.Unlock()
-	if streaming || len(s.work) > 0 {
+	if outstanding > 0 || len(s.work) > 0 {
 		return "queued"
 	}
 	return "started"
+}
+
+// addOutstanding adjusts the count of prompts enqueued but not yet
+// settled. Called by the reader (+1 on a successful prompt enqueue)
+// and by the agent (-1 when a turn settles or a queued prompt is
+// dropped, -cleared when clear_queue drains prompts).
+func (s *Server) addOutstanding(delta int) {
+	s.mu.Lock()
+	s.outstanding += delta
+	s.mu.Unlock()
 }
 
 // enqueue puts a work item on the agent goroutine's queue. It
@@ -468,6 +499,11 @@ func (s *Server) onEvent(ev agent.Event) {
 func (s *Server) agentLoop() {
 	for item := range s.work {
 		if s.isDone() {
+			// A prompt dropped at shutdown never settles, so it
+			// leaves the outstanding count here instead.
+			if item.kind == workPrompt {
+				s.addOutstanding(-1)
+			}
 			continue
 		}
 		switch item.kind {
@@ -550,6 +586,7 @@ func (s *Server) runTurn(req Request) {
 	if err != nil {
 		settled.Error = err.Error()
 	}
+	s.addOutstanding(-1)
 	s.writeEvent(settled)
 }
 
@@ -632,7 +669,11 @@ func (s *Server) doControl(req Request) {
 		s.respond(req, map[string]any{"ok": true}, nil)
 		s.shutdown()
 	case "clear_queue":
-		s.respond(req, map[string]any{"cleared": s.drainPrompts()}, nil)
+		cleared := s.drainPrompts()
+		// Drained prompts never settle, so they leave the
+		// outstanding count here instead of in runTurn.
+		s.addOutstanding(-cleared)
+		s.respond(req, map[string]any{"cleared": cleared}, nil)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown control request %q", req.Type))
 	}

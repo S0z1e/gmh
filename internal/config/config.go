@@ -106,7 +106,15 @@ type Model struct {
 	// Reasoning reports whether the model supports thinking
 	// (Pi default false). The harness already handles reasoning
 	// content generically; this is metadata for now.
-	Reasoning      bool              `json:"reasoning"`
+	Reasoning bool `json:"reasoning"`
+	// Effort is how hard a reasoning model thinks: low, medium or
+	// high ("": the provider default). It is sent per API shape —
+	// chat: reasoning_effort, responses: reasoning.effort,
+	// anthropic: thinking with a budget of maxTokens/16, /4 or /2
+	// (at least 1024 tokens, always below maxTokens). A model that
+	// does not reason ignores it; a non-reasoning model should
+	// leave it unset.
+	Effort         string            `json:"effort"`
 	ContextWindow  *int              `json:"contextWindow"`
 	MaxTokens      *int              `json:"maxTokens"`
 	SamplingParams map[string]any    `json:"samplingParams"`
@@ -402,6 +410,19 @@ func NormalizeAPI(api string) (string, error) {
 	return "", fmt.Errorf("api %q is not supported: use chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages", api)
 }
 
+// normalizeEffort lowercases a reasoning-effort level and rejects
+// anything outside low/medium/high ("": unset, the provider
+// default).
+func normalizeEffort(effort string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "":
+		return "", nil
+	case "low", "medium", "high":
+		return strings.ToLower(strings.TrimSpace(effort)), nil
+	}
+	return "", fmt.Errorf("effort %q: use low, medium or high", effort)
+}
+
 // ResolveModel picks the model for a provider and merges the entry
 // over the provider's flat fields. id "" means "the default": the
 // provider's flat model, else the first models entry. When the
@@ -444,6 +465,11 @@ func (p Provider) ResolveModel(id string) (Model, bool) {
 			m.BaseURL = e.BaseURL
 		}
 		m.Reasoning = e.Reasoning
+		if eff, err := normalizeEffort(e.Effort); err == nil {
+			m.Effort = eff
+		} else {
+			m.Effort = e.Effort
+		}
 		m.ContextWindow = e.ContextWindow
 		m.MaxTokens = e.MaxTokens
 		m.SamplingParams = e.SamplingParams
@@ -570,6 +596,9 @@ func validateModel(provider string, m Model) error {
 	}
 	if m.ContextWindow != nil && *m.ContextWindow <= 0 {
 		return fmt.Errorf("provider %q model %q: contextWindow must be > 0", provider, m.ID)
+	}
+	if _, err := normalizeEffort(m.Effort); err != nil {
+		return fmt.Errorf("provider %q model %q: %w", provider, m.ID, err)
 	}
 	if m.MaxTokens != nil && *m.MaxTokens <= 0 {
 		return fmt.Errorf("provider %q model %q: maxTokens must be > 0", provider, m.ID)

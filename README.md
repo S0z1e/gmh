@@ -315,7 +315,7 @@ Each `models` entry's only required field is `id`. The rest is
 optional, with Pi defaults: `contextWindow` 128000 (drives the
 compact trigger), `maxTokens` 16384, `reasoning` false,
 `input` `["text"]`. The rest has no default: `name`, `api` and
-`baseUrl` (override the provider's), `samplingParams`, `headers`.
+`baseUrl` (override the provider's), `effort`, `samplingParams`, `headers`.
 `api` accepts Pi spellings and the harness short names:
 `openai-completions` = `chat`, `openai-responses` = `responses`,
 `anthropic-messages` = `anthropic`; `google-generative-ai` is
@@ -330,7 +330,18 @@ When a provider sets no `apiKey`, `OPENAI_API_KEY` is used.
 `samplingParams` (e.g. `temperature`, `top_p`) is merged into every
 request body of the two OpenAI modes only — Pi's rule; Anthropic
 ignores it. Structural keys (`model`, `messages`, `tools`, `stream`,
-`max_tokens`, …) are never overridden by it. `maxTokens` is sent by
+`max_tokens`, …) are never overridden by it.
+
+`effort` (`low`, `medium` or `high`; empty means the provider
+default) is how hard a reasoning model thinks, sent per API shape:
+chat sends `reasoning_effort`, responses sends
+`reasoning: {"effort": ...}`, and Anthropic sends
+`thinking: {"type": "enabled", "budget_tokens": ...}` with a budget
+of maxTokens/16, /4 or /2 (at least 1024 tokens, always below
+maxTokens — with the default maxTokens of 16384 that is 1024, 4096
+or 8192). A model that does not reason ignores it. `effort` is
+per-model, so switching models with `/model` (or RPC `set_model`)
+carries each model's own effort. `maxTokens` is sent by
 all three modes (chat: `max_tokens`, responses: `max_output_tokens`,
 anthropic: `max_tokens`). `cost` (USD per million tokens, all four
 rates required when present, plus optional `tiers`) is parsed and

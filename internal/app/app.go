@@ -335,7 +335,7 @@ func Setup(p Params) (*App, error) {
 	a.Config = cfg
 	a.Provider = provName
 	a.Cfg = &agent.Config{
-		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers},
+		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort},
 		Exec:                executor,
 		Tools:               agent.ToolDefs(),
 		System:              system,
@@ -586,7 +586,7 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 	if contextLimit <= 0 {
 		contextLimit = config.DefaultContextWindow
 	}
-	a.Cfg.Client = &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers}
+	a.Cfg.Client = &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort}
 	a.Cfg.Exec.ImageInput = slices.Contains(mdl.Input, "image")
 	a.Model = mdl
 	a.Provider = provName

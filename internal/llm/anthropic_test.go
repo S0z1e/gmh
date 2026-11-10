@@ -321,3 +321,60 @@ func TestAnthropicIgnoresSamplingParams(t *testing.T) {
 		t.Fatalf("max_tokens = %v, want 16384", body["max_tokens"])
 	}
 }
+
+func TestAnthropicSendsThinkingBudget(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":1,\"cache_read_input_tokens\":0,\"output_tokens\":0}}}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "anthropic", MaxTokens: 16384, Effort: "high"}
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+		t.Fatal(err)
+	}
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok || thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(8192) {
+		t.Fatalf("thinking = %v, want {type: enabled, budget_tokens: 8192}: %+v", body["thinking"], body)
+	}
+
+	// Unset effort omits the field entirely.
+	body = nil
+	c.Effort = ""
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["thinking"]; ok {
+		t.Fatalf("thinking must be absent without effort: %+v", body)
+	}
+}
+
+func TestEffortThinkingBudget(t *testing.T) {
+	cases := []struct {
+		effort    string
+		maxTokens int
+		want      int
+	}{
+		{"low", 16384, 1024},
+		{"medium", 16384, 4096},
+		{"high", 16384, 8192},
+		{"low", 100000, 6250},
+		{"medium", 100000, 25000},
+		{"high", 100000, 50000},
+		{"low", 2048, 1024},  // floor: 2048/16 = 128 < 1024
+		{"high", 2048, 1024}, // 2048/2 = 1024, still below maxTokens
+		{"low", 1024, 1023},  // degenerate: floor 1024 then capped below maxTokens
+		{"", 16384, 0},
+		{"ultra", 16384, 0},
+	}
+	for _, tc := range cases {
+		if got := effortThinkingBudget(tc.effort, tc.maxTokens); got != tc.want {
+			t.Fatalf("effortThinkingBudget(%q, %d) = %d, want %d", tc.effort, tc.maxTokens, got, tc.want)
+		}
+	}
+}

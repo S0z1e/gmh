@@ -145,6 +145,36 @@ func TestStreamChatMergesSamplingParamsAndMaxTokens(t *testing.T) {
 	}
 }
 
+func TestStreamChatSendsReasoningEffort(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", Effort: "high"}
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+		t.Fatal(err)
+	}
+	if body["reasoning_effort"] != "high" {
+		t.Fatalf("reasoning_effort = %v, want high: %+v", body["reasoning_effort"], body)
+	}
+
+	// Unset effort omits the field entirely.
+	body = nil
+	c.Effort = ""
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["reasoning_effort"]; ok {
+		t.Fatalf("reasoning_effort must be absent without effort: %+v", body)
+	}
+}
+
 // Config headers are sent; auth and framing headers are never taken
 // from the config, or a stray Authorization would replace the real key.
 func TestStreamChatSendsConfigHeaders(t *testing.T) {

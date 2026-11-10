@@ -77,6 +77,46 @@ type anthropicRequest struct {
 	Messages  []anthropicMessage `json:"messages"`
 	Tools     []anthropicTool    `json:"tools,omitempty"`
 	Stream    bool               `json:"stream"`
+	// Thinking enables extended thinking with a token budget.
+	// Nil omits the field (the provider default).
+	Thinking *anthropicThinking `json:"thinking,omitempty"`
+}
+
+// anthropicThinking is the Messages API's thinking object.
+type anthropicThinking struct {
+	Type         string `json:"type"` // "enabled"
+	BudgetTokens int    `json:"budget_tokens"`
+}
+
+// effortThinkingBudget maps a reasoning-effort level to an
+// Anthropic thinking budget: a share of the output budget — low
+// 1/16, medium 1/4, high 1/2 — because Anthropic has no
+// low/medium/high knob, only a token budget, and the budget must
+// stay below max_tokens (Anthropic's own rule). The floor is
+// Anthropic's minimum of 1024 thinking tokens. With the default
+// maxTokens of 16384 that is low 1024, medium 4096, high 8192.
+// A maxTokens at or below 1024 cannot satisfy both the floor and
+// the below-maxTokens rule; the budget then lands just under
+// maxTokens and the provider returns a clear error.
+func effortThinkingBudget(effort string, maxTokens int) int {
+	var share int
+	switch effort {
+	case "low":
+		share = maxTokens / 16
+	case "medium":
+		share = maxTokens / 4
+	case "high":
+		share = maxTokens / 2
+	default:
+		return 0
+	}
+	if share < 1024 {
+		share = 1024
+	}
+	if share >= maxTokens {
+		share = maxTokens - 1
+	}
+	return share
 }
 
 // anthropicEvent is the common envelope for Messages SSE events.
@@ -197,10 +237,14 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 	if maxTokens <= 0 {
 		maxTokens = defaultAnthropicMaxTokens
 	}
-	body, err := json.Marshal(anthropicRequest{
+	anthReq := anthropicRequest{
 		Model: c.Model, MaxTokens: maxTokens, System: system,
 		Messages: anthMsgs, Tools: atools, Stream: true,
-	})
+	}
+	if c.Effort != "" {
+		anthReq.Thinking = &anthropicThinking{Type: "enabled", BudgetTokens: effortThinkingBudget(c.Effort, maxTokens)}
+	}
+	body, err := json.Marshal(anthReq)
 	if err != nil {
 		return err
 	}
