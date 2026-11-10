@@ -3,10 +3,12 @@ package tools
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -272,6 +274,100 @@ func TestWebfetchRefusesMetadataIP(t *testing.T) {
 	_, err := e.Webfetch(context.Background(), WebfetchArgs{URL: "http://169.254.169.254/latest/meta-data/"})
 	if err == nil || !strings.Contains(err.Error(), "non-public address") {
 		t.Fatalf("metadata fetch err = %v, want a non-public-address refusal", err)
+	}
+}
+
+func TestWebfetchPinnedDialUsesValidatedIP(t *testing.T) {
+	// Whole-chain test: a fake hostname whose only address (via the
+	// injected resolver) is a public IP. The transport's own dialer
+	// records the address it is asked to dial and redirects the
+	// connection to the local test server, so the test proves the
+	// dial used the validated IP, not the hostname — without any
+	// real DNS or any real connection to that IP.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "pinned ok")
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	_, port, _ := net.SplitHostPort(u.Host)
+	var mu sync.Mutex
+	var dialed []string
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		d := &net.Dialer{}
+		return d.DialContext(ctx, network, "127.0.0.1:"+port)
+	}
+	tr := &http.Transport{Proxy: nil, DialContext: baseDial}
+	e := &Executor{Root: t.TempDir(), HTTPClient: &http.Client{Transport: tr}}
+	e.LookupIP = func(ctx context.Context, host string) ([]net.IP, error) {
+		if host == "pinned.example" {
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		}
+		return nil, &net.DNSError{IsNotFound: true, Name: host}
+	}
+	out, err := e.Webfetch(context.Background(), WebfetchArgs{URL: "http://pinned.example/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "pinned ok" {
+		t.Fatalf("pinned fetch = %q, want %q", out, "pinned ok")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:80" {
+		t.Fatalf("dialed = %v, want [93.184.216.34:80]", dialed)
+	}
+}
+
+func TestWebfetchPinnedTLSKeepsHostname(t *testing.T) {
+	// The load-bearing property of pinning: TLS must still verify
+	// against the hostname, not the IP. The httptest TLS server's
+	// certificate is valid for "example.com" and nothing else, so
+	// if the handshake used the pinned IP as the ServerName it
+	// would fail with a certificate error. A successful fetch
+	// proves the ServerName stayed "example.com" while the socket
+	// went to the validated IP.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "tls pinned ok")
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	_, port, _ := net.SplitHostPort(u.Host)
+	var mu sync.Mutex
+	var dialed []string
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		d := &net.Dialer{}
+		return d.DialContext(ctx, network, "127.0.0.1:"+port)
+	}
+	client := srv.Client()
+	tr := client.Transport.(*http.Transport)
+	tr.Proxy = nil // no proxy: the pinned path must engage
+	tr.DialContext = baseDial
+	e := &Executor{Root: t.TempDir(), HTTPClient: client}
+	e.LookupIP = func(ctx context.Context, host string) ([]net.IP, error) {
+		if host == "example.com" {
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		}
+		return nil, &net.DNSError{IsNotFound: true, Name: host}
+	}
+	out, err := e.Webfetch(context.Background(), WebfetchArgs{URL: "https://example.com/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "tls pinned ok" {
+		t.Fatalf("pinned TLS fetch = %q, want %q", out, "tls pinned ok")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:443" {
+		t.Fatalf("dialed = %v, want [93.184.216.34:443]", dialed)
 	}
 }
 

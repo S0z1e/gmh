@@ -60,9 +60,14 @@ What is enforced:
 - webfetch refuses private, loopback (except localhost, kept for the
   user's own dev servers), link-local and cloud-metadata addresses
   before any network use, and never follows a redirect to another
-  host — it reports the target instead. It returns Markdown by
-  default, in 30,000-character pages (`offset` pages on), and caches
-  a fetched page for 15 minutes.
+  host — it reports the target instead. The connection is then
+  pinned to one of the addresses the check already validated
+  (transport-layer IP pinning), so a DNS record cannot change
+  between the check and the dial; TLS still verifies against the
+  hostname. Pinning is skipped when a proxy is in use — the proxy
+  dials the target itself. It returns Markdown by default, in
+  30,000-character pages (`offset` pages on), and caches a fetched
+  page for 15 minutes.
 - `--sandbox` (also `HARNESS_SANDBOX=1` or config `sandbox`) runs bash
   calls under bwrap (bubblewrap, Linux only): the filesystem outside
   the workspace is hidden behind a fresh tmpfs root, then only /usr
@@ -141,7 +146,7 @@ internal/tools/tools.go  // read/write/edit/bash, workspace-root jail, timeout
 internal/tools/sandbox.go  // --sandbox: bwrap invocation + probe
 internal/tools/webfetch.go  // webfetch tool: http(s) fetch, HTML to Markdown, 30k-char pages, 15-min cache
 internal/tools/html2md.go   // hand-written stdlib HTML to Markdown (tokenizer + rule table, no new dep)
-internal/tools/ssrf.go      // webfetch SSRF guard: public-IP check, cross-host redirect refusal
+internal/tools/ssrf.go      // webfetch SSRF guard: public-IP check, cross-host redirect refusal, IP pinning
 internal/tools/grep.go   // grep tool (ripgrep backend, grep -r fallback, match cap + truncation, match count)
 internal/tools/glob.go   // glob tool (rg --files backend, WalkDir fallback, limit + truncation, file count)
 internal/session/session.go // JSONL append + resume

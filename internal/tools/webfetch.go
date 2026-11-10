@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -110,10 +111,14 @@ func (c *webfetchCache) put(key string, e *webfetchCacheEntry) {
 // private, loopback, link-local and cloud-metadata addresses are
 // refused (localhost is deliberately kept, for the user's own dev
 // servers), and a redirect to another host is not followed: the
-// target is reported instead. Fetched pages are cached for 15
-// minutes, so repeated fetches and offset paging do not
-// re-download. Read-only, like read and grep: it needs no approval
-// in suggest mode.
+// target is reported instead. The connection is then pinned to one
+// of the validated addresses (transport-layer IP pinning), so a DNS
+// record cannot change between the check and the dial; TLS still
+// verifies against the hostname. Pinning is skipped when a proxy
+// is in use — the proxy dials the target itself. Fetched pages are
+// cached for 15 minutes, so repeated fetches and offset paging do
+// not re-download. Read-only, like read and grep: it needs no
+// approval in suggest mode.
 func (e *Executor) Webfetch(ctx context.Context, a WebfetchArgs) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(a.URL))
 	if err != nil || u.Scheme == "" || u.Host == "" {
@@ -145,15 +150,18 @@ func (e *Executor) Webfetch(ctx context.Context, a WebfetchArgs) (string, error)
 	if timeout <= 0 {
 		timeout = DefaultWebfetchTimeout
 	}
-	// SSRF preflight, before any network use of the URL.
-	if err := e.validateFetchHost(ctx, u.Hostname()); err != nil {
+	// SSRF preflight, before any network use of the URL. It returns
+	// the validated addresses the connection is pinned to, so the
+	// hostname is resolved exactly once.
+	ips, err := e.resolveFetchHost(ctx, u.Hostname())
+	if err != nil {
 		return "", err
 	}
 	cacheKey := u.String() + "\n" + format
 	cache := e.webfetchCache()
 	entry, hit := cache.get(cacheKey)
 	if !hit {
-		entry, err = e.fetchPage(ctx, u, format, timeout)
+		entry, err = e.fetchPage(ctx, u, format, timeout, ips)
 		if err != nil {
 			return "", err
 		}
@@ -185,8 +193,10 @@ func (e *Executor) Webfetch(ctx context.Context, a WebfetchArgs) (string, error)
 
 // fetchPage does one HTTP fetch and converts the body. It is the
 // only place that touches the network; Webfetch wraps it with the
-// cache and the paging.
-func (e *Executor) fetchPage(ctx context.Context, u *url.URL, format string, timeout time.Duration) (*webfetchCacheEntry, error) {
+// cache and the paging. ips are the addresses resolveFetchHost
+// already validated: the transport dials one of them, never the
+// hostname again.
+func (e *Executor) fetchPage(ctx context.Context, u *url.URL, format string, timeout time.Duration, ips []net.IP) (*webfetchCacheEntry, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	client := e.HTTPClient
@@ -203,6 +213,12 @@ func (e *Executor) fetchPage(ctx context.Context, u *url.URL, format string, tim
 	}
 	req.Header.Set("User-Agent", "minimalharness/1.0 (+https://github.com/S0z1e/gmh)")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	// Pin the connection to the validated addresses (no-op when the
+	// fetch is proxied or the host is a localhost name: then there
+	// is nothing to pin).
+	if rt := pinFetchTransport(c.Transport, ips, req); rt != nil {
+		c.Transport = rt
+	}
 	resp, err := c.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("webfetch %s: %w", u.String(), err)

@@ -14,7 +14,7 @@ import (
 // URL with zero user interaction. Without a guard, a fetched URL —
 // or one it redirects to — can reach the cloud metadata endpoint
 // (169.254.169.254, which hands out temporary credentials) or a
-// service on the local network. The guard has three parts:
+// service on the local network. The guard has four parts:
 //
 //  1. the host is validated before any network use: a literal
 //     non-public IP is refused, and a hostname is resolved and
@@ -26,13 +26,17 @@ import (
 //     servers live there. That is a documented choice, not an
 //     oversight — and it does not extend to the metadata address,
 //     which has no legitimate use from a dev server.
+//  4. transport-layer IP pinning (Gemini CLI's rule): the
+//     connection is dialled to one of the addresses the check
+//     already validated — a custom DialContext on a cloned
+//     transport — so a DNS record cannot change between the check
+//     and the dial (DNS rebinding). TLS still verifies against the
+//     hostname, not the IP.
 //
-// What this does NOT do: pin the validated IP to the connection
-// (Gemini CLI's transport-layer pinning). A DNS record could in
-// principle change between the check and the dial — a TOCTOU window
-// that only pinning closes. That is a known residual, not an
-// accident: pinning needs a custom DialContext and is a follow-up
-// if the user wants it.
+// Residual: pinning only applies to a direct connection. When a
+// proxy is in use the proxy dials the target itself, so there is
+// nothing to pin — the preflight check still runs, but the TOCTOU
+// window is the proxy's, not the harness's.
 
 // isLocalhostName reports whether host is a loopback name the user
 // deliberately kept fetchable: their own dev servers live here.
@@ -58,18 +62,22 @@ func isPublicIP(ip net.IP) bool {
 		!ip.IsLinkLocalMulticast() && !ip.IsUnspecified() && !ip.IsMulticast()
 }
 
-// validateFetchHost resolves host (unless it is a localhost name or
-// an IP literal) and refuses it when any resolved address is not
-// public. It runs before webfetch makes any network use of the URL.
-func (e *Executor) validateFetchHost(ctx context.Context, host string) error {
+// resolveFetchHost resolves host and returns the validated public
+// addresses the connection may be pinned to. A localhost name
+// returns nil addresses (no pinning: the loopback address is not
+// an attacker-controlled DNS answer, and the user's dev servers
+// live there). It runs before webfetch makes any network use of
+// the URL, and the returned addresses are the ones the transport
+// dials — the hostname is never resolved a second time.
+func (e *Executor) resolveFetchHost(ctx context.Context, host string) ([]net.IP, error) {
 	if isLocalhostName(host) {
-		return nil // deliberate: the user's own dev servers
+		return nil, nil // deliberate: the user's own dev servers
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		if !isPublicIP(ip) {
-			return fmt.Errorf("webfetch refuses non-public address %s", host)
+			return nil, fmt.Errorf("webfetch refuses non-public address %s", host)
 		}
-		return nil
+		return []net.IP{ip}, nil
 	}
 	lookup := e.LookupIP
 	if lookup == nil {
@@ -79,17 +87,89 @@ func (e *Executor) validateFetchHost(ctx context.Context, host string) error {
 	}
 	ips, err := lookup(ctx, host)
 	if err != nil {
-		return fmt.Errorf("webfetch cannot resolve %s: %w", host, err)
+		return nil, fmt.Errorf("webfetch cannot resolve %s: %w", host, err)
 	}
 	if len(ips) == 0 {
-		return fmt.Errorf("webfetch cannot resolve %s: no addresses", host)
+		return nil, fmt.Errorf("webfetch cannot resolve %s: no addresses", host)
 	}
 	for _, ip := range ips {
 		if !isPublicIP(ip) {
-			return fmt.Errorf("webfetch refuses %s: resolves to non-public address %s", host, ip)
+			return nil, fmt.Errorf("webfetch refuses %s: resolves to non-public address %s", host, ip)
 		}
 	}
-	return nil
+	return ips, nil
+}
+
+// dialPinned dials addr's port at one of ips, in order, instead of
+// resolving addr's hostname. The transport calls this with the
+// target's host:port; the host part is ignored on purpose — this
+// dialer is installed on a transport built for one fetch of one
+// host, so every dial it sees is for that host, and resolving the
+// hostname again would reopen the TOCTOU window the pinning
+// closes. base is the transport's own dialer, so timeouts and
+// keep-alives behave as before; only the address changes.
+func dialPinned(ctx context.Context, network, addr string, ips []net.IP, base func(context.Context, string, string) (net.Conn, error)) (net.Conn, error) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, ip := range ips {
+		conn, err := base(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	if lastErr == nil {
+		return nil, fmt.Errorf("no addresses to dial")
+	}
+	return nil, lastErr
+}
+
+// pinFetchTransport returns a RoundTripper for one fetch that dials
+// only ips, or nil when pinning does not apply. The transport is a
+// clone of base, so the caller's client is never mutated. Pinning
+// is skipped when there are no validated addresses (a localhost
+// name), when base is a custom RoundTripper rather than an
+// *http.Transport, and when the request will go through a proxy —
+// the proxy dials the target itself, so the transport never dials
+// the pinned host, and pinning the proxy's address to the target's
+// IP would break the fetch outright.
+func pinFetchTransport(base http.RoundTripper, ips []net.IP, req *http.Request) http.RoundTripper {
+	if len(ips) == 0 {
+		return nil
+	}
+	var tr *http.Transport
+	switch t := base.(type) {
+	case nil:
+		if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+			tr = dt
+		} else {
+			tr = &http.Transport{}
+		}
+	case *http.Transport:
+		tr = t
+	default:
+		return nil // a custom RoundTripper cannot be pinned
+	}
+	clone := tr.Clone()
+	if clone.Proxy != nil {
+		if proxyURL, _ := clone.Proxy(req); proxyURL != nil {
+			return nil // proxied: the proxy dials the target
+		}
+	}
+	baseDial := clone.DialContext
+	if baseDial == nil {
+		baseDial = (&net.Dialer{}).DialContext
+	}
+	clone.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dialPinned(ctx, network, addr, ips, baseDial)
+	}
+	return clone
 }
 
 // checkFetchRedirect is the http.Client policy for webfetch: a
