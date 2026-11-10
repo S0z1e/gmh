@@ -148,7 +148,7 @@ func main() {
 	}
 
 	// REPL
-	fmt.Println("Type a task, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /clear to drop context, /compact to summarise context, or /quit to exit.")
+	fmt.Println("Type a task, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /clear to drop context, /compact to summarise context, or /quit to exit.")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for {

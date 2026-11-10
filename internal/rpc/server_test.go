@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"minimalharness/internal/app"
+	"minimalharness/internal/llm"
+	"minimalharness/internal/session"
 )
 
 // fakeStep is one scripted LLM reply, mirroring /tmp/tui-shot/
@@ -566,6 +568,83 @@ func TestSetModel(t *testing.T) {
 	settled := d.waitFor("agent_settled", 10*time.Second)
 	if settled["error"] != nil {
 		t.Fatalf("turn after switch settled with error: %v", settled["error"])
+	}
+	d.quit(t)
+}
+
+// list_sessions / rename_session / resume_session, plus the slash forms.
+func TestListRenameResumeSessions(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{{kind: "text", text: "Done."}})
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+
+	// A second session on disk, with one message.
+	other, err := session.New("second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Append(llm.Message{Role: "user", Content: "task about beta"}); err != nil {
+		t.Fatal(err)
+	}
+	other.Close()
+	current := a.Store.ID
+
+	d.send(map[string]any{"id": "l1", "type": "list_sessions"})
+	resp := d.waitFor("response", 5*time.Second)
+	data, _ := resp["data"].(map[string]any)
+	rows, _ := data["sessions"].([]any)
+	if len(rows) != 2 {
+		t.Fatalf("list_sessions = %v", data)
+	}
+	seen := map[string]bool{}
+	for _, row := range rows {
+		m, _ := row.(map[string]any)
+		seen[m["id"].(string)] = m["current"].(bool)
+	}
+	if seen[current] != true || seen["second"] != false {
+		t.Fatalf("list_sessions current flags = %v", seen)
+	}
+
+	// Rename the other session, then resume it.
+	d.send(map[string]any{"id": "r1", "type": "rename_session", "name": "second", "new": "renamed"})
+	resp = d.waitFor("response", 5*time.Second)
+	data, _ = resp["data"].(map[string]any)
+	if data["renamed"] != true || data["to"] != "renamed" {
+		t.Fatalf("rename_session data = %v", data)
+	}
+	d.send(map[string]any{"id": "r2", "type": "resume_session", "session": "renamed"})
+	resp = d.waitFor("response", 5*time.Second)
+	data, _ = resp["data"].(map[string]any)
+	if data["session"] != "renamed" || data["messages"] != float64(1) {
+		t.Fatalf("resume_session data = %v", data)
+	}
+	d.send(map[string]any{"id": "g1", "type": "get_state"})
+	resp = d.waitFor("response", 5*time.Second)
+	data, _ = resp["data"].(map[string]any)
+	if data["session"] != "renamed" {
+		t.Fatalf("get_state after resume = %v", data)
+	}
+	if len(a.History) != 1 || a.History[0].Content != "task about beta" {
+		t.Fatalf("history after resume = %v", a.History)
+	}
+
+	// Errors: unknown resume, rename onto an existing id.
+	d.send(map[string]any{"id": "r3", "type": "resume_session", "session": "nope"})
+	if resp := d.waitFor("error", 5*time.Second); resp["id"] != "r3" {
+		t.Fatalf("unknown resume = %v", resp)
+	}
+	d.send(map[string]any{"id": "r4", "type": "rename_session", "name": "renamed", "new": current})
+	if resp := d.waitFor("error", 5*time.Second); resp["id"] != "r4" {
+		t.Fatalf("rename onto existing = %v", resp)
+	}
+
+	// The "/sessions" slash form lists through a prompt.
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "/sessions"})
+	resp = d.waitFor("response", 5*time.Second)
+	data, _ = resp["data"].(map[string]any)
+	rows, _ = data["sessions"].([]any)
+	if len(rows) != 2 {
+		t.Fatalf("slash /sessions = %v", data)
 	}
 	d.quit(t)
 }

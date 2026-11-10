@@ -27,6 +27,7 @@ import (
 	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
 	"minimalharness/internal/llm"
+	"minimalharness/internal/session"
 )
 
 const (
@@ -169,11 +170,11 @@ func (s *Server) handleLine(line string) {
 		s.handleApprovalResponse(req)
 	case "abort":
 		s.handleAbort(req)
-	case "get_state", "usage", "jobs":
+	case "get_state", "usage", "jobs", "list_sessions":
 		s.handleQuery(req)
 	case "prompt":
 		s.handlePrompt(req)
-	case "clear", "compact", "new_session", "skill", "quit", "clear_queue", "attach_image", "set_model":
+	case "clear", "compact", "new_session", "skill", "quit", "clear_queue", "attach_image", "set_model", "rename_session", "resume_session":
 		s.enqueue(req, workControl)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown request type %q", req.Type))
@@ -200,7 +201,16 @@ func (s *Server) handlePrompt(req Request) {
 			prov, mdl := app.SplitModelArg(arg)
 			ctrl = Request{ID: req.ID, Type: typ, Provider: prov, Model: mdl}
 		}
-		if typ == "usage" || typ == "jobs" {
+		if typ == "resume_session" {
+			ctrl = Request{ID: req.ID, Type: typ, Session: arg}
+		}
+		if typ == "rename_session" {
+			parts := strings.Fields(arg)
+			if len(parts) == 2 {
+				ctrl = Request{ID: req.ID, Type: typ, Name: parts[0], New: parts[1]}
+			}
+		}
+		if typ == "usage" || typ == "jobs" || typ == "list_sessions" {
 			// Read-only: answer at once, like the request of the same name.
 			s.handleQuery(ctrl)
 			return
@@ -233,6 +243,12 @@ func slashRequest(line string) (typ, arg string) {
 		return "attach_image", strings.TrimSpace(strings.TrimPrefix(line, "/image"))
 	case line == "/model" || strings.HasPrefix(line, "/model "):
 		return "set_model", strings.TrimSpace(strings.TrimPrefix(line, "/model"))
+	case line == "/sessions":
+		return "list_sessions", ""
+	case line == "/resume" || strings.HasPrefix(line, "/resume "):
+		return "resume_session", strings.TrimSpace(strings.TrimPrefix(line, "/resume"))
+	case line == "/rename" || strings.HasPrefix(line, "/rename "):
+		return "rename_session", strings.TrimSpace(strings.TrimPrefix(line, "/rename"))
 	default:
 		return "", ""
 	}
@@ -342,6 +358,21 @@ func (s *Server) handleQuery(req Request) {
 		s.respond(req, data, nil)
 	case "jobs":
 		s.respond(req, map[string]any{"jobs": s.jobsList()}, nil)
+	case "list_sessions":
+		list, err := session.List()
+		if err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		rows := make([]map[string]any, 0, len(list))
+		for _, info := range list {
+			rows = append(rows, map[string]any{
+				"id": info.ID, "messages": info.Messages,
+				"modified": info.Modified.Format(time.RFC3339), "preview": info.Preview,
+				"current": info.ID == s.app.Store.ID,
+			})
+		}
+		s.respond(req, map[string]any{"sessions": rows}, nil)
 	}
 }
 
@@ -522,9 +553,11 @@ func (s *Server) doControl(req Request) {
 	switch req.Type {
 	case "clear":
 		s.runner.Handle(ctx, "/clear")
+		s.refreshState()
 		s.respond(req, map[string]any{"ok": true}, nil)
 	case "compact":
 		s.runner.Handle(ctx, "/compact")
+		s.refreshState()
 		s.respond(req, map[string]any{"ok": true}, nil)
 	case "new_session":
 		id, err := s.runner.ResetSession()
@@ -532,6 +565,7 @@ func (s *Server) doControl(req Request) {
 			s.respond(req, nil, err)
 			return
 		}
+		s.refreshState()
 		s.respond(req, map[string]any{"session": id}, nil)
 	case "skill":
 		body, ok := s.findSkill(req.Name)
@@ -557,7 +591,37 @@ func (s *Server) doControl(req Request) {
 			s.respond(req, nil, err)
 			return
 		}
+		s.refreshState()
 		s.respond(req, map[string]any{"provider": provName, "model": modelID, "api": api}, nil)
+	case "rename_session":
+		if req.Name == "" || req.New == "" {
+			s.respond(req, nil, fmt.Errorf("rename_session needs {\"name\": old, \"new\": new}"))
+			return
+		}
+		var err error
+		if req.Name == s.app.Store.ID {
+			err = s.app.Store.Rename(req.New)
+		} else {
+			err = session.RenameSession(req.Name, req.New)
+		}
+		if err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		s.refreshState()
+		s.respond(req, map[string]any{"renamed": true, "from": req.Name, "to": req.New}, nil)
+	case "resume_session":
+		if req.Session == "" {
+			s.respond(req, nil, fmt.Errorf("resume_session needs {\"session\": id}"))
+			return
+		}
+		n, err := s.runner.ResumeSession(req.Session)
+		if err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		s.refreshState()
+		s.respond(req, map[string]any{"session": req.Session, "messages": n}, nil)
 	case "quit":
 		s.respond(req, map[string]any{"ok": true}, nil)
 		s.shutdown()

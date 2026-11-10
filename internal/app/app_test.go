@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"minimalharness/internal/agent"
+	"minimalharness/internal/llm"
+	"minimalharness/internal/session"
 	"minimalharness/internal/tools"
 )
 
@@ -738,5 +740,89 @@ func TestSetupLoadsProjectContext(t *testing.T) {
 	defer a.Store.Close()
 	if !strings.Contains(a.Cfg.System, "ZEBRA-7") {
 		t.Fatalf("system prompt = %q, want the AGENTS.md content", a.Cfg.System)
+	}
+}
+
+// /sessions lists, /resume switches, /rename moves (current and other).
+func TestSessionsCommand(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	root := t.TempDir()
+	writeMockProvider(t, root)
+	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	current := a.Store.ID
+
+	other, err := session.New("other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Append(llm.Message{Role: "user", Content: "task about beta"}); err != nil {
+		t.Fatal(err)
+	}
+	other.Close()
+
+	var printed []string
+	r := &Runner{App: a, Print: func(format string, args ...any) {
+		printed = append(printed, fmt.Sprintf(format, args...))
+	}}
+	// List: current marked *, other with its preview.
+	r.Handle(context.Background(), "/sessions")
+	joined := strings.Join(printed, "\n")
+	if !strings.Contains(joined, "* "+current) || !strings.Contains(joined, "other") || !strings.Contains(joined, "task about beta") {
+		t.Fatalf("/sessions = %v", printed)
+	}
+	// Resume the other session: history loads, store id follows.
+	printed = nil
+	r.Handle(context.Background(), "/resume other")
+	if a.Store.ID != "other" {
+		t.Fatalf("after /resume, store = %q", a.Store.ID)
+	}
+	if len(a.History) != 1 || a.History[0].Content != "task about beta" {
+		t.Fatalf("after /resume, history = %v", a.History)
+	}
+	if !strings.Contains(strings.Join(printed, "\n"), "Resumed session other (1 messages)") {
+		t.Fatalf("resume confirmation = %v", printed)
+	}
+	// Rename the (now current) session: the store follows.
+	printed = nil
+	r.Handle(context.Background(), "/rename other renamed")
+	if a.Store.ID != "renamed" {
+		t.Fatalf("after /rename current, store = %q", a.Store.ID)
+	}
+	if !strings.Contains(strings.Join(printed, "\n"), "Renamed session other → renamed.") {
+		t.Fatalf("rename confirmation = %v", printed)
+	}
+	// Rename a session that is not current.
+	third, err := session.New("third")
+	if err != nil {
+		t.Fatal(err)
+	}
+	third.Close()
+	printed = nil
+	r.Handle(context.Background(), "/rename third third2")
+	if _, err := os.Stat(filepath.Join(session.Dir(), "third2.jsonl")); err != nil {
+		t.Fatalf("renamed file missing: %v", err)
+	}
+	// Errors: unknown resume, rename onto an existing id, bad id.
+	for _, bad := range []string{"/resume nope", "/rename renamed third2", "/rename renamed bad/id", "/resume", "/rename renamed"} {
+		printed = nil
+		r.Handle(context.Background(), bad)
+		if !strings.Contains(strings.Join(printed, "\n"), "[error]") && !strings.Contains(strings.Join(printed, "\n"), "Usage:") {
+			t.Fatalf("%q = %v, want an error or usage line", bad, printed)
+		}
+	}
+	if a.Store.ID != "renamed" {
+		t.Fatal("failed commands moved the session")
+	}
+	// The list now shows the renamed session.
+	printed = nil
+	r.Handle(context.Background(), "/sessions")
+	joined = strings.Join(printed, "\n")
+	if !strings.Contains(joined, "* renamed") || strings.Contains(joined, " other ") {
+		t.Fatalf("/sessions after rename = %v", printed)
 	}
 }

@@ -125,6 +125,7 @@ internal/tools/webfetch.go  // webfetch tool: http(s) fetch, HTML to text, 64 Ki
 internal/tools/grep.go   // grep tool (ripgrep backend, grep -r fallback, match cap + truncation)
 internal/tools/glob.go   // glob tool (rg --files backend, WalkDir fallback, limit + truncation)
 internal/session/session.go // JSONL append + resume
+internal/session/manage.go // session list, rename, id validation
 internal/config/config.go   // JSON config file: providers, models, merge (stdlib only)
 internal/skills/skills.go  // .agents/skills/*/SKILL.md discovery, listing only
 internal/rpc/server.go     // RPC mode: JSONL over stdio for a GUI (see below)
@@ -184,7 +185,11 @@ internal/agent/prompts/system.md // lightweight system prompt, embedded
 - REPL commands: `/usage` shows session token totals, `/clear` drops
   the conversation context (a marker is written to the session file;
   `--resume` starts from the clear point, older messages stay in the
-  file). `/model` lists the configured models; `/model <provider>/<model>`
+  file). `/sessions` lists the sessions (newest first, with message
+  count and the first user message as a preview; the current one is
+  marked `*`); `/resume <id>` switches to one, `/rename <old> <new>`
+  renames one (transcript, audit sidecar and pre-compact archives
+  follow). `/model` lists the configured models; `/model <provider>/<model>`
   (or a bare model id) switches model mid-session — the client is
   rebuilt from that model's config (api, baseUrl, maxTokens,
   contextWindow, image input) and history replays through the new
@@ -348,7 +353,8 @@ echoed in the response):
   The response only means accepted; the turn ends with
   `agent_settled`. A second prompt while a turn runs is queued (cap
   64; beyond that an error). A known slash line (`/usage`, `/jobs`,
-  `/clear`, `/compact`, `/skill:<name>`, `/quit`) behaves as the
+  `/clear`, `/compact`, `/skill:<name>`, `/sessions`, `/resume <id>`,
+  `/rename <old> <new>`, `/quit`) behaves as the
   matching control request, exactly like the REPL; any other line,
   including an unknown `/foo`, is a task for the model.
 - `approval_response` `{"approval_id":"appr-1","approved":true}` →
@@ -374,6 +380,9 @@ echoed in the response):
 - `skill` `{"name":"..."}` → `{"loaded":true,"bytes":N}`.
 - `attach_image` `{"path":"..."}` → `{"attached":true,"path":"...","media_type":"...","bytes":N,"width":W,"height":H}`. Queues the image for the next turn, like `/image` in the REPL (same caps, same model-input check).
 - `set_model` `{"provider":"...","model":"..."}` (either may be omitted: no provider keeps the current one, no model takes the provider default; a bare `model` searches the current provider first, then the rest) → `{"provider":"...","model":"...","api":"..."}`. Same switch as `/model` in the REPL; `get_state` reports the new model and api at once.
+- `list_sessions` → `{"sessions":[{"id":"...","messages":N,"modified":"...","preview":"...","current":true}]}` (newest first; audit sidecars and pre-compact archives are not sessions).
+- `rename_session` `{"name":"old","new":"new"}` → `{"renamed":true,"from":"old","to":"new"}`. Same rename as `/rename` in the REPL.
+- `resume_session` `{"session":"..."}` → `{"session":"...","messages":N}`. Same switch as `/resume` in the REPL; `get_state` reports the new session at once.
 - `quit` → `{"ok":true}`, then the process exits 0. It waits for the
   current turn; send `abort` first to quit at once. Closing stdin
   shuts down the same way (orderly, like Pi's Stop).

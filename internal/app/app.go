@@ -604,6 +604,37 @@ func (a *App) NewSession() (*session.Store, error) {
 	return store, nil
 }
 
+// LoadSession switches to an existing session: its history is loaded
+// (like --resume) and the store is opened for appending. The id must
+// name a session file; a missing one is an error, not a new session.
+func (a *App) LoadSession(id string) ([]llm.Message, error) {
+	if _, err := os.Stat(filepath.Join(session.Dir(), id+".jsonl")); os.IsNotExist(err) {
+		return nil, fmt.Errorf("unknown session %q (see /sessions)", id)
+	}
+	history, err := session.Load(id)
+	if err != nil {
+		return nil, err
+	}
+	store, err := session.New(id)
+	if err != nil {
+		return nil, err
+	}
+	old := a.Store
+	a.Store = store
+	a.History = history
+	a.ResumedMessage = fmt.Sprintf("Resumed session %s (%d messages).", id, len(history))
+	if a.Cfg != nil {
+		a.Cfg.Session = store
+		if a.Cfg.Exec != nil {
+			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
+		}
+	}
+	if old != nil {
+		_ = old.Close()
+	}
+	return history, nil
+}
+
 // Print is the line printer (plain: fmt.Printf; TUI: sent as a message
 // so it stays ordered with the model's own scrollback prints).
 // Session totals accumulate across turns. Cost is estimated only when
@@ -635,6 +666,20 @@ func (r *Runner) ResetSession() (string, error) {
 	r.Turns = 0
 	r.LastErr = nil
 	return store.ID, nil
+}
+
+// ResumeSession switches to an existing session and zeroes the
+// runner's totals. It returns how many messages were loaded.
+func (r *Runner) ResumeSession(id string) (int, error) {
+	history, err := r.App.LoadSession(id)
+	if err != nil {
+		return 0, err
+	}
+	r.SessionUsage = llm.Usage{}
+	r.SessionCost = 0
+	r.Turns = 0
+	r.LastErr = nil
+	return len(history), nil
 }
 
 // costLine renders the estimate suffix for a usage line, or the
@@ -673,6 +718,44 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 			return false
 		}
 		r.Print("Attached %s — will be sent with your next message.", img.Describe())
+		return false
+	}
+	if line == "/sessions" {
+		r.printSessions()
+		return false
+	}
+	if line == "/resume" || strings.HasPrefix(line, "/resume ") {
+		id := strings.TrimSpace(strings.TrimPrefix(line, "/resume"))
+		if id == "" {
+			r.Print("Usage: /resume <id> (see /sessions).")
+			return false
+		}
+		n, err := r.ResumeSession(id)
+		if err != nil {
+			r.Print("[error] %v", err)
+			return false
+		}
+		r.Print("Resumed session %s (%d messages).", id, n)
+		return false
+	}
+	if line == "/rename" || strings.HasPrefix(line, "/rename ") {
+		args := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "/rename")))
+		if len(args) != 2 {
+			r.Print("Usage: /rename <old> <new>.")
+			return false
+		}
+		old, newID := args[0], args[1]
+		var err error
+		if old == r.App.Store.ID {
+			err = r.App.Store.Rename(newID)
+		} else {
+			err = session.RenameSession(old, newID)
+		}
+		if err != nil {
+			r.Print("[error] %v", err)
+			return false
+		}
+		r.Print("Renamed session %s → %s.", old, newID)
 		return false
 	}
 	if line == "/model" || strings.HasPrefix(line, "/model ") {
@@ -724,6 +807,32 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 	}
 	r.runOnce(ctx, line)
 	return false
+}
+
+// printSessions lists the sessions, newest first, current marked *.
+func (r *Runner) printSessions() {
+	list, err := session.List()
+	if err != nil {
+		r.Print("[error] %v", err)
+		return
+	}
+	if len(list) == 0 {
+		r.Print("No sessions yet.")
+		return
+	}
+	r.Print("Sessions (newest first; * = current):")
+	for _, s := range list {
+		mark := " "
+		if s.ID == r.App.Store.ID {
+			mark = "*"
+		}
+		line := fmt.Sprintf("%s %s  %d msgs  %s", mark, s.ID, s.Messages, s.Modified.Format("2006-01-02 15:04"))
+		if s.Preview != "" {
+			line += "  " + s.Preview
+		}
+		r.Print("%s", line)
+	}
+	r.Print("/resume <id> to switch, /rename <old> <new> to rename.")
 }
 
 // printModels lists every configured model, current one marked *.
