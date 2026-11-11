@@ -808,7 +808,13 @@ type Runner struct {
 	// The RPC server reads it to report a turn's outcome; the plain
 	// CLI and TUI already print the error through Print.
 	LastErr error
-	Print   func(format string, args ...any)
+	// OnCompact, when set, fires after a successful compaction
+	// (manual or automatic) with the new message count and the
+	// summary's token count. The RPC server sets it to emit the
+	// compacted event; the CLI and TUI leave it nil and keep their
+	// [compact] print.
+	OnCompact func(messages, summaryTokens int)
+	Print     func(format string, args ...any)
 }
 
 // ResetSession starts a fresh session and zeroes the runner's
@@ -1273,5 +1279,10 @@ func (r *Runner) doCompact(ctx context.Context) {
 	}
 	r.SessionUsage.Add(cUsage)
 	r.SessionCost += r.App.Rates.Cost(cUsage, time.Now())
+	// The summary's token count is the completion of the compact
+	// call, which generated the summary text.
+	if r.OnCompact != nil {
+		r.OnCompact(len(r.App.History), cUsage.CompletionTokens)
+	}
 	r.Print("[compact] %d tokens used for the summary; history replaced by summary (%d chars). Original transcript saved to %s", cUsage.TotalTokens, len(summary), archivePath)
 }

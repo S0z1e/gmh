@@ -28,6 +28,7 @@ import (
 
 	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
+	"minimalharness/internal/config"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
 )
@@ -139,6 +140,13 @@ func Run(a *app.App, runner *app.Runner, in io.Reader, out io.Writer) error {
 func (s *Server) run() error {
 	s.app.Cfg.OnEvent = s.onEvent
 	s.app.Cfg.Ask = s.ask
+	// A successful compaction (manual or automatic) is reported on
+	// stdout so the GUI learns the history was replaced by a
+	// summary; the CLI and TUI leave OnCompact nil and keep their
+	// [compact] print.
+	s.runner.OnCompact = func(messages, summaryTokens int) {
+		s.writeEvent(Event{Type: "compacted", Messages: messages, SummaryTokens: summaryTokens})
+	}
 	s.state.sessionID = s.app.Store.ID
 	s.state.messages = len(s.app.History)
 	s.state.toolMode = string(s.app.ToolMode())
@@ -184,7 +192,7 @@ func (s *Server) handleLine(line string) {
 		s.handleApprovalResponse(req)
 	case "abort":
 		s.handleAbort(req)
-	case "get_state", "usage", "jobs", "list_sessions", "list_plugins":
+	case "get_state", "usage", "jobs", "list_sessions", "list_plugins", "list_models", "list_skills", "history":
 		s.handleQuery(req)
 	case "prompt":
 		s.handlePrompt(req)
@@ -403,6 +411,11 @@ func (s *Server) handleQuery(req Request) {
 			"mode": s.app.Cfg.Mode, "tool_mode": st.toolMode, "root": s.app.Root, "streaming": st.streaming,
 			"queued": len(s.work), "messages": st.messages, "turns": st.turns,
 			"total_tokens": st.sessionUsage.TotalTokens,
+			// The effective window and output cap for the current
+			// model (Setup/SwitchModel resolved flag/env/model/
+			// config/default), so the GUI can meter context against
+			// the limit the compact trigger uses.
+			"context_window": s.app.ContextLimit, "max_tokens": s.app.Cfg.Client.MaxTokens,
 		}, nil)
 	case "usage":
 		s.mu.Lock()
@@ -436,6 +449,28 @@ func (s *Server) handleQuery(req Request) {
 		s.respond(req, map[string]any{"sessions": rows}, nil)
 	case "list_plugins":
 		s.respond(req, map[string]any{"plugins": s.pluginsList()}, nil)
+	case "list_models":
+		s.respond(req, map[string]any{"providers": s.modelsList()}, nil)
+	case "list_skills":
+		s.respond(req, map[string]any{"skills": s.skillsList()}, nil)
+	case "history":
+		id := req.Session
+		if id == "" {
+			id = s.app.Store.ID
+		}
+		if err := session.ValidateSessionID(id); err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		msgs, err := session.Load(id)
+		if err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		if msgs == nil {
+			msgs = []llm.Message{}
+		}
+		s.respond(req, map[string]any{"session": id, "messages": msgs}, nil)
 	}
 }
 
@@ -459,6 +494,68 @@ func (s *Server) pluginsList() []map[string]any {
 			item["error"] = info.Reason
 		}
 		list = append(list, item)
+	}
+	return list
+}
+
+// modelsList renders the resolved providers and their models for
+// list_models: the same values App.Setup resolves for the current
+// model (per-model overrides applied, defaults filled), not the raw
+// config file. Providers are in config order (sorted by name); a
+// provider's flat model is listed too when it is not in its models
+// array.
+func (s *Server) modelsList() []map[string]any {
+	cfg := s.app.Config
+	if cfg == nil {
+		return []map[string]any{}
+	}
+	list := make([]map[string]any, 0, len(cfg.Providers))
+	for _, name := range cfg.ProviderNames() {
+		prov := cfg.Providers[name]
+		api, _ := config.NormalizeAPI(prov.API)
+		item := map[string]any{"name": name, "api": api}
+		models := make([]map[string]any, 0, len(prov.Models)+1)
+		seen := map[string]bool{}
+		add := func(id string) {
+			if seen[id] {
+				return
+			}
+			mdl, ok := prov.ResolveModel(id)
+			if !ok {
+				return
+			}
+			seen[id] = true
+			cw := config.DefaultContextWindow
+			if mdl.ContextWindow != nil {
+				cw = *mdl.ContextWindow
+			}
+			mt := config.DefaultMaxTokens
+			if mdl.MaxTokens != nil {
+				mt = *mdl.MaxTokens
+			}
+			models = append(models, map[string]any{
+				"id": mdl.ID, "name": mdl.Name, "api": mdl.API,
+				"context_window": cw, "max_tokens": mt, "input": mdl.Input,
+			})
+		}
+		for _, e := range prov.Models {
+			add(e.ID)
+		}
+		if prov.Model != "" {
+			add(prov.Model)
+		}
+		item["models"] = models
+		list = append(list, item)
+	}
+	return list
+}
+
+// skillsList renders the discovered skills for list_skills: the same
+// name+description listing the system prompt carries.
+func (s *Server) skillsList() []map[string]any {
+	list := make([]map[string]any, 0, len(s.app.Skills))
+	for _, sk := range s.app.Skills {
+		list = append(list, map[string]any{"name": sk.Name, "description": sk.Description})
 	}
 	return list
 }

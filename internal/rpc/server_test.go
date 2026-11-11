@@ -937,3 +937,242 @@ func TestListPlugins(t *testing.T) {
 	}
 	d.quit(t)
 }
+
+// query sends a read-only request and returns its data map.
+func (d *driver) query(t *testing.T, id, typ string, extra map[string]any) map[string]any {
+	t.Helper()
+	req := map[string]any{"id": id, "type": typ}
+	for k, v := range extra {
+		req[k] = v
+	}
+	d.send(req)
+	resp := d.waitFor("response", 5*time.Second)
+	if resp["type"] != "response" {
+		t.Fatalf("%s response = %v", typ, resp)
+	}
+	data, _ := resp["data"].(map[string]any)
+	return data
+}
+
+func TestHistoryReturnsTranscript(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{
+		{kind: "text", text: "forty two"},
+	})
+	d := startDriver(t, a, runner)
+	ready := d.waitFor("ready", 5*time.Second)
+	sessionA := ready["session"].(string)
+
+	// Turn in session A.
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "What is 6 times 7?"})
+	d.waitFor("response", 5*time.Second)
+	d.waitFor("agent_settled", 5*time.Second)
+
+	// history defaults to the current session.
+	data := d.query(t, "h1", "history", nil)
+	if data["session"] != sessionA {
+		t.Fatalf("history session = %v, want %s", data["session"], sessionA)
+	}
+	msgs, _ := data["messages"].([]any)
+	if len(msgs) < 2 {
+		t.Fatalf("history messages = %d, want >= 2", len(msgs))
+	}
+	first, _ := msgs[0].(map[string]any)
+	if first["role"] != "user" || !strings.Contains(fmt.Sprintf("%v", first["content"]), "6 times 7") {
+		t.Fatalf("first history message = %v", first)
+	}
+	last, _ := msgs[len(msgs)-1].(map[string]any)
+	if last["role"] != "assistant" || !strings.Contains(fmt.Sprintf("%v", last["content"]), "forty two") {
+		t.Fatalf("last history message = %v", last)
+	}
+
+	// A second session, then fetch its transcript by id while back on A.
+	d.send(map[string]any{"id": "n1", "type": "new_session"})
+	resp := d.waitFor("response", 5*time.Second)
+	sessionB := resp["data"].(map[string]any)["session"].(string)
+	d.send(map[string]any{"id": "p2", "type": "prompt", "message": "What is 8 times 9?"})
+	d.waitFor("response", 5*time.Second)
+	d.waitFor("agent_settled", 5*time.Second)
+	d.send(map[string]any{"id": "r1", "type": "resume_session", "session": sessionA})
+	d.waitFor("response", 5*time.Second)
+	data = d.query(t, "h2", "history", map[string]any{"session": sessionB})
+	msgs, _ = data["messages"].([]any)
+	if len(msgs) < 2 {
+		t.Fatalf("session B history messages = %d, want >= 2", len(msgs))
+	}
+	first, _ = msgs[0].(map[string]any)
+	if first["role"] != "user" || !strings.Contains(fmt.Sprintf("%v", first["content"]), "8 times 9") {
+		t.Fatalf("session B first message = %v", first)
+	}
+
+	// Unknown id and invalid id are error responses.
+	d.send(map[string]any{"id": "h3", "type": "history", "session": "no-such-session"})
+	resp = d.waitFor("error", 5*time.Second)
+	if resp["id"] != "h3" {
+		t.Fatalf("unknown-session history response = %v", resp)
+	}
+	d.send(map[string]any{"id": "h4", "type": "history", "session": "../x"})
+	resp = d.waitFor("error", 5*time.Second)
+	if resp["id"] != "h4" {
+		t.Fatalf("invalid-id history response = %v", resp)
+	}
+	d.quit(t)
+}
+
+func TestCompactedEventManual(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{
+		{kind: "text", text: "hello world"},
+	})
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "Say hello"})
+	d.waitFor("response", 5*time.Second)
+	d.waitFor("agent_settled", 5*time.Second)
+
+	d.send(map[string]any{"id": "c1", "type": "compact"})
+	ev := d.waitFor("compacted", 5*time.Second)
+	if ev["messages"] != float64(1) {
+		t.Fatalf("compacted messages = %v, want 1", ev["messages"])
+	}
+	// The fake's usage is completion 5 for every call, and the
+	// compact call's completion is the summary itself.
+	if ev["summary_tokens"] != float64(5) {
+		t.Fatalf("compacted summary_tokens = %v, want 5", ev["summary_tokens"])
+	}
+	resp := d.waitFor("response", 5*time.Second)
+	if resp["id"] != "c1" || resp["type"] != "response" {
+		t.Fatalf("compact response = %v", resp)
+	}
+	// History afterwards is the summary alone.
+	data := d.query(t, "h1", "history", nil)
+	msgs, _ := data["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("post-compact history = %d messages, want 1", len(msgs))
+	}
+	only, _ := msgs[0].(map[string]any)
+	if only["role"] != "user" || !strings.Contains(fmt.Sprintf("%v", only["content"]), "Previous conversation summary:") {
+		t.Fatalf("post-compact message = %v", only)
+	}
+	d.quit(t)
+}
+
+func TestCompactedEventAuto(t *testing.T) {
+	// A tiny context window (14 tokens): the fake's 10-token prompt
+	// is past 70% of it, so the turn auto-compacts. The config is
+	// rewritten in place (the fake server URL is already in it).
+	tinyWindow := func(root string) {
+		path := filepath.Join(root, ".harness.json")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cfg map[string]any
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		mock := cfg["providers"].(map[string]any)["mock"].(map[string]any)
+		models := mock["models"].([]any)
+		models[0].(map[string]any)["contextWindow"] = 14
+		mock["models"] = models
+		out, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, out, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{
+		{kind: "text", text: "hello world"},
+	}, tinyWindow)
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "Say hello"})
+	d.waitFor("response", 5*time.Second)
+	// doCompact runs inside the turn, before agent_settled.
+	ev := d.waitFor("compacted", 5*time.Second)
+	if ev["messages"] != float64(1) || ev["summary_tokens"] != float64(5) {
+		t.Fatalf("compacted = %v, want messages 1 summary_tokens 5", ev)
+	}
+	d.waitFor("agent_settled", 5*time.Second)
+	d.quit(t)
+}
+
+func TestListModels(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{{kind: "text", text: "hi"}})
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	data := d.query(t, "m1", "list_models", nil)
+	provs, _ := data["providers"].([]any)
+	if len(provs) != 1 {
+		t.Fatalf("providers = %v", data)
+	}
+	prov, _ := provs[0].(map[string]any)
+	if prov["name"] != "mock" || prov["api"] != "chat" {
+		t.Fatalf("provider = %v", prov)
+	}
+	models, _ := prov["models"].([]any)
+	if len(models) != 2 {
+		t.Fatalf("models = %v", prov)
+	}
+	byID := map[string]map[string]any{}
+	for _, m := range models {
+		mm, _ := m.(map[string]any)
+		byID[mm["id"].(string)] = mm
+	}
+	mock := byID["mock"]
+	if mock["api"] != "chat" || mock["context_window"] != float64(128000) || mock["max_tokens"] != float64(16384) {
+		t.Fatalf("mock model = %v", mock)
+	}
+	input, _ := mock["input"].([]any)
+	if len(input) != 2 || input[0] != "text" || input[1] != "image" {
+		t.Fatalf("mock input = %v", input)
+	}
+	mock2 := byID["mock2"]
+	if mock2["api"] != "responses" || mock2["context_window"] != float64(128000) || mock2["max_tokens"] != float64(16384) {
+		t.Fatalf("mock2 model = %v", mock2)
+	}
+	input, _ = mock2["input"].([]any)
+	if len(input) != 1 || input[0] != "text" {
+		t.Fatalf("mock2 input = %v", input)
+	}
+	d.quit(t)
+}
+
+func TestListSkills(t *testing.T) {
+	addSkill := func(root string) {
+		dir := filepath.Join(root, ".agents", "skills", "demo")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: demo\ndescription: A demo skill.\n---\n# Demo\nBody here.\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{{kind: "text", text: "hi"}}, addSkill)
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	data := d.query(t, "s1", "list_skills", nil)
+	rows, _ := data["skills"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("skills = %v", data)
+	}
+	row, _ := rows[0].(map[string]any)
+	if row["name"] != "demo" || row["description"] != "A demo skill." {
+		t.Fatalf("skill row = %v", row)
+	}
+	d.quit(t)
+}
+
+func TestGetStateHasWindow(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{{kind: "text", text: "hi"}})
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	data := d.query(t, "g1", "get_state", nil)
+	if data["context_window"] != float64(128000) {
+		t.Fatalf("context_window = %v, want 128000", data["context_window"])
+	}
+	if data["max_tokens"] != float64(16384) {
+		t.Fatalf("max_tokens = %v, want 16384", data["max_tokens"])
+	}
+	d.quit(t)
+}

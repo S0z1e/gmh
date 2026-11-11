@@ -35,7 +35,10 @@ echoed in the response):
   `abort` alone lets queued prompts continue after the turn ends.
 - `get_state` → session/model/api/mode/root, `tool_mode`
   (`"default"` or `"plan"`), `streaming`, `queued`, `messages`,
-  `turns`, `total_tokens`.
+  `turns`, `total_tokens`, `context_window` and `max_tokens` (the
+  effective window and output cap for the current model — the values
+  Setup resolved, so a GUI can meter context against the limit the
+  compact trigger uses).
 - `usage` → session usage object, `cost_usd` (null when no rates are
   configured), `fee` (a note that the price is unverified against the
   provider's actual prices), `turns`.
@@ -51,6 +54,16 @@ echoed in the response):
 - `set_model` `{"provider":"...","model":"..."}` (either may be omitted: no provider keeps the current one, no model takes the provider default; a bare `model` searches the current provider first, then the rest) → `{"provider":"...","model":"...","api":"..."}`. Same switch as `/model` in the REPL; `get_state` reports the new model and api at once.
 - `list_sessions` → `{"sessions":[{"id":"...","messages":N,"modified":"...","preview":"...","current":true}]}` (newest first; audit sidecars and pre-compact archives are not sessions).
 - `list_plugins` → `{"plugins":[{"name":"...","version":"...","description":"...","tools":["..."],"state":"loaded"|"disabled"|"skipped","error":"..."}]}` (directory order; `error` only for a skipped plugin, with the load failure as the reason; a disabled plugin's tools list is empty).
+- `list_models` → `{"providers":[{"name":"...","api":"...","models":[{"id":"...","name":"...","api":"...","context_window":N,"max_tokens":N,"input":["text"]}]}]}` (providers sorted by name; the resolved values Setup computes — per-model overrides applied, defaults filled — not the raw config file; a provider's flat model is listed too when it is not in its models array).
+- `list_skills` → `{"skills":[{"name":"...","description":"..."}]}` (the discovered skills, the same listing the system prompt carries).
+- `history` → `{"session":"<id>","messages":[...]}`. The session
+  transcript in the session-file JSON shape (`role`/`content`/
+  `tool_calls`/`tool_call_id`/`images`; image bytes are never in it,
+  only path/media type/dimensions). Defaults to the current session;
+  `{"session":"<id>"}` fetches another session's transcript (an
+  unknown id is an error). The full history, no truncation — the GUI
+  asked for it. After a `/clear` or a compact the file only holds
+  what the model still sees, so history matches the live context.
 - `rename_session` `{"name":"old","new":"new"}` → `{"renamed":true,"from":"old","to":"new"}`. Same rename as `/rename` in the REPL.
 - `resume_session` `{"session":"..."}` → `{"session":"...","messages":N}`. Same switch as `/resume` in the REPL; `get_state` reports the new session at once.
 - `command` `{"name":"plan","message":""}` → `{"ok":true,"output":"..."}`. Runs a plugin command by name (`message` is the raw args string, the text after `/name`); same as typing `/name` in the REPL. A `/name ...` prompt line behaves the same way.
@@ -81,6 +94,14 @@ Events (stdout):
   failure is in `error`. The GUI waits for this event, never for the
   `prompt` response. `tool_mode` is the loop's tool mode at the end
   of the turn, so the GUI knows which tools the next turn offers.
+- `compacted` `{"messages":N,"summary_tokens":N}` — a compaction
+  succeeded (manual `/compact` or automatic after a turn): the
+  history was replaced by a summary, `messages` is the new message
+  count, `summary_tokens` is the summary's token count (the
+  completion tokens of the compact call, which generated it). The
+  CLI and TUI keep their `[compact]` print and see nothing new; the
+  GUI should re-fetch `history` after this event, since the
+  transcript it holds is now stale.
 - `error` `{"error":"..."}` — protocol-level errors only (a malformed
   line, an unknown request type). Turn errors go through
   `agent_settled`.

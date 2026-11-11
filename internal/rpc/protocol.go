@@ -19,7 +19,8 @@ type Request struct {
 	// Type is one of: prompt, approval_response, abort, clear_queue,
 	// get_state, new_session, clear, compact, usage, jobs, skill,
 	// quit, attach_image, set_model, list_sessions, rename_session,
-	// resume_session, list_plugins, command.
+	// resume_session, list_plugins, list_models, list_skills,
+	// history, command.
 	Type string `json:"type"`
 	// Message is the task for prompt, and the raw args string for
 	// command (the text after "/name", unparsed).
@@ -67,7 +68,7 @@ type UsageJSON struct {
 // the rest are omitted. Types: ready, turn_started, text_delta,
 // step_usage, tool_start, tool_end, tool_backgrounded,
 // background_wait, tool_background_done, approval_request,
-// agent_settled, error.
+// agent_settled, compacted, error.
 type Event struct {
 	Type string `json:"type"`
 	// ready: protocol version and session identity.
@@ -113,6 +114,10 @@ type Event struct {
 	// agent_settled, so the GUI knows which tools the next turn
 	// offers without polling get_state.
 	ToolMode string `json:"tool_mode,omitempty"`
+	// compacted: the summary's token count (the completion tokens of
+	// the compact call, which generated the summary). Messages
+	// carries the new message count after the compact.
+	SummaryTokens int `json:"summary_tokens,omitempty"`
 	// get_state answers (also carried in the response data, not events).
 	Streaming   bool `json:"streaming,omitempty"`
 	Queued      int  `json:"queued,omitempty"`
