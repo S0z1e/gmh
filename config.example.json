@@ -1,0 +1,18 @@
+{
+  "defaultProvider": "example",
+  "defaultModel": "example-model",
+  "providers": {
+    "example": {
+      "baseUrl": "https://api.example.com/v1",
+      "api": "anthropic-messages",
+      "apiKey": "$EXAMPLE_API_KEY",
+      "models": [
+        {
+          "id": "example-model",
+          "reasoning": true,
+          "contextWindow": 256000
+        }
+      ]
+    }
+  }
+}

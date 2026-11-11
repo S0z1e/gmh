@@ -1,672 +1,119 @@
 # minimal-harness
 
-A minimal, Pi-light coding agent harness in Go. The core (CLI, agent
+A minimal coding agent harness in Go. The core (CLI, agent
 loop, tools, sessions, config, RPC) is stdlib-only; the TUI binary
 adds Bubble Tea v2 + lipgloss v2. Eight tools: read, write, edit,
-bash, grep, glob, `load_skill`, `webfetch`. Usage is shown per turn and per
-session (prompt, cached, completion, total tokens), always from the
-API's returned usage — never estimated locally (no local tokenizer).
-Cost is estimated only when you set rates:
-`OPENAI_PRICE_INPUT_PER_MTOK`, `OPENAI_PRICE_OUTPUT_PER_MTOK`,
-`OPENAI_PRICE_CACHED_PER_MTOK` (USD per 1M tokens), plus `_PEAK_`
-variants and `OPENAI_PRICE_SOURCE` to label the source. Peak hours
-are Mon–Fri 01:00–04:00 and 06:00–10:00 UTC; without peak rates the
-off-peak rates apply. Every estimate is labelled with its source and
-"`<Provider>` 實價未驗證"; without rates, no estimate is shown.
+bash, grep, glob, `load_skill`, `webfetch`.
 
-## Quickstart
+It stays small on purpose: a lightweight system prompt, no
+sub-agents, no built-in permission popups. It also has suggest mode
+(approval before write/edit/bash), background bash jobs, JavaScript
+plugins, plan mode via a plugin, and an RPC mode (JSONL over stdio)
+for driving it from a GUI — see [rpc](docs/rpc.md).
+
+Use it interactively, run one task headless with `-p`, or drive it
+from a GUI over `--rpc`. See [docs/index.md](docs/index.md) for the
+full documentation.
+
+## Getting started
+
+You need Go and an API key in the environment — the key is read only
+from env vars, never from a file.
 
 ```bash
-# 1. Write ~/.minimal-harness/config.json (see Configuration below).
-#    It names your providers and models; the keys stay in env vars.
-# 2. Run it.
-go run ./cmd/harness -root /path/to/project
-
-# One task, headless, then exit:
-go run ./cmd/harness -p -root /path/to/project "look at this project and add a test"
-
-# Resume a session:
-go run ./cmd/harness --resume <session-id> -root /path/to/project
+go build -o harness ./cmd/harness
 ```
 
-Flags and env vars override the config file (flag > env > model >
-project file > global file > default). `OPENAI_BASE_URL`,
-`OPENAI_MODEL` and `OPENAI_API_MODE` still work as overrides;
-`-provider`, `-model`, `-api` and `-config` pick the provider, model,
-API shape, or config file for one run.
+Copy the example config into place (see
+[configuration](docs/configuration.md) for the full format). It names
+your providers and models; the keys stay in env vars:
 
-## Safety (suggest mode) — what it can and cannot promise
-
-Approval is a policy boundary, **not a sandbox**. In `-mode suggest`,
-write/edit/bash ask first (stdin in plain mode, a y/n dialog in the
-TUI); read, grep, glob and `load_skill` never ask. `-p` print mode
-and `--deny-instead-of-prompt` (also `OPENAI_DENY_INSTEAD_OF_PROMPT=1`)
-refuse every approval without asking — they only ever deny, never
-approve, and the turn continues with the denial as an observation.
-
-What is enforced:
-- read/write/edit/grep/glob paths are jailed to the workspace root
-  (`..` escapes refused); bash starts in the root.
-- bash has a timeout (default 60s, per-call up to 300s,
-  `-bash-timeout` / `OPENAI_BASH_TIMEOUT_SECONDS`) and a 64 KiB
-  output cap.
-- A denylist refuses the obvious catastrophes before they run:
-  `rm -rf /` (or `~`), `mkfs` with a device, `dd` to a device,
-  writes into `~/.ssh` / `~/.aws` / `~/.config/gcloud` / `~/.kube` /
-  `~/.docker`, and anything touching the Docker socket.
-- Every approval decision, every bash run (with exit code), and every
-  denial is written to `<session>-audit.jsonl` next to the session
-  transcript, for later review.
-- webfetch refuses private, loopback (except localhost, kept for the
-  user's own dev servers), link-local and cloud-metadata addresses
-  before any network use, and never follows a redirect to another
-  host — it reports the target instead. The connection is then
-  pinned to one of the addresses the check already validated
-  (transport-layer IP pinning), so a DNS record cannot change
-  between the check and the dial; TLS still verifies against the
-  hostname. Pinning is skipped when a proxy is in use — the proxy
-  dials the target itself. It returns Markdown by default, in
-  30,000-character pages (`offset` pages on), and caches a fetched
-  page for 15 minutes.
-- `--sandbox` (also `HARNESS_SANDBOX=1` or config `sandbox`) runs bash
-  calls under bwrap (bubblewrap, Linux only): the filesystem outside
-  the workspace is hidden behind a fresh tmpfs root, then only /usr
-  and /etc come back (read-only), plus /proc, /dev, a fresh /tmp and
-  the workspace itself (read-write, HOME set to it). A sandboxed bash
-  cannot write outside the root; the network is NOT blocked, and each
-  call gets a fresh /tmp. Setup fails fast when bwrap is missing or
-  cannot create a sandbox here (unprivileged user namespaces
-  disabled). read/write/edit run in-process and are jailed by the
-  harness itself, not by bwrap.
-
-What is NOT promised (residual risk — run on disposable copies or in
-a container):
-- The denylist is pattern matching over the command text; it can be
-  bypassed with variables, quoting, or indirection.
-- Without `--sandbox`, bash is only started in the root — once a bash
-  call is approved it can `cd` out and write anywhere, including
-  paths the write/edit tools refuse. Denying write/edit does not stop
-  bash from writing.
-- There is no OS sandbox by default; the denylist and jail are harm
-  reduction, not isolation. `--sandbox` adds one for bash only.
-
-## Background bash (long commands don't block the loop)
-
-A bash call that runs longer than the background threshold (default
-10s, `-bg-threshold` / `OPENAI_BG_THRESHOLD_SECONDS`; `0` disables
-it) keeps running as a job instead of blocking the model: the model
-gets a "still running in the background (job bg-1)" observation and
-continues with other work. When the model stops calling tools, the
-loop waits for the running jobs and feeds each result back as a user
-message ("Background job bg-1 finished (exit 0). Output: …"), so the
-model can act on it. The result is a user message, not a second tool
-message for the same call id — the call already has its tool result,
-and a second one with the same id is a 400 from the API. A bash call
-that finishes within the threshold never becomes a job. `/jobs` lists
-the background jobs (id, status, elapsed, command, exit code once
-done). The denylist, timeout, 64 KiB output cap and audit log apply
-to background jobs exactly as to synchronous ones. `-p` print mode
-never backgrounds (it stays synchronous). If the step cap hits (or
-the API call fails) with jobs still running, their results are still
-delivered to the session before the error is reported, capped at
-32 KiB head+tail; quitting with jobs running warns that they are
-abandoned (their child processes keep running, orphaned).
-
-## Images
-
-The harness can send images to a model that declares image input
-(`"input": ["text", "image"]` in the config). Three ways in:
-- `-image <path>` (repeatable) attaches images to the first turn,
-  in `-p` or the REPL.
-- `/image <path>` in the REPL attaches to your next message
-  (`/image` alone lists what is attached).
-- The model itself can `read` an image file (png, jpg, gif, webp):
-  the read returns a marker, and the image is attached to the next
-  request as a user message (tool messages cannot carry images in
-  any of the three APIs).
-
-The model receives the image in its own format: chat gets an
-`image_url` data URI, Responses gets `input_image`, Anthropic gets a
-base64 image block. One image is capped at 10 MiB, ten per message.
-Sessions store the image path, never the bytes; on `--resume` the
-bytes are re-read from disk, so a deleted file leaves only the marker
-text. A model without `"image"` in its `input` refuses the attach
-with an error that says what to add. The GUI route is the RPC
-`attach_image` request (see below).
-
-## Layout
-
-```
-cmd/harness/main.go      // CLI: -p print mode, REPL, --resume, -mode suggest/auto
-internal/llm/client.go   // OpenAI-compatible client, streaming, tool-call accumulation
-internal/llm/image.go    // Image type + wire parts for chat/anthropic/responses
-internal/tools/image.go  // LoadImage: workspace jail, type/size caps, dimensions
-internal/agent/loop.go   // single loop: LLM -> tool -> observe -> repeat
-internal/tools/tools.go  // read/write/edit/bash, workspace-root jail, timeout
-internal/tools/sandbox.go  // --sandbox: bwrap invocation + probe
-internal/tools/webfetch.go  // webfetch tool: http(s) fetch, HTML to Markdown, 30k-char pages, 15-min cache
-internal/tools/html2md.go   // hand-written stdlib HTML to Markdown (tokenizer + rule table, no new dep)
-internal/tools/ssrf.go      // webfetch SSRF guard: public-IP check, cross-host redirect refusal, IP pinning
-internal/tools/grep.go   // grep tool (ripgrep backend, grep -r fallback, match cap + truncation, match count)
-internal/tools/glob.go   // glob tool (rg --files backend, WalkDir fallback, limit + truncation, file count)
-internal/session/session.go // JSONL append + resume
-internal/session/manage.go // session list, rename, id validation
-internal/config/config.go   // JSON config file: providers, models, merge (stdlib only)
-internal/skills/skills.go  // .agents/skills/*/SKILL.md discovery, listing only
-internal/plugins/plugins.go  // plugin discovery, registry, JS handler calls (moejs)
-internal/plugins/host.go  // the `harness` host API: registerTool/log, jailed store
-internal/rpc/server.go     // RPC mode: JSONL over stdio for a GUI (see below)
-internal/rpc/protocol.go   // RPC request/response/event JSON types
-internal/agent/prompts/system.md // lightweight system prompt, embedded
+```bash
+cp config.example.json ~/.minimal-harness/config.json
 ```
 
-## Plugins (JavaScript, via moejs)
-
-Plugins extend the agent with new tools written in JavaScript (or
-TypeScript, types stripped). One directory per plugin under
-`.agents/plugins/<name>/`, with a `plugin.json` and one entry file:
-
-```json
-{"name": "todo", "description": "A personal todo list.", "version": "1.0.0", "entry": "todo.js"}
-```
-
-The entry registers tools at its top level through the `harness`
-global; the model then sees them like the eight built-ins:
-
-```js
-harness.registerTool("todo_add", "Add a todo item.", {
-  type: "object",
-  properties: { text: { type: "string" } },
-  required: ["text"],
-}, (args) => {
-  // ...return the observation as a string
-});
-```
-
-Host API: `harness.registerTool(name, description, parameters,
-handler)`; `harness.log(...)` (one line on stderr);
-`harness.readFile(path)` / `harness.writeFile(path, content)` — a
-file store jailed to the plugin's own data dir,
-`.agents/plugins/<name>/data/` (paths must stay inside it;
-`../escape` and absolute paths are refused, and plugins cannot see
-each other's data). No bash, no network, no arbitrary filesystem in
-Phase 1. Phase 3 adds commands, hooks and modes (below); Phase 4
-adds the lifecycle hooks (also below).
-
-A plugin tool runs JS only, inside its own runtime (16 MiB memory
-limit, 10 s call timeout with interrupt — a timed-out or
-memory-limited call leaves the runtime usable for the next call),
-so it needs no approval in suggest mode. A bad plugin is skipped
-with a warning on stderr and never fails startup; a missing
-plugins directory loads nothing, no error. Kill switch:
-`HARNESS_PLUGINS=0` (or `false`) disables plugin loading entirely.
-
-Disable one plugin in the config file (global or project; a project
-section replaces the global one):
-
-```json
-{"plugins": {"disabled": ["todo"]}}
-```
-
-A disabled plugin is skipped entirely at load — its entry is never
-compiled, no runtime is created — and its tools never reach the
-model. A disabled name that matches no plugin warns at load, so a
-typo is visible. `/plugins` lists every discovered plugin with its
-tools and state (`loaded` / `disabled` / `skipped` with the reason),
-and RPC `list_plugins` returns the same information. There is no hot
-reload and no enable/disable command: edit the config file and
-restart. The harness never rewrites the config file.
-
-### Commands
-
-A plugin can register slash commands the user runs from the REPL
-(or the GUI, via the RPC `command` request):
-
-```js
-harness.registerCommand("plan", "Switch to plan mode.", (args) => {
-  // args is the raw text after "/plan", unparsed.
-  return "Plan mode: read-only.";
-});
-```
-
-Commands register at load time only (like tools: a handler that
-registers one after load fails). The name must be lowercase
-alphanumeric with underscores, and must not collide with a built-in
-slash command (`image`, `sessions`, `plugins`, `resume`, `rename`,
-`model`, `quit`, `exit`, `usage`, `jobs`, `clear`, `compact`,
-`skill`). The handler returns the output text (any other value is
-JSON-encoded); a throw or a call past the 10 s timeout becomes
-`[error]`. An unknown `/foo` is still a task for the model, not an
-error.
-
-### Hooks
-
-A plugin can watch and gate tool calls (at most one handler per
-event per plugin, registered at load time only):
-
-```js
-harness.on("tool_call", (input) => {
-  // input: {tool, args}. Return undefined (or true) to allow,
-  // {deny: "reason"} to deny, or {args: {...}} to rewrite the call.
-});
-harness.on("tool_result", (input) => {
-  // input: {tool, args, result, error}. Return a string to replace
-  // the observation the model sees, or undefined to keep it.
-});
-```
-
-`tool_call` hooks run after the tool-start event and before the
-approval prompt, in plugin load order; the first denial stops the
-chain, and arg rewrites chain on. A denied call never prompts: the
-model gets the observation `Denied by plugin <name>: <reason>` and a
-tool-end event with an error, and the denial is audited like a
-refused approval. A hook that throws or times out **denies the
-call** (fail closed). `tool_result` hooks run after the tool
-dispatches (bash never reaches them — it has its own path) and
-before the result enters history; a hook that throws, times out, or
-returns a non-string keeps the original result and warns on stderr
-(fail open). Hooks never bypass approval: anything they let through
-still prompts in suggest mode.
-
-### Lifecycle hooks
-
-Four more hooks, all registered with `harness.on` at load time
-only, at most one per event per plugin. Unlike `tool_call`, all
-four **fail open**: a hook that throws, times out, or returns an
-unusable value is skipped with a stderr warning and the turn,
-compact, or session switch carries on without it.
-
-`before_agent_start` — per-turn context injection. Runs once per
-turn, before the model call, in plugin load order; the
-contributions are concatenated into one system message, each
-prefixed `"[plugin <name>] "`. The todo pilot uses it to inject
-the open todos, so the model knows what is pending without calling
-`todo_list` first.
-
-```js
-harness.on("before_agent_start", (input) => {
-  // input: {session, mode}. Return a string to inject, or
-  // undefined (or an empty string) for nothing.
-  return "Open todos (2): #1 buy milk; #2 call mom";
-});
-```
-
-`context` — rewrite the turn's starting messages. Runs once per
-turn, after `before_agent_start` and before the model call, in
-load order (each hook sees the previous one's rewrite). The input
-is `{session, mode, messages}` — the turn's starting history with
-the system message excluded (the harness prepends its own system
-prompt itself). Return the modified list, or undefined to keep the
-current one. The rewrite is in-memory only: the session file
-keeps the true history, so a rewrite never persists. The returned
-list is validated (an array of messages with roles `user`,
-`assistant` or `tool` — a `system` message is rejected, since the
-harness owns the system prompt); an invalid return keeps the
-original. Image bytes never travel as JSON, so images in a
-rewritten list are restored from the original history by path —
-a hook cannot inject image bytes it never had.
-
-`session_before_compact` — extra instructions for the summary.
-Runs when a session is compacted (manual `/compact` and
-auto-compact share the one insertion point), in load order; the
-instructions are appended to the compact prompt after section 6
-and before the conversation, each prefixed `"[plugin <name>] "`.
-The plan pilot uses it to ask the summary to keep the current
-plan. It is append-only: a plugin steers what the summary keeps,
-it cannot replace the summary.
-
-```js
-harness.on("session_before_compact", (input) => {
-  // input: {session, messages: count} — the count, not the list.
-  return 'Keep the current plan in the summary — title: "Demo".';
-});
-```
-
-`session_start` / `session_switch` — notifications when a session
-becomes current (`NewSession`, `LoadSession`, `ResumeSession`;
-the initial session at startup fires nothing, plugins are not
-loaded yet). `session_start` fires every time, with `{session}`;
-`session_switch` fires only when the id changes, with `{session,
-previous}`. `/clear` (`ResetSession`) fires neither. Return values
-are ignored; a failing hook warns and never fails the switch.
-
-| Hook | Input | Return | On failure |
-| --- | --- | --- | --- |
-| `tool_call` | `{tool, args}` | allow / `{deny}` / `{args}` | **deny the call** (fail closed) |
-| `tool_result` | `{tool, args, result, error}` | replacement string | keep the original result |
-| `before_agent_start` | `{session, mode}` | string to inject | skip the contribution |
-| `context` | `{session, mode, messages}` | rewritten list | keep the original history |
-| `session_before_compact` | `{session, messages: count}` | instruction string | skip the instruction |
-| `session_start` | `{session}` | ignored | warn only |
-| `session_switch` | `{session, previous}` | ignored | warn only |
-
-### Modes (plan mode)
-
-The loop's tool set has two modes: `default` (all tools) and `plan`
-(read-only — `write`, `edit` and `bash` are removed; plugin tools
-stay, because a JS tool is jailed to its own data dir and needs no
-approval). A plugin reads the mode with `harness.getMode()` and
-switches it with `harness.setMode("plan" | "default")`; an unknown
-mode is an error. Modes switch only between turns, and a switch
-queues a one-line system reminder for the next turn so the model is
-told the tools changed. The mode is session-only: a new or resumed
-session starts in `default`, and it is never written to the config
-file. The TUI shows a `plan` chip next to the approval-mode chip
-while plan mode is on; RPC `get_state` and `agent_settled` carry
-`tool_mode`.
-
-The shipped pilot is `.agents/plugins/plan/` — tools
-`plan_create` / `plan_step` / `plan_done` / `plan_show` (state in
-`data/plan.json`, steps numbered from 1) and commands `/plan` +
-`/execute`. The flow: `/plan` → explore (read/grep/glob/webfetch)
-and write the plan → review it → `/execute` → the model executes
-it. Plan approval is the user's next message ("照做"); `/execute`
-only switches the mode back. A plan is a reference for the model,
-not a contract — plan mode enforces read-only by removing the
-mutating tools; it does not force the model to follow the plan once
-it is back in default mode.
-
-Cost: moejs is the one non-stdlib dependency outside the TUI, and it
-adds ~8 MB to the stripped binary (core harness ~8 MB → ~16 MB).
-The shipped pilot is `.agents/plugins/todo/` — `todo_add` /
-`todo_list` / `todo_done`, state in its `data/todos.json`.
-
-## Run
-
-- The API key is read only from the environment. Never commit it,
-  never put it in a file.
-- `OPENAI_BASE_URL` may be given with or without a trailing `/v1`;
-  the client normalises it.
-- Three API shapes: `-api chat` (`POST /v1/chat/completions`,
-  messages, `tool_calls[]`); `-api responses` (`POST /v1/responses`,
-  instructions + input items, `function_call` /
-  `function_call_output`, `store: false` — stateless, JSONL is the
-  store; not every provider/model supports it, and a rejection is
-  returned verbatim); `-api anthropic` (`POST /v1/messages`, system
-  string + messages with `tool_use` / `tool_result` blocks). Auth is
-  picked by host: `api.anthropic.com` gets `x-api-key` only; every
-  other host gets Bearer only — sending both breaks Discovery, which
-  prefers `x-api-key`. History is translated at call time, so
-  sessions stay in the shared format and replay across modes;
-  consecutive same-role messages merge into one (Anthropic requires
-  strict user/assistant alternation), an empty tool result replays as
-  `(no output)`, and thinking blocks are skipped like
-  `reasoning_content` in chat mode. `max_tokens` defaults to 16384
-  (Pi's default), or `ANTHROPIC_MAX_TOKENS`.
-- Stream integrity: a chat stream that ends without `[DONE]`, a
-  Responses stream without `response.completed`, or an Anthropic
-  stream without `message_stop`, is an error, not a silently
-  truncated reply. A Responses `response.completed` that lists only
-  some of the calls the stream carried no longer drops the rest: the
-  missing ones are merged from the accumulated fragments. Chat
-  streams request `stream_options: {"include_usage": true}` — without
-  it a spec-compliant provider sends no usage object at all and the
-  turn reports 0 tokens.
-- Modes: `-mode suggest` (default, ask before write/edit/bash),
-  `-mode auto` (no prompts, use only on a disposable copy).
-- Skills: put `SKILL.md` files under `.agents/skills/<name>/` in the
-  project, or `~/.config/minimal-harness/skills/`. Only name +
-  description are loaded at startup; the full text loads on demand
-  three ways: the user types `/skill:<name>`, the task names a skill
-  as a whole word (auto-loaded before the turn), or the model calls
-  the `load_skill` tool when a task matches a skill. A skill's
-  `references/` files are never loaded up front: `load_skill` lists
-  them in a footer, and the model loads one with
-  `load_skill {name, reference}` (paths are jailed to that skill's
-  `references/`).
-- Project context: `AGENTS.md` and `CLAUDE.md` in the workspace root
-  (and ancestors up to `$HOME`) are loaded once at startup into the
-  system prompt, each capped at 8 KiB, with a git snapshot (branch,
-  working-tree status, recent commits) added the same way. Editing a
-  context file mid-session needs a restart.
-- Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`.
-- REPL commands: `/usage` shows session token totals, `/clear` drops
-  the conversation context (a marker is written to the session file;
-  `--resume` starts from the clear point, older messages stay in the
-  file). `/plugins` lists the discovered plugins with their tools
-  and state. `/sessions` lists the sessions (newest first, with message
-  count and the first user message as a preview; the current one is
-  marked `*`); `/resume <id>` switches to one, `/rename <old> <new>`
-  renames one (transcript, audit sidecar and pre-compact archives
-  follow). `/model` lists the configured models; `/model <provider>/<model>`
-  (or a bare model id) switches model mid-session — the client is
-  rebuilt from that model's config (api, baseUrl, maxTokens,
-  contextWindow, image input) and history replays through the new
-  API on the next turn. The switch lasts for the session only; it
-  does not rewrite the config file.
-- Compaction: `/compact` summarises the conversation into a 6-section
-  brief and replaces history with it; the original transcript is
-  saved to `<session>-pre-compact-<time>.jsonl`. It also triggers
-  automatically when the last call's context reaches 70% of the
-  window (`-context-limit`, default: the model's `contextWindow`,
-  else 128000).
-- Events: the agent loop emits an event stream (`text_delta`,
-  `step_usage`, `tool_start`, `tool_end`, `done`, `error`); the CLI
-  is one renderer of it, the TUI and the RPC server are two more. The
-  loop never imports UI code.
-- UI selection (`--ui auto|plain|tui`, default `auto`): precedence is
-  flag > `NO_COLOR` (non-empty) > `TERM=dumb` > TTY. On a terminal,
-  `auto` opens the TUI; piped, `NO_COLOR`, or `TERM=dumb` means plain.
-  `-p` is always plain and ignores `--ui`. `harness --ui tui` without
-  a terminal falls back to plain with a warning. The TUI is a separate
-  binary (`harness-tui` next to `harness`); `harness` re-execs it
-  when the TUI is selected, so `-p` / the plain CLI never import
-  Bubble Tea.
-
-### TUI
-
-Inline (no alt-screen, so shell scrollback still works), opencode-style:
-dark palette with peach `#fab283` and purple `#9d7cd8` accents; user
-turns are raised panels with a peach `┃` left border; assistant text
-is markdown-rendered and indented; tool rows are muted
-(`✓ Read t.txt`, `✗ Write u.txt`); bash shows a raised block with the
-command in the top border (`┤ $ <cmd> ├`) and an output tail (≤10
-lines). Write and edit show what actually landed in a raised block
-below the row — the written content for write, a red/green `-`/`+`
-diff of the replaced lines for edit (first 20 lines). Grep and glob
-report their count on the row (`Grep "TODO" in . (3 matches)`);
-the count comes from the tool, never invented. While working, a braille spinner shows the pending tool label
-in plain words (`Reading src/foo.ts…`), or `Thinking…` — but only
-after the turn has run 300 ms with no text, so short turns never
-flash a spinner. Usage lines stay in the timeline with thousands
-separators. The approval dialog is a full-width panel:
-`△ Approval required`, the tool summary, `[y] Allow once` on a solid
-blue background, `[n] Deny`, `esc = deny` (single key, Esc = deny).
-The composer is a `┃` input line with a meta line: left is the mode
-chip · model · api, right is the workspace git branch and the session
-totals (`3 turns · 12,345 tokens`). Themes:
-`HARNESS_TUI_THEME=default|terminal|catppuccin-mocha`; `terminal`
-paints no raised background, `catppuccin-mocha` is the Catppuccin
-Mocha palette. Screenshots (real captures):
-`harness-tui-screenshot.png` (real model), `harness-tui-approval.png`
-(approval dialog).
-
-## Configuration file (JSON, Pi-style)
-
-Model setup lives in a JSON file instead of a dozen exports, following
-Pi's `models.json` shape (see pi.dev/docs/latest/models-configuration).
-Two files, merged field by field (project wins where it sets a value):
-
-- global: `~/.minimal-harness/config.json`
-- project: `<root>/.harness.json`
+`config.example.json`:
 
 ```json
 {
-  "defaultProvider": "discovery",
-  "defaultModel": "Agents-A1",
+  "defaultProvider": "example",
+  "defaultModel": "example-model",
   "providers": {
-    "openconsole": {
-      "baseUrl": "https://www.openconsole.cn/v1",
-      "api": "openai-completions",
-      "apiKey": "$OPENAI_API_KEY",
-      "models": [
-        {"id": "deepseek-v4.1-flash", "contextWindow": 1000000, "maxTokens": 16384,
-         "input": ["text", "image"],
-         "cost": {"input": 0.2, "output": 0.8, "cacheRead": 0.05, "cacheWrite": 0.2},
-         "samplingParams": {"temperature": 0.7}}
-      ]
-    },
-    "discovery": {
-      "baseUrl": "https://discovery-api.intern-ai.org.cn/v1",
+    "example": {
+      "baseUrl": "https://api.example.com/v1",
       "api": "anthropic-messages",
-      "apiKey": "$DISCOVERY_API_KEY",
+      "apiKey": "$EXAMPLE_API_KEY",
       "models": [
-        {"id": "Agents-A1", "reasoning": true, "contextWindow": 256000, "maxTokens": 16384,
-         "input": ["text", "image"]},
-        {"id": "deepseek-v4-flash-0731", "api": "openai-completions"}
+        {"id": "example-model", "reasoning": true, "contextWindow": 256000}
       ]
     }
   }
 }
 ```
 
-A provider must be configured by the user — there is no built-in
-default provider. With no config file, or a config with no provider,
-setup fails with "no providers configured". A new provider needs a
-`baseUrl` and an `api` at provider or model level.
-
-Each `models` entry's only required field is `id`. The rest is
-optional, with Pi defaults: `contextWindow` 128000 (drives the
-compact trigger), `maxTokens` 16384, `reasoning` false,
-`input` `["text"]`. The rest has no default: `name`, `api` and
-`baseUrl` (override the provider's), `effort`, `samplingParams`, `headers`.
-`api` accepts Pi spellings and the harness short names:
-`openai-completions` = `chat`, `openai-responses` = `responses`,
-`anthropic-messages` = `anthropic`; `google-generative-ai` is
-rejected — the harness has no client for it.
-
-`apiKey` is a `"$NAME"` / `"${NAME}"` environment reference only: a
-literal key in the file is refused, and `!command` is not supported.
-When a provider sets no `apiKey`, `OPENAI_API_KEY` is used.
-`headers` (provider and per-model, model wins) accept the same
-`$NAME` references; auth headers are never taken from them.
-
-`samplingParams` (e.g. `temperature`, `top_p`) is merged into every
-request body of the two OpenAI modes only — Pi's rule; Anthropic
-ignores it. Structural keys (`model`, `messages`, `tools`, `stream`,
-`max_tokens`, …) are never overridden by it.
-
-`effort` (`low`, `medium` or `high`; empty means the provider
-default) is how hard a reasoning model thinks, sent per API shape:
-chat sends `reasoning_effort`, responses sends
-`reasoning: {"effort": ...}`, and Anthropic sends
-`thinking: {"type": "enabled", "budget_tokens": ...}` with a budget
-of maxTokens/16, /4 or /2 (at least 1024 tokens, always below
-maxTokens — with the default maxTokens of 16384 that is 1024, 4096
-or 8192). A model that does not reason ignores it. `effort` is
-per-model, so switching models with `/model` (or RPC `set_model`)
-carries each model's own effort. `maxTokens` is sent by
-all three modes (chat: `max_tokens`, responses: `max_output_tokens`,
-anthropic: `max_tokens`). `cost` (USD per million tokens, all four
-rates required when present, plus optional `tiers`) is parsed and
-stored only — the cost estimate still comes from the `OPENAI_PRICE_*`
-environment rates. `input` is stored only: the harness is text-only
-for now, so a model can declare `["text", "image"]` but no image is
-sent yet.
-
-Merge rules: a project file's `models` list replaces the provider's
-whole list (Pi-style); a `baseUrl`/`headers`-only override keeps the
-provider's models. Values are validated on the merged result, not
-per file. Unknown fields are rejected, so a typo fails fast. A
-`"$schema"` key is accepted and ignored. The top-level `baseUrl` /
-`api` / `model` fields are a shorthand for a single provider without
-the `providers` map. Other top-level knobs: `mode`
-(`suggest|auto`), `bashTimeoutSeconds`, `bgThresholdSeconds` (`0`
-disables backgrounding), `denyInsteadOfPrompt`, `contextLimit`,
-`anthropicMaxTokens`, `tuiTheme`
-(`default|terminal|catppuccin-mocha`). Precedence is flag >
-environment variable > model value > project file > global file > Pi
-default, so existing flag/env usage keeps working unchanged.
-
-With that file in place, `harness` needs nothing but the keys — no
-`OPENAI_BASE_URL` / `OPENAI_MODEL` / `OPENAI_API_MODE` exports.
-Switch providers without editing the file:
-`harness -provider openconsole`. Switch models:
-`harness -model deepseek-v4-flash-0731`. Point at one file
-explicitly: `harness -config /path/to/config.json`.
-
-## RPC mode (JSONL over stdio, for a GUI)
-
-`harness --rpc` is the machine frontend: one JSON object per line on
-stdin (requests) and stdout (responses and events), LF terminated,
-split on LF only — the same framing as `pi --mode rpc`, so a GUI
-written against Pi's protocol needs only small changes. stdout
-carries protocol data only; diagnostics go to stderr. `-p` conflicts
-with `--rpc`; `--ui` is ignored.
+Then run it in the project you want it to work in:
 
 ```bash
-harness --rpc -root /path/to/project -mode suggest
+./harness -root /path/to/project
+
+# One task, headless, then exit:
+./harness -p -root /path/to/project "look at this project and add a test"
+
+# Resume a session:
+./harness --resume <session-id> -root /path/to/project
 ```
 
-Startup: the first line on stdout is a `ready` event:
-`{"type":"ready","protocol":1,"session":"<id>","model":"...","api":"chat","mode":"suggest","root":"...","resumed":false,"messages":0}`.
+Flags and env vars override the config file (flag > env > model >
+project file > global file > default). `OPENAI_BASE_URL`,
+`OPENAI_MODEL` and `OPENAI_API_MODE` still work as overrides;
+`-provider`, `-model`, `-api` and `-config` pick the provider, model,
+API shape, or config file for one run. Three API shapes: `-api chat`,
+`-api responses`, `-api anthropic`.
 
-Requests (each `{"id":"<req>","type":"..."}`; `id` is optional and
-echoed in the response):
-- `prompt` `{"message":"..."}` → `{"disposition":"started"|"queued"}`.
-  The response only means accepted; the turn ends with
-  `agent_settled`. A second prompt while a turn runs is queued (cap
-  64; beyond that an error). A known slash line (`/usage`, `/jobs`,
-  `/clear`, `/compact`, `/skill:<name>`, `/sessions`, `/resume <id>`,
-  `/rename <old> <new>`, `/plugins`, `/quit`) behaves as the
-  matching control request, exactly like the REPL; any other line,
-  including an unknown `/foo`, is a task for the model.
-- `approval_response` `{"approval_id":"appr-1","approved":true}` →
-  `{"ok":true}`. The approval id comes from the `approval_request`
-  event; `id` (the request's own correlation id) is separate.
-- `abort` → `{"aborted":true|false}`. Cancels the running turn, and
-  fails any approval waiting on a dialog, so a turn blocked on
-  approval can still be stopped.
-- `clear_queue` → `{"cleared":N}`. Drops queued prompts, keeps
-  control items. Send it before `abort` (Pi's Escape recipe):
-  `abort` alone lets queued prompts continue after the turn ends.
-- `get_state` → session/model/api/mode/root, `tool_mode`
-  (`"default"` or `"plan"`), `streaming`, `queued`, `messages`,
-  `turns`, `total_tokens`.
-- `usage` → session usage object, `cost_usd` (null when no rates are
-  configured), `fee` (`<Provider> 實價未驗證`), `turns`.
-- `jobs` → background bash jobs (id, status, elapsed seconds,
-  command, exit code once done).
-- `new_session` → `{"session":"<new id>"}`. Starts a fresh session
-  and zeroes the runner totals. Session ids are second-resolution
-  timestamps; two created in the same second get a `-1`, `-2`…
-  suffix, so a new session never reopens the old file.
-- `clear` / `compact` → `{"ok":true}` (same as the REPL commands).
-- `skill` `{"name":"..."}` → `{"loaded":true,"bytes":N}`.
-- `attach_image` `{"path":"..."}` → `{"attached":true,"path":"...","media_type":"...","bytes":N,"width":W,"height":H}`. Queues the image for the next turn, like `/image` in the REPL (same caps, same model-input check).
-- `set_model` `{"provider":"...","model":"..."}` (either may be omitted: no provider keeps the current one, no model takes the provider default; a bare `model` searches the current provider first, then the rest) → `{"provider":"...","model":"...","api":"..."}`. Same switch as `/model` in the REPL; `get_state` reports the new model and api at once.
-- `list_sessions` → `{"sessions":[{"id":"...","messages":N,"modified":"...","preview":"...","current":true}]}` (newest first; audit sidecars and pre-compact archives are not sessions).
-- `list_plugins` → `{"plugins":[{"name":"...","version":"...","description":"...","tools":["..."],"state":"loaded"|"disabled"|"skipped","error":"..."}]}` (directory order; `error` only for a skipped plugin, with the load failure as the reason; a disabled plugin's tools list is empty).
-- `rename_session` `{"name":"old","new":"new"}` → `{"renamed":true,"from":"old","to":"new"}`. Same rename as `/rename` in the REPL.
-- `resume_session` `{"session":"..."}` → `{"session":"...","messages":N}`. Same switch as `/resume` in the REPL; `get_state` reports the new session at once.
-- `command` `{"name":"plan","message":""}` → `{"ok":true,"output":"..."}`. Runs a plugin command by name (`message` is the raw args string, the text after `/name`); same as typing `/name` in the REPL. A `/name ...` prompt line behaves the same way.
-- `quit` → `{"ok":true}`, then the process exits 0. It waits for the
-  current turn; send `abort` first to quit at once. Closing stdin
-  shuts down the same way (orderly, like Pi's Stop).
+Usage is shown per turn and per session (prompt, cached, completion,
+total tokens), always from the API's returned usage — never estimated
+locally. Cost is estimated only when you set rates
+(`OPENAI_PRICE_*_PER_MTOK`); every estimate is labelled with its
+source and marked as unverified against the provider's actual prices.
+Without rates, no estimate is shown.
 
-Events (stdout):
-- `turn_started` `{"text":"<first 200 runes of the task>"}`.
-- `text_delta` `{"text":"..."}` — streamed assistant text.
-- `step_usage` `{"usage":{"prompt":N,"cached":N,"completion":N,"total":N}}` — per LLM call.
-- `tool_start` `{"tool":"read","args":{...}}` — args as parsed JSON
-  (the raw string when unparseable).
-- `tool_end` `{"tool":"...","output":"...","truncated":bool,"error":null|"...","detail":"...","count":N}` — output capped at 32 KiB head+tail, like the loop's
-  truncation for the LLM view. `detail` carries the write content / edit diff (display-only, never sent to the model); `count` is the
-  grep/glob match count (omitted when 0).
-- `tool_backgrounded` / `background_wait` / `tool_background_done` —
-  the background bash events, the same shapes as the CLI's scrollback
-  notices.
-- `approval_request` `{"id":"appr-1","tool":"write","args":{...},"prompt":"Run write ...?"}` — emitted by the approval bridge (not
-  by the loop's `approval` event, which the server ignores to avoid
-  sending it twice). The agent blocks until the GUI answers; in
-  `-mode auto` or with `--deny-instead-of-prompt` no request is ever
-  sent.
-- `agent_settled` — exactly one per turn, whatever happened:
-  `{"text":"...","usage":{...},"session_usage":{...},"cost_usd":null|N,"session_cost_usd":null|N,"fee":"...","aborted":false,"error":null|"...","tool_mode":"default"|"plan"}`.
-  `aborted` is true only when the GUI aborted the turn; any other
-  failure is in `error`. The GUI waits for this event, never for the
-  `prompt` response. `tool_mode` is the loop's tool mode at the end
-  of the turn, so the GUI knows which tools the next turn offers.
-- `error` `{"error":"..."}` — protocol-level errors only (a malformed
-  line, an unknown request type). Turn errors go through
-  `agent_settled`.
+## Safety
+
+Approval is a policy boundary, **not a sandbox**. In `-mode suggest`
+(the default), write/edit/bash ask first; read, grep, glob and
+`load_skill` never ask. `-mode auto` never prompts — use it only on a
+disposable copy. `-p` print mode refuses every approval without
+asking.
+
+Paths are jailed to the workspace root, bash has a timeout and a
+64 KiB output cap, and a denylist refuses the obvious catastrophes
+before they run. But the denylist is pattern matching and can be
+bypassed, and an approved bash call can `cd` out and write anywhere.
+`--sandbox` runs bash under bwrap for real isolation of bash only.
+Full details, including what is *not* promised, are in
+[docs/safety.md](docs/safety.md).
+
+## Documentation
+
+| Doc | What it covers |
+| --- | --- |
+| [configuration](docs/configuration.md) | Providers, models, APIs, effort, cost rates, merge rules |
+| [usage](docs/usage.md) | Modes, skills, sessions, compaction, commands, the TUI |
+| [safety](docs/safety.md) | What suggest mode enforces, and what it does not promise |
+| [background-bash](docs/background-bash.md) | Long bash calls as background jobs |
+| [images](docs/images.md) | Sending images to a model that accepts them |
+| [plugins](docs/plugins.md) | JavaScript plugins: tools, commands, hooks, plan mode |
+| [architecture](docs/architecture.md) | Source layout |
+| [rpc](docs/rpc.md) | `--rpc`: JSONL over stdio for a GUI |
+
+## Development
+
+```bash
+go build ./...
+go vet ./...
+go test ./...
+```
+
+`go build ./...` also builds the TUI binary (`harness-tui`), which
+`harness` re-execs when the TUI is selected, so `-p` and the plain
+CLI never import Bubble Tea.
