@@ -4,11 +4,13 @@
 // and answers read-only queries (get_state, usage, jobs) immediately;
 // everything that touches history or the session goes through one work
 // queue, and a single agent goroutine runs the items in order — the
-// same shape as the TUI's lines channel. Approvals and aborts are the
-// only things the reader handles out of band: the agent goroutine
-// blocks in Config.Ask, and the reader resolves it when the GUI
-// answers; abort cancels the turn's context and fails any pending
-// approval, so a turn waiting on a dialog can still be stopped.
+// same shape as the TUI's lines channel. Approvals, aborts and
+// clear_queue are the only things the reader handles out of band:
+// the agent goroutine blocks in Config.Ask, and the reader resolves
+// it when the GUI answers; abort cancels the turn's context and
+// fails any pending approval, so a turn waiting on a dialog can
+// still be stopped; clear_queue drops queued prompts at once, which
+// it could not do as a work item (a queued prompt would run first).
 //
 // stdout carries protocol data only; diagnostics go to stderr.
 package rpc
@@ -186,7 +188,9 @@ func (s *Server) handleLine(line string) {
 		s.handleQuery(req)
 	case "prompt":
 		s.handlePrompt(req)
-	case "clear", "compact", "new_session", "skill", "quit", "clear_queue", "attach_image", "set_model", "rename_session", "resume_session", "command":
+	case "clear_queue":
+		s.handleClearQueue(req)
+	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "set_model", "rename_session", "resume_session", "command":
 		s.enqueue(req, workControl)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown request type %q", req.Type))
@@ -359,6 +363,20 @@ func (s *Server) handleAbort(req Request) {
 	s.turnMu.Unlock()
 	s.failApprovals(errAborted)
 	s.respond(req, map[string]any{"aborted": cancel != nil}, nil)
+}
+
+// handleClearQueue drops queued prompts at once, from the reader
+// goroutine. It must run here, not as a work item: a queued control
+// item would run first if clear_queue itself waited in the FIFO,
+// and by then the queued prompt it was meant to drop has already
+// started. Drained prompts never settle, so they leave the
+// outstanding count here instead of in runTurn. The running turn
+// is untouched: only abort cancels it (the Pi Escape recipe is
+// clear_queue first, then abort).
+func (s *Server) handleClearQueue(req Request) {
+	cleared := s.drainPrompts()
+	s.addOutstanding(-cleared)
+	s.respond(req, map[string]any{"cleared": cleared}, nil)
 }
 
 func (s *Server) failApprovals(err error) {
@@ -716,12 +734,6 @@ func (s *Server) doControl(req Request) {
 		}
 		s.refreshState()
 		s.respond(req, map[string]any{"ok": true, "output": out}, nil)
-	case "clear_queue":
-		cleared := s.drainPrompts()
-		// Drained prompts never settle, so they leave the
-		// outstanding count here instead of in runTurn.
-		s.addOutstanding(-cleared)
-		s.respond(req, map[string]any{"cleared": cleared}, nil)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown control request %q", req.Type))
 	}
@@ -742,8 +754,11 @@ func (s *Server) findSkill(name string) (string, bool) {
 }
 
 // drainPrompts drops queued prompt items, keeping control items in
-// order. It runs on the agent goroutine; workMu keeps the reader from
-// enqueueing mid-drain.
+// order. It runs on the reader goroutine (clear_queue is answered
+// immediately, not queued); workMu keeps the reader from enqueueing
+// mid-drain, and the agent goroutine only receives from the channel,
+// so an item is taken by exactly one of them — a prompt the agent
+// already picked up counts as running and is never dropped here.
 func (s *Server) drainPrompts() int {
 	s.workMu.Lock()
 	defer s.workMu.Unlock()

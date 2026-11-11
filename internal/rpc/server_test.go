@@ -557,6 +557,139 @@ func TestQueuedPrompt(t *testing.T) {
 	d.quit(t)
 }
 
+// waitForResponse waits for the response to the request with the
+// given id, stashing events of other types (or responses to other
+// requests) in d.pending like waitFor does.
+func (d *driver) waitForResponse(id string, timeout time.Duration) map[string]any {
+	d.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		for i, rec := range d.pending {
+			if rec["type"] == "response" && rec["id"] == id {
+				d.pending = append(d.pending[:i], d.pending[i+1:]...)
+				return rec
+			}
+		}
+		rest := time.Until(deadline)
+		if rest <= 0 {
+			d.t.Fatalf("timed out waiting for response to %q", id)
+		}
+		rec := d.next(rest)
+		if rec["type"] == "response" && rec["id"] == id {
+			return rec
+		}
+		d.pending = append(d.pending, rec)
+	}
+}
+
+// noSettledWithin fails if an agent_settled event arrives within
+// the given duration, draining (and discarding) any other events.
+// The backlog is checked first: a settled stashed there by an
+// earlier wait counts too.
+func (d *driver) noSettledWithin(timeout time.Duration) {
+	d.t.Helper()
+	for _, rec := range d.pending {
+		if rec["type"] == "agent_settled" {
+			d.t.Fatalf("unexpected agent_settled: %v", rec["text"])
+		}
+	}
+	deadline := time.After(timeout)
+	for {
+		select {
+		case rec, ok := <-d.events:
+			if !ok {
+				return
+			}
+			if rec["type"] == "agent_settled" {
+				d.t.Fatalf("unexpected agent_settled: %v", rec["text"])
+			}
+		case <-deadline:
+			return
+		}
+	}
+}
+
+// clear_queue must drop queued prompts at once, from the reader:
+// the sweep found it returned cleared:0 because it waited in the
+// same FIFO behind the queued prompt. The running turn is untouched
+// and a control item queued behind the prompts (here /compact)
+// still runs. A fresh prompt afterwards starts at once, which
+// proves the outstanding count is balanced again.
+func TestClearQueueDropsQueuedPrompt(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{
+		{kind: "text", text: "first reply", delay: 1500 * time.Millisecond},
+		{kind: "text", text: "second reply"},
+		{kind: "text", text: "third reply"},
+	})
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "First task"})
+	resp := d.waitFor("response", 5*time.Second)
+	if data, _ := resp["data"].(map[string]any); data["disposition"] != "started" {
+		t.Fatalf("first prompt disposition = %v, want started", data["disposition"])
+	}
+	for _, id := range []string{"p2", "p2b"} {
+		d.send(map[string]any{"id": id, "type": "prompt", "message": "Queued task " + id})
+		resp = d.waitFor("response", 5*time.Second)
+		if data, _ := resp["data"].(map[string]any); data["disposition"] != "queued" {
+			t.Fatalf("prompt %s disposition = %v, want queued", id, data["disposition"])
+		}
+	}
+	// A control item queued behind the prompts must survive the drain.
+	d.send(map[string]any{"id": "cx", "type": "prompt", "message": "/compact"})
+	d.send(map[string]any{"id": "cq", "type": "clear_queue"})
+	cq := d.waitForResponse("cq", 5*time.Second)
+	if data, _ := cq["data"].(map[string]any); data["cleared"] != float64(2) {
+		t.Fatalf("clear_queue cleared = %v, want 2", data["cleared"])
+	}
+	first := d.waitFor("agent_settled", 10*time.Second)
+	if first["text"] == nil || !strings.Contains(first["text"].(string), "first") {
+		t.Fatalf("first settled text = %v", first["text"])
+	}
+	cx := d.waitForResponse("cx", 10*time.Second)
+	if cx["type"] != "response" {
+		t.Fatalf("compact reply = %v, want a response", cx)
+	}
+	// The dropped prompts never settle, even though the fake steps
+	// would have answered them at once.
+	d.noSettledWithin(3 * time.Second)
+	d.send(map[string]any{"id": "p3", "type": "prompt", "message": "Third task"})
+	resp = d.waitFor("response", 5*time.Second)
+	if data, _ := resp["data"].(map[string]any); data["disposition"] != "started" {
+		t.Fatalf("prompt after clear disposition = %v, want started", data["disposition"])
+	}
+	third := d.waitFor("agent_settled", 10*time.Second)
+	if third["text"] == nil || !strings.Contains(third["text"].(string), "third") {
+		t.Fatalf("third settled text = %v", third["text"])
+	}
+	d.quit(t)
+}
+
+// clear_queue with nothing queued returns 0 and leaves the running
+// turn alone.
+func TestClearQueueEmptyLeavesRunningTurn(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{
+		{kind: "text", text: "only reply", delay: 1500 * time.Millisecond},
+	})
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "Only task"})
+	resp := d.waitFor("response", 5*time.Second)
+	if data, _ := resp["data"].(map[string]any); data["disposition"] != "started" {
+		t.Fatalf("prompt disposition = %v, want started", data["disposition"])
+	}
+	d.send(map[string]any{"id": "cq", "type": "clear_queue"})
+	cq := d.waitForResponse("cq", 5*time.Second)
+	if data, _ := cq["data"].(map[string]any); data["cleared"] != float64(0) {
+		t.Fatalf("clear_queue cleared = %v, want 0", data["cleared"])
+	}
+	settled := d.waitFor("agent_settled", 10*time.Second)
+	if settled["text"] == nil || !strings.Contains(settled["text"].(string), "only") {
+		t.Fatalf("settled text = %v", settled["text"])
+	}
+	d.quit(t)
+}
+
 // attach_image queues an image for the next turn; a missing file is
 // an error response, and the image rides on the prompt after it.
 func TestAttachImage(t *testing.T) {
