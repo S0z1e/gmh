@@ -689,3 +689,21 @@ func TestMetaUpdateSetsModel(t *testing.T) {
 		t.Fatalf("empty update moved meta to %s/%s", m.metaModel, m.metaAPI)
 	}
 }
+
+// MetaUpdateMsg with ToolMode "plan" shows a plan chip after the
+// approval-mode chip; "default" (or an empty update) shows none.
+func TestMetaLinePlanChip(t *testing.T) {
+	m := NewModel("").WithMeta("suggest", "chat", "mock")
+	if got := stripANSI(m.metaLine()); strings.Contains(got, "plan") {
+		t.Fatalf("meta line before any update = %q, want no plan chip", got)
+	}
+	m = apply(t, m, MetaUpdateMsg{Tokens: 10, Turns: 1, ToolMode: "plan"})
+	got := stripANSI(m.metaLine())
+	if !strings.Contains(got, "plan") || !strings.Contains(got, "suggest") {
+		t.Fatalf("meta line in plan mode = %q, want both chips", got)
+	}
+	m = apply(t, m, MetaUpdateMsg{Tokens: 20, Turns: 2, ToolMode: "default"})
+	if got := stripANSI(m.metaLine()); strings.Contains(got, "plan") {
+		t.Fatalf("meta line back in default = %q, want no plan chip", got)
+	}
+}

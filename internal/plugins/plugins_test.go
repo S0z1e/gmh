@@ -463,3 +463,296 @@ func TestLoadKillSwitchListsDisabled(t *testing.T) {
 		t.Fatalf("kill-switch infos = %+v", infos)
 	}
 }
+
+// Phase 3: commands.
+
+func TestRegisterCommand(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "shout", "", "s.js", `
+harness.registerCommand("shout", "Shout.", (args) => "SHOUT: " + args);
+harness.registerCommand("obj", "Return an object.", (args) => ({loud: true, args: args}));
+`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if !reg.HasCommand("shout") || !reg.HasCommand("obj") {
+		t.Fatal("commands not registered")
+	}
+	out, err := reg.CallCommand(context.Background(), "shout", "hello")
+	if err != nil || out != "SHOUT: hello" {
+		t.Fatalf("shout = %q, %v", out, err)
+	}
+	out, err = reg.CallCommand(context.Background(), "obj", "x")
+	if err != nil || out != `{"loud":true,"args":"x"}` {
+		t.Fatalf("obj = %q, %v", out, err)
+	}
+	if _, err := reg.CallCommand(context.Background(), "nope", ""); err == nil {
+		t.Fatal("unknown command ran without an error")
+	}
+}
+
+func TestRegisterCommandBuiltinCollision(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "bad", "", "b.js", `harness.registerCommand("model", "Collides.", () => "x");`)
+	_, errs := Load(root, nil)
+	if len(errs) == 0 {
+		t.Fatal("command colliding with a built-in loaded without an error")
+	}
+}
+
+func TestRegisterCommandAfterLoadRejected(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "late", "", "l.js", `
+harness.registerTool("late", "Tries to register a command from a handler.", {type: "object", properties: {}}, () => {
+  harness.registerCommand("nope", "Too late.", () => "x");
+  return "registered";
+});
+`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if _, err := reg.Call(context.Background(), "late", `{}`); err == nil || !strings.Contains(err.Error(), "top level") {
+		t.Fatalf("late register err = %v, want a top-level error", err)
+	}
+}
+
+func TestCommandTimeout(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "spin", "", "s.js", `harness.registerCommand("spin", "Loop forever.", () => { for (;;) {} });`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	reg.CallTimeout = 200 * time.Millisecond
+	if _, err := reg.CallCommand(context.Background(), "spin", ""); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("spin err = %v, want a timeout", err)
+	}
+}
+
+// Phase 3: mode switching through the registry callbacks.
+
+func TestModeSetterGetter(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "modes", "", "m.js", `
+harness.registerCommand("goplan", "Go plan.", () => { harness.setMode("plan"); return "switched"; });
+harness.registerCommand("whatmode", "What mode.", () => harness.getMode());
+harness.registerCommand("badmode", "Bad mode.", () => { harness.setMode("nope"); return "never"; });
+`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	mode := "default"
+	reg.ModeSetter = func(name string) error {
+		if name != "default" && name != "plan" {
+			return fmt.Errorf("unknown tool mode %q", name)
+		}
+		mode = name
+		return nil
+	}
+	reg.ModeGetter = func() string { return mode }
+	out, err := reg.CallCommand(context.Background(), "goplan", "")
+	if err != nil || out != "switched" || mode != "plan" {
+		t.Fatalf("goplan = %q, %v, mode %q", out, err, mode)
+	}
+	out, err = reg.CallCommand(context.Background(), "whatmode", "")
+	if err != nil || out != "plan" {
+		t.Fatalf("whatmode = %q, %v", out, err)
+	}
+	if _, err := reg.CallCommand(context.Background(), "badmode", ""); err == nil || !strings.Contains(err.Error(), "unknown tool mode") {
+		t.Fatalf("badmode err = %v, want an unknown-mode error", err)
+	}
+}
+
+func TestGetModeDefaultWithoutSetter(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "modes", "", "m.js", `
+harness.registerCommand("whatmode", "What mode.", () => harness.getMode());
+harness.registerCommand("goplan", "Go plan.", () => { harness.setMode("plan"); return "switched"; });
+`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	out, err := reg.CallCommand(context.Background(), "whatmode", "")
+	if err != nil || out != "default" {
+		t.Fatalf("whatmode without setter = %q, %v", out, err)
+	}
+	if _, err := reg.CallCommand(context.Background(), "goplan", ""); err == nil || !strings.Contains(err.Error(), "not available") {
+		t.Fatalf("setMode without setter err = %v, want a not-available error", err)
+	}
+}
+
+// Phase 3: hooks.
+
+func TestToolCallHookDeny(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "gate", "", "g.js", `
+harness.on("tool_call", (input) => {
+  if (input.tool === "bash") return {deny: "bash is not allowed here"};
+});
+`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	_, deny := reg.RunToolCallHooks(context.Background(), "bash", `{"command":"ls"}`)
+	if deny != "gate: bash is not allowed here" {
+		t.Fatalf("deny = %q", deny)
+	}
+	args, deny := reg.RunToolCallHooks(context.Background(), "read", `{"path":"x"}`)
+	if deny != "" || args != `{"path":"x"}` {
+		t.Fatalf("read hook = %q, %q", args, deny)
+	}
+}
+
+func TestToolCallHookRewriteChains(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "aaa", "", "a.js", `
+harness.on("tool_call", (input) => {
+  if (input.tool === "read") return {args: {path: input.args.path + "-a"}};
+});
+`)
+	writePlugin(t, root, "bbb", "", "b.js", `
+harness.on("tool_call", (input) => {
+  if (input.tool === "read") return {args: {path: input.args.path + "-b"}};
+});
+`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	args, deny := reg.RunToolCallHooks(context.Background(), "read", `{"path":"/x"}`)
+	if deny != "" {
+		t.Fatalf("deny = %q", deny)
+	}
+	if args != `{"path":"/x-a-b"}` {
+		t.Fatalf("rewritten args = %s, want /x-a-b (chained)", args)
+	}
+}
+
+func TestToolCallHookThrowDenies(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "boom", "", "b.js", `harness.on("tool_call", () => { throw new Error("kaboom"); });`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	_, deny := reg.RunToolCallHooks(context.Background(), "read", `{}`)
+	if !strings.Contains(deny, "tool_call hook failed") || !strings.Contains(deny, "kaboom") {
+		t.Fatalf("deny = %q, want a fail-closed hook failure", deny)
+	}
+}
+
+func TestToolResultHookRewriteChains(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "aaa", "", "a.js", `harness.on("tool_result", (input) => "[a] " + input.result);`)
+	writePlugin(t, root, "bbb", "", "b.js", `harness.on("tool_result", (input) => "[b] " + input.result);`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	out := reg.RunToolResultHooks(context.Background(), "read", `{"path":"x"}`, "hello", nil)
+	if out != "[b] [a] hello" {
+		t.Fatalf("rewritten result = %q, want chained rewrites", out)
+	}
+}
+
+func TestToolResultHookThrowKeeps(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "boom", "", "b.js", `harness.on("tool_result", () => { throw new Error("kaboom"); });`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	out := reg.RunToolResultHooks(context.Background(), "read", `{}`, "original", nil)
+	if out != "original" {
+		t.Fatalf("result = %q, want the original kept on hook failure", out)
+	}
+}
+
+func TestOnUnknownEventAndTwice(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "bad", "", "b.js", `harness.on("bogus", () => {});`)
+	if _, errs := Load(root, nil); len(errs) == 0 {
+		t.Fatal("unknown hook event loaded without an error")
+	}
+	root2 := t.TempDir()
+	writePlugin(t, root2, "twice", "", "t.js", `
+harness.on("tool_call", () => {});
+harness.on("tool_call", () => {});
+`)
+	if _, errs := Load(root2, nil); len(errs) == 0 {
+		t.Fatal("two tool_call handlers loaded without an error")
+	}
+}
+
+func TestPlanPluginRoundTrip(t *testing.T) {
+	// The shipped pilot, loaded from the repo tree: create/show a
+	// plan, and the /plan + /execute commands switching modes.
+	repo := filepath.Join("..", "..", ".agents", "plugins", "plan")
+	raw, err := os.ReadFile(filepath.Join(repo, "plan.js"))
+	if err != nil {
+		t.Skipf("pilot plugin not found (repo layout?): %v", err)
+	}
+	root := t.TempDir()
+	writePlugin(t, root, "plan", "", "plan.js", string(raw))
+	manifest, _ := os.ReadFile(filepath.Join(repo, "plugin.json"))
+	if err := os.WriteFile(filepath.Join(root, ".agents", "plugins", "plan", "plugin.json"), manifest, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	mode := "default"
+	reg.ModeSetter = func(name string) error {
+		if name != "default" && name != "plan" {
+			return fmt.Errorf("unknown tool mode %q", name)
+		}
+		mode = name
+		return nil
+	}
+	reg.ModeGetter = func() string { return mode }
+	ctx := context.Background()
+	out, err := reg.Call(ctx, "plan_create", `{"title":"Demo","steps":["one","two"]}`)
+	if err != nil || !strings.Contains(out, "Plan: Demo") || !strings.Contains(out, "#1 [open] one") {
+		t.Fatalf("plan_create = %q, %v", out, err)
+	}
+	out, err = reg.Call(ctx, "plan_done", `{"index":1}`)
+	if err != nil || !strings.Contains(out, "#1 [done] one") {
+		t.Fatalf("plan_done = %q, %v", out, err)
+	}
+	out, err = reg.CallCommand(ctx, "plan", "")
+	if err != nil || out != "Plan mode: read-only. Explore and write a plan with plan_create." || mode != "plan" {
+		t.Fatalf("/plan = %q, %v, mode %q", out, err, mode)
+	}
+	out, err = reg.CallCommand(ctx, "plan", "")
+	if err != nil || out != "Already in plan mode." {
+		t.Fatalf("/plan again = %q, %v", out, err)
+	}
+	out, err = reg.CallCommand(ctx, "execute", "")
+	if err != nil || out != "Back in default mode." || mode != "default" {
+		t.Fatalf("/execute = %q, %v, mode %q", out, err, mode)
+	}
+	// The state file on disk agrees with the tools.
+	raw, err = os.ReadFile(filepath.Join(root, ".agents", "plugins", "plan", "data", "plan.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved struct {
+		Title string `json:"title"`
+		Steps []struct {
+			Text string `json:"text"`
+			Done bool   `json:"done"`
+		} `json:"steps"`
+	}
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.Title != "Demo" || len(saved.Steps) != 2 || !saved.Steps[0].Done {
+		t.Fatalf("plan.json = %+v", saved)
+	}
+}

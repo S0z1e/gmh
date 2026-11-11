@@ -51,6 +51,8 @@ type serverState struct {
 	sessionCost  float64
 	messages     int
 	sessionID    string
+	// toolMode is the loop's tool mode ("default" or "plan").
+	toolMode string
 }
 
 type turnOutcome struct {
@@ -137,6 +139,7 @@ func (s *Server) run() error {
 	s.app.Cfg.Ask = s.ask
 	s.state.sessionID = s.app.Store.ID
 	s.state.messages = len(s.app.History)
+	s.state.toolMode = string(s.app.ToolMode())
 	fmt.Fprintf(os.Stderr, "harness rpc ready: session %s (stdin/stdout JSONL)\n", s.app.Store.ID)
 	s.writeEvent(Event{
 		Type: "ready", Protocol: protocolVersion,
@@ -183,7 +186,7 @@ func (s *Server) handleLine(line string) {
 		s.handleQuery(req)
 	case "prompt":
 		s.handlePrompt(req)
-	case "clear", "compact", "new_session", "skill", "quit", "clear_queue", "attach_image", "set_model", "rename_session", "resume_session":
+	case "clear", "compact", "new_session", "skill", "quit", "clear_queue", "attach_image", "set_model", "rename_session", "resume_session", "command":
 		s.enqueue(req, workControl)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown request type %q", req.Type))
@@ -225,6 +228,13 @@ func (s *Server) handlePrompt(req Request) {
 			return
 		}
 		s.enqueue(ctrl, workControl)
+		return
+	}
+	// A plugin command ("/plan", "/execute", ...) behaves as the
+	// matching control request, exactly like the REPL; any other
+	// line is a task for the model.
+	if name, args, ok := app.ParsePluginCommand(req.Message); ok && s.app.Plugins != nil && s.app.Plugins.HasCommand(name) {
+		s.enqueue(Request{ID: req.ID, Type: "command", Name: name, Message: args}, workControl)
 		return
 	}
 	// Snapshot the disposition before enqueueing, then count this
@@ -372,7 +382,7 @@ func (s *Server) handleQuery(req Request) {
 		s.mu.Unlock()
 		s.respond(req, map[string]any{
 			"session": st.sessionID, "model": s.app.Cfg.Client.Model, "api": s.app.Cfg.Client.API,
-			"mode": s.app.Cfg.Mode, "root": s.app.Root, "streaming": st.streaming,
+			"mode": s.app.Cfg.Mode, "tool_mode": st.toolMode, "root": s.app.Root, "streaming": st.streaming,
 			"queued": len(s.work), "messages": st.messages, "turns": st.turns,
 			"total_tokens": st.sessionUsage.TotalTokens,
 		}, nil)
@@ -551,6 +561,7 @@ func (s *Server) refreshState() {
 	s.state.turns = s.runner.Turns
 	s.state.sessionUsage = s.runner.SessionUsage
 	s.state.sessionCost = s.runner.SessionCost
+	s.state.toolMode = string(s.runner.App.ToolMode())
 	s.mu.Unlock()
 }
 
@@ -604,6 +615,7 @@ func (s *Server) runTurn(req Request) {
 	settled := Event{
 		Type: "agent_settled", Text: text, Usage: usageJSON(usage),
 		SessionUsage: usageJSON(st.sessionUsage), Fee: s.feeLabel(), Aborted: aborted,
+		ToolMode: st.toolMode,
 	}
 	if s.app.Rates.Configured {
 		c := s.app.Rates.Cost(usage, time.Now())
@@ -696,6 +708,14 @@ func (s *Server) doControl(req Request) {
 	case "quit":
 		s.respond(req, map[string]any{"ok": true}, nil)
 		s.shutdown()
+	case "command":
+		out, err := s.runner.RunCommand(ctx, req.Name, req.Message)
+		if err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		s.refreshState()
+		s.respond(req, map[string]any{"ok": true, "output": out}, nil)
 	case "clear_queue":
 		cleared := s.drainPrompts()
 		// Drained prompts never settle, so they leave the

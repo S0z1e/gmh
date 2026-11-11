@@ -10,6 +10,9 @@
 //
 // The host API a plugin sees is the single global `harness`:
 //   - harness.registerTool(name, description, parameters, handler)
+//   - harness.registerCommand(name, description, handler)
+//   - harness.on("tool_call" | "tool_result", handler)
+//   - harness.setMode(name) / harness.getMode()
 //   - harness.log(...args)
 //   - harness.readFile(path) / harness.writeFile(path, content)
 //
@@ -100,6 +103,16 @@ type Tool struct {
 	plugin      *Plugin
 }
 
+// Command is one slash command a plugin registered with
+// registerCommand: user-invoked (never model-invoked), so it needs
+// no approval and never enters ToolDefs.
+type Command struct {
+	Name        string
+	Description string
+	handler     moejs.Value
+	plugin      *Plugin
+}
+
 // Plugin is one loaded plugin: its runtime, its data dir, and the
 // tools it registered while loading.
 type Plugin struct {
@@ -113,16 +126,35 @@ type Plugin struct {
 	mu      sync.Mutex // serialises calls into this runtime (a runtime runs on one goroutine; only Interrupt is concurrent-safe)
 	loading bool       // true while the entry's top level runs: registerTool is only valid then
 	broken  bool       // true when a call never stopped after Interrupt: refuse further calls
-	tools   []*Tool
-	byName  map[string]*Tool
+	// registry is the owning registry: setMode/getMode read its
+	// ModeSetter/ModeGetter, which app.Setup wires after Load.
+	registry *Registry
+	tools    []*Tool
+	byName   map[string]*Tool
+	// commands registered at load time, by name.
+	commands       []*Command
+	commandsByName map[string]*Command
+	// Hooks, at most one per event per plugin (see harness.on).
+	toolCallHook      moejs.Value
+	hasToolCallHook   bool
+	toolResultHook    moejs.Value
+	hasToolResultHook bool
 }
 
 // Registry is the loaded plugins of one run, indexed by tool name.
 type Registry struct {
-	plugins []*Plugin
-	byTool  map[string]*Tool
-	// CallTimeout bounds one plugin tool call (0 = DefaultCallTimeout).
+	plugins   []*Plugin
+	byTool    map[string]*Tool
+	byCommand map[string]*Command
+	// CallTimeout bounds one plugin call (tool, command, or hook)
+	// (0 = DefaultCallTimeout).
 	CallTimeout time.Duration
+	// ModeSetter switches the agent's tool mode; ModeGetter reads
+	// it. app.Setup wires both after Load (the mode lives on the
+	// App, not here); a registry without them reports "default" and
+	// refuses setMode, so standalone uses never panic.
+	ModeSetter func(string) error
+	ModeGetter func() string
 	// dir is the plugins directory Load read (<root>/.agents/plugins).
 	dir string
 	// infos is the discovery outcome: one entry per plugin directory
@@ -194,7 +226,7 @@ func (r *Registry) Has(name string) bool {
 // reported as an error (a visible warning at load, so a typo is
 // caught), not a load failure.
 func Load(root string, disabled []string) (*Registry, []error) {
-	reg := &Registry{byTool: map[string]*Tool{}}
+	reg := &Registry{byTool: map[string]*Tool{}, byCommand: map[string]*Command{}}
 	dir := filepath.Join(root, ".agents", "plugins")
 	reg.dir = dir
 	disabledSet := map[string]bool{}
@@ -235,7 +267,7 @@ func Load(root string, disabled []string) (*Registry, []error) {
 			reg.infos = append(reg.infos, describe(pdir, en.Name(), "disabled", ""))
 			continue
 		}
-		p, err := loadOne(pdir)
+		p, err := loadOne(reg, pdir)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("plugin %s: %w", en.Name(), err))
 			reg.infos = append(reg.infos, describe(pdir, en.Name(), "skipped", err.Error()))
@@ -247,6 +279,13 @@ func Load(root string, disabled []string) (*Registry, []error) {
 				continue
 			}
 			reg.byTool[t.Name] = t
+		}
+		for _, c := range p.commands {
+			if _, ok := reg.byCommand[c.Name]; ok {
+				errs = append(errs, fmt.Errorf("plugin %s: command %q is already registered by another plugin, skipped", p.Name, c.Name))
+				continue
+			}
+			reg.byCommand[c.Name] = c
 		}
 		reg.plugins = append(reg.plugins, p)
 		info := Info{Name: p.Name, Version: p.Version, Description: p.Description, Tools: []string{}, State: "loaded"}
@@ -283,7 +322,7 @@ func describe(dir, dirName, state, reason string) Info {
 	return info
 }
 
-func loadOne(dir string) (*Plugin, error) {
+func loadOne(reg *Registry, dir string) (*Plugin, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, "plugin.json"))
 	if err != nil {
 		return nil, fmt.Errorf("read plugin.json: %w", err)
@@ -327,8 +366,10 @@ func loadOne(dir string) (*Plugin, error) {
 	p := &Plugin{
 		Name: m.Name, Description: m.Description, Version: m.Version,
 		Dir: dir, DataDir: filepath.Join(dir, "data"),
-		byName:  map[string]*Tool{},
-		loading: true,
+		registry:       reg,
+		byName:         map[string]*Tool{},
+		commandsByName: map[string]*Command{},
+		loading:        true,
 	}
 	p.rt = moejs.NewRuntime(moejs.Options{
 		MemoryLimit:        DefaultMemoryLimit,
@@ -363,11 +404,180 @@ func (r *Registry) Call(ctx context.Context, name, argsJSON string) (string, err
 	if !ok {
 		return "", fmt.Errorf("unknown plugin tool: %s", name)
 	}
-	timeout := r.CallTimeout
-	if timeout <= 0 {
-		timeout = DefaultCallTimeout
+	return t.plugin.call(ctx, t, argsJSON, r.timeout())
+}
+
+// timeout returns the call timeout for this registry (0 = default).
+func (r *Registry) timeout() time.Duration {
+	if r.CallTimeout > 0 {
+		return r.CallTimeout
 	}
-	return t.plugin.call(ctx, t, argsJSON, timeout)
+	return DefaultCallTimeout
+}
+
+// HasCommand reports whether a plugin command of this name is registered.
+func (r *Registry) HasCommand(name string) bool {
+	_, ok := r.byCommand[name]
+	return ok
+}
+
+// CallCommand runs a plugin command with the raw args string (the
+// text after "/name", unparsed) and returns its output text.
+func (r *Registry) CallCommand(ctx context.Context, name, args string) (string, error) {
+	c, ok := r.byCommand[name]
+	if !ok {
+		return "", fmt.Errorf("unknown plugin command: %s", name)
+	}
+	return c.plugin.callCommand(ctx, c, args, r.timeout())
+}
+
+// RunToolCallHooks runs the registered tool_call hooks in load order,
+// before approval. It returns the (possibly rewritten) args JSON and
+// a denial: "" when the call is allowed, otherwise
+// "plugin <name>: <reason>". A hook that throws, times out, or
+// returns a malformed value denies too (fail closed). The first
+// denial stops the chain; arg rewrites chain on to the next hook.
+func (r *Registry) RunToolCallHooks(ctx context.Context, tool, argsJSON string) (string, string) {
+	argsJSON = hookArgsJSON(argsJSON)
+	for _, p := range r.plugins {
+		if !p.hasToolCallHook {
+			continue
+		}
+		res, err := p.callHook(ctx, p.toolCallHook, hookCallInput(tool, argsJSON), r.timeout())
+		if err != nil {
+			return argsJSON, fmt.Sprintf("%s: tool_call hook failed: %v", p.Name, err)
+		}
+		deny, rewrite, bad := interpretToolCallResult(p, res)
+		if bad != "" {
+			return argsJSON, fmt.Sprintf("%s: %s", p.Name, bad)
+		}
+		if deny != "" {
+			return argsJSON, fmt.Sprintf("%s: %s", p.Name, deny)
+		}
+		if rewrite != "" {
+			argsJSON = rewrite
+		}
+	}
+	return argsJSON, ""
+}
+
+// RunToolResultHooks runs the registered tool_result hooks in load
+// order, each seeing the previous one's rewrite, and returns the
+// observation to use. A hook that throws, times out, or returns a
+// non-string keeps the current result and is logged to stderr
+// (fail open: the result is already in hand, denying it would only
+// break the turn).
+func (r *Registry) RunToolResultHooks(ctx context.Context, tool, argsJSON, result string, toolErr error) string {
+	argsJSON = hookArgsJSON(argsJSON)
+	for _, p := range r.plugins {
+		if !p.hasToolResultHook {
+			continue
+		}
+		res, err := p.callHook(ctx, p.toolResultHook, hookResultInput(tool, argsJSON, result, toolErr), r.timeout())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: plugin %s tool_result hook failed: %v\n", p.Name, err)
+			continue
+		}
+		if s, ok := hookResultString(p, res); ok {
+			result = s
+		}
+	}
+	return result
+}
+
+// hookArgsJSON is the args object a hook sees: the call's args JSON,
+// or {} when it is empty or does not parse (the original args still
+// go to Dispatch if the call is allowed, where the parse error
+// surfaces properly).
+func hookArgsJSON(argsJSON string) string {
+	if strings.TrimSpace(argsJSON) == "" {
+		return "{}"
+	}
+	var v any
+	if json.Unmarshal([]byte(argsJSON), &v) != nil {
+		return "{}"
+	}
+	return argsJSON
+}
+
+// hookCallInput builds the tool_call hook input: {tool, args}.
+func hookCallInput(tool, argsJSON string) string {
+	name, _ := json.Marshal(tool)
+	return `{"tool":` + string(name) + `,"args":` + argsJSON + `}`
+}
+
+// hookResultInput builds the tool_result hook input:
+// {tool, args, result, error} (error is null when the call succeeded).
+func hookResultInput(tool, argsJSON, result string, toolErr error) string {
+	name, _ := json.Marshal(tool)
+	text, _ := json.Marshal(result)
+	errJSON := "null"
+	if toolErr != nil {
+		b, _ := json.Marshal(toolErr.Error())
+		errJSON = string(b)
+	}
+	return `{"tool":` + string(name) + `,"args":` + argsJSON + `,"result":` + string(text) + `,"error":` + errJSON + `}`
+}
+
+// interpretToolCallResult reads a tool_call hook's return value:
+// (deny, rewrite, bad) — deny and rewrite are mutually exclusive,
+// deny wins; bad is a malformed return, which denies too.
+func interpretToolCallResult(p *Plugin, res moejs.Value) (deny, rewrite, bad string) {
+	g, err := p.rt.ToGo(res)
+	if err != nil {
+		return "", "", fmt.Sprintf("tool_call hook returned an unreadable value: %v", err)
+	}
+	switch v := g.(type) {
+	case nil:
+		return "", "", "" // undefined: allow
+	case bool:
+		if v {
+			return "", "", ""
+		}
+		return "", "", "tool_call hook returned false"
+	case map[string]any:
+		if d, ok := v["deny"]; ok {
+			s, ok := d.(string)
+			if !ok || strings.TrimSpace(s) == "" {
+				return "", "", "tool_call hook denied the call without a reason"
+			}
+			return s, "", ""
+		}
+		if a, ok := v["args"]; ok {
+			m, ok := a.(map[string]any)
+			if !ok {
+				return "", "", "tool_call hook returned args that is not an object"
+			}
+			b, err := json.Marshal(m)
+			if err != nil {
+				return "", "", fmt.Sprintf("tool_call hook returned args that are not JSON: %v", err)
+			}
+			return "", string(b), ""
+		}
+		return "", "", ""
+	default:
+		return "", "", "tool_call hook returned an unexpected value"
+	}
+}
+
+// hookResultString reads a tool_result hook's return value: (s, true)
+// replaces the observation with s; ("", false) keeps the current
+// result (undefined, or a malformed value, which is warned about).
+func hookResultString(p *Plugin, res moejs.Value) (string, bool) {
+	g, err := p.rt.ToGo(res)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: plugin %s tool_result hook returned an unreadable value: %v\n", p.Name, err)
+		return "", false
+	}
+	switch v := g.(type) {
+	case nil:
+		return "", false // undefined: keep the current result
+	case string:
+		return v, true
+	default:
+		fmt.Fprintf(os.Stderr, "warning: plugin %s tool_result hook returned a non-string value; keeping the original result\n", p.Name)
+		return "", false
+	}
 }
 
 func (p *Plugin) call(ctx context.Context, t *Tool, argsJSON string, timeout time.Duration) (string, error) {
@@ -383,41 +593,118 @@ func (p *Plugin) call(ctx context.Context, t *Tool, argsJSON string, timeout tim
 	if err != nil {
 		return "", fmt.Errorf("plugin %s tool %s: bad args JSON: %w", p.Name, t.Name, err)
 	}
-	done := make(chan callResult, 1)
-	go func() {
+	cr, err := p.runWithTimeout(ctx, timeout, func() callResult {
 		res, err := p.rt.CallFunction(t.handler, moejs.Undefined(), argVal)
-		if err == nil {
-			// An async handler returns a Promise: unwrap it. The
-			// jobs that settle it run before CallFunction returns,
-			// so a handler that only awaits settled values is
-			// already fulfilled here.
-			if state, val, ok := moejs.PromiseResult(res); ok {
-				if state != moejs.PromiseFulfilled {
-					err = fmt.Errorf("async handler returned a %s promise; async handlers must settle without awaiting", promiseStateName(state))
-					if s, convErr := p.resultString(val); convErr == nil && s != "" {
-						err = fmt.Errorf("async handler rejected: %s", s)
-					}
-				} else {
-					res = val
-				}
-			}
-		}
-		done <- callResult{res: res, err: err}
-	}()
+		res, err = p.unwrapAsync(res, err)
+		return callResult{res: res, err: err}
+	})
+	if err != nil {
+		return "", fmt.Errorf("plugin %s tool %s: %w", p.Name, t.Name, err)
+	}
+	if cr.err != nil {
+		return "", fmt.Errorf("plugin %s tool %s: %w", p.Name, t.Name, cr.err)
+	}
+	return p.resultString(cr.res)
+}
+
+// callCommand runs one command handler with the raw args string.
+func (p *Plugin) callCommand(ctx context.Context, c *Command, args string, timeout time.Duration) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.broken {
+		return "", fmt.Errorf("plugin %s is unusable after a call that never stopped; restart the harness", p.Name)
+	}
+	argVal := moejs.String(args)
+	cr, err := p.runWithTimeout(ctx, timeout, func() callResult {
+		res, err := p.rt.CallFunction(c.handler, moejs.Undefined(), argVal)
+		res, err = p.unwrapAsync(res, err)
+		return callResult{res: res, err: err}
+	})
+	if err != nil {
+		return "", fmt.Errorf("plugin %s command %s: %w", p.Name, c.Name, err)
+	}
+	if cr.err != nil {
+		return "", fmt.Errorf("plugin %s command %s: %w", p.Name, c.Name, cr.err)
+	}
+	return p.resultString(cr.res)
+}
+
+// callHook runs one hook handler with the input JSON (already built
+// by hookCallInput / hookResultInput) and returns the raw JS value.
+func (p *Plugin) callHook(ctx context.Context, fn moejs.Value, inputJSON string, timeout time.Duration) (moejs.Value, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.broken {
+		return moejs.Value{}, fmt.Errorf("plugin %s is unusable after a call that never stopped; restart the harness", p.Name)
+	}
+	argVal, err := p.rt.ParseJSONString(inputJSON)
+	if err != nil {
+		return moejs.Value{}, fmt.Errorf("bad hook input JSON: %w", err)
+	}
+	cr, err := p.runWithTimeout(ctx, timeout, func() callResult {
+		res, err := p.rt.CallFunction(fn, moejs.Undefined(), argVal)
+		res, err = p.unwrapAsync(res, err)
+		return callResult{res: res, err: err}
+	})
+	if err != nil {
+		return moejs.Value{}, err
+	}
+	if cr.err != nil {
+		return moejs.Value{}, cr.err
+	}
+	return cr.res, nil
+}
+
+// runWithTimeout runs fn (a JS call on this runtime's goroutine) and
+// waits for it, the context, or the timeout. The caller holds p.mu.
+// A memory-limit or interrupt error resets the runtime
+// (ClearInterrupt + ResetAllocation) so the next call does not fail
+// with the stale interrupt (spike finding 1).
+func (p *Plugin) runWithTimeout(ctx context.Context, timeout time.Duration, run func() callResult) (callResult, error) {
+	done := make(chan callResult, 1)
+	go func() { done <- run() }()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case cr := <-done:
-		return p.finishCall(t, cr)
+		if cr.err != nil {
+			var ie *moejs.InterruptedError
+			if errors.Is(cr.err, moejs.ErrMemoryLimit) || errors.As(cr.err, &ie) {
+				p.rt.ClearInterrupt()
+				p.rt.ResetAllocation()
+			}
+		}
+		return cr, nil
 	case <-ctx.Done():
 		// The turn was aborted (or the harness is shutting down):
 		// stop the call the same way a timeout does.
 		p.interruptAndWait(done, ctx.Err())
-		return "", fmt.Errorf("plugin %s tool %s: %w", p.Name, t.Name, ctx.Err())
+		return callResult{}, ctx.Err()
 	case <-timer.C:
-		p.interruptAndWait(done, errors.New("plugin tool call timed out"))
-		return "", fmt.Errorf("plugin %s tool %s: timed out after %s", p.Name, t.Name, timeout)
+		p.interruptAndWait(done, errors.New("plugin call timed out"))
+		return callResult{}, fmt.Errorf("timed out after %s", timeout)
 	}
+}
+
+// unwrapAsync unwraps an async handler's Promise: a promise that is
+// still pending when the call returns is an error — Phase 1 has no
+// event loop, so an async handler must settle without awaiting
+// anything host-driven.
+func (p *Plugin) unwrapAsync(res moejs.Value, err error) (moejs.Value, error) {
+	if err != nil {
+		return res, err
+	}
+	if state, val, ok := moejs.PromiseResult(res); ok {
+		if state != moejs.PromiseFulfilled {
+			err = fmt.Errorf("async handler returned a %s promise; async handlers must settle without awaiting", promiseStateName(state))
+			if s, convErr := p.resultString(val); convErr == nil && s != "" {
+				err = fmt.Errorf("async handler rejected: %s", s)
+			}
+		} else {
+			res = val
+		}
+	}
+	return res, err
 }
 
 func promiseStateName(state moejs.PromiseState) string {
@@ -447,22 +734,6 @@ func (p *Plugin) interruptAndWait(done chan callResult, cause error) {
 	case <-time.After(interruptGrace):
 		p.broken = true
 	}
-}
-
-// finishCall converts a finished call into the observation, or the
-// error. A memory-limit or interrupt error also resets the runtime
-// (ClearInterrupt + ResetAllocation) so the next call does not fail
-// with the stale interrupt.
-func (p *Plugin) finishCall(t *Tool, cr callResult) (string, error) {
-	if cr.err != nil {
-		var ie *moejs.InterruptedError
-		if errors.Is(cr.err, moejs.ErrMemoryLimit) || errors.As(cr.err, &ie) {
-			p.rt.ClearInterrupt()
-			p.rt.ResetAllocation()
-		}
-		return "", fmt.Errorf("plugin %s tool %s: %w", p.Name, t.Name, cr.err)
-	}
-	return p.resultString(cr.res)
 }
 
 func (p *Plugin) resultString(v moejs.Value) (string, error) {

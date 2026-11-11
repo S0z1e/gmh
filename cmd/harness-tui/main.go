@@ -111,8 +111,9 @@ func main() {
 		for line := range lines {
 			quit := runner.Handle(ctx, line)
 			// Session totals for the meta line's right side, plus
-			// the current model/api so a /model switch shows up.
-			prog.Send(tui.MetaUpdateMsg{Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns, Model: a.Model.ID, API: a.Cfg.Client.API})
+			// the current model/api so a /model switch shows up,
+			// and the tool mode so a /plan switch shows its chip.
+			prog.Send(tui.MetaUpdateMsg{Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns, Model: a.Model.ID, API: a.Cfg.Client.API, ToolMode: string(a.ToolMode())})
 			if quit {
 				prog.Quit()
 				return

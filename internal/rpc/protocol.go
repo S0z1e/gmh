@@ -19,11 +19,13 @@ type Request struct {
 	// Type is one of: prompt, approval_response, abort, clear_queue,
 	// get_state, new_session, clear, compact, usage, jobs, skill,
 	// quit, attach_image, set_model, list_sessions, rename_session,
-	// resume_session, list_plugins.
+	// resume_session, list_plugins, command.
 	Type string `json:"type"`
-	// Message is the task for prompt.
+	// Message is the task for prompt, and the raw args string for
+	// command (the text after "/name", unparsed).
 	Message string `json:"message,omitempty"`
-	// Name is the skill name for skill.
+	// Name is the skill name for skill, and the command name for
+	// command (without the leading "/").
 	Name string `json:"name,omitempty"`
 	// Path is the image file for attach_image.
 	Path string `json:"path,omitempty"`
@@ -107,6 +109,10 @@ type Event struct {
 	Prompt string `json:"prompt,omitempty"`
 	// agent_settled.
 	Aborted bool `json:"aborted,omitempty"`
+	// ToolMode is the loop's tool mode ("default" or "plan") on
+	// agent_settled, so the GUI knows which tools the next turn
+	// offers without polling get_state.
+	ToolMode string `json:"tool_mode,omitempty"`
 	// get_state answers (also carried in the response data, not events).
 	Streaming   bool `json:"streaming,omitempty"`
 	Queued      int  `json:"queued,omitempty"`

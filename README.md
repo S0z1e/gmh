@@ -190,7 +190,7 @@ file store jailed to the plugin's own data dir,
 `.agents/plugins/<name>/data/` (paths must stay inside it;
 `../escape` and absolute paths are refused, and plugins cannot see
 each other's data). No bash, no network, no arbitrary filesystem in
-Phase 1.
+Phase 1. Phase 3 adds commands, hooks and modes (below).
 
 A plugin tool runs JS only, inside its own runtime (16 MiB memory
 limit, 10 s call timeout with interrupt — a timed-out or
@@ -215,6 +215,83 @@ tools and state (`loaded` / `disabled` / `skipped` with the reason),
 and RPC `list_plugins` returns the same information. There is no hot
 reload and no enable/disable command: edit the config file and
 restart. The harness never rewrites the config file.
+
+### Commands
+
+A plugin can register slash commands the user runs from the REPL
+(or the GUI, via the RPC `command` request):
+
+```js
+harness.registerCommand("plan", "Switch to plan mode.", (args) => {
+  // args is the raw text after "/plan", unparsed.
+  return "Plan mode: read-only.";
+});
+```
+
+Commands register at load time only (like tools: a handler that
+registers one after load fails). The name must be lowercase
+alphanumeric with underscores, and must not collide with a built-in
+slash command (`image`, `sessions`, `plugins`, `resume`, `rename`,
+`model`, `quit`, `exit`, `usage`, `jobs`, `clear`, `compact`,
+`skill`). The handler returns the output text (any other value is
+JSON-encoded); a throw or a call past the 10 s timeout becomes
+`[error]`. An unknown `/foo` is still a task for the model, not an
+error.
+
+### Hooks
+
+A plugin can watch and gate tool calls (at most one handler per
+event per plugin, registered at load time only):
+
+```js
+harness.on("tool_call", (input) => {
+  // input: {tool, args}. Return undefined (or true) to allow,
+  // {deny: "reason"} to deny, or {args: {...}} to rewrite the call.
+});
+harness.on("tool_result", (input) => {
+  // input: {tool, args, result, error}. Return a string to replace
+  // the observation the model sees, or undefined to keep it.
+});
+```
+
+`tool_call` hooks run after the tool-start event and before the
+approval prompt, in plugin load order; the first denial stops the
+chain, and arg rewrites chain on. A denied call never prompts: the
+model gets the observation `Denied by plugin <name>: <reason>` and a
+tool-end event with an error, and the denial is audited like a
+refused approval. A hook that throws or times out **denies the
+call** (fail closed). `tool_result` hooks run after the tool
+dispatches (bash never reaches them — it has its own path) and
+before the result enters history; a hook that throws, times out, or
+returns a non-string keeps the original result and warns on stderr
+(fail open). Hooks never bypass approval: anything they let through
+still prompts in suggest mode.
+
+### Modes (plan mode)
+
+The loop's tool set has two modes: `default` (all tools) and `plan`
+(read-only — `write`, `edit` and `bash` are removed; plugin tools
+stay, because a JS tool is jailed to its own data dir and needs no
+approval). A plugin reads the mode with `harness.getMode()` and
+switches it with `harness.setMode("plan" | "default")`; an unknown
+mode is an error. Modes switch only between turns, and a switch
+queues a one-line system reminder for the next turn so the model is
+told the tools changed. The mode is session-only: a new or resumed
+session starts in `default`, and it is never written to the config
+file. The TUI shows a `plan` chip next to the approval-mode chip
+while plan mode is on; RPC `get_state` and `agent_settled` carry
+`tool_mode`.
+
+The shipped pilot is `.agents/plugins/plan/` — tools
+`plan_create` / `plan_step` / `plan_done` / `plan_show` (state in
+`data/plan.json`, steps numbered from 1) and commands `/plan` +
+`/execute`. The flow: `/plan` → explore (read/grep/glob/webfetch)
+and write the plan → review it → `/execute` → the model executes
+it. Plan approval is the user's next message ("照做"); `/execute`
+only switches the mode back. A plan is a reference for the model,
+not a contract — plan mode enforces read-only by removing the
+mutating tools; it does not force the model to follow the plan once
+it is back in default mode.
 
 Cost: moejs is the one non-stdlib dependency outside the TUI, and it
 adds ~8 MB to the stripped binary (core harness ~8 MB → ~16 MB).
@@ -470,8 +547,9 @@ echoed in the response):
 - `clear_queue` → `{"cleared":N}`. Drops queued prompts, keeps
   control items. Send it before `abort` (Pi's Escape recipe):
   `abort` alone lets queued prompts continue after the turn ends.
-- `get_state` → session/model/api/mode/root, `streaming`, `queued`,
-  `messages`, `turns`, `total_tokens`.
+- `get_state` → session/model/api/mode/root, `tool_mode`
+  (`"default"` or `"plan"`), `streaming`, `queued`, `messages`,
+  `turns`, `total_tokens`.
 - `usage` → session usage object, `cost_usd` (null when no rates are
   configured), `fee` (`<Provider> 實價未驗證`), `turns`.
 - `jobs` → background bash jobs (id, status, elapsed seconds,
@@ -488,6 +566,7 @@ echoed in the response):
 - `list_plugins` → `{"plugins":[{"name":"...","version":"...","description":"...","tools":["..."],"state":"loaded"|"disabled"|"skipped","error":"..."}]}` (directory order; `error` only for a skipped plugin, with the load failure as the reason; a disabled plugin's tools list is empty).
 - `rename_session` `{"name":"old","new":"new"}` → `{"renamed":true,"from":"old","to":"new"}`. Same rename as `/rename` in the REPL.
 - `resume_session` `{"session":"..."}` → `{"session":"...","messages":N}`. Same switch as `/resume` in the REPL; `get_state` reports the new session at once.
+- `command` `{"name":"plan","message":""}` → `{"ok":true,"output":"..."}`. Runs a plugin command by name (`message` is the raw args string, the text after `/name`); same as typing `/name` in the REPL. A `/name ...` prompt line behaves the same way.
 - `quit` → `{"ok":true}`, then the process exits 0. It waits for the
   current turn; send `abort` first to quit at once. Closing stdin
   shuts down the same way (orderly, like Pi's Stop).
@@ -510,10 +589,11 @@ Events (stdout):
   `-mode auto` or with `--deny-instead-of-prompt` no request is ever
   sent.
 - `agent_settled` — exactly one per turn, whatever happened:
-  `{"text":"...","usage":{...},"session_usage":{...},"cost_usd":null|N,"session_cost_usd":null|N,"fee":"...","aborted":false,"error":null|"..."}`.
+  `{"text":"...","usage":{...},"session_usage":{...},"cost_usd":null|N,"session_cost_usd":null|N,"fee":"...","aborted":false,"error":null|"...","tool_mode":"default"|"plan"}`.
   `aborted` is true only when the GUI aborted the turn; any other
   failure is in `error`. The GUI waits for this event, never for the
-  `prompt` response.
+  `prompt` response. `tool_mode` is the loop's tool mode at the end
+  of the turn, so the GUI knows which tools the next turn offers.
 - `error` `{"error":"..."}` — protocol-level errors only (a malformed
   line, an unknown request type). Turn errors go through
   `agent_settled`.

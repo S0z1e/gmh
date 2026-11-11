@@ -309,6 +309,19 @@ func diffDetail(oldText, newText string) string {
 type PluginRunner interface {
 	Has(name string) bool
 	Call(ctx context.Context, name, argsJSON string) (string, error)
+	// RunToolCallHooks runs the registered tool_call hooks in load
+	// order, before approval. It returns the (possibly rewritten)
+	// args JSON and a denial: "" when the call is allowed, otherwise
+	// "plugin <name>: <reason>". A hook that throws or times out
+	// denies too (fail closed), with the failure as the reason.
+	// The first denial stops the chain; arg rewrites chain on.
+	RunToolCallHooks(ctx context.Context, tool, argsJSON string) (string, string)
+	// RunToolResultHooks runs the registered tool_result hooks in
+	// load order, each seeing the previous one's rewrite, and returns
+	// the observation to use. A hook that throws, times out, or
+	// returns a non-string keeps the current result (fail open);
+	// the failure is logged to stderr by the implementation.
+	RunToolResultHooks(ctx context.Context, tool, argsJSON, result string, toolErr error) string
 }
 
 // Dispatch runs a tool call by name and returns the observation.

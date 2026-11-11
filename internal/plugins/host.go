@@ -15,11 +15,149 @@ import (
 // at the top level of the entry file.
 func (p *Plugin) installHostAPI() error {
 	return p.rt.SetGlobal("harness", map[string]any{
-		"registerTool": moejs.NativeFunc(p.nativeRegisterTool),
-		"log":          moejs.NativeFunc(p.nativeLog),
-		"readFile":     moejs.NativeFunc(p.nativeReadFile),
-		"writeFile":    moejs.NativeFunc(p.nativeWriteFile),
+		"registerTool":    moejs.NativeFunc(p.nativeRegisterTool),
+		"registerCommand": moejs.NativeFunc(p.nativeRegisterCommand),
+		"on":              moejs.NativeFunc(p.nativeOn),
+		"setMode":         moejs.NativeFunc(p.nativeSetMode),
+		"getMode":         moejs.NativeFunc(p.nativeGetMode),
+		"log":             moejs.NativeFunc(p.nativeLog),
+		"readFile":        moejs.NativeFunc(p.nativeReadFile),
+		"writeFile":       moejs.NativeFunc(p.nativeWriteFile),
 	})
+}
+
+// builtinCommands are the harness's own slash command names (without
+// the leading "/"): a plugin may not register one, or the user's
+// "/model" would stop switching models.
+var builtinCommands = map[string]bool{
+	"image": true, "sessions": true, "plugins": true, "resume": true,
+	"rename": true, "model": true, "quit": true, "exit": true,
+	"usage": true, "jobs": true, "clear": true, "compact": true,
+	"skill": true,
+}
+
+// nativeRegisterCommand implements
+// harness.registerCommand(name, description, handler). The handler
+// takes the raw args string (the text after "/name", unparsed) and
+// returns the output text. Registration is only valid while the
+// entry's top level runs, like registerTool: the command list is
+// snapshotted right after load. A registration error throws, which
+// fails the plugin's load.
+func (p *Plugin) nativeRegisterCommand(r *moejs.Realm, _ moejs.Value, args []moejs.Value) (moejs.Value, error) {
+	if !p.loading {
+		return moejs.Undefined(), fmt.Errorf("registerCommand must be called at the top level of the plugin entry, during load")
+	}
+	name, err := toGoString(r, moejs.Arg(args, 0))
+	if err != nil {
+		return moejs.Undefined(), err
+	}
+	if !validToolName.MatchString(name) {
+		return moejs.Undefined(), fmt.Errorf("invalid command name %q: use lowercase letters, digits and underscores, starting with a letter", name)
+	}
+	if builtinCommands[name] {
+		return moejs.Undefined(), fmt.Errorf("command %q collides with a built-in command", name)
+	}
+	if _, ok := p.commandsByName[name]; ok {
+		return moejs.Undefined(), fmt.Errorf("command %q is already registered by this plugin", name)
+	}
+	desc, err := toGoString(r, moejs.Arg(args, 1))
+	if err != nil {
+		return moejs.Undefined(), err
+	}
+	if strings.TrimSpace(desc) == "" {
+		return moejs.Undefined(), fmt.Errorf("command %q needs a description", name)
+	}
+	handler := moejs.Arg(args, 2)
+	if !handler.IsObject() {
+		return moejs.Undefined(), fmt.Errorf("command %q handler must be a function", name)
+	}
+	c := &Command{Name: name, Description: desc, handler: handler, plugin: p}
+	p.commands = append(p.commands, c)
+	p.commandsByName[name] = c
+	return moejs.Undefined(), nil
+}
+
+// nativeOn implements harness.on(event, handler), the lifecycle
+// hooks: "tool_call" (before a tool runs) and "tool_result" (after
+// it returns). At most one handler per event per plugin. Like
+// registerTool, only valid while the entry's top level runs.
+func (p *Plugin) nativeOn(r *moejs.Realm, _ moejs.Value, args []moejs.Value) (moejs.Value, error) {
+	if !p.loading {
+		return moejs.Undefined(), fmt.Errorf("harness.on must be called at the top level of the plugin entry, during load")
+	}
+	event, err := toGoString(r, moejs.Arg(args, 0))
+	if err != nil {
+		return moejs.Undefined(), err
+	}
+	handler := moejs.Arg(args, 1)
+	if !handler.IsObject() {
+		return moejs.Undefined(), fmt.Errorf("harness.on(%q) handler must be a function", event)
+	}
+	switch event {
+	case "tool_call":
+		if p.hasToolCallHook {
+			return moejs.Undefined(), fmt.Errorf("plugin %s already has a tool_call handler", p.Name)
+		}
+		p.toolCallHook = handler
+		p.hasToolCallHook = true
+	case "tool_result":
+		if p.hasToolResultHook {
+			return moejs.Undefined(), fmt.Errorf("plugin %s already has a tool_result handler", p.Name)
+		}
+		p.toolResultHook = handler
+		p.hasToolResultHook = true
+	default:
+		return moejs.Undefined(), fmt.Errorf("unknown hook event %q (want tool_call or tool_result)", event)
+	}
+	return moejs.Undefined(), nil
+}
+
+// registryModeSetter / registryModeGetter read the mode callbacks
+// off the owning registry (nil registry = a plugin built outside
+// Load, which never happens in production).
+func (p *Plugin) registryModeSetter() func(string) error {
+	if p.registry == nil {
+		return nil
+	}
+	return p.registry.ModeSetter
+}
+
+func (p *Plugin) registryModeGetter() func() string {
+	if p.registry == nil {
+		return nil
+	}
+	return p.registry.ModeGetter
+}
+
+// nativeSetMode implements harness.setMode(name): switch the agent's
+// tool mode (core-defined: "default" or "plan"). The mode lives on
+// the App, so this calls the registry's ModeSetter, wired by
+// app.Setup; an unknown mode is a throw, which the command handler
+// reports as the command's error.
+func (p *Plugin) nativeSetMode(r *moejs.Realm, _ moejs.Value, args []moejs.Value) (moejs.Value, error) {
+	name, err := toGoString(r, moejs.Arg(args, 0))
+	if err != nil {
+		return moejs.Undefined(), err
+	}
+	setter := p.registryModeSetter()
+	if setter == nil {
+		return moejs.Undefined(), fmt.Errorf("mode switching is not available in this run")
+	}
+	if err := setter(name); err != nil {
+		return moejs.Undefined(), err
+	}
+	return moejs.Undefined(), nil
+}
+
+// nativeGetMode implements harness.getMode(): the current tool mode
+// ("default" when no setter is wired, e.g. a standalone registry in
+// tests).
+func (p *Plugin) nativeGetMode(r *moejs.Realm, _ moejs.Value, args []moejs.Value) (moejs.Value, error) {
+	getter := p.registryModeGetter()
+	if getter == nil {
+		return moejs.String("default"), nil
+	}
+	return moejs.String(getter()), nil
 }
 
 // nativeRegisterTool implements

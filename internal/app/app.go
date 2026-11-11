@@ -94,6 +94,18 @@ type App struct {
 	// Kept so later commands can list plugins; the executor holds
 	// the same registry for dispatch.
 	Plugins *plugins.Registry
+	// toolMode is the loop's active tool set (agent.ToolModeDefault
+	// or ToolModePlan — NOT Cfg.Mode, the approval mode). Set only
+	// between turns, via SetToolMode; the registry's ModeSetter
+	// points at it, so a plugin command can switch modes.
+	toolMode agent.ToolMode
+	// allTools is the full tool list (built-ins + plugin tools) that
+	// SetToolMode filters per mode. Cfg.Tools is the filtered view.
+	allTools []llm.ToolDef
+	// pendingReminder is a one-turn system message set by a mode
+	// switch and consumed by the next runOnce (never persisted to
+	// the session): the model needs to be told the tools changed.
+	pendingReminder string
 }
 
 // Setup builds the client, session and agent config. The caller sets
@@ -242,6 +254,12 @@ func Setup(p Params) (*App, error) {
 	}
 	a.Plugins = pluginReg
 	pluginTools := pluginReg.ToolDefs()
+	// The mode callbacks: a plugin command (e.g. /plan) switches
+	// the tool mode through the registry, and getMode reads it back.
+	// Wired here, after Load; they only run at runtime, once Setup
+	// has built the agent config below.
+	pluginReg.ModeSetter = func(name string) error { return a.SetToolMode(agent.ToolMode(name)) }
+	pluginReg.ModeGetter = func() string { return string(a.ToolMode()) }
 
 	executor := &tools.Executor{Root: absRoot, ImageInput: slices.Contains(mdl.Input, "image"), Plugins: pluginReg}
 	if p.BashTimeoutSeconds > 0 {
@@ -353,10 +371,13 @@ func Setup(p Params) (*App, error) {
 	a.Model = mdl
 	a.Config = cfg
 	a.Provider = provName
+	// The tool mode starts at default, with the full tool list.
+	a.toolMode = agent.ToolModeDefault
+	a.allTools = append(agent.ToolDefs(), pluginTools...)
 	a.Cfg = &agent.Config{
 		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort},
 		Exec:                executor,
-		Tools:               append(agent.ToolDefs(), pluginTools...),
+		Tools:               a.allTools,
 		System:              system,
 		Mode:                mode,
 		MaxSteps:            p.MaxSteps,
@@ -631,6 +652,47 @@ func modelIDs(p config.Provider) string {
 // the new store; a background job finishing mid-swap can still audit
 // to the old session's sidecar. The runner's totals are reset by
 // ResetSession, not here.
+// ToolMode returns the loop's active tool set (agent.ToolModeDefault
+// or ToolModePlan). This is the tool mode, not Cfg.Mode (the approval
+// mode "suggest"/"auto").
+func (a *App) ToolMode() agent.ToolMode {
+	if a.toolMode == "" {
+		return agent.ToolModeDefault
+	}
+	return a.toolMode
+}
+
+// SetToolMode switches the loop's tool set between turns: the next
+// turn's tools are rebuilt from the full list, and a one-turn system
+// reminder is queued so the model is told the tools changed.
+// Switching to the current mode is a no-op (no reminder). An unknown
+// mode is an error. Only ever called between turns — the loop reads
+// Cfg.Tools fresh every step, so no locking is needed.
+func (a *App) SetToolMode(m agent.ToolMode) error {
+	if !m.Valid() {
+		return fmt.Errorf("unknown tool mode %q (want default or plan)", string(m))
+	}
+	if m == a.ToolMode() {
+		return nil
+	}
+	a.toolMode = m
+	if a.Cfg != nil {
+		a.Cfg.Tools = agent.ToolsForMode(m, a.allTools)
+	}
+	a.pendingReminder = agent.ReminderFor(m)
+	return nil
+}
+
+// resetToolMode returns to the default tool set (new or resumed
+// session): the mode is session-only and never persists.
+func (a *App) resetToolMode() {
+	a.toolMode = agent.ToolModeDefault
+	a.pendingReminder = ""
+	if a.Cfg != nil {
+		a.Cfg.Tools = agent.ToolsForMode(agent.ToolModeDefault, a.allTools)
+	}
+}
+
 func (a *App) NewSession() (*session.Store, error) {
 	store, err := session.New("")
 	if err != nil {
@@ -639,6 +701,7 @@ func (a *App) NewSession() (*session.Store, error) {
 	old := a.Store
 	a.Store = store
 	a.History = nil
+	a.resetToolMode()
 	if a.Cfg != nil {
 		a.Cfg.Session = store
 		if a.Cfg.Exec != nil {
@@ -670,6 +733,7 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	a.Store = store
 	a.History = history
 	a.ResumedMessage = fmt.Sprintf("Resumed session %s (%d messages).", id, len(history))
+	a.resetToolMode()
 	if a.Cfg != nil {
 		a.Cfg.Session = store
 		if a.Cfg.Exec != nil {
@@ -739,6 +803,32 @@ func (r *Runner) costLine(cost float64) string {
 		return "fee: " + label
 	}
 	return fmt.Sprintf("est. cost: ~$%.4f (rates: %s; %s)", cost, r.App.Rates.Source, label)
+}
+
+// ParsePluginCommand splits a "/name" or "/name args" line into the
+// command name and the raw args string. It reports false for anything
+// that is not a slash line, or whose first word is empty — the caller
+// then checks HasCommand, and an unknown name falls through to the
+// model as a task, like any other line.
+func ParsePluginCommand(line string) (name, args string, ok bool) {
+	if !strings.HasPrefix(line, "/") {
+		return "", "", false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(line, "/"))
+	if rest == "" {
+		return "", "", false
+	}
+	name, args, _ = strings.Cut(rest, " ")
+	return name, strings.TrimSpace(args), true
+}
+
+// RunCommand runs one plugin command by name and returns its output
+// text. Handle prints it (REPL/TUI); the RPC server answers with it.
+func (r *Runner) RunCommand(ctx context.Context, name, args string) (string, error) {
+	if r.App.Plugins == nil {
+		return "", fmt.Errorf("no plugins loaded")
+	}
+	return r.App.Plugins.CallCommand(ctx, name, args)
 }
 
 // Handle runs one input line. It returns true when the UI should quit.
@@ -855,6 +945,20 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 	case "/compact":
 		r.doCompact(ctx)
 		return false
+	}
+	// Plugin commands (/plan, /execute, ...): after the built-ins,
+	// before an unknown slash line falls through to the model as a
+	// task. A command is user-invoked, so it needs no approval.
+	if name, args, ok := ParsePluginCommand(line); ok {
+		if r.App.Plugins != nil && r.App.Plugins.HasCommand(name) {
+			out, err := r.RunCommand(ctx, name, args)
+			if err != nil {
+				r.Print("[error] %v", err)
+			} else {
+				r.Print("%s", out)
+			}
+			return false
+		}
 	}
 	r.runOnce(ctx, line)
 	return false
@@ -1025,7 +1129,19 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	r.App.History = append(r.App.History, userMsg)
 	_ = r.App.Store.Append(userMsg)
 	r.Turns++
-	_, usage, err := r.App.Cfg.Run(ctx, r.App.History)
+	// A mode switch queues a one-turn system reminder: prepend it to
+	// this turn's history only, so the model is told the tools
+	// changed without the reminder persisting in the session.
+	history := r.App.History
+	if r.App.pendingReminder != "" {
+		reminder := r.App.pendingReminder
+		r.App.pendingReminder = ""
+		turnHistory := make([]llm.Message, 0, len(history)+1)
+		turnHistory = append(turnHistory, llm.Message{Role: "system", Content: reminder})
+		turnHistory = append(turnHistory, history...)
+		history = turnHistory
+	}
+	_, usage, err := r.App.Cfg.Run(ctx, history)
 	r.LastErr = err
 	if err != nil {
 		r.Print("\n[error] %v", err)

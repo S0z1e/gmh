@@ -84,6 +84,18 @@ func (c *Config) needsApproval(name string) bool {
 	return name == "write" || name == "edit" || name == "bash"
 }
 
+// toolOffered reports whether name is in the turn's offered tool
+// list (c.Tools). Plan mode removes write/edit/bash from that list,
+// and this is what stops a hallucinated call from running.
+func toolOffered(tools []llm.ToolDef, name string) bool {
+	for _, d := range tools {
+		if d.Function.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // execBash runs a bash tool call, backgrounding it when it runs past
 // the executor's threshold. It returns the observation for the model
 // and, when backgrounded, the job so Run can feed its result back
@@ -258,6 +270,52 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		// avoids two tools writing the same file at once.)
 		for _, tc := range assistant.ToolCalls {
 			c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments})
+			// Plugin tool_call hooks run before approval: a denied
+			// call never prompts the user, and the approval flow
+			// still applies to anything the hooks let through — a
+			// hook can add a gate, never remove one. A rewrite
+			// replaces the args the rest of this path sees
+			// (approval prompt, audit, dispatch); the assistant
+			// message already in history keeps what the model asked.
+			argsJSON := tc.Function.Arguments
+			if c.Exec != nil && c.Exec.Plugins != nil {
+				newArgs, deny := c.Exec.Plugins.RunToolCallHooks(ctx, tc.Function.Name, argsJSON)
+				if deny != "" {
+					obs := "Denied by plugin " + deny + ". Do not retry this tool call; explain and propose an alternative."
+					if c.Session != nil {
+						_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: deny})
+					}
+					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: fmt.Errorf("denied by plugin %s", deny)})
+					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
+					if c.Session != nil {
+						_ = c.Session.Append(msgs[len(msgs)-1])
+					}
+					continue
+				}
+				argsJSON = newArgs
+				tc.Function.Arguments = argsJSON
+			}
+			// A tool the model was not offered in this turn's list
+			// is refused outright, before approval: the offered
+			// list is the enforcement, not just a hint. Without
+			// this, a model that hallucinates a write call from
+			// the system prompt (which still lists all seven
+			// built-ins) would bypass plan mode — and a call for
+			// a disabled plugin's tool would run too. The model
+			// gets an error observation, like a hook denial, and
+			// the refusal is audited.
+			if !toolOffered(c.Tools, tc.Function.Name) {
+				obs := fmt.Sprintf("Tool %s is not available in this turn. Do not retry this tool call; explain and propose an alternative.", tc.Function.Name)
+				if c.Session != nil {
+					_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "tool not offered in this turn"})
+				}
+				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: fmt.Errorf("tool %s not offered in this turn", tc.Function.Name)})
+				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
+				if c.Session != nil {
+					_ = c.Session.Append(msgs[len(msgs)-1])
+				}
+				continue
+			}
 			if c.needsApproval(tc.Function.Name) {
 				prompt := fmt.Sprintf("Run %s %s?", tc.Function.Name, truncate(tc.Function.Arguments, 200))
 				c.emit(Event{Kind: EventApproval, Text: prompt})
@@ -300,12 +358,20 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				}
 			} else {
 				var dispatchErr error
-				res, dispatchErr = c.Exec.Dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+				res, dispatchErr = c.Exec.Dispatch(ctx, tc.Function.Name, argsJSON)
 				obs = res.Text
 				err = dispatchErr
 				if err != nil {
 					// Tool errors are observations, not fatal errors.
 					obs = fmt.Sprintf("Error: %v\nOutput:\n%s", err, res.Text)
+				}
+				// Plugin tool_result hooks rewrite the observation
+				// before it enters history and the session: the
+				// model sees the rewritten text, and the session
+				// records it too. Bash observations never reach a
+				// hook (they do not go through Dispatch).
+				if c.Exec.Plugins != nil {
+					obs = c.Exec.Plugins.RunToolResultHooks(ctx, tc.Function.Name, argsJSON, obs, err)
 				}
 			}
 			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count})

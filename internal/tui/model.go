@@ -108,6 +108,10 @@ type Model struct {
 	metaMode  string
 	metaModel string
 	metaAPI   string
+	// metaToolMode is the loop's tool mode ("default" or "plan"),
+	// set by MetaUpdateMsg; the meta line shows a plan chip while
+	// it is "plan". Empty until the first update (tests).
+	metaToolMode string
 	// metaBranch is the workspace's git branch ("" when the root is
 	// not a git checkout), set by WithBranch.
 	metaBranch string
@@ -145,12 +149,14 @@ func (m Model) WithBranch(branch string) Model {
 // MetaUpdateMsg carries the session totals after a turn, so the meta
 // line can show tokens and turns without the runner knowing the TUI.
 // Model/API name the current model after a /model switch; empty means
-// unchanged.
+// unchanged. ToolMode is the loop's tool mode ("default" or "plan");
+// the meta line shows a plan chip while it is "plan".
 type MetaUpdateMsg struct {
-	Tokens int
-	Turns  int
-	Model  string
-	API    string
+	Tokens   int
+	Turns    int
+	Model    string
+	API      string
+	ToolMode string
 }
 
 // markWorking starts a turn: working becomes true, and workingSince
@@ -254,6 +260,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.API != "" {
 			m.metaAPI = msg.API
+		}
+		if msg.ToolMode != "" {
+			m.metaToolMode = msg.ToolMode
 		}
 		return m, nil
 	}
@@ -891,7 +900,11 @@ func (m Model) metaLine() string {
 	if m.metaMode == "" && m.metaModel == "" && m.metaAPI == "" {
 		return ""
 	}
-	left := styleModeChip.Render(m.metaMode) + styleMuted.Render(" · ") +
+	left := styleModeChip.Render(m.metaMode)
+	if m.metaToolMode == "plan" {
+		left += styleMuted.Render(" · ") + styleModeChip.Render("plan")
+	}
+	left += styleMuted.Render(" · ") +
 		styleBase.Render(m.metaModel) + styleMuted.Render(" · ") +
 		styleMuted.Render(m.metaAPI)
 	var right string
