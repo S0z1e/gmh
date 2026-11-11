@@ -128,6 +128,9 @@ var (
 	styleWarning lipgloss.Style
 	styleSuccess lipgloss.Style
 	styleSelect  lipgloss.Style
+	// styleThinking renders the model's streamed thinking: dim and
+	// italic, so it reads as monologue rather than the answer.
+	styleThinking lipgloss.Style
 	// styleModeChip is the mode badge on the meta line: dark text on
 	// the accent colour (yazi's mode chip), not just coloured text.
 	styleModeChip lipgloss.Style
@@ -164,6 +167,7 @@ func SetTheme(t Theme) {
 	styleError = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Error)).Bold(true)
 	styleWarning = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Warning))
 	styleSuccess = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Success))
+	styleThinking = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Muted)).Italic(true)
 	styleSelect = lipgloss.NewStyle().Background(lipgloss.Color(t.SelectBg)).Foreground(lipgloss.Color(t.SelectFg)).Bold(true)
 	styleModeChip = lipgloss.NewStyle().Background(lipgloss.Color(t.Peach)).Foreground(lipgloss.Color(t.SelectFg)).Bold(true).Padding(0, 1)
 	badgeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Muted))

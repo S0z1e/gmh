@@ -609,6 +609,10 @@ func (s *Server) onEvent(ev agent.Event) {
 	switch ev.Kind {
 	case agent.EventTextDelta:
 		s.writeEvent(Event{Type: "text_delta", Text: ev.Text})
+	case agent.EventThinkingDelta:
+		s.writeEvent(Event{Type: "thinking_delta", Text: ev.Text})
+	case agent.EventThinkingEnd:
+		s.writeEvent(Event{Type: "thinking_end", Text: ev.Text})
 	case agent.EventStepUsage:
 		s.turnUsage.Add(ev.Usage)
 		s.writeEvent(Event{Type: "step_usage", Usage: usageJSON(ev.Usage)})
@@ -912,7 +916,7 @@ func (s *Server) feeLabel() string {
 }
 
 func usageJSON(u llm.Usage) *UsageJSON {
-	return &UsageJSON{Prompt: u.PromptTokens, Cached: u.CachedTokens, Completion: u.CompletionTokens, Total: u.TotalTokens}
+	return &UsageJSON{Prompt: u.PromptTokens, Cached: u.CachedTokens, Completion: u.CompletionTokens, Total: u.TotalTokens, Reasoning: u.ReasoningTokens}
 }
 
 func truncateRunes(s string, n int) string {

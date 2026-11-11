@@ -124,8 +124,13 @@ type anthropicEvent struct {
 	Type  string `json:"type"`
 	Index int    `json:"index"`
 	Delta struct {
-		Type        string `json:"type"`
-		Text        string `json:"text"`
+		Type string `json:"type"`
+		Text string `json:"text"`
+		// Thinking is the text of a thinking_delta. Signature is
+		// the opaque replay data of a signature_delta: never text,
+		// never forwarded to onThinking.
+		Thinking    string `json:"thinking"`
+		Signature   string `json:"signature"`
 		PartialJSON string `json:"partial_json"`
 		StopReason  string `json:"stop_reason"`
 	} `json:"delta"`
@@ -133,6 +138,9 @@ type anthropicEvent struct {
 		Type string `json:"type"`
 		ID   string `json:"id"`
 		Name string `json:"name"`
+		// Signature is a thinking block's signature, sent with its
+		// content_block_start. Opaque replay data, never text.
+		Signature string `json:"signature"`
 	} `json:"content_block"`
 	Message struct {
 		Usage anthropicUsage `json:"usage"`
@@ -223,7 +231,7 @@ func anthropicBearerAuth(baseURL string) bool {
 	return host != "api.anthropic.com" && !strings.HasSuffix(host, ".anthropic.com")
 }
 
-func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage)) error {
+func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage), onThinking func(string)) error {
 	system, anthMsgs := toAnthropicMessages(messages)
 	var atools []anthropicTool
 	for _, t := range tools {
@@ -262,6 +270,12 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 	var msg Message
 	msg.Role = "assistant"
 	var usage Usage
+	// thinkingSignature accumulates the thinking block's signature
+	// (content_block_start + signature_delta). It is opaque replay
+	// data, never text: it is kept here only so a future step that
+	// persists thinking can replay it verbatim, and it is never
+	// passed to onThinking.
+	var thinkingSignature strings.Builder
 	type acc struct {
 		id   string
 		name string
@@ -301,6 +315,11 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			a.kind = ev.ContentBlock.Type
 			a.id = ev.ContentBlock.ID
 			a.name = ev.ContentBlock.Name
+			// A thinking block's signature arrives with its start
+			// event; record it (opaque replay data, never text).
+			if ev.ContentBlock.Type == "thinking" && ev.ContentBlock.Signature != "" {
+				thinkingSignature.WriteString(ev.ContentBlock.Signature)
+			}
 		case "content_block_delta":
 			switch ev.Delta.Type {
 			case "text_delta":
@@ -310,6 +329,16 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 						onText(ev.Delta.Text)
 					}
 				}
+			case "thinking_delta":
+				// Thinking is display-only: forward it, never add
+				// it to the answer.
+				if ev.Delta.Thinking != "" && onThinking != nil {
+					onThinking(ev.Delta.Thinking)
+				}
+			case "signature_delta":
+				// Opaque replay data, not text: accumulate it and
+				// never forward it to onThinking.
+				thinkingSignature.WriteString(ev.Delta.Signature)
 			case "input_json_delta":
 				a, ok := accs[ev.Index]
 				if !ok {
@@ -318,8 +347,8 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 					order = append(order, ev.Index)
 				}
 				a.args.WriteString(ev.Delta.PartialJSON)
-				// thinking_delta and signature_delta are reasoning:
-				// skipped, like reasoning_content in chat mode.
+				// redacted_thinking has no text: there is nothing
+				// to forward, so it is ignored entirely.
 			}
 		case "message_delta":
 			usage.CompletionTokens = ev.Usage.OutputTokens

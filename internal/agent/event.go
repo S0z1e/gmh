@@ -14,9 +14,18 @@ type EventKind string
 
 const (
 	EventTextDelta EventKind = "text_delta"
-	EventStepUsage EventKind = "step_usage"
-	EventToolStart EventKind = "tool_start"
-	EventToolEnd   EventKind = "tool_end"
+	// EventThinkingDelta carries one streamed thinking fragment.
+	// Text is a delta, like TextDelta. Thinking is display-only:
+	// it is never part of the assistant message or the session.
+	EventThinkingDelta EventKind = "thinking_delta"
+	// EventThinkingEnd carries the full thinking text for one LLM
+	// call, so renderers can replace the accumulated deltas with
+	// the authoritative text. It is emitted only when the thinking
+	// is non-empty; a call with no thinking emits nothing.
+	EventThinkingEnd EventKind = "thinking_end"
+	EventStepUsage   EventKind = "step_usage"
+	EventToolStart   EventKind = "tool_start"
+	EventToolEnd     EventKind = "tool_end"
 	// EventApproval fires when the loop pauses for a tool approval.
 	// Text carries the approval prompt. The answer itself is visible
 	// in the following ToolEnd (denied) or ToolStart/ToolEnd (approved).

@@ -22,6 +22,18 @@ func renderText(s string) string {
 	return strings.Join(lines, "\n")
 }
 
+// renderThinking renders streamed thinking text as dim/italic lines
+// under the same 3-space gutter. Plain text, no markdown: thinking
+// is the model's internal monologue, and the style must stay uniform
+// across the block (markdown would re-style parts of it).
+func renderThinking(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = "   " + styleThinking.Render(l)
+	}
+	return strings.Join(lines, "\n")
+}
+
 func formatMarkdown(s string) string {
 	lines := strings.Split(s, "\n")
 	var out []string

@@ -17,8 +17,8 @@
   sessions stay in the shared format and replay across modes;
   consecutive same-role messages merge into one (Anthropic requires
   strict user/assistant alternation), an empty tool result replays as
-  `(no output)`, and thinking blocks are skipped like
-  `reasoning_content` in chat mode. `max_tokens` defaults to 16384
+  `(no output)`, and thinking blocks are skipped on replay (they were
+  never persisted — thinking is display-only). `max_tokens` defaults to 16384
   (Pi's default), or `ANTHROPIC_MAX_TOKENS`.
 - Stream integrity: a chat stream that ends without `[DONE]`, a
   Responses stream without `response.completed`, or an Anthropic
@@ -95,7 +95,11 @@ report their count on the row (`Grep "TODO" in . (3 matches)`);
 the count comes from the tool, never invented. While working, a braille spinner shows the pending tool label
 in plain words (`Reading src/foo.ts…`), or `Thinking…` — but only
 after the turn has run 300 ms with no text, so short turns never
-flash a spinner. Usage lines stay in the timeline with thousands
+flash a spinner. When the model streams thinking, the first thinking
+delta replaces that row with the accumulating thinking text, dim and
+italic, above the live answer; it stays in the scrollback after the
+turn, ahead of the reply. Thinking is display-only: it is never part
+of the answer, the session file, or the usage totals. Usage lines stay in the timeline with thousands
 separators. The approval dialog is a full-width panel:
 `△ Approval required`, the tool summary, `[y] Allow once` on a solid
 blue background, `[n] Deny`, `esc = deny` (single key, Esc = deny).

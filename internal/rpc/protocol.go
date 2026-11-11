@@ -62,13 +62,17 @@ type UsageJSON struct {
 	Cached     int `json:"cached"`
 	Completion int `json:"completion"`
 	Total      int `json:"total"`
+	// Reasoning is the thinking part of the completion tokens: a
+	// subset of Completion, never an extra charge. Omitted when the
+	// provider did not report it.
+	Reasoning int `json:"reasoning,omitempty"`
 }
 
 // Event is one line to the GUI. Only the fields for its Type are set;
 // the rest are omitted. Types: ready, turn_started, text_delta,
-// step_usage, tool_start, tool_end, tool_backgrounded,
-// background_wait, tool_background_done, approval_request,
-// agent_settled, compacted, error.
+// thinking_delta, thinking_end, step_usage, tool_start, tool_end,
+// tool_backgrounded, background_wait, tool_background_done,
+// approval_request, agent_settled, compacted, error.
 type Event struct {
 	Type string `json:"type"`
 	// ready: protocol version and session identity.

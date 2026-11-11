@@ -25,11 +25,12 @@ import (
 // fakeStep is one scripted LLM reply, mirroring /tmp/tui-shot/
 // mock_openai.py: each POST advances one step, the last repeats.
 type fakeStep struct {
-	kind  string // "tool" or "text"
-	tool  string
-	args  map[string]any
-	text  string
-	delay time.Duration
+	kind     string // "tool" or "text"
+	tool     string
+	args     map[string]any
+	text     string
+	thinking string // reasoning_content deltas, streamed before text
+	delay    time.Duration
 }
 
 func sseChunk(delta map[string]any, finish string, usage map[string]any) string {
@@ -86,6 +87,14 @@ func fakeHandler(t *testing.T, steps []fakeStep) http.HandlerFunc {
 			}
 			out.WriteString(sseChunk(map[string]any{}, "tool_calls", usage))
 		default:
+			// Thinking streams first (reasoning_content deltas),
+			// then the answer — the same order a real provider
+			// sends them in.
+			if step.thinking != "" {
+				for _, word := range strings.Split(step.thinking, " ") {
+					out.WriteString(sseChunk(map[string]any{"reasoning_content": word + " "}, "", nil))
+				}
+			}
 			for _, word := range strings.Split(step.text, " ") {
 				out.WriteString(sseChunk(map[string]any{"content": word + " "}, "", nil))
 			}

@@ -130,7 +130,7 @@ func TestAnthropicStreamTextAndThinking(t *testing.T) {
 	err := c.Stream(context.Background(), []Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "hi"},
-	}, nil, func(s string) { streamed += s }, func(m Message, u Usage) { got = m; gotUsage = u })
+	}, nil, func(s string) { streamed += s }, func(m Message, u Usage) { got = m; gotUsage = u }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestAnthropicStreamFragmentedToolCall(t *testing.T) {
 
 	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "anthropic"}
 	var got Message
-	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "read it"}}, nil, nil, func(m Message, u Usage) { got = m })
+	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "read it"}}, nil, nil, func(m Message, u Usage) { got = m }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestAnthropicStreamTwoToolCallsInOneTurn(t *testing.T) {
 
 	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "anthropic"}
 	var got Message
-	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "do two things"}}, nil, nil, func(m Message, u Usage) { got = m })
+	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "do two things"}}, nil, nil, func(m Message, u Usage) { got = m }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func TestAnthropicStreamRequiresMessageStop(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "anthropic"}
-	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {})
+	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil)
 	if err == nil || !strings.Contains(err.Error(), "without message_stop") {
 		t.Fatalf("err = %v, want a missing-message_stop error", err)
 	}
@@ -311,7 +311,7 @@ func TestAnthropicIgnoresSamplingParams(t *testing.T) {
 		BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "anthropic",
 		SamplingParams: map[string]any{"temperature": 0.7},
 	}
-	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := body["temperature"]; ok {
@@ -335,7 +335,7 @@ func TestAnthropicSendsThinkingBudget(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "anthropic", MaxTokens: 16384, Effort: "high"}
-	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
 		t.Fatal(err)
 	}
 	thinking, ok := body["thinking"].(map[string]any)
@@ -346,7 +346,7 @@ func TestAnthropicSendsThinkingBudget(t *testing.T) {
 	// Unset effort omits the field entirely.
 	body = nil
 	c.Effort = ""
-	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := body["thinking"]; ok {

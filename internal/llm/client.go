@@ -68,6 +68,12 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// ReasoningTokens is the thinking part of the completion tokens:
+	// a subset of CompletionTokens, never an extra charge. Filled
+	// from completion_tokens_details.reasoning_tokens (chat) or
+	// output_tokens_details.reasoning_tokens (responses); Anthropic
+	// does not report it separately, so it stays 0 there.
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 	// CachedTokens is filled from whichever field the provider returns:
 	// top-level cached_tokens, prompt_cache_hit_tokens, or
 	// prompt_tokens_details.cached_tokens. See Usage.normalize.
@@ -76,6 +82,9 @@ type Usage struct {
 	PromptTokensDetails  struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
+	CompletionTokensDetails struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
 }
 
 type chatRequest struct {
@@ -104,8 +113,12 @@ type streamOptions struct {
 type streamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content   string `json:"content"`
-			ToolCalls []struct {
+			Content string `json:"content"`
+			// ReasoningContent is the model's thinking for this delta
+			// (DeepSeek / OpenConsole). It is not the answer and must
+			// never enter msg.Content; it goes to onThinking instead.
+			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
 				Function struct {
@@ -155,6 +168,9 @@ type responsesUsage struct {
 	InputTokensDetails struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"input_tokens_details"`
+	OutputTokensDetails struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"output_tokens_details"`
 }
 
 // responsesEvent is the common envelope for Responses SSE events.
@@ -177,6 +193,7 @@ type responsesEvent struct {
 	Response struct {
 		Output []struct {
 			Type      string `json:"type"`
+			ID        string `json:"id"`
 			CallID    string `json:"call_id"`
 			Name      string `json:"name"`
 			Arguments string `json:"arguments"`
@@ -330,22 +347,27 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolDef, 
 	}, func(m Message, u Usage) {
 		msg = m
 		usage = u
-	})
+	}, nil)
 	return msg, usage, err
 }
 
-// Stream dispatches to the selected API mode.
-func (c *Client) Stream(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage)) error {
+// Stream dispatches to the selected API mode. onThinking, when
+// non-nil, receives the model's thinking deltas as they stream
+// (reasoning_content in chat, reasoning summary/text deltas in
+// Responses, thinking_delta in Anthropic). Thinking is display-only:
+// it is never part of the returned message's Content, and signatures
+// / encrypted_content are never passed through it.
+func (c *Client) Stream(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage), onThinking func(string)) error {
 	if c.APIKey == "" {
 		return fmt.Errorf("missing API key: set OPENAI_API_KEY")
 	}
 	switch c.Mode() {
 	case "responses":
-		return c.streamResponses(ctx, messages, tools, onText, onDone)
+		return c.streamResponses(ctx, messages, tools, onText, onDone, onThinking)
 	case "anthropic":
-		return c.streamAnthropic(ctx, messages, tools, onText, onDone)
+		return c.streamAnthropic(ctx, messages, tools, onText, onDone, onThinking)
 	}
-	return c.streamChat(ctx, messages, tools, onText, onDone)
+	return c.streamChat(ctx, messages, tools, onText, onDone, onThinking)
 }
 
 // mergeSamplingParams merges free-form sampling parameters
@@ -382,7 +404,7 @@ func reasoningForEffort(effort string) *reasoningParams {
 	return &reasoningParams{Effort: effort}
 }
 
-func (c *Client) streamChat(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage)) error {
+func (c *Client) streamChat(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage), onThinking func(string)) error {
 	req := chatRequest{Model: c.Model, Messages: toChatWireMessages(messages), Tools: tools, Stream: true, StreamOptions: &streamOptions{IncludeUsage: true}}
 	if c.MaxTokens > 0 {
 		req.MaxTokens = &c.MaxTokens
@@ -442,6 +464,11 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 				if onText != nil {
 					onText(ch.Delta.Content)
 				}
+			}
+			// Thinking is display-only: forward it, never add it
+			// to the answer.
+			if ch.Delta.ReasoningContent != "" && onThinking != nil {
+				onThinking(ch.Delta.ReasoningContent)
 			}
 			for _, tc := range ch.Delta.ToolCalls {
 				a, ok := accs[tc.Index]
@@ -549,7 +576,7 @@ func maxOutputTokensPtr(n int) *int {
 	return &n
 }
 
-func (c *Client) streamResponses(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage)) error {
+func (c *Client) streamResponses(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage), onThinking func(string)) error {
 	instructions, input := toResponsesInput(messages)
 	var rtools []responsesTool
 	for _, t := range tools {
@@ -589,7 +616,27 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 	}
 	accs := map[string]*acc{} // keyed by item_id
 	order := []string{}
-
+	// reasoningSeen tracks, per reasoning item id, whether its
+	// summary already arrived as deltas. A reasoning item whose
+	// text never streamed is backfilled once from its done event
+	// (Pi's summaryText || contentText pattern); an item already
+	// seen as deltas is never repeated.
+	reasoningSeen := map[string]bool{}
+	// reasoningPartsText joins one reasoning item's content parts
+	// into the text to backfill. encrypted_content is opaque and is
+	// never among the parts; only summary/text parts reach here.
+	reasoningPartsText := func(parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}) string {
+		var texts []string
+		for _, p := range parts {
+			if p.Text != "" {
+				texts = append(texts, p.Text)
+			}
+		}
+		return strings.Join(texts, "\n")
+	}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	// OpenConsole's Responses stream ends with response.completed and
@@ -615,6 +662,15 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 				msg.Content += ev.Delta
 				if onText != nil {
 					onText(ev.Delta)
+				}
+			}
+		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			// Reasoning summary/text deltas are thinking, not the
+			// answer: forward them, never add them to msg.Content.
+			if ev.Delta != "" {
+				reasoningSeen[ev.ItemID] = true
+				if onThinking != nil {
+					onThinking(ev.Delta)
 				}
 			}
 		case "response.output_item.added":
@@ -651,6 +707,23 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 				a.args.WriteString(ev.Arguments)
 			}
 		case "response.output_item.done":
+			if ev.Item.Type == "reasoning" {
+				// Backfill a reasoning item whose summary never
+				// streamed as deltas; skip it when the deltas
+				// already carried the text.
+				id := ev.Item.ID
+				if id == "" {
+					id = ev.ItemID
+				}
+				if !reasoningSeen[id] {
+					if text := reasoningPartsText(ev.Item.Content); text != "" {
+						reasoningSeen[id] = true
+						if onThinking != nil {
+							onThinking(text)
+						}
+					}
+				}
+			}
 			if ev.Item.Type == "function_call" {
 				id := ev.Item.ID
 				if id == "" {
@@ -689,6 +762,23 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 			sawCompleted = true
 			for _, out := range ev.Response.Output {
 				switch out.Type {
+				case "reasoning":
+					// Last-chance backfill: a reasoning item the
+					// stream never delivered as deltas or a done
+					// event. Guarded by reasoningSeen, so text
+					// already forwarded is never repeated.
+					id := out.ID
+					if id == "" {
+						id = out.CallID
+					}
+					if !reasoningSeen[id] {
+						if text := reasoningPartsText(out.Content); text != "" {
+							reasoningSeen[id] = true
+							if onThinking != nil {
+								onThinking(text)
+							}
+						}
+					}
 				case "function_call":
 					// Completed carries the authoritative call list.
 					found := false
@@ -714,7 +804,7 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 			}
 			u := ev.Response.Usage
 			if u.TotalTokens != 0 {
-				usage = Usage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens, CachedTokens: u.InputTokensDetails.CachedTokens}
+				usage = Usage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens, CachedTokens: u.InputTokensDetails.CachedTokens, ReasoningTokens: u.OutputTokensDetails.ReasoningTokens}
 			}
 		}
 	}

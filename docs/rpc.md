@@ -74,7 +74,18 @@ echoed in the response):
 Events (stdout):
 - `turn_started` `{"text":"<first 200 runes of the task>"}`.
 - `text_delta` `{"text":"..."}` — streamed assistant text.
-- `step_usage` `{"usage":{"prompt":N,"cached":N,"completion":N,"total":N}}` — per LLM call.
+- `thinking_delta` `{"text":"..."}` — one streamed thinking
+  fragment (the model's reasoning, not the answer). Deltas only, like
+  `text_delta`; no `thinking_start` event.
+- `thinking_end` `{"text":"..."}` — the full thinking text for one
+  LLM call, so the GUI can replace the accumulated deltas with the
+  authoritative text. Emitted only when the thinking is non-empty; a
+  call with no thinking emits neither event. Thinking is display-only:
+  it never enters `agent_settled.text`, the session file, or
+  `history`.
+- `step_usage` `{"usage":{"prompt":N,"cached":N,"completion":N,"total":N,"reasoning":N}}` — per LLM call. `reasoning` is the thinking
+  part of the completion tokens — a subset of `completion`, never an
+  extra charge — and is omitted when the provider did not report it.
 - `tool_start` `{"tool":"read","args":{...}}` — args as parsed JSON
   (the raw string when unparseable).
 - `tool_end` `{"tool":"...","output":"...","truncated":bool,"error":null|"...","detail":"...","count":N}` — output capped at 32 KiB head+tail, like the loop's

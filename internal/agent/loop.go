@@ -222,6 +222,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 	for step := 0; step < steps; step++ {
 		var assistant llm.Message
 		var usage llm.Usage
+		// thinking accumulates this step's thinking text. It is
+		// display-only: it never enters the assistant message or
+		// the session, and thinking_end fires only when it is
+		// non-empty.
+		var thinking strings.Builder
 		// Send the truncated view to the LLM; the full history stays
 		// in msgs and in the session file.
 		apiMsgs := truncateToolResults(msgs, 2, 2000, 32*1024)
@@ -230,6 +235,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		}, func(m llm.Message, u llm.Usage) {
 			assistant = m
 			usage = u
+			if thinking.Len() > 0 {
+				c.emit(Event{Kind: EventThinkingEnd, Text: thinking.String()})
+			}
+		}, func(s string) {
+			thinking.WriteString(s)
+			c.emit(Event{Kind: EventThinkingDelta, Text: s})
 		})
 		if err != nil {
 			wrapped := fmt.Errorf("step %d: %w", step+1, err)

@@ -32,7 +32,7 @@ func TestResponsesStreamAccumulatesFragmentedToolCall(t *testing.T) {
 	err := c.Stream(context.Background(), []Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "hi"},
-	}, nil, nil, func(m Message, u Usage) { got = m; gotUsage = u })
+	}, nil, nil, func(m Message, u Usage) { got = m; gotUsage = u }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestResponsesStreamTwoToolCallsInOneTurn(t *testing.T) {
 	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "responses"}
 	var got Message
 	var gotUsage Usage
-	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "do two things"}}, nil, nil, func(m Message, u Usage) { got = m; gotUsage = u })
+	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "do two things"}}, nil, nil, func(m Message, u Usage) { got = m; gotUsage = u }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestResponsesStreamRequiresCompleted(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "responses"}
-	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {})
+	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil)
 	if err == nil || !strings.Contains(err.Error(), "without response.completed") {
 		t.Fatalf("err = %v, want a missing-completed error", err)
 	}
@@ -145,7 +145,7 @@ func TestResponsesStreamMergesPartialCompleted(t *testing.T) {
 
 	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "responses"}
 	var got Message
-	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "do two things"}}, nil, nil, func(m Message, u Usage) { got = m })
+	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "do two things"}}, nil, nil, func(m Message, u Usage) { got = m }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestResponsesMergesSamplingParamsAndMaxOutputTokens(t *testing.T) {
 		MaxTokens:      16384,
 		SamplingParams: map[string]any{"temperature": 0.7},
 	}
-	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if body["temperature"] != 0.7 {
@@ -231,7 +231,7 @@ func TestResponsesSendsReasoningEffort(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "responses", Effort: "medium"}
-	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
 		t.Fatal(err)
 	}
 	reasoning, ok := body["reasoning"].(map[string]any)
@@ -242,7 +242,7 @@ func TestResponsesSendsReasoningEffort(t *testing.T) {
 	// Unset effort omits the field entirely.
 	body = nil
 	c.Effort = ""
-	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := body["reasoning"]; ok {

@@ -81,6 +81,10 @@ type Model struct {
 	live   string // streamed text of the current turn (a string, not a
 	// strings.Builder: Update copies the model by value, and a
 	// copied non-zero Builder panics on the next WriteString)
+	// liveThinking is the streamed thinking of the current turn,
+	// accumulated like live. It is display-only: it never enters
+	// the assistant message or the session.
+	liveThinking string
 	liveTool     string // tool currently running, "" when idle
 	liveToolArgs string // JSON args of the running tool (ToolEnd
 	// carries no args, so the summary is built from these)
@@ -102,6 +106,11 @@ type Model struct {
 	// land above the reply. Verified live: the ordering test failed
 	// exactly this way before this field existed.
 	pendingReply string
+	// pendingThinking is a finished turn's thinking, waiting to be
+	// committed to the scrollback together with the reply (same
+	// one-print ordering rule as pendingReply: thinking first, then
+	// the reply, then the runner's text).
+	pendingThinking string
 
 	// Meta for the composer line under the input (mode · model · api).
 	// Set by WithMeta; empty in tests, which then show no meta line.
@@ -239,14 +248,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case EventMsg:
 		return m.handleEvent(msg.Event)
 	case PrintMsg:
-		// The finished turn's reply, if any, goes out in the same
-		// print as the runner's text — one Println, so the two can
-		// never swap order (see pendingReply). The reply is rendered
-		// (indent + markdown); the runner's part keeps its own styling.
-		if m.pendingReply != "" {
-			text := renderText(m.pendingReply) + "\n" + stylePrint(msg.Text)
-			m.pendingReply = ""
-			return m, tea.Println(text)
+		// The finished turn's thinking and reply, if any, go out
+		// in the same print as the runner's text — one Println, so
+		// they can never swap order (see pendingReply). Thinking
+		// first, then the reply, then the runner's part.
+		if m.pendingReply != "" || m.pendingThinking != "" {
+			var parts []string
+			if m.pendingThinking != "" {
+				parts = append(parts, renderThinking(m.pendingThinking))
+				m.pendingThinking = ""
+			}
+			if m.pendingReply != "" {
+				parts = append(parts, renderText(m.pendingReply))
+				m.pendingReply = ""
+			}
+			parts = append(parts, stylePrint(msg.Text))
+			return m, tea.Println(strings.Join(parts, "\n"))
 		}
 		return m, tea.Println(stylePrint(msg.Text))
 	case ApprovalMsg:
@@ -356,6 +373,14 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		}
 		m.live += ev.Text
 		m.markWorking()
+	case agent.EventThinkingDelta:
+		m.liveThinking += ev.Text
+		m.markWorking()
+	case agent.EventThinkingEnd:
+		// The authoritative full text replaces the accumulated
+		// deltas (same rule as Pi's thinking_end).
+		m.liveThinking = ev.Text
+		m.markWorking()
 	case agent.EventToolStart:
 		m.liveTool = ev.ToolName
 		m.liveToolArgs = ev.ToolArgs
@@ -405,9 +430,12 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		// Do not print the reply here: hold it as pendingReply and
 		// let the runner's next print (the usage lines) carry it out
 		// in the same Println. Two separate Println commands can
-		// swap order; one print cannot.
+		// swap order; one print cannot. The thinking goes with it,
+		// ahead of the reply.
 		m.pendingReply = strings.TrimRight(m.live, "\n")
+		m.pendingThinking = strings.TrimRight(m.liveThinking, "\n")
 		m.live = ""
+		m.liveThinking = ""
 		m.liveTool = ""
 		m.liveToolArgs = ""
 		m.working = false
@@ -415,6 +443,7 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	case agent.EventError:
 		m.liveTool = ""
 		m.liveToolArgs = ""
+		m.liveThinking = ""
 		m.working = false
 		m.workingSince = time.Time{}
 		// The error line itself is printed by the runner.
@@ -828,12 +857,17 @@ func formatInt(n int) string {
 // input line, because the meta line sits below it.
 func (m Model) View() tea.View {
 	var liveLines []string
+	// Thinking streams first and sits above the answer, dim and
+	// italic, so it reads as monologue rather than the reply.
+	if m.liveThinking != "" {
+		liveLines = append(liveLines, strings.Split(renderThinking(m.liveThinking), "\n")...)
+	}
 	if m.live != "" {
 		liveLines = append(liveLines, strings.Split(renderText(m.live), "\n")...)
 	}
 	if m.liveTool != "" {
 		liveLines = append(liveLines, "   "+styleMuted.Render(spinnerGlyph(m.spinnerFrame))+" "+styleMuted.Render(toolPendingLabel(m.liveTool, m.liveToolArgs)))
-	} else if m.working && m.live == "" && m.showThinking() {
+	} else if m.working && m.live == "" && m.liveThinking == "" && m.showThinking() {
 		liveLines = append(liveLines, "   "+styleWarning.Render(spinnerGlyph(m.spinnerFrame))+" "+styleWarning.Render("Thinking…"))
 	}
 	var lines []string

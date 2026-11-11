@@ -31,7 +31,7 @@ func TestStreamAccumulatesFragmentedToolCall(t *testing.T) {
 
 	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model"}
 	var got Message
-	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) { got = m })
+	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) { got = m }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestStreamChatRequestsUsage(t *testing.T) {
 
 	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model"}
 	var gotUsage Usage
-	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) { gotUsage = u })
+	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) { gotUsage = u }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestStreamChatRequiresDone(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model"}
-	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {})
+	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil)
 	if err == nil || !strings.Contains(err.Error(), "without [DONE]") {
 		t.Fatalf("err = %v, want a missing-[DONE] error", err)
 	}
@@ -131,7 +131,7 @@ func TestStreamChatMergesSamplingParamsAndMaxTokens(t *testing.T) {
 		MaxTokens:      16384,
 		SamplingParams: map[string]any{"temperature": 0.7, "top_p": 0.95, "model": "evil", "max_tokens": 1},
 	}
-	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if body["temperature"] != 0.7 || body["top_p"] != 0.95 {
@@ -157,7 +157,7 @@ func TestStreamChatSendsReasoningEffort(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", Effort: "high"}
-	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if body["reasoning_effort"] != "high" {
@@ -167,7 +167,7 @@ func TestStreamChatSendsReasoningEffort(t *testing.T) {
 	// Unset effort omits the field entirely.
 	body = nil
 	c.Effort = ""
-	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := body["reasoning_effort"]; ok {
@@ -192,7 +192,7 @@ func TestStreamChatSendsConfigHeaders(t *testing.T) {
 		BaseURL: srv.URL, APIKey: "test-key", Model: "test-model",
 		Headers: map[string]string{"X-Custom": "yes", "Authorization": "Bearer evil", "X-Api-Key": "bad"},
 	}
-	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}); err != nil {
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if gotCustom != "yes" {
