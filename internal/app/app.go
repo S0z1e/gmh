@@ -230,8 +230,13 @@ func Setup(p Params) (*App, error) {
 	system := agent.SystemPrompt + agent.ProjectContext(absRoot) + skills.Listing(skillList)
 
 	// Plugins: a bad plugin is skipped with a warning on stderr; it
-	// never fails Setup. Disabled with HARNESS_PLUGINS=0.
-	pluginReg, pluginErrs := plugins.Load(absRoot)
+	// never fails Setup. Disabled with HARNESS_PLUGINS=0, or one by
+	// one in the config file (plugins.disabled).
+	disabled := []string{}
+	if cfg.Plugins != nil {
+		disabled = cfg.Plugins.Disabled
+	}
+	pluginReg, pluginErrs := plugins.Load(absRoot, disabled)
 	for _, err := range pluginErrs {
 		fmt.Fprintf(os.Stderr, "warning: plugin: %v\n", err)
 	}
@@ -766,6 +771,10 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 		r.printSessions()
 		return false
 	}
+	if line == "/plugins" {
+		r.printPlugins()
+		return false
+	}
 	if line == "/resume" || strings.HasPrefix(line, "/resume ") {
 		id := strings.TrimSpace(strings.TrimPrefix(line, "/resume"))
 		if id == "" {
@@ -875,6 +884,45 @@ func (r *Runner) printSessions() {
 		r.Print("%s", line)
 	}
 	r.Print("/resume <id> to switch, /rename <old> <new> to rename.")
+}
+
+// printPlugins lists every discovered plugin with its tools and
+// state (loaded / disabled / skipped with reason), in directory
+// order. A plugin that never loaded still shows, so a typo in
+// plugins.disabled or a broken entry is visible here. Like
+// /sessions, this goes through the normal Print path, so it works
+// in the TUI too. Restart to pick up changes: there is no hot
+// reload, and disabling is config-file editing only.
+func (r *Runner) printPlugins() {
+	reg := r.App.Plugins
+	if reg == nil {
+		r.Print("No plugins found.")
+		return
+	}
+	infos := reg.Infos()
+	if len(infos) == 0 {
+		r.Print("No plugins found in %s.", reg.Dir())
+		return
+	}
+	r.Print("Plugins in %s:", reg.Dir())
+	for _, info := range infos {
+		parts := []string{info.Name}
+		if info.Version != "" {
+			parts = append(parts, info.Version)
+		}
+		parts = append(parts, "["+info.State+"]")
+		if info.Description != "" {
+			parts = append(parts, info.Description)
+		}
+		if len(info.Tools) > 0 {
+			parts = append(parts, "tools: "+strings.Join(info.Tools, ", "))
+		}
+		if info.Reason != "" {
+			parts = append(parts, "("+info.Reason+")")
+		}
+		r.Print("%s", strings.Join(parts, "  "))
+	}
+	r.Print("Edit plugins.disabled in the config file and restart to change which plugins load.")
 }
 
 // printModels lists every configured model, current one marked *.

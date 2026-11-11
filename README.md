@@ -200,6 +200,22 @@ with a warning on stderr and never fails startup; a missing
 plugins directory loads nothing, no error. Kill switch:
 `HARNESS_PLUGINS=0` (or `false`) disables plugin loading entirely.
 
+Disable one plugin in the config file (global or project; a project
+section replaces the global one):
+
+```json
+{"plugins": {"disabled": ["todo"]}}
+```
+
+A disabled plugin is skipped entirely at load — its entry is never
+compiled, no runtime is created — and its tools never reach the
+model. A disabled name that matches no plugin warns at load, so a
+typo is visible. `/plugins` lists every discovered plugin with its
+tools and state (`loaded` / `disabled` / `skipped` with the reason),
+and RPC `list_plugins` returns the same information. There is no hot
+reload and no enable/disable command: edit the config file and
+restart. The harness never rewrites the config file.
+
 Cost: moejs is the one non-stdlib dependency outside the TUI, and it
 adds ~8 MB to the stripped binary (core harness ~8 MB → ~16 MB).
 The shipped pilot is `.agents/plugins/todo/` — `todo_add` /
@@ -257,7 +273,8 @@ The shipped pilot is `.agents/plugins/todo/` — `todo_add` /
 - REPL commands: `/usage` shows session token totals, `/clear` drops
   the conversation context (a marker is written to the session file;
   `--resume` starts from the clear point, older messages stay in the
-  file). `/sessions` lists the sessions (newest first, with message
+  file). `/plugins` lists the discovered plugins with their tools
+  and state. `/sessions` lists the sessions (newest first, with message
   count and the first user message as a preview; the current one is
   marked `*`); `/resume <id>` switches to one, `/rename <old> <new>`
   renames one (transcript, audit sidecar and pre-compact archives
@@ -441,7 +458,7 @@ echoed in the response):
   `agent_settled`. A second prompt while a turn runs is queued (cap
   64; beyond that an error). A known slash line (`/usage`, `/jobs`,
   `/clear`, `/compact`, `/skill:<name>`, `/sessions`, `/resume <id>`,
-  `/rename <old> <new>`, `/quit`) behaves as the
+  `/rename <old> <new>`, `/plugins`, `/quit`) behaves as the
   matching control request, exactly like the REPL; any other line,
   including an unknown `/foo`, is a task for the model.
 - `approval_response` `{"approval_id":"appr-1","approved":true}` →
@@ -468,6 +485,7 @@ echoed in the response):
 - `attach_image` `{"path":"..."}` → `{"attached":true,"path":"...","media_type":"...","bytes":N,"width":W,"height":H}`. Queues the image for the next turn, like `/image` in the REPL (same caps, same model-input check).
 - `set_model` `{"provider":"...","model":"..."}` (either may be omitted: no provider keeps the current one, no model takes the provider default; a bare `model` searches the current provider first, then the rest) → `{"provider":"...","model":"...","api":"..."}`. Same switch as `/model` in the REPL; `get_state` reports the new model and api at once.
 - `list_sessions` → `{"sessions":[{"id":"...","messages":N,"modified":"...","preview":"...","current":true}]}` (newest first; audit sidecars and pre-compact archives are not sessions).
+- `list_plugins` → `{"plugins":[{"name":"...","version":"...","description":"...","tools":["..."],"state":"loaded"|"disabled"|"skipped","error":"..."}]}` (directory order; `error` only for a skipped plugin, with the load failure as the reason; a disabled plugin's tools list is empty).
 - `rename_session` `{"name":"old","new":"new"}` → `{"renamed":true,"from":"old","to":"new"}`. Same rename as `/rename` in the REPL.
 - `resume_session` `{"session":"..."}` → `{"session":"...","messages":N}`. Same switch as `/resume` in the REPL; `get_state` reports the new session at once.
 - `quit` → `{"ok":true}`, then the process exits 0. It waits for the

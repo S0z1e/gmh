@@ -160,7 +160,7 @@ func TestRunPluginTool(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(plugDir, "echo.js"), []byte(`harness.registerTool("echo", "Echo back the message.", {type: "object", properties: {msg: {type: "string"}}, required: ["msg"]}, (args) => "echo:" + args.msg);`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	reg, errs := plugins.Load(root)
+	reg, errs := plugins.Load(root, nil)
 	if len(errs) != 0 {
 		t.Fatal(errs)
 	}

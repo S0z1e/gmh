@@ -19,7 +19,7 @@ type Request struct {
 	// Type is one of: prompt, approval_response, abort, clear_queue,
 	// get_state, new_session, clear, compact, usage, jobs, skill,
 	// quit, attach_image, set_model, list_sessions, rename_session,
-	// resume_session.
+	// resume_session, list_plugins.
 	Type string `json:"type"`
 	// Message is the task for prompt.
 	Message string `json:"message,omitempty"`

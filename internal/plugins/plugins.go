@@ -20,7 +20,10 @@
 //
 // Loading is disabled with HARNESS_PLUGINS=0 (or false). A missing
 // plugins directory loads nothing, no error. A plugin that fails to
-// load is skipped with a warning; it never fails Setup.
+// load is skipped with a warning; it never fails Setup. Load also
+// records what it discovered (Registry.Infos): every plugin
+// directory, loaded, disabled, or skipped with its reason — so
+// /plugins and RPC list_plugins can show plugins that never loaded.
 package plugins
 
 import (
@@ -120,7 +123,36 @@ type Registry struct {
 	byTool  map[string]*Tool
 	// CallTimeout bounds one plugin tool call (0 = DefaultCallTimeout).
 	CallTimeout time.Duration
+	// dir is the plugins directory Load read (<root>/.agents/plugins).
+	dir string
+	// infos is the discovery outcome: one entry per plugin directory
+	// found, in directory order (loaded, disabled, or skipped).
+	infos []Info
 }
+
+// Info is what Load discovered about one plugin directory: a loaded
+// plugin (with the tools the model can actually call), a disabled
+// one, or a skipped one with its reason.
+type Info struct {
+	Name        string
+	Version     string
+	Description string
+	// Tools are the plugin's tool names, in registration order.
+	// Only the tools that survived loading are listed (a tool lost
+	// in a cross-plugin name clash is not listed).
+	Tools []string
+	// State is "loaded", "disabled" or "skipped".
+	State string
+	// Reason says why a plugin is disabled or skipped ("" otherwise).
+	Reason string
+}
+
+// Dir returns the plugins directory Load read.
+func (r *Registry) Dir() string { return r.dir }
+
+// Infos returns the discovery outcome: one entry per plugin
+// directory found, in directory order.
+func (r *Registry) Infos() []Info { return r.infos }
 
 // Plugins returns the loaded plugins in directory order.
 func (r *Registry) Plugins() []*Plugin { return r.plugins }
@@ -153,12 +185,36 @@ func (r *Registry) Has(name string) bool {
 // bad plugin, and the bad plugin is skipped; Load never fails the
 // run. Directories are loaded in sorted order, so a tool-name clash
 // between two plugins is resolved deterministically (first wins).
-func Load(root string) (*Registry, []error) {
+//
+// disabled names plugins to skip entirely: their manifest is not
+// read for tool purposes, their entry is never compiled, and no
+// runtime is created. They still appear in Registry.Infos as
+// disabled, with the manifest's name/version/description when it
+// parses. A disabled name that matches no plugin directory is
+// reported as an error (a visible warning at load, so a typo is
+// caught), not a load failure.
+func Load(root string, disabled []string) (*Registry, []error) {
 	reg := &Registry{byTool: map[string]*Tool{}}
+	dir := filepath.Join(root, ".agents", "plugins")
+	reg.dir = dir
+	disabledSet := map[string]bool{}
+	for _, d := range disabled {
+		disabledSet[d] = true
+	}
 	if v := os.Getenv("HARNESS_PLUGINS"); v == "0" || strings.EqualFold(v, "false") {
+		// Loading is off, but the listing still shows what was
+		// found, as disabled.
+		if entries, err := os.ReadDir(dir); err == nil {
+			sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+			for _, en := range entries {
+				if !en.IsDir() {
+					continue
+				}
+				reg.infos = append(reg.infos, describe(filepath.Join(dir, en.Name()), en.Name(), "disabled", "plugin loading disabled (HARNESS_PLUGINS=0)"))
+			}
+		}
 		return reg, nil
 	}
-	dir := filepath.Join(root, ".agents", "plugins")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -168,13 +224,21 @@ func Load(root string) (*Registry, []error) {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	var errs []error
+	seen := map[string]bool{}
 	for _, en := range entries {
 		if !en.IsDir() {
 			continue
 		}
-		p, err := loadOne(filepath.Join(dir, en.Name()))
+		seen[en.Name()] = true
+		pdir := filepath.Join(dir, en.Name())
+		if disabledSet[en.Name()] {
+			reg.infos = append(reg.infos, describe(pdir, en.Name(), "disabled", ""))
+			continue
+		}
+		p, err := loadOne(pdir)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("plugin %s: %w", en.Name(), err))
+			reg.infos = append(reg.infos, describe(pdir, en.Name(), "skipped", err.Error()))
 			continue
 		}
 		for _, t := range p.tools {
@@ -185,8 +249,38 @@ func Load(root string) (*Registry, []error) {
 			reg.byTool[t.Name] = t
 		}
 		reg.plugins = append(reg.plugins, p)
+		info := Info{Name: p.Name, Version: p.Version, Description: p.Description, Tools: []string{}, State: "loaded"}
+		for _, t := range p.tools {
+			if reg.byTool[t.Name] == t {
+				info.Tools = append(info.Tools, t.Name)
+			}
+		}
+		reg.infos = append(reg.infos, info)
+	}
+	for _, d := range disabled {
+		if !seen[d] {
+			errs = append(errs, fmt.Errorf("plugin %q is listed in plugins.disabled but no such plugin was found", d))
+		}
 	}
 	return reg, errs
+}
+
+// describe builds the Info for a plugin that never loaded: the
+// manifest's name/version/description when plugin.json parses, the
+// directory name otherwise (version/description empty).
+func describe(dir, dirName, state, reason string) Info {
+	info := Info{Name: dirName, Tools: []string{}, State: state, Reason: reason}
+	if raw, err := os.ReadFile(filepath.Join(dir, "plugin.json")); err == nil {
+		var m Manifest
+		if err := json.Unmarshal(raw, &m); err == nil {
+			if m.Name != "" {
+				info.Name = m.Name
+			}
+			info.Version = m.Version
+			info.Description = m.Description
+		}
+	}
+	return info
 }
 
 func loadOne(dir string) (*Plugin, error) {

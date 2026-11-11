@@ -55,6 +55,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -72,7 +73,25 @@ const (
 	ProjectFileName = ".harness.json"
 )
 
-// ModelCost is Pi's per-model pricing in USD per million tokens.
+// PluginsConfig is the optional plugins section of the config file:
+// which discovered plugins are not loaded at all. A disabled plugin
+// is skipped entirely at load (its entry is never compiled, no
+// runtime is created); it still shows in /plugins and list_plugins
+// as disabled. A name that matches no plugin warns at load.
+type PluginsConfig struct {
+	Disabled []string `json:"disabled"`
+}
+
+// validPluginName reports whether a plugin name uses the plugin name
+// pattern: lowercase letters, digits and underscores, starting with
+// a letter. This must match plugins.validToolName: the plugin name
+// is the same namespace as the tool names a plugin registers.
+var validPluginNameRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+func validPluginName(name string) bool {
+	return validPluginNameRe.MatchString(name)
+}
+
 // The four rates are required when a cost object is present (Pi marks
 // them required); a rate of 0 is a free tier, not an absent one. The
 // harness parses and stores cost; it is not yet wired into the cost
@@ -168,6 +187,10 @@ type File struct {
 	ContextLimit        *int   `json:"contextLimit"`
 	AnthropicMaxTokens  *int   `json:"anthropicMaxTokens"`
 	TUITheme            string `json:"tuiTheme"`
+	// Plugins is the optional plugins section (nil = unset: nothing
+	// is disabled). A project file's section replaces the global
+	// one, like a provider's models list.
+	Plugins *PluginsConfig `json:"plugins"`
 }
 
 // GlobalPath returns ~/.minimal-harness/config.json.
@@ -297,6 +320,9 @@ func Merge(dst, src *File) {
 	}
 	if src.TUITheme != "" {
 		dst.TUITheme = src.TUITheme
+	}
+	if src.Plugins != nil {
+		dst.Plugins = src.Plugins
 	}
 	for name, sp := range src.Providers {
 		if dst.Providers == nil {
@@ -547,6 +573,13 @@ func Validate(f *File) error {
 	}
 	if f.TUITheme != "" && f.TUITheme != "default" && f.TUITheme != "terminal" && f.TUITheme != "catppuccin-mocha" {
 		return fmt.Errorf("tuiTheme %q: use default, terminal or catppuccin-mocha", f.TUITheme)
+	}
+	if f.Plugins != nil {
+		for _, name := range f.Plugins.Disabled {
+			if !validPluginName(name) {
+				return fmt.Errorf("plugins.disabled %q: use lowercase letters, digits and underscores, starting with a letter", name)
+			}
+		}
 	}
 	return nil
 }

@@ -207,7 +207,7 @@ func (d *driver) waitFor(typ string, timeout time.Duration) map[string]any {
 	}
 }
 
-func setupTestApp(t *testing.T, mode string, steps []fakeStep) (*app.App, *app.Runner, string) {
+func setupTestApp(t *testing.T, mode string, steps []fakeStep, writePlugins ...func(root string)) (*app.App, *app.Runner, string) {
 	t.Helper()
 	srv := httptest.NewServer(fakeHandler(t, steps))
 	t.Cleanup(srv.Close)
@@ -222,6 +222,11 @@ func setupTestApp(t *testing.T, mode string, steps []fakeStep) (*app.App, *app.R
 	cfg := fmt.Sprintf(`{"providers": {"mock": {"baseUrl": %q, "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}, {"id": "mock2", "api": "openai-responses"}]}}}`, srv.URL+"/v1")
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	// writePlugins runs last, before Setup: a test can add plugin
+	// directories and rewrite the config (e.g. plugins.disabled).
+	for _, w := range writePlugins {
+		w(root)
 	}
 	t.Setenv("OPENAI_API_KEY", "test")
 	a, err := app.Setup(app.Params{
@@ -725,6 +730,77 @@ func TestListRenameResumeSessions(t *testing.T) {
 	rows, _ = data["sessions"].([]any)
 	if len(rows) != 2 {
 		t.Fatalf("slash /sessions = %v", data)
+	}
+	d.quit(t)
+}
+
+// list_plugins returns the same information /plugins shows: a loaded
+// plugin with its tools, a disabled one, and a skipped one with its
+// reason — plus the "/plugins" slash form.
+func TestListPlugins(t *testing.T) {
+	writePlugins := func(root string) {
+		write := func(name, entry, src string) {
+			dir := filepath.Join(root, ".agents", "plugins", name)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			manifest := fmt.Sprintf(`{"name": %q, "description": "%s plugin.", "version": "0.1.0", "entry": %q}`, name, name, entry)
+			if err := os.WriteFile(filepath.Join(dir, "plugin.json"), []byte(manifest), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, entry), []byte(src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write("echo", "echo.js", `harness.registerTool("echo", "Echo.", {type: "object", properties: {}}, () => "echo");`)
+		write("off", "off.js", `harness.registerTool("offtool", "Off.", {type: "object", properties: {}}, () => "off");`)
+		write("boom", "boom.js", `throw new Error("kaboom");`)
+		// Disable "off" in the project config (replaces the config
+		// setupTestApp wrote).
+		cfg := `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}]}}, "plugins": {"disabled": ["off"]}}`
+		if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{{kind: "text", text: "Done."}}, writePlugins)
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+
+	d.send(map[string]any{"id": "p1", "type": "list_plugins"})
+	resp := d.waitFor("response", 5*time.Second)
+	data, _ := resp["data"].(map[string]any)
+	rows, _ := data["plugins"].([]any)
+	if len(rows) != 3 {
+		t.Fatalf("list_plugins = %v", data)
+	}
+	byName := map[string]map[string]any{}
+	for _, row := range rows {
+		m, _ := row.(map[string]any)
+		byName[m["name"].(string)] = m
+	}
+	echo := byName["echo"]
+	if echo["state"] != "loaded" || echo["version"] != "0.1.0" || echo["description"] != "echo plugin." {
+		t.Fatalf("echo row = %v", echo)
+	}
+	tools, _ := echo["tools"].([]any)
+	if len(tools) != 1 || tools[0] != "echo" {
+		t.Fatalf("echo tools = %v", tools)
+	}
+	if byName["off"]["state"] != "disabled" {
+		t.Fatalf("off row = %v", byName["off"])
+	}
+	boom := byName["boom"]
+	if boom["state"] != "skipped" || !strings.Contains(fmt.Sprintf("%v", boom["error"]), "kaboom") {
+		t.Fatalf("boom row = %v", boom)
+	}
+
+	// The "/plugins" slash form answers the same query.
+	d.send(map[string]any{"id": "p2", "type": "prompt", "message": "/plugins"})
+	resp = d.waitFor("response", 5*time.Second)
+	data, _ = resp["data"].(map[string]any)
+	rows, _ = data["plugins"].([]any)
+	if len(rows) != 3 {
+		t.Fatalf("slash /plugins = %v", data)
 	}
 	d.quit(t)
 }

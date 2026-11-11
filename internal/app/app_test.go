@@ -787,6 +787,80 @@ func TestSetupLoadsPlugins(t *testing.T) {
 	}
 }
 
+// /plugins lists every discovered plugin with its tools and state:
+// loaded, disabled (config), skipped (broken entry) — and a root
+// with no plugins says so plainly.
+func TestPluginsCommand(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	root := t.TempDir()
+	cfg := `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "model": "mock"}}, "plugins": {"disabled": ["off"]}}`
+	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writePlugin := func(name, entry, src string) {
+		dir := filepath.Join(root, ".agents", "plugins", name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		manifest := fmt.Sprintf(`{"name": %q, "description": "%s plugin.", "version": "0.1.0", "entry": %q}`, name, name, entry)
+		if err := os.WriteFile(filepath.Join(dir, "plugin.json"), []byte(manifest), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, entry), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writePlugin("echo", "echo.js", `harness.registerTool("echo", "Echo back the message.", {type: "object", properties: {msg: {type: "string"}}, required: ["msg"]}, (args) => "echo:" + args.msg);`)
+	writePlugin("off", "off.js", `harness.registerTool("offtool", "Off.", {type: "object", properties: {}}, () => "off");`)
+	writePlugin("boom", "boom.js", `throw new Error("kaboom");`)
+	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	// The disabled plugin's tools never reach the model or dispatch.
+	if a.Plugins.Has("offtool") {
+		t.Fatal("disabled plugin tool still registered")
+	}
+	for _, d := range a.Cfg.Tools {
+		if d.Function.Name == "offtool" {
+			t.Fatal("disabled tool in the model tool list")
+		}
+	}
+	var printed []string
+	r := &Runner{App: a, Print: func(format string, args ...any) {
+		printed = append(printed, fmt.Sprintf(format, args...))
+	}}
+	r.Handle(context.Background(), "/plugins")
+	joined := strings.Join(printed, "\n")
+	if !strings.Contains(joined, "echo") || !strings.Contains(joined, "echo") || !strings.Contains(joined, "[loaded]") {
+		t.Fatalf("/plugins loaded line = %v", printed)
+	}
+	if !strings.Contains(joined, "off") || !strings.Contains(joined, "[disabled]") {
+		t.Fatalf("/plugins disabled line = %v", printed)
+	}
+	if !strings.Contains(joined, "boom") || !strings.Contains(joined, "[skipped]") || !strings.Contains(joined, "kaboom") {
+		t.Fatalf("/plugins skipped line = %v", printed)
+	}
+	// A root with no plugins says so plainly.
+	root2 := t.TempDir()
+	writeMockProvider(t, root2)
+	a2, err := Setup(Params{Root: root2, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a2.Store.Close()
+	printed = nil
+	r2 := &Runner{App: a2, Print: func(format string, args ...any) {
+		printed = append(printed, fmt.Sprintf(format, args...))
+	}}
+	r2.Handle(context.Background(), "/plugins")
+	if !strings.Contains(strings.Join(printed, "\n"), "No plugins found in") {
+		t.Fatalf("/plugins empty = %v", printed)
+	}
+}
+
 // /sessions lists, /resume switches, /rename moves (current and other).
 func TestSessionsCommand(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())

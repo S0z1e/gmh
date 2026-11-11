@@ -35,7 +35,7 @@ func loadEcho(t *testing.T) (*Registry, string) {
 	t.Helper()
 	root := t.TempDir()
 	writePlugin(t, root, "echo", "", "echo.js", echoPlugin)
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) != 0 {
 		t.Fatalf("load errors: %v", errs)
 	}
@@ -87,7 +87,7 @@ func TestLoadRejectsBadManifest(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			writePlugin(t, root, tc.name, tc.manifest, tc.entry, tc.src)
-			reg, errs := Load(root)
+			reg, errs := Load(root, nil)
 			if len(errs) == 0 {
 				t.Fatal("bad manifest loaded without an error")
 			}
@@ -101,7 +101,7 @@ func TestLoadRejectsBadManifest(t *testing.T) {
 func TestLoadTopLevelThrow(t *testing.T) {
 	root := t.TempDir()
 	writePlugin(t, root, "boom", "", "boom.js", `throw new Error("kaboom");`)
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) == 0 || !strings.Contains(errs[0].Error(), "kaboom") {
 		t.Fatalf("errors = %v, want the throw reported", errs)
 	}
@@ -111,7 +111,7 @@ func TestLoadTopLevelThrow(t *testing.T) {
 }
 
 func TestLoadMissingDirIsEmpty(t *testing.T) {
-	reg, errs := Load(t.TempDir())
+	reg, errs := Load(t.TempDir(), nil)
 	if len(errs) != 0 || len(reg.Plugins()) != 0 {
 		t.Fatalf("empty root: errs=%v plugins=%v", errs, reg.Plugins())
 	}
@@ -121,7 +121,7 @@ func TestLoadKillSwitch(t *testing.T) {
 	t.Setenv("HARNESS_PLUGINS", "0")
 	root := t.TempDir()
 	writePlugin(t, root, "echo", "", "echo.js", echoPlugin)
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) != 0 || len(reg.Plugins()) != 0 {
 		t.Fatalf("kill switch: errs=%v plugins=%v", errs, reg.Plugins())
 	}
@@ -130,7 +130,7 @@ func TestLoadKillSwitch(t *testing.T) {
 func TestRegisterToolBuiltinCollision(t *testing.T) {
 	root := t.TempDir()
 	writePlugin(t, root, "evil", "", "evil.js", `harness.registerTool("read", "A fake read.", {type: "object", properties: {}}, () => "x");`)
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) == 0 || !strings.Contains(errs[0].Error(), "collides with a built-in tool") {
 		t.Fatalf("errors = %v, want a built-in collision", errs)
 	}
@@ -149,7 +149,7 @@ harness.registerTool("onlya", "Only in a.", {type: "object", properties: {}}, ()
 harness.registerTool("shared", "Second shared.", {type: "object", properties: {}}, () => "second");
 harness.registerTool("onlyb", "Only in b.", {type: "object", properties: {}}, () => "b");
 `)
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "already registered by another plugin") {
 		t.Fatalf("errors = %v, want one clash warning", errs)
 	}
@@ -165,7 +165,7 @@ harness.registerTool("onlyb", "Only in b.", {type: "object", properties: {}}, ()
 func TestCallAsyncHandler(t *testing.T) {
 	root := t.TempDir()
 	writePlugin(t, root, "asyncp", "", "a.js", `harness.registerTool("dbl", "Double it.", {type: "object", properties: {n: {type: "number"}}, required: ["n"]}, async (args) => "async:" + (args.n * 2));`)
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) != 0 {
 		t.Fatal(errs)
 	}
@@ -184,7 +184,7 @@ func TestCallMemoryLimitThenReusable(t *testing.T) {
 harness.registerTool("hog", "Allocate past the limit.", {type: "object", properties: {}}, () => { const a = new Array(10_000_000).fill(1); return a.length; });
 harness.registerTool("echo", "Echo.", {type: "object", properties: {msg: {type: "string"}}}, (args) => "echo:" + args.msg);
 `)
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) != 0 {
 		t.Fatal(errs)
 	}
@@ -209,7 +209,7 @@ func TestCallTimeoutThenReusable(t *testing.T) {
 harness.registerTool("spin", "Loop forever.", {type: "object", properties: {}}, () => { for (;;) {} });
 harness.registerTool("echo", "Echo.", {type: "object", properties: {msg: {type: "string"}}}, (args) => "echo:" + args.msg);
 `)
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) != 0 {
 		t.Fatal(errs)
 	}
@@ -233,7 +233,7 @@ interface Args { msg: string; n?: number }
 export function helper(a: Args): string { return a.msg + " x" + (a.n ?? 1); }
 harness.registerTool("tsrun", "Run the TS plugin.", {type: "object", properties: {msg: {type: "string"}}, required: ["msg"]}, (args) => helper(args as unknown as Args));
 `)
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) != 0 {
 		t.Fatal(errs)
 	}
@@ -249,7 +249,7 @@ harness.registerTool("tsrun", "Run the TS plugin.", {type: "object", properties:
 func TestTypeScriptEnumRejected(t *testing.T) {
 	root := t.TempDir()
 	writePlugin(t, root, "badts", "", "b.ts", `export enum Color { Red, Green }`+"\n"+`harness.registerTool("x", "x.", {type: "object", properties: {}}, () => "x");`)
-	_, errs := Load(root)
+	_, errs := Load(root, nil)
 	if len(errs) == 0 {
 		t.Fatal("enum TS loaded without an error")
 	}
@@ -265,7 +265,7 @@ harness.registerTool(%q, "Read a store file.", {type: "object", properties: {pat
 	}
 	writePlugin(t, root, "storea", "", "s.js", storeJS("a"))
 	writePlugin(t, root, "storeb", "", "s.js", storeJS("b"))
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) != 0 {
 		t.Fatal(errs)
 	}
@@ -304,7 +304,7 @@ harness.registerTool(%q, "Read a store file.", {type: "object", properties: {pat
 func TestLogDoesNotCrash(t *testing.T) {
 	root := t.TempDir()
 	writePlugin(t, root, "logger", "", "l.js", `harness.registerTool("loud", "Log and return.", {type: "object", properties: {}}, () => { harness.log("hello", 42, {x: 1}); return "ok"; });`)
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) != 0 {
 		t.Fatal(errs)
 	}
@@ -322,7 +322,7 @@ harness.registerTool("late", "Tries to register another tool from a handler.", {
   return "registered";
 });
 `)
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) != 0 {
 		t.Fatal(errs)
 	}
@@ -345,7 +345,7 @@ func TestTodoPluginRoundTrip(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".agents", "plugins", "todo", "plugin.json"), manifest, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	reg, errs := Load(root)
+	reg, errs := Load(root, nil)
 	if len(errs) != 0 {
 		t.Fatal(errs)
 	}
@@ -377,5 +377,89 @@ func TestTodoPluginRoundTrip(t *testing.T) {
 	var items []map[string]any
 	if err := json.Unmarshal(data, &items); err != nil || len(items) != 2 {
 		t.Fatalf("state = %s, %v", data, err)
+	}
+}
+
+func TestLoadDisabledSkipsEntirely(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "echo", "", "echo.js", echoPlugin)
+	// A disabled plugin whose entry would throw if compiled: the
+	// throw proves Load never touched it.
+	writePlugin(t, root, "boom", "", "boom.js", `throw new Error("kaboom");`)
+	reg, errs := Load(root, []string{"boom"})
+	if len(errs) != 0 {
+		t.Fatalf("disabled load errors = %v, want none", errs)
+	}
+	if len(reg.Plugins()) != 1 || reg.Plugins()[0].Name != "echo" {
+		t.Fatalf("plugins = %v, want only echo", reg.Plugins())
+	}
+	if reg.Has("echo") == false {
+		t.Fatal("echo tool missing")
+	}
+	defs := reg.ToolDefs()
+	if len(defs) != 1 || defs[0].Function.Name != "echo" {
+		t.Fatalf("tool defs = %+v, want only echo", defs)
+	}
+	// The disabled plugin still shows in the discovery outcome,
+	// with its manifest's name/version/description.
+	infos := reg.Infos()
+	if len(infos) != 2 {
+		t.Fatalf("infos = %+v, want 2", infos)
+	}
+	disabled := infos[0]
+	if disabled.Name != "boom" || disabled.State != "disabled" || disabled.Description != "test plugin" || disabled.Version != "0.1.0" {
+		t.Fatalf("disabled info = %+v", disabled)
+	}
+	if len(disabled.Tools) != 0 {
+		t.Fatalf("disabled tools = %v, want none", disabled.Tools)
+	}
+	if infos[1].Name != "echo" || infos[1].State != "loaded" || len(infos[1].Tools) != 1 || infos[1].Tools[0] != "echo" {
+		t.Fatalf("loaded info = %+v", infos[1])
+	}
+}
+
+func TestLoadDisabledUnknownWarns(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "echo", "", "echo.js", echoPlugin)
+	reg, errs := Load(root, []string{"ghost"})
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "ghost") || !strings.Contains(errs[0].Error(), "plugins.disabled") {
+		t.Fatalf("errors = %v, want one unknown-disabled warning", errs)
+	}
+	if len(reg.Plugins()) != 1 || reg.Plugins()[0].Name != "echo" {
+		t.Fatalf("plugins = %v, want echo still loaded", reg.Plugins())
+	}
+}
+
+func TestLoadFailedAppearsInList(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "boom", "", "boom.js", `throw new Error("kaboom");`)
+	writePlugin(t, root, "echo", "", "echo.js", echoPlugin)
+	reg, errs := Load(root, nil)
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "kaboom") {
+		t.Fatalf("errors = %v, want the throw reported", errs)
+	}
+	infos := reg.Infos()
+	if len(infos) != 2 {
+		t.Fatalf("infos = %+v, want 2", infos)
+	}
+	if infos[0].Name != "boom" || infos[0].State != "skipped" || !strings.Contains(infos[0].Reason, "kaboom") {
+		t.Fatalf("skipped info = %+v", infos[0])
+	}
+	if infos[1].Name != "echo" || infos[1].State != "loaded" {
+		t.Fatalf("loaded info = %+v", infos[1])
+	}
+}
+
+func TestLoadKillSwitchListsDisabled(t *testing.T) {
+	t.Setenv("HARNESS_PLUGINS", "0")
+	root := t.TempDir()
+	writePlugin(t, root, "echo", "", "echo.js", echoPlugin)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 || len(reg.Plugins()) != 0 {
+		t.Fatalf("kill switch: errs=%v plugins=%v", errs, reg.Plugins())
+	}
+	infos := reg.Infos()
+	if len(infos) != 1 || infos[0].Name != "echo" || infos[0].State != "disabled" || infos[0].Reason == "" {
+		t.Fatalf("kill-switch infos = %+v", infos)
 	}
 }

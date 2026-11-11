@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -411,5 +412,58 @@ func TestSelectSingleProvider(t *testing.T) {
 func TestLoadExplicitMissingIsError(t *testing.T) {
 	if _, err := LoadExplicit(filepath.Join(t.TempDir(), "nope.json")); err == nil {
 		t.Fatal("explicit missing file should be an error")
+	}
+}
+
+func TestPluginsDisabledParse(t *testing.T) {
+	p := write(t, t.TempDir(), "c.json", `{"plugins": {"disabled": ["todo", "old_notes"]}}`)
+	f, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Plugins == nil || len(f.Plugins.Disabled) != 2 || f.Plugins.Disabled[0] != "todo" || f.Plugins.Disabled[1] != "old_notes" {
+		t.Fatalf("plugins = %+v", f.Plugins)
+	}
+	// Absent section stays nil: nothing is disabled.
+	f, err = Load(write(t, t.TempDir(), "c.json", `{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Plugins != nil {
+		t.Fatalf("plugins = %+v, want nil", f.Plugins)
+	}
+}
+
+func TestMergePluginsReplaces(t *testing.T) {
+	global := &File{Plugins: &PluginsConfig{Disabled: []string{"a", "b"}}}
+	project := &File{Plugins: &PluginsConfig{Disabled: []string{"c"}}}
+	Merge(global, project)
+	if len(global.Plugins.Disabled) != 1 || global.Plugins.Disabled[0] != "c" {
+		t.Fatalf("merged disabled = %v, want [c]", global.Plugins.Disabled)
+	}
+	// A project file with no plugins section keeps the global one.
+	global = &File{Plugins: &PluginsConfig{Disabled: []string{"a"}}}
+	Merge(global, &File{})
+	if len(global.Plugins.Disabled) != 1 || global.Plugins.Disabled[0] != "a" {
+		t.Fatalf("merged disabled = %v, want [a]", global.Plugins.Disabled)
+	}
+	// An explicit empty list replaces too: it re-enables everything.
+	global = &File{Plugins: &PluginsConfig{Disabled: []string{"a"}}}
+	Merge(global, &File{Plugins: &PluginsConfig{Disabled: []string{}}})
+	if global.Plugins == nil || len(global.Plugins.Disabled) != 0 {
+		t.Fatalf("merged disabled = %v, want []", global.Plugins)
+	}
+}
+
+func TestValidatePluginsDisabled(t *testing.T) {
+	for _, bad := range []string{"Todo", "my-plugin", "1abc", "has space", ""} {
+		f := &File{Plugins: &PluginsConfig{Disabled: []string{bad}}}
+		if err := Validate(f); err == nil || !strings.Contains(err.Error(), "plugins.disabled") {
+			t.Fatalf("disabled %q err = %v, want a plugins.disabled error", bad, err)
+		}
+	}
+	f := &File{Plugins: &PluginsConfig{Disabled: []string{"todo", "old_notes2"}}}
+	if err := Validate(f); err != nil {
+		t.Fatalf("valid disabled names rejected: %v", err)
 	}
 }

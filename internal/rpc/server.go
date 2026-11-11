@@ -179,7 +179,7 @@ func (s *Server) handleLine(line string) {
 		s.handleApprovalResponse(req)
 	case "abort":
 		s.handleAbort(req)
-	case "get_state", "usage", "jobs", "list_sessions":
+	case "get_state", "usage", "jobs", "list_sessions", "list_plugins":
 		s.handleQuery(req)
 	case "prompt":
 		s.handlePrompt(req)
@@ -219,7 +219,7 @@ func (s *Server) handlePrompt(req Request) {
 				ctrl = Request{ID: req.ID, Type: typ, Name: parts[0], New: parts[1]}
 			}
 		}
-		if typ == "usage" || typ == "jobs" || typ == "list_sessions" {
+		if typ == "usage" || typ == "jobs" || typ == "list_sessions" || typ == "list_plugins" {
 			// Read-only: answer at once, like the request of the same name.
 			s.handleQuery(ctrl)
 			return
@@ -266,6 +266,8 @@ func slashRequest(line string) (typ, arg string) {
 		return "set_model", strings.TrimSpace(strings.TrimPrefix(line, "/model"))
 	case line == "/sessions":
 		return "list_sessions", ""
+	case line == "/plugins":
+		return "list_plugins", ""
 	case line == "/resume" || strings.HasPrefix(line, "/resume "):
 		return "resume_session", strings.TrimSpace(strings.TrimPrefix(line, "/resume"))
 	case line == "/rename" || strings.HasPrefix(line, "/rename "):
@@ -404,7 +406,33 @@ func (s *Server) handleQuery(req Request) {
 			})
 		}
 		s.respond(req, map[string]any{"sessions": rows}, nil)
+	case "list_plugins":
+		s.respond(req, map[string]any{"plugins": s.pluginsList()}, nil)
 	}
+}
+
+// pluginsList renders the registry's discovery outcome for
+// list_plugins: the same information /plugins shows — name, version,
+// description, tools, state (loaded / disabled / skipped), and the
+// reason as "error" for a skipped plugin.
+func (s *Server) pluginsList() []map[string]any {
+	if s.app.Plugins == nil {
+		return []map[string]any{}
+	}
+	infos := s.app.Plugins.Infos()
+	list := make([]map[string]any, 0, len(infos))
+	for _, info := range infos {
+		item := map[string]any{
+			"name": info.Name, "version": info.Version,
+			"description": info.Description, "tools": info.Tools,
+			"state": info.State,
+		}
+		if info.Reason != "" {
+			item["error"] = info.Reason
+		}
+		list = append(list, item)
+	}
+	return list
 }
 
 func (s *Server) jobsList() []map[string]any {
