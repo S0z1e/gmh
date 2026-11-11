@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -153,6 +154,12 @@ func main() {
 	fmt.Println("Type a task, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /clear to drop context, /compact to summarise context, or /quit to exit.")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	// The approval prompt shares the REPL's scanner: the scanner
+	// buffers piped stdin ahead, so a fresh reader on os.Stdin in
+	// the loop's default ask would see EOF after the first task
+	// line. (The TUI and RPC paths set their own Ask and never
+	// reach this code; -p denies without asking.)
+	a.Cfg.Ask = askFromScanner(scanner)
 	for {
 		fmt.Print("> ")
 		if !scanner.Scan() {
@@ -161,6 +168,28 @@ func main() {
 		if runner.Handle(ctx, strings.TrimSpace(scanner.Text())) {
 			break
 		}
+	}
+}
+
+// askFromScanner is the plain CLI's approval prompt: it reads the
+// answer from the same scanner the REPL loop uses, so an answer
+// piped after a task ("y" on the next line) is read from the
+// already-buffered stream instead of a fresh reader that would see
+// EOF. Interactive TTY input behaves the same either way — the
+// terminal only delivers a line once it is typed — and type-ahead
+// ("y" typed before the prompt appears) now works too, instead of
+// being swallowed by the scanner's read-ahead.
+func askFromScanner(scanner *bufio.Scanner) func(string) (bool, error) {
+	return func(prompt string) (bool, error) {
+		fmt.Printf("%s [y/N] ", prompt)
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				return false, err
+			}
+			return false, io.EOF
+		}
+		ans := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		return ans == "y" || ans == "yes", nil
 	}
 }
 
