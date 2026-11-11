@@ -190,7 +190,8 @@ file store jailed to the plugin's own data dir,
 `.agents/plugins/<name>/data/` (paths must stay inside it;
 `../escape` and absolute paths are refused, and plugins cannot see
 each other's data). No bash, no network, no arbitrary filesystem in
-Phase 1. Phase 3 adds commands, hooks and modes (below).
+Phase 1. Phase 3 adds commands, hooks and modes (below); Phase 4
+adds the lifecycle hooks (also below).
 
 A plugin tool runs JS only, inside its own runtime (16 MiB memory
 limit, 10 s call timeout with interrupt — a timed-out or
@@ -266,6 +267,78 @@ before the result enters history; a hook that throws, times out, or
 returns a non-string keeps the original result and warns on stderr
 (fail open). Hooks never bypass approval: anything they let through
 still prompts in suggest mode.
+
+### Lifecycle hooks
+
+Four more hooks, all registered with `harness.on` at load time
+only, at most one per event per plugin. Unlike `tool_call`, all
+four **fail open**: a hook that throws, times out, or returns an
+unusable value is skipped with a stderr warning and the turn,
+compact, or session switch carries on without it.
+
+`before_agent_start` — per-turn context injection. Runs once per
+turn, before the model call, in plugin load order; the
+contributions are concatenated into one system message, each
+prefixed `"[plugin <name>] "`. The todo pilot uses it to inject
+the open todos, so the model knows what is pending without calling
+`todo_list` first.
+
+```js
+harness.on("before_agent_start", (input) => {
+  // input: {session, mode}. Return a string to inject, or
+  // undefined (or an empty string) for nothing.
+  return "Open todos (2): #1 buy milk; #2 call mom";
+});
+```
+
+`context` — rewrite the turn's starting messages. Runs once per
+turn, after `before_agent_start` and before the model call, in
+load order (each hook sees the previous one's rewrite). The input
+is `{session, mode, messages}` — the turn's starting history with
+the system message excluded (the harness prepends its own system
+prompt itself). Return the modified list, or undefined to keep the
+current one. The rewrite is in-memory only: the session file
+keeps the true history, so a rewrite never persists. The returned
+list is validated (an array of messages with roles `user`,
+`assistant` or `tool` — a `system` message is rejected, since the
+harness owns the system prompt); an invalid return keeps the
+original. Image bytes never travel as JSON, so images in a
+rewritten list are restored from the original history by path —
+a hook cannot inject image bytes it never had.
+
+`session_before_compact` — extra instructions for the summary.
+Runs when a session is compacted (manual `/compact` and
+auto-compact share the one insertion point), in load order; the
+instructions are appended to the compact prompt after section 6
+and before the conversation, each prefixed `"[plugin <name>] "`.
+The plan pilot uses it to ask the summary to keep the current
+plan. It is append-only: a plugin steers what the summary keeps,
+it cannot replace the summary.
+
+```js
+harness.on("session_before_compact", (input) => {
+  // input: {session, messages: count} — the count, not the list.
+  return 'Keep the current plan in the summary — title: "Demo".';
+});
+```
+
+`session_start` / `session_switch` — notifications when a session
+becomes current (`NewSession`, `LoadSession`, `ResumeSession`;
+the initial session at startup fires nothing, plugins are not
+loaded yet). `session_start` fires every time, with `{session}`;
+`session_switch` fires only when the id changes, with `{session,
+previous}`. `/clear` (`ResetSession`) fires neither. Return values
+are ignored; a failing hook warns and never fails the switch.
+
+| Hook | Input | Return | On failure |
+| --- | --- | --- | --- |
+| `tool_call` | `{tool, args}` | allow / `{deny}` / `{args}` | **deny the call** (fail closed) |
+| `tool_result` | `{tool, args, result, error}` | replacement string | keep the original result |
+| `before_agent_start` | `{session, mode}` | string to inject | skip the contribution |
+| `context` | `{session, mode, messages}` | rewritten list | keep the original history |
+| `session_before_compact` | `{session, messages: count}` | instruction string | skip the instruction |
+| `session_start` | `{session}` | ignored | warn only |
+| `session_switch` | `{session, previous}` | ignored | warn only |
 
 ### Modes (plan mode)
 

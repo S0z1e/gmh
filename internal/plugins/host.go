@@ -78,8 +78,12 @@ func (p *Plugin) nativeRegisterCommand(r *moejs.Realm, _ moejs.Value, args []moe
 }
 
 // nativeOn implements harness.on(event, handler), the lifecycle
-// hooks: "tool_call" (before a tool runs) and "tool_result" (after
-// it returns). At most one handler per event per plugin. Like
+// hooks: "tool_call" (before a tool runs), "tool_result" (after it
+// returns), "before_agent_start" (per-turn context injection),
+// "context" (rewrite the turn's starting messages),
+// "session_before_compact" (extra instructions for the summary),
+// "session_start" and "session_switch" (notifications when a session
+// becomes current). At most one handler per event per plugin. Like
 // registerTool, only valid while the entry's top level runs.
 func (p *Plugin) nativeOn(r *moejs.Realm, _ moejs.Value, args []moejs.Value) (moejs.Value, error) {
 	if !p.loading {
@@ -106,8 +110,38 @@ func (p *Plugin) nativeOn(r *moejs.Realm, _ moejs.Value, args []moejs.Value) (mo
 		}
 		p.toolResultHook = handler
 		p.hasToolResultHook = true
+	case "before_agent_start":
+		if p.hasBeforeAgentStartHook {
+			return moejs.Undefined(), fmt.Errorf("plugin %s already has a before_agent_start handler", p.Name)
+		}
+		p.beforeAgentStartHook = handler
+		p.hasBeforeAgentStartHook = true
+	case "context":
+		if p.hasContextHook {
+			return moejs.Undefined(), fmt.Errorf("plugin %s already has a context handler", p.Name)
+		}
+		p.contextHook = handler
+		p.hasContextHook = true
+	case "session_before_compact":
+		if p.hasSessionBeforeCompactHook {
+			return moejs.Undefined(), fmt.Errorf("plugin %s already has a session_before_compact handler", p.Name)
+		}
+		p.sessionBeforeCompactHook = handler
+		p.hasSessionBeforeCompactHook = true
+	case "session_start":
+		if p.hasSessionStartHook {
+			return moejs.Undefined(), fmt.Errorf("plugin %s already has a session_start handler", p.Name)
+		}
+		p.sessionStartHook = handler
+		p.hasSessionStartHook = true
+	case "session_switch":
+		if p.hasSessionSwitchHook {
+			return moejs.Undefined(), fmt.Errorf("plugin %s already has a session_switch handler", p.Name)
+		}
+		p.sessionSwitchHook = handler
+		p.hasSessionSwitchHook = true
 	default:
-		return moejs.Undefined(), fmt.Errorf("unknown hook event %q (want tool_call or tool_result)", event)
+		return moejs.Undefined(), fmt.Errorf("unknown hook event %q (want tool_call, tool_result, before_agent_start, context, session_before_compact, session_start or session_switch)", event)
 	}
 	return moejs.Undefined(), nil
 }

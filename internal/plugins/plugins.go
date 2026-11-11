@@ -12,6 +12,9 @@
 //   - harness.registerTool(name, description, parameters, handler)
 //   - harness.registerCommand(name, description, handler)
 //   - harness.on("tool_call" | "tool_result", handler)
+//   - harness.on("before_agent_start" | "context" |
+//     "session_before_compact" | "session_start" |
+//     "session_switch", handler)
 //   - harness.setMode(name) / harness.getMode()
 //   - harness.log(...args)
 //   - harness.readFile(path) / harness.writeFile(path, content)
@@ -139,6 +142,19 @@ type Plugin struct {
 	hasToolCallHook   bool
 	toolResultHook    moejs.Value
 	hasToolResultHook bool
+	// Phase 4 lifecycle hooks, at most one per event per plugin.
+	// All four fail open (unlike tool_call, which fails closed):
+	// they add context, instructions or notifications, never a gate.
+	beforeAgentStartHook        moejs.Value
+	hasBeforeAgentStartHook     bool
+	contextHook                 moejs.Value
+	hasContextHook              bool
+	sessionBeforeCompactHook    moejs.Value
+	hasSessionBeforeCompactHook bool
+	sessionStartHook            moejs.Value
+	hasSessionStartHook         bool
+	sessionSwitchHook           moejs.Value
+	hasSessionSwitchHook        bool
 }
 
 // Registry is the loaded plugins of one run, indexed by tool name.
@@ -483,6 +499,259 @@ func (r *Registry) RunToolResultHooks(ctx context.Context, tool, argsJSON, resul
 		}
 	}
 	return result
+}
+
+// RunBeforeAgentStartHooks runs the registered before_agent_start
+// hooks in load order and returns the contributions as one system
+// message (each prefixed "[plugin <name>] ", empty contributions
+// dropped). A hook that throws, times out, or returns a non-string
+// is skipped with a stderr warning (fail open: the contribution is
+// additive context, never a gate).
+func (r *Registry) RunBeforeAgentStartHooks(ctx context.Context, session, mode string) string {
+	var parts []string
+	for _, p := range r.plugins {
+		if !p.hasBeforeAgentStartHook {
+			continue
+		}
+		res, err := p.callHook(ctx, p.beforeAgentStartHook, hookSessionModeInput(session, mode), r.timeout())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: plugin %s before_agent_start hook failed: %v\n", p.Name, err)
+			continue
+		}
+		if s, ok := hookTextResult(p, "before_agent_start", res); ok {
+			parts = append(parts, "[plugin "+p.Name+"] "+s)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// RunContextHooks runs the registered context hooks in load order,
+// each seeing the previous one's rewrite, and returns the history to
+// use for this turn. A hook that throws, times out, or returns an
+// invalid list keeps the current list (fail open). The returned list
+// is a fresh slice; the session file keeps the true history, so a
+// rewrite never persists. Image bytes, which never travel as JSON,
+// are restored from the original history by path (a hook cannot
+// inject image bytes it never had).
+func (r *Registry) RunContextHooks(ctx context.Context, session, mode string, msgs []llm.Message) []llm.Message {
+	for _, p := range r.plugins {
+		if !p.hasContextHook {
+			continue
+		}
+		input, err := hookContextInput(session, mode, msgs)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: plugin %s context hook input failed: %v\n", p.Name, err)
+			continue
+		}
+		res, err := p.callHook(ctx, p.contextHook, input, r.timeout())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: plugin %s context hook failed: %v\n", p.Name, err)
+			continue
+		}
+		if next, ok := hookMessagesResult(p, res); ok {
+			msgs = rehydrateImages(msgs, next)
+		}
+	}
+	return msgs
+}
+
+// RunSessionBeforeCompactHooks runs the registered
+// session_before_compact hooks in load order and returns the extra
+// instructions, each prefixed "[plugin <name>] ". A hook that throws,
+// times out, or returns a non-string is skipped with a warning
+// (fail open: the compact runs with the six fixed sections).
+func (r *Registry) RunSessionBeforeCompactHooks(ctx context.Context, session string, messageCount int) []string {
+	var out []string
+	for _, p := range r.plugins {
+		if !p.hasSessionBeforeCompactHook {
+			continue
+		}
+		res, err := p.callHook(ctx, p.sessionBeforeCompactHook, hookCompactInput(session, messageCount), r.timeout())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: plugin %s session_before_compact hook failed: %v\n", p.Name, err)
+			continue
+		}
+		if s, ok := hookTextResult(p, "session_before_compact", res); ok {
+			out = append(out, "[plugin "+p.Name+"] "+s)
+		}
+	}
+	return out
+}
+
+// RunSessionStartHooks runs the registered session_start hooks in load
+// order. They are notifications: return values are ignored, and a
+// failing hook is warned about but never fails anything.
+func (r *Registry) RunSessionStartHooks(ctx context.Context, session string) {
+	for _, p := range r.plugins {
+		if !p.hasSessionStartHook {
+			continue
+		}
+		if _, err := p.callHook(ctx, p.sessionStartHook, hookSessionInput(session), r.timeout()); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: plugin %s session_start hook failed: %v\n", p.Name, err)
+		}
+	}
+}
+
+// RunSessionSwitchHooks runs the registered session_switch hooks in
+// load order (same notification rules as RunSessionStartHooks).
+func (r *Registry) RunSessionSwitchHooks(ctx context.Context, session, previous string) {
+	for _, p := range r.plugins {
+		if !p.hasSessionSwitchHook {
+			continue
+		}
+		if _, err := p.callHook(ctx, p.sessionSwitchHook, hookSessionSwitchInput(session, previous), r.timeout()); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: plugin %s session_switch hook failed: %v\n", p.Name, err)
+		}
+	}
+}
+
+// hookTextResult reads a text-returning hook's return value:
+// (s, true) is a contribution; ("", false) is none (undefined,
+// empty, or a malformed value, which is warned about).
+func hookTextResult(p *Plugin, event string, res moejs.Value) (string, bool) {
+	g, err := p.rt.ToGo(res)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: plugin %s %s hook returned an unreadable value: %v\n", p.Name, event, err)
+		return "", false
+	}
+	switch v := g.(type) {
+	case nil:
+		return "", false // undefined: no contribution
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return "", false
+		}
+		return v, true
+	default:
+		fmt.Fprintf(os.Stderr, "warning: plugin %s %s hook returned a non-string value; ignoring it\n", p.Name, event)
+		return "", false
+	}
+}
+
+// hookMessagesResult reads a context hook's return value:
+// (list, true) is the rewritten history; (nil, false) keeps the
+// current list (undefined, or an invalid value, which is warned
+// about). Only the roles are validated — deeper checks would reject
+// legitimate rewrites — and a system message is rejected: the
+// harness prepends c.System itself, so a hook must never inject
+// one (it would be a forged system prompt).
+func hookMessagesResult(p *Plugin, res moejs.Value) ([]llm.Message, bool) {
+	g, err := p.rt.ToGo(res)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: plugin %s context hook returned an unreadable value: %v\n", p.Name, err)
+		return nil, false
+	}
+	if g == nil {
+		return nil, false // undefined: keep the current list
+	}
+	b, err := p.rt.AppendJSON(nil, res)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: plugin %s context hook returned a value that is not JSON: %v\n", p.Name, err)
+		return nil, false
+	}
+	var out []llm.Message
+	if err := json.Unmarshal(b, &out); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: plugin %s context hook returned a value that is not a message list; keeping the original history\n", p.Name)
+		return nil, false
+	}
+	for _, m := range out {
+		switch m.Role {
+		case "user", "assistant", "tool":
+		default:
+			// "system" is rejected too: the harness prepends
+			// c.System itself, so a hook must never inject a
+			// system message (a forged system prompt would
+			// override the harness's own instructions).
+			fmt.Fprintf(os.Stderr, "warning: plugin %s context hook returned a message with role %q; keeping the original history\n", p.Name, m.Role)
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+// rehydrateImages restores image bytes on a context hook's rewritten
+// history: the hook input JSON carries paths only (Data is json:"-"),
+// so a verbatim round-trip would silently drop the bytes. Images are
+// matched by path; an image the hook invented (no matching path in
+// the original) is dropped — a hook cannot inject image bytes it
+// never had.
+func rehydrateImages(orig, rewritten []llm.Message) []llm.Message {
+	byPath := map[string]llm.Image{}
+	for _, m := range orig {
+		for _, img := range m.Images {
+			byPath[img.Path] = img
+		}
+	}
+	for i := range rewritten {
+		if len(rewritten[i].Images) == 0 {
+			continue
+		}
+		kept := rewritten[i].Images[:0]
+		for _, img := range rewritten[i].Images {
+			if src, ok := byPath[img.Path]; ok {
+				img.Data = src.Data
+				kept = append(kept, img)
+			}
+		}
+		rewritten[i].Images = kept
+	}
+	return rewritten
+}
+
+// hookSessionInput builds the {session} input for session_start.
+func hookSessionInput(session string) string {
+	b, _ := json.Marshal(struct {
+		Session string `json:"session"`
+	}{Session: session})
+	return string(b)
+}
+
+// hookSessionModeInput builds the {session, mode} input for
+// before_agent_start.
+func hookSessionModeInput(session, mode string) string {
+	b, _ := json.Marshal(struct {
+		Session string `json:"session"`
+		Mode    string `json:"mode"`
+	}{Session: session, Mode: mode})
+	return string(b)
+}
+
+// hookSessionSwitchInput builds the {session, previous} input for
+// session_switch.
+func hookSessionSwitchInput(session, previous string) string {
+	b, _ := json.Marshal(struct {
+		Session  string `json:"session"`
+		Previous string `json:"previous"`
+	}{Session: session, Previous: previous})
+	return string(b)
+}
+
+// hookCompactInput builds the {session, messages} input for
+// session_before_compact: messages is the count, not the list —
+// compacting is already expensive, and the hook adds instructions,
+// it does not re-read the conversation.
+func hookCompactInput(session string, count int) string {
+	b, _ := json.Marshal(struct {
+		Session  string `json:"session"`
+		Messages int    `json:"messages"`
+	}{Session: session, Messages: count})
+	return string(b)
+}
+
+// hookContextInput builds the {session, mode, messages} input for
+// the context hook: the turn's starting history, system message
+// excluded (Run prepends c.System itself, so the hook never sees
+// or changes it).
+func hookContextInput(session, mode string, msgs []llm.Message) (string, error) {
+	b, err := json.Marshal(struct {
+		Session  string        `json:"session"`
+		Mode     string        `json:"mode"`
+		Messages []llm.Message `json:"messages"`
+	}{Session: session, Mode: mode, Messages: msgs})
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 // hookArgsJSON is the args object a hook sees: the call's args JSON,

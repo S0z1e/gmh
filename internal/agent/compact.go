@@ -33,7 +33,11 @@ func ShouldCompact(lastPromptTokens, contextLimit int) bool {
 
 // BuildCompactPrompt renders the history plus the 6-section summary
 // instructions (Pi-style) used to produce the compaction summary.
-func BuildCompactPrompt(history []llm.Message) string {
+// extras are additional instructions from session_before_compact
+// hooks, already prefixed "[plugin <name>] "; they go after section 6
+// and before the conversation, so a plugin can steer what the
+// summary keeps without replacing it.
+func BuildCompactPrompt(history []llm.Message, extras []string) string {
 	var b strings.Builder
 	b.WriteString("Summarise the conversation below into a compact brief the next assistant can continue from. Use exactly these sections, keep each tight, drop chatter:\n\n")
 	b.WriteString("1. Task summary — what the user asked for and what was done\n")
@@ -42,6 +46,13 @@ func BuildCompactPrompt(history []llm.Message) string {
 	b.WriteString("4. Pending — what is unfinished or was deferred\n")
 	b.WriteString("5. Errors and fixes — what failed and how it was resolved\n")
 	b.WriteString("6. Next steps — what to do next\n\n")
+	if len(extras) > 0 {
+		b.WriteString("Additional instructions from plugins:\n")
+		for _, e := range extras {
+			b.WriteString(e + "\n")
+		}
+		b.WriteString("\n")
+	}
 	b.WriteString("--- conversation ---\n")
 	for _, m := range history {
 		switch m.Role {
@@ -72,10 +83,11 @@ func truncateForSummary(s string) string {
 
 // Compact asks the model to summarise history. It is one extra LLM call
 // with no tools; the caller replaces history with the returned summary.
-func Compact(ctx context.Context, client *llm.Client, history []llm.Message) (string, llm.Usage, error) {
+// extras are passed through to BuildCompactPrompt.
+func Compact(ctx context.Context, client *llm.Client, history []llm.Message, extras []string) (string, llm.Usage, error) {
 	msgs := []llm.Message{
 		{Role: "system", Content: "You write compact conversation summaries for a coding agent. Follow the requested sections exactly."},
-		{Role: "user", Content: BuildCompactPrompt(history)},
+		{Role: "user", Content: BuildCompactPrompt(history, extras)},
 	}
 	msg, usage, err := client.Chat(ctx, msgs, nil, nil)
 	if err != nil {

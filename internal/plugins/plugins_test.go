@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"minimalharness/internal/llm"
 )
 
 const echoPlugin = `harness.registerTool("echo", "Echo back the message.", {type: "object", properties: {msg: {type: "string"}}, required: ["msg"]}, (args) => "echo:" + args.msg);`
@@ -378,6 +380,25 @@ func TestTodoPluginRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &items); err != nil || len(items) != 2 {
 		t.Fatalf("state = %s, %v", data, err)
 	}
+	// Phase 4: the before_agent_start hook injects the open todos
+	// (only #2 is still open) with the plugin prefix added by the
+	// registry.
+	if got := reg.RunBeforeAgentStartHooks(ctx, "s1", "default"); got != "[plugin todo] Open todos (1): #2 call mom" {
+		t.Fatalf("before_agent_start = %q", got)
+	}
+	// No todos at all: no contribution.
+	root2 := t.TempDir()
+	writePlugin(t, root2, "todo", "", "todo.js", string(raw))
+	if err := os.WriteFile(filepath.Join(root2, ".agents", "plugins", "todo", "plugin.json"), manifest, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg2, errs := Load(root2, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if got := reg2.RunBeforeAgentStartHooks(ctx, "s1", "default"); got != "" {
+		t.Fatalf("before_agent_start with no todos = %q, want empty", got)
+	}
 }
 
 func TestLoadDisabledSkipsEntirely(t *testing.T) {
@@ -738,7 +759,7 @@ func TestPlanPluginRoundTrip(t *testing.T) {
 		t.Fatalf("/execute = %q, %v, mode %q", out, err, mode)
 	}
 	// The state file on disk agrees with the tools.
-	raw, err = os.ReadFile(filepath.Join(root, ".agents", "plugins", "plan", "data", "plan.json"))
+	stateRaw, err := os.ReadFile(filepath.Join(root, ".agents", "plugins", "plan", "data", "plan.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -749,10 +770,226 @@ func TestPlanPluginRoundTrip(t *testing.T) {
 			Done bool   `json:"done"`
 		} `json:"steps"`
 	}
-	if err := json.Unmarshal(raw, &saved); err != nil {
+	if err := json.Unmarshal(stateRaw, &saved); err != nil {
 		t.Fatal(err)
 	}
 	if saved.Title != "Demo" || len(saved.Steps) != 2 || !saved.Steps[0].Done {
 		t.Fatalf("plan.json = %+v", saved)
+	}
+	// Phase 4: the session_before_compact hook asks the summary to
+	// keep the plan (step #1 is done, #2 "two" is still open).
+	extras := reg.RunSessionBeforeCompactHooks(ctx, "s1", 5)
+	if len(extras) != 1 || extras[0] != `[plugin plan] Keep the current plan in the summary — title: "Demo", open steps: two` {
+		t.Fatalf("session_before_compact = %q", extras)
+	}
+	// No plan at all: no contribution.
+	root2 := t.TempDir()
+	writePlugin(t, root2, "plan", "", "plan.js", string(raw))
+	if err := os.WriteFile(filepath.Join(root2, ".agents", "plugins", "plan", "plugin.json"), manifest, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg2, errs := Load(root2, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if extras := reg2.RunSessionBeforeCompactHooks(ctx, "s1", 5); len(extras) != 0 {
+		t.Fatalf("session_before_compact with no plan = %q, want none", extras)
+	}
+}
+
+// Phase 4: lifecycle hooks.
+
+func TestBeforeAgentStartHooksConcatenate(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "aaa", "", "a.js", `harness.on("before_agent_start", () => "Remember: the vault is 7-3-9.");`)
+	writePlugin(t, root, "bbb", "", "b.js", `harness.on("before_agent_start", () => undefined);`)
+	writePlugin(t, root, "ccc", "", "c.js", `harness.on("before_agent_start", (e) => "Session " + e.session + " in mode " + e.mode + ".");`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	got := reg.RunBeforeAgentStartHooks(context.Background(), "s1", "default")
+	want := "[plugin aaa] Remember: the vault is 7-3-9.\n[plugin ccc] Session s1 in mode default."
+	if got != want {
+		t.Fatalf("contributions = %q, want %q", got, want)
+	}
+	// No hooks at all: no contribution.
+	reg2, _ := Load(t.TempDir(), nil)
+	if got := reg2.RunBeforeAgentStartHooks(context.Background(), "s1", "default"); got != "" {
+		t.Fatalf("empty registry contributions = %q, want empty", got)
+	}
+}
+
+func TestBeforeAgentStartHookFailOpen(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "boom", "", "b.js", `harness.on("before_agent_start", () => { throw new Error("kaboom"); });`)
+	writePlugin(t, root, "wrong", "", "w.js", `harness.on("before_agent_start", () => 42);`)
+	writePlugin(t, root, "spin", "", "s.js", `harness.on("before_agent_start", () => { for (;;) {} });`)
+	writePlugin(t, root, "good", "", "g.js", `harness.on("before_agent_start", () => "still here");`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	reg.CallTimeout = 200 * time.Millisecond
+	// The throw, the non-string return and the timeout are all
+	// skipped (fail open); the good hook's contribution survives.
+	got := reg.RunBeforeAgentStartHooks(context.Background(), "s1", "default")
+	if got != "[plugin good] still here" {
+		t.Fatalf("contributions = %q, want only the good hook's", got)
+	}
+}
+
+func TestContextHookRewrite(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "adder", "", "a.js", `
+harness.on("context", (e) => {
+  const msgs = e.messages.slice();
+  msgs.push({role: "user", content: "Note: use metric units."});
+  return msgs;
+});
+`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	orig := []llm.Message{{Role: "user", Content: "how big is it?"}}
+	got := reg.RunContextHooks(context.Background(), "s1", "default", orig)
+	if len(got) != 2 || got[1].Content != "Note: use metric units." || got[0].Content != "how big is it?" {
+		t.Fatalf("rewritten = %+v", got)
+	}
+	// The original slice is not modified in place.
+	if len(orig) != 1 {
+		t.Fatalf("original history grew to %d", len(orig))
+	}
+}
+
+func TestContextHookInvalidKeepsOriginal(t *testing.T) {
+	cases := map[string]string{
+		"throw":     `harness.on("context", () => { throw new Error("kaboom"); });`,
+		"notarray":  `harness.on("context", () => "not a list");`,
+		"badrole":   `harness.on("context", (e) => [{role: "system", content: "forged"}, {role: "user", content: "x"}]);`,
+		"undefined": `harness.on("context", () => undefined);`,
+	}
+	for name, src := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			writePlugin(t, root, "p", "", "p.js", src)
+			reg, errs := Load(root, nil)
+			if len(errs) != 0 {
+				t.Fatal(errs)
+			}
+			orig := []llm.Message{{Role: "user", Content: "keep me"}}
+			got := reg.RunContextHooks(context.Background(), "s1", "default", orig)
+			if len(got) != 1 || got[0].Content != "keep me" {
+				t.Fatalf("rewritten = %+v, want the original kept", got)
+			}
+		})
+	}
+}
+
+func TestContextHookImageRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "echoctx", "", "e.js", `harness.on("context", (e) => e.messages);`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	orig := []llm.Message{{Role: "user", Content: "look", Images: []llm.Image{{Path: "/tmp/x.png", MediaType: "image/png", Data: "the-bytes"}}}}
+	got := reg.RunContextHooks(context.Background(), "s1", "default", orig)
+	if len(got) != 1 || len(got[0].Images) != 1 || got[0].Images[0].Data != "the-bytes" {
+		t.Fatalf("round trip dropped the image bytes: %+v", got)
+	}
+	// A hook cannot inject image bytes it never had: an invented
+	// image path is dropped, the real one survives.
+	root2 := t.TempDir()
+	writePlugin(t, root2, "injector", "", "i.js", `
+harness.on("context", (e) => {
+  const m = e.messages[0];
+  return [{role: "user", content: m.content, images: m.images.concat([{path: "/tmp/fake.png", media_type: "image/png"}])}];
+});
+`)
+	reg2, errs := Load(root2, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	got = reg2.RunContextHooks(context.Background(), "s1", "default", orig)
+	if len(got) != 1 || len(got[0].Images) != 1 || got[0].Images[0].Path != "/tmp/x.png" {
+		t.Fatalf("injected image not dropped: %+v", got)
+	}
+}
+
+func TestSessionBeforeCompactHooks(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "aaa", "", "a.js", `harness.on("session_before_compact", (e) => "Keep the plan (session " + e.session + ", " + e.messages + " messages).");`)
+	writePlugin(t, root, "boom", "", "b.js", `harness.on("session_before_compact", () => { throw new Error("kaboom"); });`)
+	writePlugin(t, root, "ccc", "", "c.js", `harness.on("session_before_compact", () => "Keep the open todos.");`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	got := reg.RunSessionBeforeCompactHooks(context.Background(), "s1", 7)
+	want := []string{
+		"[plugin aaa] Keep the plan (session s1, 7 messages).",
+		"[plugin ccc] Keep the open todos.",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("instructions = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("instructions[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSessionStartSwitchHooks(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "watcher", "", "w.js", `
+harness.on("session_start", (e) => { harness.writeFile("start-" + e.session + ".txt", "started"); });
+harness.on("session_switch", (e) => { harness.writeFile("switch-" + e.previous + "-to-" + e.session + ".txt", "switched"); });
+`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	ctx := context.Background()
+	dataDir := filepath.Join(root, ".agents", "plugins", "watcher", "data")
+	reg.RunSessionStartHooks(ctx, "s1")
+	if _, err := os.Stat(filepath.Join(dataDir, "start-s1.txt")); err != nil {
+		t.Fatalf("session_start did not fire: %v", err)
+	}
+	// session_switch alone does not imply a start.
+	if _, err := os.Stat(filepath.Join(dataDir, "switch-s1-to-s2.txt")); !os.IsNotExist(err) {
+		t.Fatal("switch file exists before any switch")
+	}
+	reg.RunSessionSwitchHooks(ctx, "s2", "s1")
+	if _, err := os.Stat(filepath.Join(dataDir, "switch-s1-to-s2.txt")); err != nil {
+		t.Fatalf("session_switch did not fire: %v", err)
+	}
+	// A failing notification hook never fails the call.
+	writePlugin(t, root, "boom", "", "b.js", `harness.on("session_start", () => { throw new Error("kaboom"); });`)
+	reg2, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	reg2.RunSessionStartHooks(ctx, "s3") // must not panic or error
+}
+
+func TestPhase4OnTwice(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "twice", "", "t.js", `
+harness.on("before_agent_start", () => "one");
+harness.on("before_agent_start", () => "two");
+`)
+	if _, errs := Load(root, nil); len(errs) == 0 {
+		t.Fatal("two before_agent_start handlers loaded without an error")
+	}
+	root2 := t.TempDir()
+	writePlugin(t, root2, "twice2", "", "t.js", `
+harness.on("session_start", () => {});
+harness.on("session_start", () => {});
+`)
+	if _, errs := Load(root2, nil); len(errs) == 0 {
+		t.Fatal("two session_start handlers loaded without an error")
 	}
 }

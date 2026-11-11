@@ -91,3 +91,19 @@ harness.registerTool(
     return "Done todo #" + id + ": " + item.text;
   },
 );
+
+// before_agent_start: inject the open todos into every turn, so the
+// model knows what is pending without calling todo_list first. No
+// open todos means no contribution (undefined). The "[plugin todo] "
+// prefix is added by the harness when it joins contributions, so
+// this returns the bare text.
+harness.on("before_agent_start", () => {
+  const open = loadTodos().filter((t) => !t.done);
+  if (open.length === 0) return undefined;
+  return (
+    "Open todos (" +
+    open.length +
+    "): " +
+    open.map((t) => "#" + t.id + " " + t.text).join("; ")
+  );
+});

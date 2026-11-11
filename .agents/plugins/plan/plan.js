@@ -141,3 +141,20 @@ harness.registerCommand(
     return "Back in default mode.";
   },
 );
+
+// session_before_compact: ask the summary to keep the plan, so a
+// compacted session does not lose what the user is working towards.
+// No plan means no contribution (undefined). The "[plugin plan] "
+// prefix is added by the harness when it joins instructions, so
+// this returns the bare text.
+harness.on("session_before_compact", (event) => {
+  const plan = loadPlan();
+  if (!plan) return undefined;
+  const open = plan.steps.filter((s) => !s.done);
+  return (
+    "Keep the current plan in the summary — title: \"" +
+    plan.title +
+    "\", open steps: " +
+    (open.length ? open.map((s) => s.text).join("; ") : "none")
+  );
+});

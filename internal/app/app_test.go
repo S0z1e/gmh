@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/png"
@@ -1004,4 +1005,228 @@ func TestSetupSandbox(t *testing.T) {
 		t.Fatal("HARNESS_SANDBOX=1 did not enable the sandbox")
 	}
 	a.Store.Close()
+}
+
+// Phase 4: lifecycle hooks.
+
+// recordingServer is mockServer that also captures every request
+// body, so a test can see exactly what the model was sent.
+func recordingServer(t *testing.T, bodies *[][]byte) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		*bodies = append(*bodies, body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi there\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+}
+
+func writePhase4Plugin(t *testing.T, root, name, src string) {
+	t.Helper()
+	dir := filepath.Join(root, ".agents", "plugins", name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := fmt.Sprintf(`{"name": %q, "description": "%s plugin.", "version": "0.1.0", "entry": "note.js"}`, name, name)
+	if err := os.WriteFile(filepath.Join(dir, "plugin.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "note.js"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A turn runs the before_agent_start and context hooks: the model
+// sees the contribution and the rewrite, but neither is persisted —
+// the session file and the in-memory history keep the true history.
+func TestRunnerTurnRunsPhase4Hooks(t *testing.T) {
+	var bodies [][]byte
+	srv := recordingServer(t, &bodies)
+	defer srv.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	root := t.TempDir()
+	writeMockProvider(t, root)
+	writePhase4Plugin(t, root, "note", `
+harness.on("before_agent_start", () => "Remember: the vault is 7-3-9.");
+harness.on("context", (e) => {
+  const msgs = e.messages.slice();
+  msgs.push({role: "user", content: "Note: use metric units."});
+  return msgs;
+});
+`)
+	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	r := &Runner{App: a, Print: func(format string, args ...any) {}}
+	if quit := r.Handle(context.Background(), "say hi"); quit {
+		t.Fatal("task should not quit")
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("requests = %d, want 1", len(bodies))
+	}
+	var req struct {
+		Messages []llm.Message `json:"messages"`
+	}
+	if err := json.Unmarshal(bodies[0], &req); err != nil {
+		t.Fatalf("request body not JSON: %v", err)
+	}
+	// The first message is the harness system prompt; the hook
+	// contribution follows it as its own system message.
+	if len(req.Messages) < 3 || req.Messages[0].Role != "system" {
+		t.Fatalf("request messages = %+v", req.Messages)
+	}
+	if req.Messages[1].Role != "system" || req.Messages[1].Content != "[plugin note] Remember: the vault is 7-3-9." {
+		t.Fatalf("contribution message = %+v, want the prefixed system message second", req.Messages[1])
+	}
+	foundRewrite, foundTask := false, false
+	for _, m := range req.Messages {
+		if m.Role == "user" && m.Content == "Note: use metric units." {
+			foundRewrite = true
+		}
+		if m.Role == "user" && m.Content == "say hi" {
+			foundTask = true
+		}
+	}
+	if !foundRewrite || !foundTask {
+		t.Fatalf("request messages = %+v, want the context rewrite and the task", req.Messages)
+	}
+	// Neither hook's text reached the session file or the
+	// in-memory history: the turn's history copy only.
+	if len(a.History) != 2 {
+		t.Fatalf("history = %d messages, want 2 (user + assistant)", len(a.History))
+	}
+	data, err := os.ReadFile(a.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "7-3-9") || strings.Contains(string(data), "metric units") {
+		t.Fatalf("session file contains hook text:\n%s", data)
+	}
+}
+
+// session_start fires when a session becomes current (NewSession,
+// LoadSession), session_switch fires when the id changes, and
+// neither fires at Setup or on ResetSession (/clear).
+func TestSessionEventsFireOnNewAndLoad(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	root := t.TempDir()
+	writeMockProvider(t, root)
+	writePhase4Plugin(t, root, "watcher", `
+harness.on("session_start", (e) => { harness.writeFile("start-" + e.session + ".txt", "started"); });
+harness.on("session_switch", (e) => { harness.writeFile("switch-" + e.previous + "-to-" + e.session + ".txt", "switched"); });
+`)
+	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	dataDir := filepath.Join(root, ".agents", "plugins", "watcher", "data")
+	countFiles := func() int {
+		entries, _ := os.ReadDir(dataDir)
+		return len(entries)
+	}
+	// The initial session at Setup fires nothing: plugins were not
+	// loaded yet when it was created.
+	if n := countFiles(); n != 0 {
+		t.Fatalf("Setup fired session events: %d files", n)
+	}
+	firstID := a.Store.ID
+	store, err := a.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "start-"+store.ID+".txt")); err != nil {
+		t.Fatalf("NewSession did not fire session_start: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "switch-"+firstID+"-to-"+store.ID+".txt")); err != nil {
+		t.Fatalf("NewSession did not fire session_switch: %v", err)
+	}
+	secondID := store.ID
+	if _, err := a.LoadSession(firstID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "start-"+firstID+".txt")); err != nil {
+		t.Fatalf("LoadSession did not fire session_start: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "switch-"+secondID+"-to-"+firstID+".txt")); err != nil {
+		t.Fatalf("LoadSession did not fire session_switch: %v", err)
+	}
+	// Loading the same session again fires start, but not switch
+	// (old id == new id): no switch file for the id to itself.
+	if _, err := a.LoadSession(firstID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "switch-"+firstID+"-to-"+firstID+".txt")); !os.IsNotExist(err) {
+		t.Fatal("same-session load fired session_switch")
+	}
+	// ResetSession (/clear) fires neither event.
+	r := &Runner{App: a, Print: func(format string, args ...any) {}}
+	before := countFiles()
+	if _, err := r.ResetSession(); err != nil {
+		t.Fatal(err)
+	}
+	if n := countFiles(); n != before {
+		t.Fatalf("ResetSession wrote %d files, want none", n-before)
+	}
+}
+
+// /compact runs the session_before_compact hooks: their instructions
+// land in the summary prompt after section 6, and a throwing hook
+// does not break the compact.
+func TestDoCompactRunsSessionBeforeCompactHooks(t *testing.T) {
+	var bodies [][]byte
+	srv := recordingServer(t, &bodies)
+	defer srv.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	root := t.TempDir()
+	writeMockProvider(t, root)
+	writePhase4Plugin(t, root, "keeper", `harness.on("session_before_compact", () => "Keep the plan: ship it.");`)
+	writePhase4Plugin(t, root, "boom", `harness.on("session_before_compact", () => { throw new Error("kaboom"); });`)
+	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	var printed []string
+	r := &Runner{App: a, Print: func(format string, args ...any) {
+		printed = append(printed, fmt.Sprintf(format, args...))
+	}}
+	r.Handle(context.Background(), "say hi")
+	if quit := r.Handle(context.Background(), "/compact"); quit {
+		t.Fatal("/compact should not quit")
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("requests = %d, want 2 (turn + compact)", len(bodies))
+	}
+	var req struct {
+		Messages []llm.Message `json:"messages"`
+	}
+	if err := json.Unmarshal(bodies[1], &req); err != nil {
+		t.Fatalf("compact request body not JSON: %v", err)
+	}
+	if len(req.Messages) != 2 {
+		t.Fatalf("compact request messages = %+v", req.Messages)
+	}
+	prompt := req.Messages[1].Content
+	sec6 := strings.Index(prompt, "6. Next steps")
+	extra := strings.Index(prompt, "[plugin keeper] Keep the plan: ship it.")
+	conv := strings.Index(prompt, "--- conversation ---")
+	if sec6 < 0 || extra < 0 || conv < 0 || !(sec6 < extra && extra < conv) {
+		t.Fatalf("compact prompt missing or misplaced the plugin instruction:\n%s", prompt)
+	}
+	if !strings.Contains(strings.Join(printed, "\n"), "[compact]") {
+		t.Fatalf("compact did not print its summary line: %v", printed)
+	}
+	if len(a.History) != 1 || a.History[0].Role != "user" || !strings.Contains(a.History[0].Content, "Previous conversation summary:") || !strings.Contains(a.History[0].Content, "hi there") {
+		t.Fatalf("history after compact = %+v, want the summary as one user message", a.History)
+	}
 }

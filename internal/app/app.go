@@ -693,12 +693,50 @@ func (a *App) resetToolMode() {
 	}
 }
 
+// sessionID is the current session's id ("" when there is no store,
+// e.g. a test App built without Setup).
+func (a *App) sessionID() string {
+	if a.Store == nil {
+		return ""
+	}
+	return a.Store.ID
+}
+
+// fireSessionEvents runs the session_start / session_switch hooks
+// after a session becomes current. oldID is "" when there was no
+// previous session. Hooks are notifications: a failing hook is
+// warned about and never fails the switch. (The initial session at
+// Setup fires nothing — plugins are not loaded yet when it is
+// created, and Setup builds it directly, not through NewSession.)
+func (a *App) fireSessionEvents(oldID, newID string) {
+	if a.Plugins == nil {
+		return
+	}
+	ctx := context.Background()
+	a.Plugins.RunSessionStartHooks(ctx, newID)
+	if oldID != "" && oldID != newID {
+		a.Plugins.RunSessionSwitchHooks(ctx, newID, oldID)
+	}
+}
+
 func (a *App) NewSession() (*session.Store, error) {
+	return a.newSession(true)
+}
+
+// newSession creates a fresh session and makes it current. fire
+// controls whether the session_start / session_switch hooks run:
+// ResetSession (/clear) creates a fresh session too, but the design
+// says it does NOT fire the session events, so it passes false.
+func (a *App) newSession(fire bool) (*session.Store, error) {
 	store, err := session.New("")
 	if err != nil {
 		return nil, err
 	}
 	old := a.Store
+	oldID := ""
+	if old != nil {
+		oldID = old.ID
+	}
 	a.Store = store
 	a.History = nil
 	a.resetToolMode()
@@ -710,6 +748,9 @@ func (a *App) NewSession() (*session.Store, error) {
 	}
 	if old != nil {
 		_ = old.Close()
+	}
+	if fire {
+		a.fireSessionEvents(oldID, store.ID)
 	}
 	return store, nil
 }
@@ -730,6 +771,10 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 		return nil, err
 	}
 	old := a.Store
+	oldID := ""
+	if old != nil {
+		oldID = old.ID
+	}
 	a.Store = store
 	a.History = history
 	a.ResumedMessage = fmt.Sprintf("Resumed session %s (%d messages).", id, len(history))
@@ -743,6 +788,7 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	if old != nil {
 		_ = old.Close()
 	}
+	a.fireSessionEvents(oldID, store.ID)
 	return history, nil
 }
 
@@ -768,7 +814,10 @@ type Runner struct {
 // ResetSession starts a fresh session and zeroes the runner's
 // totals. It returns the new session id.
 func (r *Runner) ResetSession() (string, error) {
-	store, err := r.App.NewSession()
+	// A fresh session, but the session events do NOT fire here
+	// (see App.newSession): /clear starts over, it does not switch
+	// between sessions.
+	store, err := r.App.newSession(false)
 	if err != nil {
 		return "", err
 	}
@@ -1129,15 +1178,33 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	r.App.History = append(r.App.History, userMsg)
 	_ = r.App.Store.Append(userMsg)
 	r.Turns++
-	// A mode switch queues a one-turn system reminder: prepend it to
-	// this turn's history only, so the model is told the tools
-	// changed without the reminder persisting in the session.
+	// The context hook rewrites this turn's starting history
+	// (in-memory only — the session file keeps the true history).
+	// It sees the original history, before the reminder and the
+	// before_agent_start contributions below are prepended.
 	history := r.App.History
+	if r.App.Plugins != nil {
+		history = r.App.Plugins.RunContextHooks(ctx, r.App.sessionID(), string(r.App.ToolMode()), history)
+	}
+	// A mode switch queues a one-turn system reminder, and
+	// before_agent_start hooks contribute per-turn context: both are
+	// prepended as system messages to this turn's history only, so
+	// the model is told the tools changed (and what is pending)
+	// without either persisting in the session. The reminder goes
+	// first (tool set), the hook contributions after (content).
+	var prefix []llm.Message
 	if r.App.pendingReminder != "" {
-		reminder := r.App.pendingReminder
+		prefix = append(prefix, llm.Message{Role: "system", Content: r.App.pendingReminder})
 		r.App.pendingReminder = ""
-		turnHistory := make([]llm.Message, 0, len(history)+1)
-		turnHistory = append(turnHistory, llm.Message{Role: "system", Content: reminder})
+	}
+	if r.App.Plugins != nil {
+		if contrib := r.App.Plugins.RunBeforeAgentStartHooks(ctx, r.App.sessionID(), string(r.App.ToolMode())); contrib != "" {
+			prefix = append(prefix, llm.Message{Role: "system", Content: contrib})
+		}
+	}
+	if len(prefix) > 0 {
+		turnHistory := make([]llm.Message, 0, len(prefix)+len(history))
+		turnHistory = append(turnHistory, prefix...)
 		turnHistory = append(turnHistory, history...)
 		history = turnHistory
 	}
@@ -1178,7 +1245,15 @@ func (r *Runner) doCompact(ctx context.Context) {
 		r.Print("[compact] nothing to compact.")
 		return
 	}
-	summary, cUsage, err := agent.Compact(ctx, r.App.Cfg.Client, r.App.History)
+	// session_before_compact hooks add instructions to the summary
+	// prompt (append-only); a failing hook is skipped, never fails
+	// the compact. Manual /compact and auto-compact share this one
+	// insertion point.
+	var extras []string
+	if r.App.Plugins != nil {
+		extras = r.App.Plugins.RunSessionBeforeCompactHooks(ctx, r.App.sessionID(), len(r.App.History))
+	}
+	summary, cUsage, err := agent.Compact(ctx, r.App.Cfg.Client, r.App.History, extras)
 	if err != nil {
 		r.Print("[compact] failed: %v (history unchanged)", err)
 		return
