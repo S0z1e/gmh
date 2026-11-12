@@ -228,8 +228,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		// non-empty.
 		var thinking strings.Builder
 		// Send the truncated view to the LLM; the full history stays
-		// in msgs and in the session file.
-		apiMsgs := truncateToolResults(msgs, 2, 2000, 32*1024)
+		// in msgs and in the session file. The cap is uniform (see
+		// truncate.go): a result's sent form never changes after
+		// its first send, so the cached prefix stays valid.
+		apiMsgs := truncateToolResults(msgs, toolResultMaxChars)
 		err := c.Client.Stream(ctx, apiMsgs, c.Tools, func(s string) {
 			c.emit(Event{Kind: EventTextDelta, Text: s})
 		}, func(m llm.Message, u llm.Usage) {

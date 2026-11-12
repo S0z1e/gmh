@@ -10,38 +10,29 @@ import (
 // observations; only the view sent to the LLM is truncated, so a huge
 // early output cannot blow up the context of later steps.
 //
-//   - The newest keepFull tool results are kept up to recentMaxChars.
-//   - Older tool results are cut to oldMaxChars.
-//   - Truncation keeps head + tail, never just the head, and always
-//     says how much was dropped.
-func truncateToolResults(msgs []llm.Message, keepFull, oldMaxChars, recentMaxChars int) []llm.Message {
-	// Count tool messages from the end to find which are "recent".
-	toolIdx := make([]int, 0, len(msgs))
-	for i, m := range msgs {
-		if m.Role == "tool" {
-			toolIdx = append(toolIdx, i)
-		}
-	}
-	recentStart := len(toolIdx) - keepFull
-	if recentStart < 0 {
-		recentStart = 0
-	}
-	recent := map[int]bool{}
-	for _, i := range toolIdx[recentStart:] {
-		recent[i] = true
-	}
+// The cap is UNIFORM: every tool result gets the same maxChars,
+// however old it is. An earlier version kept the newest 2 results
+// full (32 KiB) and cut older ones to 2,000 chars, so a result's sent
+// form changed every step as newer results arrived — the prefix the
+// provider had cached no longer matched, and cache hits collapsed
+// (measured 9.6% over a 100-step run, 11/100 steps hitting, 0
+// otherwise). With one cap, the sent view is a deterministic function
+// of the append-only history: a message, once sent, is resent
+// byte-identical forever, which is what prefix caching keys on — the
+// same shape opencode (truncate once at tool-return time) and Codex
+// (truncate in record_items) use. The price is that old results stay
+// up to maxChars instead of shrinking to 2,000, so prompts grow
+// faster on long runs; the compaction trigger bounds that growth.
+const toolResultMaxChars = 32 * 1024
 
+func truncateToolResults(msgs []llm.Message, maxChars int) []llm.Message {
 	out := make([]llm.Message, len(msgs))
 	copy(out, msgs)
 	for i, m := range msgs {
 		if m.Role != "tool" {
 			continue
 		}
-		max := oldMaxChars
-		if recent[i] {
-			max = recentMaxChars
-		}
-		out[i].Content = capText(m.Content, max)
+		out[i].Content = capText(m.Content, maxChars)
 	}
 	return out
 }

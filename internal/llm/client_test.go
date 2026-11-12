@@ -175,6 +175,49 @@ func TestStreamChatSendsReasoningEffort(t *testing.T) {
 	}
 }
 
+// PromptCacheKey is sent as prompt_cache_key on chat completions
+// and omitted when empty; a sampling param must never override it.
+func TestStreamChatSendsPromptCacheKey(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", PromptCacheKey: "20261112-153000"}
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if body["prompt_cache_key"] != "20261112-153000" {
+		t.Fatalf("prompt_cache_key = %v, want 20261112-153000: %+v", body["prompt_cache_key"], body)
+	}
+
+	// Unset key omits the field entirely.
+	body = nil
+	c.PromptCacheKey = ""
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["prompt_cache_key"]; ok {
+		t.Fatalf("prompt_cache_key must be absent without a key: %+v", body)
+	}
+
+	// A sampling param named prompt_cache_key must not override it.
+	body = nil
+	c.PromptCacheKey = "20261112-153000"
+	c.SamplingParams = map[string]any{"prompt_cache_key": "evil"}
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, func(m Message, u Usage) {}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if body["prompt_cache_key"] != "20261112-153000" {
+		t.Fatalf("prompt_cache_key = %v, want 20261112-153000: %+v", body["prompt_cache_key"], body)
+	}
+}
+
 // Config headers are sent; auth and framing headers are never taken
 // from the config, or a stray Authorization would replace the real key.
 func TestStreamChatSendsConfigHeaders(t *testing.T) {

@@ -98,6 +98,9 @@ type chatRequest struct {
 	// ReasoningEffort is how hard a reasoning model thinks
 	// (low/medium/high). Empty omits the field.
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// PromptCacheKey is the stable per-session routing hint for
+	// prefix caching (OpenAI chat completions). Empty omits it.
+	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
 }
 
 // streamOptions requests token usage in the final SSE chunk. Without
@@ -228,6 +231,14 @@ type Client struct {
 	// effortThinkingBudget). A model that does not reason ignores
 	// it.
 	Effort string
+	// PromptCacheKey is a stable per-session routing hint for prefix
+	// caching: chat completions send it as prompt_cache_key, the
+	// session id, the same value on every request of the session.
+	// Empty omits the field. A gateway may strip or ignore it — it
+	// is a hint, not a guarantee — so cache wins are verified from
+	// usage.prompt_tokens_details.cached_tokens, never assumed.
+	// SamplingParams can never override it (see mergeSamplingParams).
+	PromptCacheKey string
 	// Headers are extra request headers from the config file
 	// (provider + model). Authorization, Content-Type, Accept and
 	// x-api-key are never taken from here: auth is the client's job.
@@ -387,7 +398,8 @@ func mergeSamplingParams(body []byte, params map[string]any) ([]byte, error) {
 		switch strings.ToLower(k) {
 		case "model", "messages", "tools", "tool_choice", "stream",
 			"stream_options", "max_tokens", "max_completion_tokens",
-			"max_output_tokens", "input", "instructions", "store", "system":
+			"max_output_tokens", "input", "instructions", "store", "system",
+			"prompt_cache_key":
 			continue
 		}
 		m[k] = v
@@ -405,7 +417,7 @@ func reasoningForEffort(effort string) *reasoningParams {
 }
 
 func (c *Client) streamChat(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage), onThinking func(string)) error {
-	req := chatRequest{Model: c.Model, Messages: toChatWireMessages(messages), Tools: tools, Stream: true, StreamOptions: &streamOptions{IncludeUsage: true}}
+	req := chatRequest{Model: c.Model, Messages: toChatWireMessages(messages), Tools: tools, Stream: true, StreamOptions: &streamOptions{IncludeUsage: true}, PromptCacheKey: c.PromptCacheKey}
 	if c.MaxTokens > 0 {
 		req.MaxTokens = &c.MaxTokens
 	}

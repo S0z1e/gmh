@@ -375,7 +375,7 @@ func Setup(p Params) (*App, error) {
 	a.toolMode = agent.ToolModeDefault
 	a.allTools = append(agent.ToolDefs(), pluginTools...)
 	a.Cfg = &agent.Config{
-		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort},
+		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort, PromptCacheKey: a.sessionID()},
 		Exec:                executor,
 		Tools:               a.allTools,
 		System:              system,
@@ -626,7 +626,7 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 	if contextLimit <= 0 {
 		contextLimit = config.DefaultContextWindow
 	}
-	a.Cfg.Client = &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort}
+	a.Cfg.Client = &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort, PromptCacheKey: a.sessionID()}
 	a.Cfg.Exec.ImageInput = slices.Contains(mdl.Input, "image")
 	a.Model = mdl
 	a.Provider = provName
@@ -742,6 +742,11 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 	a.resetToolMode()
 	if a.Cfg != nil {
 		a.Cfg.Session = store
+		if a.Cfg.Client != nil {
+			// The cache key follows the current session: a new
+			// session must not reuse the previous session's key.
+			a.Cfg.Client.PromptCacheKey = store.ID
+		}
 		if a.Cfg.Exec != nil {
 			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 		}
@@ -781,6 +786,10 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	a.resetToolMode()
 	if a.Cfg != nil {
 		a.Cfg.Session = store
+		if a.Cfg.Client != nil {
+			// The cache key follows the current session.
+			a.Cfg.Client.PromptCacheKey = store.ID
+		}
 		if a.Cfg.Exec != nil {
 			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 		}
