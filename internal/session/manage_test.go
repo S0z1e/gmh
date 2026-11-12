@@ -192,3 +192,53 @@ func TestStoreRename(t *testing.T) {
 		t.Fatalf("store after failed rename = %s, err %v", data, err)
 	}
 }
+
+// DeleteSession removes a session's transcript, audit sidecar and
+// pre-compact archives, and refuses unknown or invalid ids.
+func TestDeleteSession(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s, err := New("gone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeMsgs(t, s, "task to delete")
+	if err := s.Audit(map[string]string{"kind": "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ArchiveCopy("gone-pre-compact-120000"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	keep, err := New("keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeMsgs(t, keep, "task to keep")
+	keep.Close()
+
+	if err := DeleteSession("gone"); err != nil {
+		t.Fatalf("DeleteSession = %v", err)
+	}
+	dir := Dir()
+	for _, name := range []string{"gone.jsonl", "gone-audit.jsonl", "gone-pre-compact-120000.jsonl"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s still exists after delete (err=%v)", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "keep.jsonl")); err != nil {
+		t.Fatalf("other session removed: %v", err)
+	}
+	list, err := List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].ID != "keep" {
+		t.Fatalf("list after delete = %v, want only keep", list)
+	}
+	if err := DeleteSession("gone"); err == nil {
+		t.Fatal("deleting an unknown session should fail")
+	}
+	if err := DeleteSession("../x"); err == nil {
+		t.Fatal("deleting an invalid id should fail")
+	}
+}

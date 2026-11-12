@@ -198,7 +198,7 @@ func (s *Server) handleLine(line string) {
 		s.handlePrompt(req)
 	case "clear_queue":
 		s.handleClearQueue(req)
-	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "set_model", "rename_session", "resume_session", "command":
+	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "set_model", "rename_session", "resume_session", "delete_session", "set_tool_mode", "command":
 		s.enqueue(req, workControl)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown request type %q", req.Type))
@@ -824,6 +824,27 @@ func (s *Server) doControl(req Request) {
 		}
 		s.refreshState()
 		s.respond(req, map[string]any{"session": req.Session, "messages": n}, nil)
+	case "delete_session":
+		if req.Session == "" {
+			s.respond(req, nil, fmt.Errorf("delete_session needs {\"session\": id}"))
+			return
+		}
+		if req.Session == s.app.Store.ID {
+			s.respond(req, nil, fmt.Errorf("cannot delete the current session %q (resume or start another session first)", req.Session))
+			return
+		}
+		if err := session.DeleteSession(req.Session); err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		s.respond(req, map[string]any{"deleted": true, "session": req.Session}, nil)
+	case "set_tool_mode":
+		if err := s.app.SetToolMode(agent.ToolMode(req.Mode)); err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		s.refreshState()
+		s.respond(req, map[string]any{"tool_mode": string(s.app.ToolMode())}, nil)
 	case "quit":
 		s.respond(req, map[string]any{"ok": true}, nil)
 		s.shutdown()
@@ -912,7 +933,7 @@ func (s *Server) isDone() bool {
 }
 
 func (s *Server) feeLabel() string {
-	return s.app.Cfg.Client.ProviderName() + " 實價未驗證"
+	return s.app.Cfg.Client.ProviderName() + " price unverified"
 }
 
 func usageJSON(u llm.Usage) *UsageJSON {

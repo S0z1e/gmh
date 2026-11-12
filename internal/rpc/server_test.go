@@ -1185,3 +1185,90 @@ func TestGetStateHasWindow(t *testing.T) {
 	}
 	d.quit(t)
 }
+
+// set_tool_mode switches the tool set without a plugin, and
+// delete_session removes another session's files.
+func TestSetToolModeAndDeleteSession(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{{kind: "text", text: "Done."}})
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+
+	// A second session on disk, with one message.
+	other, err := session.New("second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Append(llm.Message{Role: "user", Content: "task about beta"}); err != nil {
+		t.Fatal(err)
+	}
+	other.Close()
+	current := a.Store.ID
+
+	// Unknown or missing mode is an error; the mode does not move.
+	d.send(map[string]any{"id": "m0", "type": "set_tool_mode", "mode": "bogus"})
+	if resp := d.waitFor("error", 5*time.Second); resp["id"] != "m0" {
+		t.Fatalf("bogus set_tool_mode = %v, want an error for m0", resp)
+	}
+	d.send(map[string]any{"id": "m0b", "type": "set_tool_mode"})
+	if resp := d.waitFor("error", 5*time.Second); resp["id"] != "m0b" {
+		t.Fatalf("missing-mode set_tool_mode = %v, want an error for m0b", resp)
+	}
+	if got := toolModeOf(t, d); got != "default" {
+		t.Fatalf("tool_mode after bad switches = %q, want default", got)
+	}
+
+	// Switch to plan, run a turn, switch back.
+	d.send(map[string]any{"id": "m1", "type": "set_tool_mode", "mode": "plan"})
+	resp := d.waitFor("response", 5*time.Second)
+	data, _ := resp["data"].(map[string]any)
+	if data["tool_mode"] != "plan" {
+		t.Fatalf("set_tool_mode data = %v", data)
+	}
+	if got := toolModeOf(t, d); got != "plan" {
+		t.Fatalf("tool_mode after switch = %q, want plan", got)
+	}
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "hello"})
+	d.waitFor("response", 5*time.Second)
+	settled := d.waitFor("agent_settled", 10*time.Second)
+	if settled["error"] != nil {
+		t.Fatalf("turn in plan mode settled with error: %v", settled["error"])
+	}
+	if settled["tool_mode"] != "plan" {
+		t.Fatalf("agent_settled tool_mode = %v, want plan", settled["tool_mode"])
+	}
+	d.send(map[string]any{"id": "m2", "type": "set_tool_mode", "mode": "default"})
+	resp = d.waitFor("response", 5*time.Second)
+	data, _ = resp["data"].(map[string]any)
+	if data["tool_mode"] != "default" {
+		t.Fatalf("set_tool_mode back = %v", data)
+	}
+
+	// Delete the other session; it leaves the list. Unknown, empty
+	// and current ids are errors.
+	d.send(map[string]any{"id": "d1", "type": "delete_session", "session": "second"})
+	resp = d.waitFor("response", 5*time.Second)
+	data, _ = resp["data"].(map[string]any)
+	if data["deleted"] != true || data["session"] != "second" {
+		t.Fatalf("delete_session data = %v", data)
+	}
+	d.send(map[string]any{"id": "l1", "type": "list_sessions"})
+	resp = d.waitFor("response", 5*time.Second)
+	data, _ = resp["data"].(map[string]any)
+	rows, _ := data["sessions"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("list_sessions after delete = %v", data)
+	}
+	d.send(map[string]any{"id": "d2", "type": "delete_session", "session": "second"})
+	if resp := d.waitFor("error", 5*time.Second); resp["id"] != "d2" {
+		t.Fatalf("deleting an unknown session = %v, want an error for d2", resp)
+	}
+	d.send(map[string]any{"id": "d3", "type": "delete_session", "session": current})
+	if resp := d.waitFor("error", 5*time.Second); resp["id"] != "d3" {
+		t.Fatalf("deleting the current session = %v, want an error for d3", resp)
+	}
+	d.send(map[string]any{"id": "d4", "type": "delete_session"})
+	if resp := d.waitFor("error", 5*time.Second); resp["id"] != "d4" {
+		t.Fatalf("deleting with no id = %v, want an error for d4", resp)
+	}
+	d.quit(t)
+}

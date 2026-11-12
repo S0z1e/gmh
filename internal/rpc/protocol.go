@@ -19,8 +19,8 @@ type Request struct {
 	// Type is one of: prompt, approval_response, abort, clear_queue,
 	// get_state, new_session, clear, compact, usage, jobs, skill,
 	// quit, attach_image, set_model, list_sessions, rename_session,
-	// resume_session, list_plugins, list_models, list_skills,
-	// history, command.
+	// resume_session, delete_session, set_tool_mode, list_plugins,
+	// list_models, list_skills, history, command.
 	Type string `json:"type"`
 	// Message is the task for prompt, and the raw args string for
 	// command (the text after "/name", unparsed).
@@ -35,10 +35,12 @@ type Request struct {
 	// current provider first, then the rest.
 	Model    string `json:"model,omitempty"`
 	Provider string `json:"provider,omitempty"`
-	// Session is the session id for resume_session.
+	// Session is the session id for resume_session and delete_session.
 	Session string `json:"session,omitempty"`
 	// New is the new id for rename_session (Name holds the old one).
 	New string `json:"new,omitempty"`
+	// Mode is the tool mode for set_tool_mode ("default" or "plan").
+	Mode string `json:"mode,omitempty"`
 	// ApprovalID names the approval_request being answered, for
 	// approval_response. It is separate from ID, which correlates
 	// the response to this request.

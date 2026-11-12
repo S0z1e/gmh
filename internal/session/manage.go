@@ -174,6 +174,37 @@ func RenameSession(oldID, newID string) error {
 	return renameSessionFiles(oldID, newID)
 }
 
+// DeleteSession removes a session that is not currently open: its
+// transcript, its audit sidecar and its pre-compact archives. The
+// sidecar and archives are optional; a missing one is not an error.
+// The open store is never deleted through this — delete another
+// session, or resume a different one first.
+func DeleteSession(id string) error {
+	if err := ValidateSessionID(id); err != nil {
+		return err
+	}
+	dir := Dir()
+	path := filepath.Join(dir, id+".jsonl")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return fmt.Errorf("unknown session %q", id)
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	// Audit sidecar follows the transcript.
+	_ = os.Remove(filepath.Join(dir, id+"-audit.jsonl"))
+	// Pre-compact archives keep the family together.
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, en := range entries {
+			name := en.Name()
+			if strings.HasPrefix(name, id+"-pre-compact-") && strings.HasSuffix(name, ".jsonl") {
+				_ = os.Remove(filepath.Join(dir, name))
+			}
+		}
+	}
+	return nil
+}
+
 // Rename renames the open store's session: the handles are closed,
 // the files are moved (transcript, audit sidecar, archives), and the
 // transcript is reopened at the new path. The store stays usable

@@ -853,7 +853,7 @@ func (r *Runner) ResumeSession(id string) (int, error) {
 // provider from the base URL: a second provider must not inherit
 // OpenConsole's name.
 func (r *Runner) costLine(cost float64) string {
-	label := r.App.Cfg.Client.ProviderName() + " 實價未驗證"
+	label := r.App.Cfg.Client.ProviderName() + " price unverified"
 	if !r.App.Rates.Configured {
 		return "fee: " + label
 	}

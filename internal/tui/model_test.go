@@ -94,7 +94,7 @@ func TestStylePrintRestylesUsageAndErrors(t *testing.T) {
 	if got := stripANSI(stylePrint("[usage] turn: prompt=3922 (cached=1920) completion=215 total=4137")); got != "   turn · prompt 3,922 (cached 1,920) · completion 215 · total 4,137" {
 		t.Fatalf("usage restyled wrong: %q", got)
 	}
-	if got := stripANSI(stylePrint("[usage] session: prompt=8457 (cached=0) completion=573 total=9030 | fee: Discovery 實價未驗證")); got != "   session · prompt 8,457 (cached 0) · completion 573 · total 9,030 · fee: Discovery 實價未驗證" {
+	if got := stripANSI(stylePrint("[usage] session: prompt=8457 (cached=0) completion=573 total=9030 | fee: Discovery price unverified")); got != "   session · prompt 8,457 (cached 0) · completion 573 · total 9,030 · fee: Discovery price unverified" {
 		t.Fatalf("session usage restyled wrong: %q", got)
 	}
 	if got := stripANSI(stylePrint("[error] step 1: boom")); got != "   ✗ step 1: boom" {
