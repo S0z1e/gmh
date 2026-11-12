@@ -372,7 +372,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 			if ctx.Err() != nil {
 				c.LastTerminalReason = TerminalAbort
 			}
-			c.emit(Event{Kind: EventError, Err: wrapped, TerminalReason: c.LastTerminalReason})
+			c.emit(Event{Kind: EventError, Err: wrapped, Text: lastText, TerminalReason: c.LastTerminalReason})
 			return lastText, total, wrapped
 		}
 		c.LastPromptTokens = usage.PromptTokens
@@ -498,7 +498,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				}
 				c.LastTerminalReason = TerminalRepeatedToolCallDenied
 				denied := fmt.Errorf("%w: %s repeated %d times with identical input", ErrRepeatedToolCallDenied, tc.Function.Name, RepeatedToolCallThreshold)
-				c.emit(Event{Kind: EventError, Err: denied, TerminalReason: TerminalRepeatedToolCallDenied})
+				c.emit(Event{Kind: EventError, Err: denied, Text: lastText, TerminalReason: TerminalRepeatedToolCallDenied})
 				return lastText, total, denied
 			}
 			argsJSON = useArgs
@@ -526,7 +526,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 					if ctx.Err() != nil {
 						c.LastTerminalReason = TerminalAbort
 					}
-					c.emit(Event{Kind: EventError, Err: err, TerminalReason: c.LastTerminalReason})
+					c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: c.LastTerminalReason})
 					return lastText, total, err
 				}
 				if !ok {
@@ -615,7 +615,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				}
 				c.LastTerminalReason = TerminalBlocked
 				blocked := fmt.Errorf("task blocked: %d consecutive steps ended with only failed tool calls; the last error was not fixed by retrying", MaxFailedFixAttempts)
-				c.emit(Event{Kind: EventError, Err: blocked, TerminalReason: TerminalBlocked})
+				c.emit(Event{Kind: EventError, Err: blocked, Text: lastText, TerminalReason: TerminalBlocked})
 				return lastText, total, blocked
 			}
 		}
@@ -642,7 +642,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 	}
 	capped := fmt.Errorf("step cap reached (%d); the task was not finished", steps)
 	c.LastTerminalReason = TerminalMaxTurns
-	c.emit(Event{Kind: EventError, Err: capped, TerminalReason: TerminalMaxTurns})
+	c.emit(Event{Kind: EventError, Err: capped, Text: lastText, TerminalReason: TerminalMaxTurns})
 	return lastText, total, capped
 }
 

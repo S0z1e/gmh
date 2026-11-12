@@ -806,7 +806,12 @@ func (s *Server) onEvent(ev agent.Event) {
 	case agent.EventDone:
 		s.turnOutcome = &turnOutcome{text: ev.Text, usage: ev.Usage, reason: ev.TerminalReason}
 	case agent.EventError:
-		s.turnOutcome = &turnOutcome{err: ev.Err, reason: ev.TerminalReason}
+		// The text survives an error-ended turn: on a step cap it
+		// is the grace summary, otherwise the model's last message.
+		// Without it the GUI gets an empty agent_settled.text
+		// whenever a turn ends in error, even though the turn
+		// produced an answer.
+		s.turnOutcome = &turnOutcome{text: ev.Text, err: ev.Err, reason: ev.TerminalReason}
 	case agent.EventStopBlocked:
 		s.writeEvent(Event{Type: "stop_blocked", Text: ev.Text})
 	}

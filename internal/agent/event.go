@@ -79,6 +79,11 @@ const (
 type Event struct {
 	Kind EventKind
 	// Text is a streamed delta for TextDelta, the final answer for Done.
+	// For Error it carries the turn's last text — the grace summary
+	// on a step cap, the model's last message otherwise — so a
+	// renderer that only sees the event stream (the RPC server) can
+	// still show what the turn produced. Empty when the turn
+	// produced no text.
 	Text string
 	// ToolName / ToolArgs identify the call for ToolStart.
 	ToolName string

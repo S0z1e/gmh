@@ -379,6 +379,34 @@ func TestBasicTurnAuto(t *testing.T) {
 	d.quit(t)
 }
 
+// The step-cap grace summary must reach the GUI: the loop ends a
+// capped turn with an error event, and until the fix the server
+// dropped the event's text, so agent_settled.text came out empty
+// even though the grace call had succeeded.
+func TestGraceTextReachesSettled(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{
+		{kind: "tool", tool: "read", args: map[string]any{"path": "t.txt"}},
+		{kind: "text", text: "best effort summary"},
+	})
+	a.Cfg.MaxSteps = 1
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "Read t.txt, then summarise it"})
+	d.waitFor("response", 5*time.Second)
+	d.waitFor("turn_started", 5*time.Second)
+	settled := d.waitFor("agent_settled", 10*time.Second)
+	if settled["reason"] != "max_turns" {
+		t.Fatalf("settled reason = %v, want max_turns", settled["reason"])
+	}
+	if settled["error"] == nil {
+		t.Fatalf("settled error = nil, want the step-cap error")
+	}
+	if settled["text"] == nil || !strings.Contains(settled["text"].(string), "best effort summary") {
+		t.Fatalf("settled text = %v, want it to contain the grace summary", settled["text"])
+	}
+	d.quit(t)
+}
+
 func TestApprovalApproveAndDeny(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

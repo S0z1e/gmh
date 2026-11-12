@@ -42,6 +42,7 @@ func TestRunStepCapGracePeriod(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	var events []Event
 	cfg := &Config{
 		Client:   &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
 		Exec:     &tools.Executor{Root: root},
@@ -49,6 +50,7 @@ func TestRunStepCapGracePeriod(t *testing.T) {
 		System:   "test system",
 		Mode:     "auto",
 		MaxSteps: 2,
+		OnEvent:  func(e Event) { events = append(events, e) },
 	}
 	text, total, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "read a.txt"}})
 	if err == nil || !strings.Contains(err.Error(), "step cap reached") {
@@ -59,6 +61,24 @@ func TestRunStepCapGracePeriod(t *testing.T) {
 	}
 	if text != "best effort summary" {
 		t.Fatalf("final text = %q, want the grace answer", text)
+	}
+	// The terminal error event must carry the grace text too: the
+	// RPC server only sees the event stream, and without it the
+	// GUI's agent_settled.text comes out empty on every capped turn.
+	var errEvent *Event
+	for i := range events {
+		if events[i].Kind == EventError {
+			errEvent = &events[i]
+		}
+	}
+	if errEvent == nil {
+		t.Fatal("no EventError emitted for the capped turn")
+	}
+	if errEvent.Text != "best effort summary" {
+		t.Fatalf("error event text = %q, want the grace answer", errEvent.Text)
+	}
+	if errEvent.TerminalReason != TerminalMaxTurns {
+		t.Fatalf("error event reason = %q, want max_turns", errEvent.TerminalReason)
 	}
 	if total.TotalTokens != 15+15+23 {
 		t.Fatalf("total tokens = %d, want 53 (two steps + grace)", total.TotalTokens)

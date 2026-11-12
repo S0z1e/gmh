@@ -135,7 +135,10 @@ Events (stdout):
   marked blocked instead of looping). `aborted` is
   true only when the GUI aborted the turn — and an aborted turn
   carries no `error` string: cancellation is semantic, not an error.
-  Any other failure is in `error`. The GUI waits for this event, never for the
+  Any other failure is in `error`. `text` is the turn's final answer
+  even when the turn ended in error: on `"max_turns"` it is the
+  step-cap grace summary, on `"error"` or `"blocked"` the model's
+  last message — empty only when the turn produced no text. The GUI waits for this event, never for the
   `prompt` response. `tool_mode` is the loop's tool mode at the end
   of the turn, so the GUI knows which tools the next turn offers.
 - `compacted` `{"messages":N,"summary_tokens":N}` — a compaction
