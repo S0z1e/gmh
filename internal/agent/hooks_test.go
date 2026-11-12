@@ -24,6 +24,11 @@ type fakePluginRunner struct {
 	rewrite   map[string]string // tool -> replacement args JSON
 	result    map[string]string // tool -> replacement observation
 	callCalls int
+	// stopBlocks is how many times RunStopHooks vetoes the turn
+	// end, with stopReason, before allowing it.
+	stopBlocks int
+	stopReason string
+	stopCalls  int
 }
 
 func (h *fakePluginRunner) Has(_ string) bool { return false }
@@ -48,6 +53,14 @@ func (h *fakePluginRunner) RunToolResultHooks(_ context.Context, tool, _, result
 		return r
 	}
 	return result
+}
+
+func (h *fakePluginRunner) RunStopHooks(_ context.Context, _, _ string) string {
+	h.stopCalls++
+	if h.stopCalls <= h.stopBlocks {
+		return h.stopReason
+	}
+	return ""
 }
 
 // toolCallSSE renders one tool-call turn as chat SSE, with the

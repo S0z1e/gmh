@@ -27,9 +27,28 @@ echoed in the response):
 - `approval_response` `{"approval_id":"appr-1","approved":true}` →
   `{"ok":true}`. The approval id comes from the `approval_request`
   event; `id` (the request's own correlation id) is separate.
+- `continuation_response` `{"continuation_id":"cont-1","decision":"once"|"session"|"deny","updated_args":"{...}"}` →
+  `{"ok":true}`. Answers the doom-loop guard's `continuation_request`
+  (see below): the model asked for the exact same tool call five
+  times in a row. `decision` is `"once"` (run it this once, then the
+  streak restarts), `"session"` (never ask again for this exact call
+  in this session) or `"deny"` (end the turn). `updated_args` is
+  optional: the GUI may let the user edit the repeated call's
+  arguments, as a JSON string. This channel is deliberately separate
+  from `approval_response`: the question is about the shape of the
+  conversation, not whether a tool may act, so no approval rule
+  applies to it. In a headless run (`-p`, or no GUI) there is nobody
+  to ask and the guard denies.
 - `abort` → `{"aborted":true|false}`. Cancels the running turn, and
-  fails any approval waiting on a dialog, so a turn blocked on
-  approval can still be stopped.
+  fails any approval, continuation, or question waiting on a dialog,
+  so a turn blocked on approval can still be stopped.
+- `question_response` `{"question_id":"quest-1","answers":[{"question":0,"selected":["Postgres"],"custom":""}]}` →
+  `{"ok":true}`. Answers the model's `question_request` (see below):
+  one answer per question, `selected` is the chosen option labels
+  (several for a multi-select question), `custom` is free text when
+  the user answered in their own words instead of picking an option.
+  Answering fails a turn blocked on a question the same way `abort`
+  does when the turn is aborted.
 - `clear_queue` → `{"cleared":N}`. Drops queued prompts, keeps
   control items. Send it before `abort`:
   `abort` alone lets queued prompts continue after the turn ends.
@@ -49,6 +68,7 @@ echoed in the response):
   timestamps; two created in the same second get a `-1`, `-2`…
   suffix, so a new session never reopens the old file.
 - `clear` / `compact` → `{"ok":true}` (same as the REPL commands).
+- `rollback` `{"count":N}` → `{"rolled_back":N,"dropped":M,"messages":K,"archive":"..."}`. Drops the last N turns (default 1) from the session — Codex's `thread/rollback`, the GUI's undo. A turn is one user task plus its replies; the pre-rollback transcript is archived first (like compaction), then the session file is rewritten to the kept prefix. Rolling back more turns than exist drops everything; rolling back an empty session is an error. Session usage totals are not rewound.
 - `skill` `{"name":"..."}` → `{"loaded":true,"bytes":N}`.
 - `attach_image` `{"path":"..."}` → `{"attached":true,"path":"...","media_type":"...","bytes":N,"width":W,"height":H}`. Queues the image for the next turn, like `/image` in the REPL (same caps, same model-input check).
 - `set_model` `{"provider":"...","model":"..."}` (either may be omitted: no provider keeps the current one, no model takes the provider default; a bare `model` searches the current provider first, then the rest) → `{"provider":"...","model":"...","api":"..."}`. Same switch as `/model` in the REPL; `get_state` reports the new model and api at once.
@@ -101,10 +121,21 @@ Events (stdout):
   sending it twice). The agent blocks until the GUI answers; in
   `-mode auto` or with `--deny-instead-of-prompt` no request is ever
   sent.
+- `continuation_request` `{"id":"cont-1","tool":"read","prompt":"<canonical args>","repeat_count":5,"threshold":5}` — the doom-loop guard: the same tool call (tool name + canonical arguments) was requested five consecutive times. A different file, command or error breaks the streak, and a tool result that differs from the previous one for the same call does too (the call is making progress). The agent blocks until the GUI answers with `continuation_response`.
+- `question_request` `{"id":"quest-1","questions":[{"question":"Which database?","header":"DB","options":[{"label":"Postgres","description":"..."}],"multi_select":false}]}` — the model's `ask_user` tool: up to 4 questions, 2–4 options each. The agent blocks until the GUI answers with `question_response`. The answers reach the model as a tool observation; in a headless run there is nobody to ask, so the model gets an observation telling it to proceed with its best judgement and state its assumptions. The TUI does not ask either (same headless observation).
+- `stop_blocked` `{"text":"go test failed"}` — a plugin `stop` hook vetoed the turn end (see `docs/plugins.md`). The turn continues; the GUI should show the reason as a notice, not as a failure. After 8 consecutive vetoes the turn is allowed to end anyway.
 - `agent_settled` — exactly one per turn, whatever happened:
-  `{"text":"...","usage":{...},"session_usage":{...},"cost_usd":null|N,"session_cost_usd":null|N,"fee":"...","aborted":false,"error":null|"...","tool_mode":"default"|"plan"}`.
-  `aborted` is true only when the GUI aborted the turn; any other
-  failure is in `error`. The GUI waits for this event, never for the
+  `{"text":"...","usage":{...},"session_usage":{...},"cost_usd":null|N,"session_cost_usd":null|N,"fee":"...","aborted":false,"reason":"end_turn"|"max_turns"|"abort"|"error"|"repeated_tool_call_denied"|"blocked","error":null|"...","tool_mode":"default"|"plan"}`.
+  `reason` is the structured terminal reason: `"end_turn"` (the model
+  finished), `"max_turns"` (step cap), `"abort"` (the GUI aborted the
+  turn), `"error"` (LLM/provider failure),
+  `"repeated_tool_call_denied"` (the user denied a repeated call at
+  the continuation prompt, or no prompt was available) or `"blocked"`
+  (3 consecutive steps whose tool calls all failed — the task was
+  marked blocked instead of looping). `aborted` is
+  true only when the GUI aborted the turn — and an aborted turn
+  carries no `error` string: cancellation is semantic, not an error.
+  Any other failure is in `error`. The GUI waits for this event, never for the
   `prompt` response. `tool_mode` is the loop's tool mode at the end
   of the turn, so the GUI knows which tools the next turn offers.
 - `compacted` `{"messages":N,"summary_tokens":N}` — a compaction

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -963,6 +964,25 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 		r.Print("Renamed session %s → %s.", old, newID)
 		return false
 	}
+	if line == "/rollback" || strings.HasPrefix(line, "/rollback ") {
+		arg := strings.TrimSpace(strings.TrimPrefix(line, "/rollback"))
+		n := 1
+		if arg != "" {
+			if v, err := strconv.Atoi(arg); err != nil || v <= 0 {
+				r.Print("Usage: /rollback [N] (drop the last N turns, default 1).")
+				return false
+			} else {
+				n = v
+			}
+		}
+		dropped, archive, err := r.Rollback(n)
+		if err != nil {
+			r.Print("[error] %v", err)
+			return false
+		}
+		r.Print("Rolled back %d turn(s) (%d messages dropped). Pre-rollback transcript saved to %s.", n, dropped, archive)
+		return false
+	}
 	if line == "/model" || strings.HasPrefix(line, "/model ") {
 		arg := strings.TrimSpace(strings.TrimPrefix(line, "/model"))
 		if arg == "" {
@@ -1251,6 +1271,38 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		r.Print("[compact] context at %d tokens (limit %d), compacting…", r.App.Cfg.LastPromptTokens, r.App.ContextLimit)
 		r.doCompact(ctx)
 	}
+}
+
+// Rollback drops the last n turns from the session — Codex's
+// thread/rollback, as the GUI's undo. The pre-rollback transcript
+// is archived first (like compaction), then the session file is
+// rewritten to the kept prefix and the in-memory history follows.
+// It returns the dropped message count and the archive path. The
+// session usage totals are not rewound: the tokens were spent.
+func (r *Runner) Rollback(n int) (dropped int, archive string, err error) {
+	if n <= 0 {
+		return 0, "", fmt.Errorf("rollback needs a positive turn count, got %d", n)
+	}
+	kept, dropped := session.Rollback(r.App.History, n)
+	if dropped == 0 {
+		return 0, "", fmt.Errorf("nothing to roll back: no turns in this session")
+	}
+	archive, err = r.App.Store.ArchiveCopy(fmt.Sprintf("%s-pre-rollback-%s", r.App.Store.ID, time.Now().Format("150405")))
+	if err != nil {
+		return 0, "", err
+	}
+	if err := r.App.Store.Rewrite(kept); err != nil {
+		return 0, archive, err
+	}
+	r.App.History = kept
+	if r.Turns > n {
+		r.Turns -= n
+	} else {
+		r.Turns = 0
+	}
+	r.LastErr = nil
+	_ = r.App.Store.Audit(tools.AuditEntry{TS: time.Now(), Kind: "rollback", Args: fmt.Sprintf("turns=%d dropped=%d", n, dropped), ExitCode: -1})
+	return dropped, archive, nil
 }
 
 // doCompact summarises history, saves the original transcript to a

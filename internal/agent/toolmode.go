@@ -12,7 +12,7 @@ import (
 type ToolMode string
 
 const (
-	// ToolModeDefault offers every tool: the eight built-ins plus
+	// ToolModeDefault offers every tool: the nine built-ins plus
 	// all plugin tools.
 	ToolModeDefault ToolMode = "default"
 	// ToolModePlan is read-only exploration: the workspace-writing

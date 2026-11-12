@@ -155,6 +155,10 @@ type Plugin struct {
 	hasSessionStartHook         bool
 	sessionSwitchHook           moejs.Value
 	hasSessionSwitchHook        bool
+	// stopHook is the turn-end gate: a non-empty return blocks the
+	// turn from ending (see RunStopHooks).
+	stopHook    moejs.Value
+	hasStopHook bool
 }
 
 // Registry is the loaded plugins of one run, indexed by tool name.
@@ -578,6 +582,31 @@ func (r *Registry) RunSessionBeforeCompactHooks(ctx context.Context, session str
 	return out
 }
 
+// RunStopHooks runs the registered stop hooks in load order when a
+// turn would otherwise end, and returns the first block reason, or
+// "" when the turn may end. A hook receives {session, lastText} and
+// returns a non-empty string to veto the end (the reason is fed back
+// to the model as a user message, so it can address it). A hook that
+// throws, times out, or returns a non-string is skipped with a
+// stderr warning: fail open, so a broken check cannot block a turn
+// forever. The loop caps consecutive blocks at MaxStopBlocks.
+func (r *Registry) RunStopHooks(ctx context.Context, session, lastText string) string {
+	for _, p := range r.plugins {
+		if !p.hasStopHook {
+			continue
+		}
+		res, err := p.callHook(ctx, p.stopHook, hookStopInput(session, lastText), r.timeout())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: plugin %s stop hook failed: %v\n", p.Name, err)
+			continue
+		}
+		if s, ok := hookTextResult(p, "stop", res); ok {
+			return s
+		}
+	}
+	return ""
+}
+
 // RunSessionStartHooks runs the registered session_start hooks in load
 // order. They are notifications: return values are ignored, and a
 // failing hook is warned about but never fails anything.
@@ -723,6 +752,19 @@ func hookSessionSwitchInput(session, previous string) string {
 		Session  string `json:"session"`
 		Previous string `json:"previous"`
 	}{Session: session, Previous: previous})
+	return string(b)
+}
+
+// hookStopInput builds the {session, lastText} input for the stop
+// hook: lastText is the final answer the model would end the turn
+// with, so a check hook can judge it (e.g. "the answer claims the
+// tests pass" vs a failing test run it can see in the history it
+// does not receive — the hook runs its own check).
+func hookStopInput(session, lastText string) string {
+	b, _ := json.Marshal(struct {
+		Session  string `json:"session"`
+		LastText string `json:"lastText"`
+	}{Session: session, LastText: lastText})
 	return string(b)
 }
 

@@ -694,6 +694,39 @@ func TestToolResultHookThrowKeeps(t *testing.T) {
 	}
 }
 
+func TestStopHookBlocksAndAllows(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "gate", "", "g.js", `
+harness.on("stop", (input) => {
+  if (input.lastText === "all done") return "go test failed";
+});
+`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if got := reg.RunStopHooks(context.Background(), "s1", "all done"); got != "go test failed" {
+		t.Fatalf("blocked = %q, want the hook reason", got)
+	}
+	if got := reg.RunStopHooks(context.Background(), "s1", "fixed it"); got != "" {
+		t.Fatalf("blocked = %q, want empty (turn may end)", got)
+	}
+}
+
+func TestStopHookThrowIsFailOpen(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "boom", "", "b.js", `harness.on("stop", () => { throw new Error("kaboom"); });`)
+	writePlugin(t, root, "good", "", "g.js", `harness.on("stop", () => "still blocked");`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	// A throwing stop hook is skipped (fail open), the next hook still runs.
+	if got := reg.RunStopHooks(context.Background(), "s1", "done"); got != "still blocked" {
+		t.Fatalf("blocked = %q, want the good hook's reason", got)
+	}
+}
+
 func TestOnUnknownEventAndTwice(t *testing.T) {
 	root := t.TempDir()
 	writePlugin(t, root, "bad", "", "b.js", `harness.on("bogus", () => {});`)

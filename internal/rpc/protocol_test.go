@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -18,7 +19,7 @@ func TestEncodeDecodeRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != req {
+	if !reflect.DeepEqual(got, req) {
 		t.Fatalf("round-trip mismatch: got %+v, want %+v", got, req)
 	}
 }

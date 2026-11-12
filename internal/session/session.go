@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -137,6 +138,87 @@ func (s *Store) ArchiveCopy(name string) (string, error) {
 		return "", err
 	}
 	return dst, nil
+}
+
+// IsTurnStart reports whether m starts a user turn: a user message
+// with no images that is not a turn-internal message the loop
+// itself appended. Turn-internal user messages are the auto-loaded
+// skill bodies ("Skill <name>:\n..."), background-job deliveries
+// ("Background job ...") and the compact summary ("Previous
+// conversation summary:\n..."). A real task that starts with one
+// of those prefixes is misread as internal — an accepted edge, and
+// the reason it is documented here rather than silently assumed.
+func IsTurnStart(m llm.Message) bool {
+	if m.Role != "user" || len(m.Images) > 0 || strings.TrimSpace(m.Content) == "" {
+		return false
+	}
+	for _, p := range []string{"Skill ", "Background job ", "Previous conversation summary:"} {
+		if strings.HasPrefix(m.Content, p) {
+			return false
+		}
+	}
+	return true
+}
+
+// Rollback drops the last n turns from msgs and returns the kept
+// prefix and how many messages were dropped. A turn is the messages
+// from one turn-start user message up to (not including) the next.
+// n <= 0 drops nothing; n >= the number of turns drops every turn,
+// keeping only the pre-turn prefix (usually a compact summary, or
+// nothing). It never mutates msgs.
+func Rollback(msgs []llm.Message, n int) ([]llm.Message, int) {
+	if n <= 0 {
+		return msgs, 0
+	}
+	var starts []int
+	for i, m := range msgs {
+		if IsTurnStart(m) {
+			starts = append(starts, i)
+		}
+	}
+	if len(starts) == 0 {
+		return msgs, 0
+	}
+	cut := 0
+	if n < len(starts) {
+		cut = starts[len(starts)-n]
+	} else {
+		cut = starts[0]
+	}
+	kept := make([]llm.Message, cut)
+	copy(kept, msgs[:cut])
+	return kept, len(msgs) - cut
+}
+
+// Rewrite replaces the session file's contents with msgs, keeping
+// the store usable for further appends. The caller archives first
+// (ArchiveCopy): a rewrite is a real deletion, and the archive is
+// the recovery path — the same shape as compaction, which archives
+// before replacing history with a summary.
+func (s *Store) Rewrite(msgs []llm.Message) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.file.Close(); err != nil {
+		return err
+	}
+	var b strings.Builder
+	for _, m := range msgs {
+		line, err := json.Marshal(m)
+		if err != nil {
+			return err
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+	}
+	if err := os.WriteFile(s.Path, []byte(b.String()), 0o644); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(s.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	s.file = f
+	return nil
 }
 
 func (s *Store) Close() error {

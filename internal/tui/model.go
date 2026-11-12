@@ -421,6 +421,8 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		return m, tea.Println(styleWarning.Render(fmt.Sprintf("… bash running in background (%s)", ev.JobID)))
 	case agent.EventBackgroundWait:
 		return m, tea.Println(styleWarning.Render(fmt.Sprintf("waiting for background jobs: %s", ev.Text)))
+	case agent.EventStopBlocked:
+		return m, tea.Println(styleWarning.Render(fmt.Sprintf("stop hook blocked the turn end: %s", ev.Text)))
 	case agent.EventToolBackgroundDone:
 		if ev.ToolErr != nil {
 			return m, tea.Println(styleError.Render(fmt.Sprintf("✗ background job %s finished with error: %v", ev.JobID, ev.ToolErr)))

@@ -1,7 +1,11 @@
 package tui
 
 import (
+	"fmt"
+
 	tea "charm.land/bubbletea/v2"
+
+	"minimalharness/internal/agent"
 )
 
 // ApprovalRequest is one pending tool approval. The agent goroutine
@@ -33,4 +37,20 @@ func (a *Approver) Ask(prompt string) (bool, error) {
 	req := &ApprovalRequest{Prompt: prompt, Reply: make(chan bool, 1)}
 	a.program.Send(ApprovalMsg{Request: req})
 	return <-req.Reply, nil
+}
+
+// ConfirmContinuation is the TUI's doom-loop prompt, reusing the
+// approval dialog: y continues once, n stops. The dialog is y/n
+// only, so "always this session" is not offered here — the CLI and
+// the RPC GUI offer all three decisions.
+func (a *Approver) ConfirmContinuation(req agent.ContinuationRequest) (agent.ContinuationDecision, error) {
+	prompt := fmt.Sprintf("Repeated tool call: %s %s was requested %d times with identical input. Continue once?", req.ToolName, req.InputPreview, req.RepeatCount)
+	ok, err := a.Ask(prompt)
+	if err != nil {
+		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
+	}
+	if ok {
+		return agent.ContinuationDecision{Outcome: agent.ContinuationOnce}, nil
+	}
+	return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, nil
 }

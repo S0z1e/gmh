@@ -108,9 +108,9 @@ still prompts in suggest mode.
 
 ## Lifecycle hooks
 
-Four more hooks, all registered with `harness.on` at load time
+Five more hooks, all registered with `harness.on` at load time
 only, at most one per event per plugin. Unlike `tool_call`, all
-four **fail open**: a hook that throws, times out, or returns an
+five **fail open**: a hook that throws, times out, or returns an
 unusable value is skipped with a stderr warning and the turn,
 compact, or session switch carries on without it.
 
@@ -168,6 +168,36 @@ loaded yet). `session_start` fires every time, with `{session}`;
 previous}`. `/clear` (`ResetSession`) fires neither. Return values
 are ignored; a failing hook warns and never fails the switch.
 
+`stop` — turn-end gate (Claude Code's Stop hook). Runs when the
+model would otherwise end the turn, in load order, with
+`{session, lastText}` — the final answer it is about to give.
+Return a non-empty string to veto the end (the reason is fed back
+to the model as a user message — `"A stop hook blocked the turn
+from ending: <reason>. Address it before finishing, then answer
+again."` — and the turn continues); return undefined or an empty
+string to let it end. The first veto stops the chain. A hook that
+throws, times out, or returns a non-string is skipped with a
+warning (fail open — a broken check must not trap a turn). After
+8 consecutive vetoes the turn is allowed to end anyway, so a
+never-passing check cannot loop forever. The RPC, CLI, and TUI
+all surface a veto as `stop_blocked` with the reason.
+
+```js
+harness.on("stop", (input) => {
+  // input: {session, lastText}. A hook sees only its input JSON,
+  // so a stop hook judges the final answer itself (a check that
+  // needs the workspace runs as a tool hook, not here); return a
+  // reason to veto, or undefined to let the turn end.
+  if (input.lastText.includes("tests pass")) return "tests have not been run in this session";
+});
+```
+
+Separately, the loop marks a task blocked on its own: after 3
+consecutive steps whose tool calls all failed, the turn ends with
+the structured terminal reason `"blocked"` instead of looping.
+Any successful tool call resets the count; denials and refusals
+do not count as fix attempts.
+
 | Hook | Input | Return | On failure |
 | --- | --- | --- | --- |
 | `tool_call` | `{tool, args}` | allow / `{deny}` / `{args}` | **deny the call** (fail closed) |
@@ -177,6 +207,7 @@ are ignored; a failing hook warns and never fails the switch.
 | `session_before_compact` | `{session, messages: count}` | instruction string | skip the instruction |
 | `session_start` | `{session}` | ignored | warn only |
 | `session_switch` | `{session, previous}` | ignored | warn only |
+| `stop` | `{session, lastText}` | block reason, or empty to allow | skip the hook (fail open) |
 
 ## Modes (plan mode)
 

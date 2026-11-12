@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -59,14 +60,22 @@ type serverState struct {
 }
 
 type turnOutcome struct {
-	text  string
-	usage llm.Usage
-	err   error
+	text   string
+	usage  llm.Usage
+	err    error
+	reason agent.TerminalReason
 }
 
 type approvalAnswer struct {
 	approved bool
 	err      error
+}
+
+// questionAnswer is one question_request's reply, or the abort that
+// cancelled it.
+type questionAnswer struct {
+	ans agent.QuestionAnswers
+	err error
 }
 
 type workKind int
@@ -111,6 +120,20 @@ type Server struct {
 	approvalsMu sync.Mutex
 	apprSeq     int
 
+	// continuations are the doom-loop guard's pending prompts, by
+	// id, like approvals but on a separate channel: the question is
+	// not a permission, so its answer is not an approval_response.
+	continuations   map[string]chan agent.ContinuationDecision
+	continuationsMu sync.Mutex
+	contSeq         int
+
+	// questions are the ask_user tool's pending structured
+	// questions, by id — a third channel, again separate from
+	// approvals: an answer is a selection, not a permission.
+	questions   map[string]chan questionAnswer
+	questionsMu sync.Mutex
+	questSeq    int
+
 	turnMu      sync.Mutex
 	turnCancel  context.CancelFunc
 	turnAborted bool
@@ -126,13 +149,15 @@ type Server struct {
 // returns nil on an orderly shutdown.
 func Run(a *app.App, runner *app.Runner, in io.Reader, out io.Writer) error {
 	s := &Server{
-		app:       a,
-		runner:    runner,
-		in:        in,
-		out:       out,
-		work:      make(chan workItem, maxQueue),
-		done:      make(chan struct{}),
-		approvals: map[string]chan approvalAnswer{},
+		app:           a,
+		runner:        runner,
+		in:            in,
+		out:           out,
+		work:          make(chan workItem, maxQueue),
+		done:          make(chan struct{}),
+		approvals:     map[string]chan approvalAnswer{},
+		continuations: map[string]chan agent.ContinuationDecision{},
+		questions:     map[string]chan questionAnswer{},
 	}
 	return s.run()
 }
@@ -140,6 +165,8 @@ func Run(a *app.App, runner *app.Runner, in io.Reader, out io.Writer) error {
 func (s *Server) run() error {
 	s.app.Cfg.OnEvent = s.onEvent
 	s.app.Cfg.Ask = s.ask
+	s.app.Cfg.ConfirmContinuation = s.confirmContinuation
+	s.app.Cfg.AskQuestion = s.askQuestion
 	// A successful compaction (manual or automatic) is reported on
 	// stdout so the GUI learns the history was replaced by a
 	// summary; the CLI and TUI leave OnCompact nil and keep their
@@ -190,6 +217,10 @@ func (s *Server) handleLine(line string) {
 	switch req.Type {
 	case "approval_response":
 		s.handleApprovalResponse(req)
+	case "continuation_response":
+		s.handleContinuationResponse(req)
+	case "question_response":
+		s.handleQuestionResponse(req)
 	case "abort":
 		s.handleAbort(req)
 	case "get_state", "usage", "jobs", "list_sessions", "list_plugins", "list_models", "list_skills", "history":
@@ -198,7 +229,7 @@ func (s *Server) handleLine(line string) {
 		s.handlePrompt(req)
 	case "clear_queue":
 		s.handleClearQueue(req)
-	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "set_model", "rename_session", "resume_session", "delete_session", "set_tool_mode", "command":
+	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "set_model", "rename_session", "resume_session", "delete_session", "set_tool_mode", "rollback", "command":
 		s.enqueue(req, workControl)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown request type %q", req.Type))
@@ -227,6 +258,18 @@ func (s *Server) handlePrompt(req Request) {
 		}
 		if typ == "resume_session" {
 			ctrl = Request{ID: req.ID, Type: typ, Session: arg}
+		}
+		if typ == "rollback" {
+			n := 1
+			if arg != "" {
+				if v, err := strconv.Atoi(arg); err != nil || v <= 0 {
+					s.respond(req, nil, fmt.Errorf("rollback needs a positive turn count"))
+					return
+				} else {
+					n = v
+				}
+			}
+			ctrl = Request{ID: req.ID, Type: typ, Count: n}
 		}
 		if typ == "rename_session" {
 			parts := strings.Fields(arg)
@@ -292,6 +335,8 @@ func slashRequest(line string) (typ, arg string) {
 		return "list_plugins", ""
 	case line == "/resume" || strings.HasPrefix(line, "/resume "):
 		return "resume_session", strings.TrimSpace(strings.TrimPrefix(line, "/resume"))
+	case line == "/rollback" || strings.HasPrefix(line, "/rollback "):
+		return "rollback", strings.TrimSpace(strings.TrimPrefix(line, "/rollback"))
 	case line == "/rename" || strings.HasPrefix(line, "/rename "):
 		return "rename_session", strings.TrimSpace(strings.TrimPrefix(line, "/rename"))
 	default:
@@ -370,6 +415,8 @@ func (s *Server) handleAbort(req Request) {
 	}
 	s.turnMu.Unlock()
 	s.failApprovals(errAborted)
+	s.failContinuations(errAborted)
+	s.failQuestions(errAborted)
 	s.respond(req, map[string]any{"aborted": cancel != nil}, nil)
 }
 
@@ -602,6 +649,118 @@ func (s *Server) ask(prompt string) (bool, error) {
 	}
 }
 
+// confirmContinuation is Config.ConfirmContinuation for RPC mode: it
+// emits a continuation_request (with the id the GUI must echo) and
+// blocks until the GUI answers, the turn is aborted, or the server
+// shuts down. It is a separate channel from approval_request on
+// purpose: the doom-loop question is not a permission.
+func (s *Server) confirmContinuation(req agent.ContinuationRequest) (agent.ContinuationDecision, error) {
+	s.continuationsMu.Lock()
+	s.contSeq++
+	id := fmt.Sprintf("cont-%d", s.contSeq)
+	ch := make(chan agent.ContinuationDecision, 1)
+	s.continuations[id] = ch
+	s.continuationsMu.Unlock()
+	s.writeEvent(Event{
+		Type: "continuation_request", ID: id, Tool: req.ToolName,
+		Prompt: req.InputPreview, RepeatCount: req.RepeatCount, Threshold: req.Threshold,
+	})
+	select {
+	case dec := <-ch:
+		return dec, nil
+	case <-s.done:
+		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, errShutdown
+	}
+}
+
+func (s *Server) handleContinuationResponse(req Request) {
+	s.continuationsMu.Lock()
+	ch, ok := s.continuations[req.ContinuationID]
+	if ok {
+		delete(s.continuations, req.ContinuationID)
+	}
+	s.continuationsMu.Unlock()
+	if !ok {
+		s.respond(req, nil, fmt.Errorf("unknown continuation id %q", req.ContinuationID))
+		return
+	}
+	dec := agent.ContinuationDecision{Outcome: agent.ContinuationOutcome(req.Decision), UpdatedArgs: req.UpdatedArgs}
+	switch dec.Outcome {
+	case agent.ContinuationOnce, agent.ContinuationSession, agent.ContinuationDeny:
+	default:
+		s.respond(req, nil, fmt.Errorf("unknown continuation decision %q", req.Decision))
+		return
+	}
+	select {
+	case ch <- dec:
+	default:
+	}
+	s.respond(req, map[string]any{"ok": true}, nil)
+}
+
+// askQuestion is Config.AskQuestion for RPC mode: it emits a
+// question_request and blocks until the GUI answers with
+// question_response, the turn is aborted, or the server shuts down.
+func (s *Server) askQuestion(req agent.QuestionRequest) (agent.QuestionAnswers, error) {
+	s.questionsMu.Lock()
+	s.questSeq++
+	id := fmt.Sprintf("quest-%d", s.questSeq)
+	ch := make(chan questionAnswer, 1)
+	s.questions[id] = ch
+	s.questionsMu.Unlock()
+	s.writeEvent(Event{Type: "question_request", ID: id, Questions: req.Questions})
+	select {
+	case qa := <-ch:
+		return qa.ans, qa.err
+	case <-s.done:
+		return agent.QuestionAnswers{}, errShutdown
+	}
+}
+
+func (s *Server) handleQuestionResponse(req Request) {
+	s.questionsMu.Lock()
+	ch, ok := s.questions[req.QuestionID]
+	if ok {
+		delete(s.questions, req.QuestionID)
+	}
+	s.questionsMu.Unlock()
+	if !ok {
+		s.respond(req, nil, fmt.Errorf("unknown question id %q", req.QuestionID))
+		return
+	}
+	select {
+	case ch <- questionAnswer{ans: agent.QuestionAnswers{Answers: req.Answers}}:
+	default:
+	}
+	s.respond(req, map[string]any{"ok": true}, nil)
+}
+
+func (s *Server) failQuestions(err error) {
+	s.questionsMu.Lock()
+	pending := s.questions
+	s.questions = map[string]chan questionAnswer{}
+	s.questionsMu.Unlock()
+	for _, ch := range pending {
+		select {
+		case ch <- questionAnswer{err: err}:
+		default:
+		}
+	}
+}
+
+func (s *Server) failContinuations(err error) {
+	s.continuationsMu.Lock()
+	pending := s.continuations
+	s.continuations = map[string]chan agent.ContinuationDecision{}
+	s.continuationsMu.Unlock()
+	for _, ch := range pending {
+		select {
+		case ch <- agent.ContinuationDecision{Outcome: agent.ContinuationDeny}:
+		default:
+		}
+	}
+}
+
 // onEvent translates the loop's event stream into RPC events. It runs
 // on the agent goroutine (emit is synchronous in Run), so turnUsage
 // and turnOutcome need no locking.
@@ -645,9 +804,11 @@ func (s *Server) onEvent(ev agent.Event) {
 	case agent.EventApproval:
 		// Ignored: ask() emits approval_request itself, with the id.
 	case agent.EventDone:
-		s.turnOutcome = &turnOutcome{text: ev.Text, usage: ev.Usage}
+		s.turnOutcome = &turnOutcome{text: ev.Text, usage: ev.Usage, reason: ev.TerminalReason}
 	case agent.EventError:
-		s.turnOutcome = &turnOutcome{err: ev.Err}
+		s.turnOutcome = &turnOutcome{err: ev.Err, reason: ev.TerminalReason}
+	case agent.EventStopBlocked:
+		s.writeEvent(Event{Type: "stop_blocked", Text: ev.Text})
 	}
 }
 
@@ -713,8 +874,10 @@ func (s *Server) runTurn(req Request) {
 	usage := s.turnUsage
 	var text string
 	var err error
+	reason := agent.TerminalReason("")
 	if out := s.turnOutcome; out != nil {
 		text = out.text
+		reason = out.reason
 		if out.err == nil {
 			usage = out.usage
 		}
@@ -723,7 +886,18 @@ func (s *Server) runTurn(req Request) {
 		err = s.runner.LastErr
 	}
 	if aborted {
-		err = errAborted
+		// Cancellation is semantic, not an error (ACP/Codex rule):
+		// the settled event carries reason "abort" and no error
+		// string. The loop's own error (context cancelled) is
+		// discarded here; the GUI reads Aborted + Reason.
+		err = nil
+		reason = agent.TerminalAbort
+	} else if reason == "" {
+		if err != nil {
+			reason = agent.TerminalError
+		} else {
+			reason = agent.TerminalEndTurn
+		}
 	}
 	s.setStreaming(false)
 	s.refreshState()
@@ -734,6 +908,7 @@ func (s *Server) runTurn(req Request) {
 	settled := Event{
 		Type: "agent_settled", Text: text, Usage: usageJSON(usage),
 		SessionUsage: usageJSON(st.sessionUsage), Fee: s.feeLabel(), Aborted: aborted,
+		Reason:   string(reason),
 		ToolMode: st.toolMode,
 	}
 	if s.app.Rates.Configured {
@@ -761,6 +936,18 @@ func (s *Server) doControl(req Request) {
 		s.runner.Handle(ctx, "/compact")
 		s.refreshState()
 		s.respond(req, map[string]any{"ok": true}, nil)
+	case "rollback":
+		n := req.Count
+		if n <= 0 {
+			n = 1
+		}
+		dropped, archive, err := s.runner.Rollback(n)
+		if err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		s.refreshState()
+		s.respond(req, map[string]any{"rolled_back": n, "dropped": dropped, "messages": len(s.app.History), "archive": archive}, nil)
 	case "new_session":
 		id, err := s.runner.ResetSession()
 		if err != nil {

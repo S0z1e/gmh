@@ -45,7 +45,7 @@ func List() ([]Info, error) {
 			continue
 		}
 		id := strings.TrimSuffix(name, ".jsonl")
-		if strings.HasSuffix(id, "-audit") || strings.Contains(id, "-pre-compact-") {
+		if strings.HasSuffix(id, "-audit") || strings.Contains(id, "-pre-compact-") || strings.Contains(id, "-pre-rollback-") {
 			continue
 		}
 		info, err := readInfo(filepath.Join(dir, name), id)

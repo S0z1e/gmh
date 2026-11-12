@@ -83,8 +83,10 @@ func (p *Plugin) nativeRegisterCommand(r *moejs.Realm, _ moejs.Value, args []moe
 // "context" (rewrite the turn's starting messages),
 // "session_before_compact" (extra instructions for the summary),
 // "session_start" and "session_switch" (notifications when a session
-// becomes current). At most one handler per event per plugin. Like
-// registerTool, only valid while the entry's top level runs.
+// becomes current), and "stop" (turn-end gate: return a non-empty
+// string to veto the turn ending, e.g. a failed check). At most one
+// handler per event per plugin. Like registerTool, only valid while
+// the entry's top level runs.
 func (p *Plugin) nativeOn(r *moejs.Realm, _ moejs.Value, args []moejs.Value) (moejs.Value, error) {
 	if !p.loading {
 		return moejs.Undefined(), fmt.Errorf("harness.on must be called at the top level of the plugin entry, during load")
@@ -140,8 +142,14 @@ func (p *Plugin) nativeOn(r *moejs.Realm, _ moejs.Value, args []moejs.Value) (mo
 		}
 		p.sessionSwitchHook = handler
 		p.hasSessionSwitchHook = true
+	case "stop":
+		if p.hasStopHook {
+			return moejs.Undefined(), fmt.Errorf("plugin %s already has a stop handler", p.Name)
+		}
+		p.stopHook = handler
+		p.hasStopHook = true
 	default:
-		return moejs.Undefined(), fmt.Errorf("unknown hook event %q (want tool_call, tool_result, before_agent_start, context, session_before_compact, session_start or session_switch)", event)
+		return moejs.Undefined(), fmt.Errorf("unknown hook event %q (want tool_call, tool_result, before_agent_start, context, session_before_compact, session_start, session_switch or stop)", event)
 	}
 	return moejs.Undefined(), nil
 }

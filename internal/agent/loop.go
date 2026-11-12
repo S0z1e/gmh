@@ -29,6 +29,21 @@ type Config struct {
 	// (There is no OnText: streamed text arrives as TextDelta events.)
 	OnEvent func(Event)
 	Ask     func(prompt string) (bool, error) // nil = use stdin prompt
+	// ConfirmContinuation is the doom-loop guard's seam: it asks the
+	// user whether a tool call repeated Threshold times may continue,
+	// with "once" / "session" / "deny" (and optionally updated
+	// arguments). It is deliberately separate from Ask: the question
+	// is about the shape of the conversation, not whether a tool
+	// may act, so no approval rule or mode may answer it. Nil means
+	// nobody can be asked (headless): the guard denies.
+	ConfirmContinuation func(req ContinuationRequest) (ContinuationDecision, error)
+	// DoomLoopThreshold overrides RepeatedToolCallThreshold (0 = default).
+	DoomLoopThreshold int
+	// AskQuestion is the structured-question seam for the ask_user
+	// tool: it asks the user the request's questions and returns
+	// their answers. Nil means nobody can be asked (headless): the
+	// loop tells the model to proceed on its best judgement.
+	AskQuestion func(req QuestionRequest) (QuestionAnswers, error)
 	// DenyInsteadOfPrompt refuses every approval without asking (copy of
 	// Claude Code's permissions.denyInsteadOfPrompting). -p print mode
 	// sets it: an unattended run must never block waiting for a human.
@@ -39,6 +54,21 @@ type Config struct {
 	// call in the last Run: the current context size, since history is
 	// resent in full each time. Used for the compaction trigger.
 	LastPromptTokens int
+	// LastTerminalReason is why the most recent Run ended, in the
+	// structured form the RPC server reports as agent_settled.reason.
+	LastTerminalReason TerminalReason
+
+	// doomLoop is the per-Config guard: its streak and session
+	// allowlist outlive one turn, like Qwen's agent-context guard.
+	doomLoop *DoomLoopGuard
+}
+
+// DoomLoop returns the Config's guard, creating it on first use.
+func (c *Config) DoomLoop() *DoomLoopGuard {
+	if c.doomLoop == nil {
+		c.doomLoop = NewDoomLoopGuard(c.DoomLoopThreshold)
+	}
+	return c.doomLoop
 }
 
 func (c *Config) emit(e Event) {
@@ -57,6 +87,7 @@ func ToolDefs() []llm.ToolDef {
 		llm.Tool("glob", "List files matching a glob pattern, e.g. **/*.go. Prefer this over bash find/ls for discovering files.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer"}},"required":["pattern"]}`),
 		llm.Tool("load_skill", "Load the full text of an available skill by name when its guidance is needed for the current task. The skill names and one-line descriptions are in the system prompt. Pass reference (a file name from the skill's references/ footer) to read one reference file instead of the whole skill.", `{"type":"object","properties":{"name":{"type":"string"},"reference":{"type":"string"}},"required":["name"]}`),
 		llm.Tool("webfetch", "Fetch a URL and return its content as Markdown (HTML is converted to Markdown, keeping headings, lists, links, code and tables; scripts and styles are dropped). Use this to read web pages, docs and API responses instead of curl. Returns up to 30000 characters per call; use offset to page through a long page. format=text returns plain text instead of Markdown; timeout is seconds (default 30, max 120). Private, loopback (except localhost) and cloud-metadata addresses are refused, and cross-host redirects are not followed.", `{"type":"object","properties":{"url":{"type":"string"},"format":{"type":"string","enum":["markdown","text"]},"offset":{"type":"integer"},"timeout":{"type":"integer"}},"required":["url"]}`),
+		llm.Tool("ask_user", "Ask the user structured questions when a decision needs their input instead of guessing: 1-4 questions, each with 2-4 options (plus free-text Other). Use it in plan mode to clarify requirements, and anywhere a choice changes what you will do. The user picks options or types their own answer; their answers come back as this call's result.", `{"type":"object","properties":{"questions":{"type":"array","minItems":1,"maxItems":4,"items":{"type":"object","properties":{"question":{"type":"string"},"header":{"type":"string"},"multiSelect":{"type":"boolean"},"options":{"type":"array","minItems":2,"maxItems":4,"items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label"]}}},"required":["question","options"]}}},"required":["questions"]}`),
 	}
 }
 
@@ -75,6 +106,66 @@ func (c *Config) ask(prompt string) (bool, error) {
 	}
 	ans := strings.ToLower(strings.TrimSpace(line))
 	return ans == "y" || ans == "yes", nil
+}
+
+// checkRepeatedCall runs the doom-loop guard for one requested
+// call. It returns the arguments to execute (possibly the user's
+// edited version) and whether the call may run. A denied call must
+// end the turn: the caller reports it with
+// TerminalRepeatedToolCallDenied.
+func (c *Config) checkRepeatedCall(ctx context.Context, toolName, argsJSON string) (string, bool) {
+	guard := c.DoomLoop()
+	detected, det := guard.Check(toolName, argsJSON)
+	if !detected {
+		return argsJSON, true
+	}
+	// Headless (no one to ask, or approvals denied without asking):
+	// deny. A headless run must never assume the user would continue.
+	if c.ConfirmContinuation == nil || c.DenyInsteadOfPrompt || ctx.Err() != nil {
+		return argsJSON, false
+	}
+	dec, err := c.ConfirmContinuation(ContinuationRequest{
+		ToolName: det.ToolName, RepeatCount: det.RepeatCount,
+		Threshold: det.Threshold, InputPreview: det.InputPreview,
+	})
+	if err != nil {
+		return argsJSON, false
+	}
+	key := det.InputKey
+	useArgs := argsJSON
+	if dec.UpdatedArgs != "" {
+		key = CanonicalToolKey(toolName, dec.UpdatedArgs)
+		useArgs = dec.UpdatedArgs
+	}
+	switch dec.Outcome {
+	case ContinuationSession:
+		guard.AllowSession(key)
+		return useArgs, true
+	case ContinuationOnce:
+		guard.AllowOnce(key)
+		return useArgs, true
+	default:
+		return argsJSON, false
+	}
+}
+
+// askUser runs one ask_user tool call: validate the questions,
+// ask them through the AskQuestion seam, and render the answers
+// as the observation. Invalid arguments and a cancelled question
+// are observations, not turn errors, so the model can recover.
+func (c *Config) askUser(ctx context.Context, argsJSON string) string {
+	req, err := ParseAskUserArgs(argsJSON)
+	if err != nil {
+		return fmt.Sprintf("Error: %v\nAsk at most %d questions, each with 2-%d options, and try again.", err, MaxQuestionsPerAsk, MaxOptionsPerQuestion)
+	}
+	if c.AskQuestion == nil || ctx.Err() != nil {
+		return "No one is available to answer questions right now. Proceed with your best judgement and state the assumptions you made."
+	}
+	ans, err := c.AskQuestion(req)
+	if err != nil {
+		return "The questions were cancelled. Proceed with your best judgement and state the assumptions you made."
+	}
+	return FormatAnswers(req, ans)
 }
 
 func (c *Config) needsApproval(name string) bool {
@@ -204,6 +295,18 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 	return msgs, nil
 }
 
+// MaxStopBlocks caps consecutive turn-end vetoes by stop hooks,
+// after Claude Code's Stop hook (8): after that many blocks the
+// turn is allowed to end anyway, so a broken check cannot trap the
+// model forever.
+const MaxStopBlocks = 8
+
+// MaxFailedFixAttempts is the consecutive all-failed tool steps
+// after which the task is marked blocked instead of looping: the
+// model tried (differently — identical repeats are the doom-loop
+// guard's job) and every attempt failed.
+const MaxFailedFixAttempts = 3
+
 // Run executes one user turn. It appends messages to the session store
 // and returns the assistant's final text, total tokens used, and error.
 func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Usage, error) {
@@ -218,6 +321,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 	// fed back as user messages when the turn would otherwise end
 	// (see drainPending).
 	var pending []pendingJob
+	// stopBlocks counts consecutive turn-end vetoes in this turn;
+	// failedFixes counts consecutive steps whose tool calls all
+	// failed (a step with any success resets it).
+	stopBlocks := 0
+	failedFixes := 0
 
 	for step := 0; step < steps; step++ {
 		var assistant llm.Message
@@ -257,7 +365,14 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 			if len(pending) > 0 {
 				_, _ = c.drainPending(ctx, msgs, pending)
 			}
-			c.emit(Event{Kind: EventError, Err: wrapped})
+			// A cancelled context is an abort, not a provider error:
+			// the RPC server reports it as reason "abort" with no
+			// error string (see TerminalAbort).
+			c.LastTerminalReason = TerminalError
+			if ctx.Err() != nil {
+				c.LastTerminalReason = TerminalAbort
+			}
+			c.emit(Event{Kind: EventError, Err: wrapped, TerminalReason: c.LastTerminalReason})
 			return lastText, total, wrapped
 		}
 		c.LastPromptTokens = usage.PromptTokens
@@ -270,7 +385,30 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		}
 		if len(assistant.ToolCalls) == 0 {
 			if len(pending) == 0 {
-				c.emit(Event{Kind: EventDone, Text: lastText, Usage: total})
+				// Turn-end gate (Claude's Stop hook): a plugin stop
+				// hook may veto the end — e.g. a check the final
+				// answer failed. The reason is fed back to the
+				// model as a user message and the turn continues,
+				// up to MaxStopBlocks vetoes; after that the turn
+				// is allowed to end anyway.
+				if ctx.Err() == nil && c.Exec != nil && c.Exec.Plugins != nil && stopBlocks < MaxStopBlocks {
+					sessionID := ""
+					if c.Session != nil {
+						sessionID = c.Session.ID
+					}
+					if reason := c.Exec.Plugins.RunStopHooks(ctx, sessionID, lastText); reason != "" {
+						stopBlocks++
+						c.emit(Event{Kind: EventStopBlocked, Text: reason})
+						blockMsg := llm.Message{Role: "user", Content: "A stop hook blocked the turn from ending: " + reason + " Address it before finishing, then answer again."}
+						msgs = append(msgs, blockMsg)
+						if c.Session != nil {
+							_ = c.Session.Append(blockMsg)
+						}
+						continue
+					}
+				}
+				c.LastTerminalReason = TerminalEndTurn
+				c.emit(Event{Kind: EventDone, Text: lastText, Usage: total, TerminalReason: TerminalEndTurn})
 				return lastText, total, nil
 			}
 			// The model stopped calling tools but background jobs are
@@ -286,6 +424,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		}
 		// Execute tool calls in order. (Parallel batches are v0.2; serial
 		// avoids two tools writing the same file at once.)
+		// stepHadExecution / stepAllFailed track this step for the
+		// blocked-after-3-failures rule: only calls that actually
+		// executed count (denials and refusals are not fix attempts).
+		stepHadExecution := false
+		stepAllFailed := true
 		for _, tc := range assistant.ToolCalls {
 			c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments})
 			// Plugin tool_call hooks run before approval: a denied
@@ -334,6 +477,33 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				}
 				continue
 			}
+			// Doom-loop guard: an identical call for the fifth
+			// consecutive time asks the user (once / session /
+			// deny), before any approval prompt — the user must
+			// not be asked twice about the same call. A denied
+			// call ends the turn with the structured reason.
+			useArgs, allowed := c.checkRepeatedCall(ctx, tc.Function.Name, argsJSON)
+			if !allowed {
+				obs := RepeatedToolCallMessage(tc.Function.Name, RepeatedToolCallThreshold)
+				if c.Session != nil {
+					_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool call denied"})
+				}
+				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs})
+				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
+				if c.Session != nil {
+					_ = c.Session.Append(msgs[len(msgs)-1])
+				}
+				if len(pending) > 0 {
+					_, _ = c.drainPending(ctx, msgs, pending)
+				}
+				c.LastTerminalReason = TerminalRepeatedToolCallDenied
+				denied := fmt.Errorf("%w: %s repeated %d times with identical input", ErrRepeatedToolCallDenied, tc.Function.Name, RepeatedToolCallThreshold)
+				c.emit(Event{Kind: EventError, Err: denied, TerminalReason: TerminalRepeatedToolCallDenied})
+				return lastText, total, denied
+			}
+			argsJSON = useArgs
+			tc.Function.Arguments = argsJSON
+			callKey := CanonicalToolKey(tc.Function.Name, argsJSON)
 			if c.needsApproval(tc.Function.Name) {
 				prompt := fmt.Sprintf("Run %s %s?", tc.Function.Name, truncate(tc.Function.Arguments, 200))
 				c.emit(Event{Kind: EventApproval, Text: prompt})
@@ -352,7 +522,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 					_ = c.Session.Audit(entry)
 				}
 				if err != nil {
-					c.emit(Event{Kind: EventError, Err: err})
+					c.LastTerminalReason = TerminalError
+					if ctx.Err() != nil {
+						c.LastTerminalReason = TerminalAbort
+					}
+					c.emit(Event{Kind: EventError, Err: err, TerminalReason: c.LastTerminalReason})
 					return lastText, total, err
 				}
 				if !ok {
@@ -368,8 +542,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 			var obs string
 			var err error
 			var res tools.ToolResult
-			if tc.Function.Name == "bash" {
-				var job *tools.Job
+			var job *tools.Job
+			if tc.Function.Name == "ask_user" {
+				// Structured questions are intercepted here, not
+				// dispatched: there is no executor tool of this
+				// name, and asking never needs approval.
+				obs = c.askUser(ctx, argsJSON)
+			} else if tc.Function.Name == "bash" {
 				obs, job = c.execBash(ctx, tc)
 				if job != nil {
 					pending = append(pending, pendingJob{callID: tc.ID, job: job})
@@ -393,6 +572,16 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				}
 			}
 			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count})
+			// A finished (not backgrounded) call whose observation
+			// differs from the previous one for the same call is
+			// making progress: the doom-loop streak clears.
+			if job == nil {
+				c.DoomLoop().Observe(callKey, obs)
+				stepHadExecution = true
+				if err == nil && !strings.HasPrefix(obs, "Error:") {
+					stepAllFailed = false
+				}
+			}
 			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 			if c.Session != nil {
 				_ = c.Session.Append(msgs[len(msgs)-1])
@@ -410,15 +599,83 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				}
 			}
 		}
+		// Three consecutive steps whose tool calls all failed mark
+		// the task blocked: the model is trying and failing, and
+		// looping further only burns context. Any success resets
+		// the count.
+		if stepHadExecution {
+			if stepAllFailed {
+				failedFixes++
+			} else {
+				failedFixes = 0
+			}
+			if failedFixes >= MaxFailedFixAttempts {
+				if len(pending) > 0 {
+					_, _ = c.drainPending(ctx, msgs, pending)
+				}
+				c.LastTerminalReason = TerminalBlocked
+				blocked := fmt.Errorf("task blocked: %d consecutive steps ended with only failed tool calls; the last error was not fixed by retrying", MaxFailedFixAttempts)
+				c.emit(Event{Kind: EventError, Err: blocked, TerminalReason: TerminalBlocked})
+				return lastText, total, blocked
+			}
+		}
 	}
 	// The step cap hit with jobs still running: deliver their results
 	// before reporting the cap, so the work is not silently lost.
 	if len(pending) > 0 {
 		_, _ = c.drainPending(ctx, msgs, pending)
 	}
+	// Step-cap grace period, after Gemini CLI: a hard cut throws
+	// away the turn, so the model gets one final, tool-less call —
+	// bounded by 60 seconds — to deliver its best answer from what
+	// it has done so far. The grace call is not persisted: the
+	// instruction and its reply live only in this turn's local
+	// history, so the next turn does not see them. The turn still
+	// ends with the cap error and TerminalMaxTurns; only the final
+	// text (and its usage) is the grace answer instead of the last
+	// tool-call step's text. A failed grace call changes nothing.
+	if ctx.Err() == nil {
+		if graceText, graceUsage, ok := c.graceCall(ctx, msgs); ok {
+			lastText = graceText
+			total.Add(graceUsage)
+		}
+	}
 	capped := fmt.Errorf("step cap reached (%d); the task was not finished", steps)
-	c.emit(Event{Kind: EventError, Err: capped})
+	c.LastTerminalReason = TerminalMaxTurns
+	c.emit(Event{Kind: EventError, Err: capped, TerminalReason: TerminalMaxTurns})
 	return lastText, total, capped
+}
+
+// graceCall makes the one tool-less final call after the step cap.
+// It returns the model's final text, its usage, and whether the
+// call succeeded. The call runs under a 60-second timeout.
+func (c *Config) graceCall(ctx context.Context, msgs []llm.Message) (string, llm.Usage, bool) {
+	graceCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	graceMsgs := append(append([]llm.Message{}, msgs...),
+		llm.Message{Role: "user", Content: "You have reached the step limit. Give your best final answer now, summarising what was done and what remains unfinished. Do not call any more tools."})
+	apiMsgs := truncateToolResults(graceMsgs, toolResultMaxChars)
+	apiMsgs = pruneOldToolResults(apiMsgs, pruneThresholdChars, pruneBlockChars, pruneKeepNewestBlocks)
+	var final llm.Message
+	var usage llm.Usage
+	var thinking strings.Builder
+	err := c.Client.Stream(graceCtx, apiMsgs, nil, func(s string) {
+		c.emit(Event{Kind: EventTextDelta, Text: s})
+	}, func(m llm.Message, u llm.Usage) {
+		final = m
+		usage = u
+		if thinking.Len() > 0 {
+			c.emit(Event{Kind: EventThinkingEnd, Text: thinking.String()})
+		}
+	}, func(s string) {
+		thinking.WriteString(s)
+		c.emit(Event{Kind: EventThinkingDelta, Text: s})
+	})
+	if err != nil || final.Content == "" {
+		return "", llm.Usage{}, false
+	}
+	c.emit(Event{Kind: EventStepUsage, Usage: usage})
+	return final.Content, usage, true
 }
 
 func truncate(s string, n int) string {

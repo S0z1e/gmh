@@ -43,6 +43,37 @@ const (
 	EventToolBackgroundDone EventKind = "tool_background_done"
 	EventDone               EventKind = "done"
 	EventError              EventKind = "error"
+	// EventStopBlocked fires when a stop hook vetoes the turn end.
+	// Text is the hook's block reason; the loop feeds it back to
+	// the model and continues, up to MaxStopBlocks times.
+	EventStopBlocked EventKind = "stop_blocked"
+)
+
+// TerminalReason is why a turn ended, as a structured value —
+// after Qwen Code 1.0's Terminal reason and Codex's typed turn
+// errors. A GUI needs to tell "finished" from "stopped by the
+// user", "hit the step cap" and "denied at the doom-loop prompt"
+// without parsing an error string. The model stop reason (why the
+// model stopped emitting) is a different thing and is not this.
+type TerminalReason string
+
+const (
+	// TerminalEndTurn: the model finished with no more tool calls.
+	TerminalEndTurn TerminalReason = "end_turn"
+	// TerminalMaxTurns: the step cap was hit.
+	TerminalMaxTurns TerminalReason = "max_turns"
+	// TerminalAbort: the turn was aborted (context cancelled).
+	TerminalAbort TerminalReason = "abort"
+	// TerminalError: the turn failed (LLM / provider error).
+	TerminalError TerminalReason = "error"
+	// TerminalRepeatedToolCallDenied: the user denied a repeated
+	// tool call at the doom-loop continuation prompt, or no prompt
+	// was available in a headless run.
+	TerminalRepeatedToolCallDenied TerminalReason = "repeated_tool_call_denied"
+	// TerminalBlocked: the task was marked blocked after three
+	// consecutive failed fix attempts — the model kept trying and
+	// failing, so the turn ends instead of looping.
+	TerminalBlocked TerminalReason = "blocked"
 )
 
 type Event struct {
@@ -70,4 +101,7 @@ type Event struct {
 	Usage llm.Usage
 	// Err is the failure for EventError.
 	Err error
+	// TerminalReason says why the turn ended, for Done and Error.
+	// Empty for all other events.
+	TerminalReason TerminalReason
 }

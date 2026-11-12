@@ -96,7 +96,9 @@ func main() {
 	// In suggest mode, approvals go through the TUI dialog: the agent
 	// blocks on a reply channel, the model answers it from a y/n key.
 	if a.Cfg.Mode == "suggest" {
-		a.Cfg.Ask = tui.NewApprover(prog).Ask
+		approver := tui.NewApprover(prog)
+		a.Cfg.Ask = approver.Ask
+		a.Cfg.ConfirmContinuation = approver.ConfirmContinuation
 	}
 
 	// Runner output goes through the program's message queue (PrintMsg),

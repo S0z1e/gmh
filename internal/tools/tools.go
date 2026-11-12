@@ -322,6 +322,15 @@ type PluginRunner interface {
 	// returns a non-string keeps the current result (fail open);
 	// the failure is logged to stderr by the implementation.
 	RunToolResultHooks(ctx context.Context, tool, argsJSON, result string, toolErr error) string
+	// RunStopHooks runs the registered stop hooks in load order
+	// when a turn would otherwise end. It returns the first block
+	// reason ("" = the turn may end): a hook returns a non-empty
+	// string to veto the turn end — typically a check the final
+	// answer failed, e.g. "go test failed". A hook that throws,
+	// times out, or returns a non-string is skipped with a stderr
+	// warning (fail open: a broken check must not endlessly block
+	// a turn).
+	RunStopHooks(ctx context.Context, session, lastText string) string
 }
 
 // Dispatch runs a tool call by name and returns the observation.

@@ -129,6 +129,8 @@ func main() {
 			textPending = false
 		}
 		switch ev.Kind {
+		case agent.EventStopBlocked:
+			fmt.Printf("stop hook blocked the turn end: %s\n", ev.Text)
 		case agent.EventToolBackgrounded:
 			fmt.Printf("… bash running in background (%s)\n", ev.JobID)
 		case agent.EventBackgroundWait:
@@ -151,7 +153,7 @@ func main() {
 	}
 
 	// REPL
-	fmt.Println("Type a task, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /clear to drop context, /compact to summarise context, or /quit to exit.")
+	fmt.Println("Type a task, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /clear to drop context, /compact to summarise context, /rollback [N] to drop the last N turns, or /quit to exit.")
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	// The approval prompt shares the REPL's scanner: the scanner
@@ -160,6 +162,14 @@ func main() {
 	// line. (The TUI and RPC paths set their own Ask and never
 	// reach this code; -p denies without asking.)
 	a.Cfg.Ask = askFromScanner(scanner)
+	// Doom-loop continuation prompt, on the same scanner (see above):
+	// once / always this session / stop. Editing the input is a GUI
+	// feature; the CLI offers the three decisions.
+	a.Cfg.ConfirmContinuation = confirmContinuationFromScanner(scanner)
+	// Structured questions, on the same scanner: one line per
+	// question — option numbers (comma-separated for multi-select),
+	// or free text for "Other".
+	a.Cfg.AskQuestion = askQuestionFromScanner(scanner)
 	for {
 		fmt.Print("> ")
 		if !scanner.Scan() {
@@ -190,6 +200,81 @@ func askFromScanner(scanner *bufio.Scanner) func(string) (bool, error) {
 		}
 		ans := strings.ToLower(strings.TrimSpace(scanner.Text()))
 		return ans == "y" || ans == "yes", nil
+	}
+}
+
+// confirmContinuationFromScanner is the plain CLI's doom-loop
+// prompt. It shares the REPL scanner with askFromScanner, for the
+// same buffered-stdin reason.
+func confirmContinuationFromScanner(scanner *bufio.Scanner) func(agent.ContinuationRequest) (agent.ContinuationDecision, error) {
+	return func(req agent.ContinuationRequest) (agent.ContinuationDecision, error) {
+		fmt.Printf("Repeated tool call: %s %s was requested %d times with identical input. Continue once (o), always this session (s), or stop (d)? [o/s/d] ", req.ToolName, req.InputPreview, req.RepeatCount)
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
+			}
+			return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, io.EOF
+		}
+		switch strings.ToLower(strings.TrimSpace(scanner.Text())) {
+		case "o", "once", "y", "yes":
+			return agent.ContinuationDecision{Outcome: agent.ContinuationOnce}, nil
+		case "s", "session", "always":
+			return agent.ContinuationDecision{Outcome: agent.ContinuationSession}, nil
+		default:
+			return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, nil
+		}
+	}
+}
+
+// askQuestionFromScanner is the plain CLI's ask_user prompt.
+func askQuestionFromScanner(scanner *bufio.Scanner) func(agent.QuestionRequest) (agent.QuestionAnswers, error) {
+	return func(req agent.QuestionRequest) (agent.QuestionAnswers, error) {
+		var answers []agent.QuestionAnswer
+		for i, q := range req.Questions {
+			if q.Header != "" {
+				fmt.Printf("%s\n", q.Header)
+			}
+			fmt.Printf("Q%d: %s\n", i+1, q.Question)
+			for j, o := range q.Options {
+				if o.Description != "" {
+					fmt.Printf("  %d. %s — %s\n", j+1, o.Label, o.Description)
+				} else {
+					fmt.Printf("  %d. %s\n", j+1, o.Label)
+				}
+			}
+			fmt.Printf("  (pick %s, or type your own answer) > ", map[bool]string{true: "numbers, comma-separated", false: "a number"}[q.MultiSelect])
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					return agent.QuestionAnswers{}, err
+				}
+				return agent.QuestionAnswers{}, io.EOF
+			}
+			line := strings.TrimSpace(scanner.Text())
+			ans := agent.QuestionAnswer{Question: i}
+			// Numbers select options; anything else is free text.
+			parts := strings.Split(line, ",")
+			allNumbers := len(parts) > 0
+			var picked []string
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				n, err := strconv.Atoi(p)
+				if err != nil || n < 1 || n > len(q.Options) {
+					allNumbers = false
+					break
+				}
+				picked = append(picked, q.Options[n-1].Label)
+			}
+			if allNumbers {
+				if !q.MultiSelect && len(picked) > 1 {
+					picked = picked[:1]
+				}
+				ans.Selected = picked
+			} else {
+				ans.Custom = line
+			}
+			answers = append(answers, ans)
+		}
+		return agent.QuestionAnswers{Answers: answers}, nil
 	}
 }
 

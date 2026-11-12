@@ -10,16 +10,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"minimalharness/internal/agent"
 )
 
 // Request is one line from the GUI. ID is echoed in the response when
 // present; a request without one still gets a response, without an id.
 type Request struct {
 	ID string `json:"id,omitempty"`
-	// Type is one of: prompt, approval_response, abort, clear_queue,
-	// get_state, new_session, clear, compact, usage, jobs, skill,
-	// quit, attach_image, set_model, list_sessions, rename_session,
-	// resume_session, delete_session, set_tool_mode, list_plugins,
+	// Type is one of: prompt, approval_response, continuation_response,
+	// question_response, abort, clear_queue, get_state, new_session,
+	// clear, compact, usage, jobs, skill, quit, attach_image,
+	// set_model, list_sessions, rename_session, resume_session,
+	// delete_session, set_tool_mode, rollback, list_plugins,
 	// list_models, list_skills, history, command.
 	Type string `json:"type"`
 	// Message is the task for prompt, and the raw args string for
@@ -47,6 +50,24 @@ type Request struct {
 	ApprovalID string `json:"approval_id,omitempty"`
 	// Approved answers an approval_request, for approval_response.
 	Approved bool `json:"approved,omitempty"`
+	// ContinuationID names the continuation_request being answered,
+	// for continuation_response (the doom-loop guard's prompt, which
+	// is deliberately separate from approval_response).
+	ContinuationID string `json:"continuation_id,omitempty"`
+	// Decision answers a continuation_request: "once", "session" or
+	// "deny".
+	Decision string `json:"decision,omitempty"`
+	// UpdatedArgs is the edited arguments JSON for a
+	// continuation_response, when the GUI let the user edit the
+	// repeated call's input.
+	UpdatedArgs string `json:"updated_args,omitempty"`
+	// Count is the turn count for rollback (default 1 when omitted).
+	Count int `json:"count,omitempty"`
+	// QuestionID names the question_request being answered, for
+	// question_response (the ask_user tool's structured questions).
+	QuestionID string `json:"question_id,omitempty"`
+	// Answers answers a question_request, one per question.
+	Answers []agent.QuestionAnswer `json:"answers,omitempty"`
 }
 
 // Response is the reply to one request, correlated by ID. Exactly one
@@ -116,6 +137,19 @@ type Event struct {
 	Prompt string `json:"prompt,omitempty"`
 	// agent_settled.
 	Aborted bool `json:"aborted,omitempty"`
+	// agent_settled: structured terminal reason — "end_turn",
+	// "max_turns", "abort", "error" or "repeated_tool_call_denied"
+	// — so the GUI never has to parse an error string to tell how
+	// the turn ended. Aborted turns carry reason "abort" and no
+	// error string: cancellation is not an error.
+	Reason string `json:"reason,omitempty"`
+	// continuation_request: how many identical calls were seen and
+	// the threshold that tripped the guard.
+	RepeatCount int `json:"repeat_count,omitempty"`
+	Threshold   int `json:"threshold,omitempty"`
+	// question_request: the ask_user tool's questions, in the
+	// agent.QuestionRequest shape.
+	Questions any `json:"questions,omitempty"`
 	// ToolMode is the loop's tool mode ("default" or "plan") on
 	// agent_settled, so the GUI knows which tools the next turn
 	// offers without polling get_state.

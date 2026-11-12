@@ -485,12 +485,23 @@ func TestAbortAndSurvive(t *testing.T) {
 	if settled["aborted"] != true {
 		t.Fatalf("settled aborted = %v, want true", settled["aborted"])
 	}
+	// Cancellation is semantic, not an error: reason "abort" and
+	// no error string.
+	if settled["reason"] != "abort" {
+		t.Fatalf("settled reason = %v, want abort", settled["reason"])
+	}
+	if settled["error"] != nil {
+		t.Fatalf("aborted turn settled with error: %v", settled["error"])
+	}
 	// The server is still alive: a second turn works.
 	d.send(map[string]any{"id": "p2", "type": "prompt", "message": "Say something fast"})
 	d.waitFor("response", 5*time.Second)
 	settled = d.waitFor("agent_settled", 10*time.Second)
 	if settled["aborted"] == true || settled["error"] != nil {
 		t.Fatalf("second turn settled badly: %v", settled)
+	}
+	if settled["reason"] != "end_turn" {
+		t.Fatalf("second turn reason = %v, want end_turn", settled["reason"])
 	}
 	if settled["text"] == nil || !strings.Contains(settled["text"].(string), "fast") {
 		t.Fatalf("second turn text = %v, want it to contain fast", settled["text"])
