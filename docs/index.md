@@ -1,7 +1,6 @@
 # Documentation
 
-Detail moved out of the README, one topic per file — the same shape
-as Pi's `docs/`.
+Detail moved out of the README, one topic per file.
 
 | Doc | What it covers |
 | --- | --- |

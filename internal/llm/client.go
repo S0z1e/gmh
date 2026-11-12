@@ -216,8 +216,8 @@ type Client struct {
 	// anthropic: max_tokens). 0 = defaultAnthropicMaxTokens.
 	MaxTokens int
 	// SamplingParams (e.g. temperature, top_p) is merged into every
-	// request body of the two OpenAI modes, Pi-style. Anthropic
-	// ignores it: Pi applies samplingParams only to OpenAI-compatible
+	// request body of the two OpenAI modes. Anthropic
+	// ignores it: samplingParams apply only to OpenAI-compatible
 	// APIs. Structural keys (model, messages, tools, stream, ...) are
 	// never overridden by it.
 	SamplingParams map[string]any
@@ -371,8 +371,8 @@ func (c *Client) Stream(ctx context.Context, messages []Message, tools []ToolDef
 }
 
 // mergeSamplingParams merges free-form sampling parameters
-// (temperature, top_p, ...) into an already-marshalled request body,
-// Pi-style. Structural keys are never overridden: a sampling param
+// (temperature, top_p, ...) into an already-marshalled request body.
+// Structural keys are never overridden: a sampling param
 // must not rewrite the model, the messages, the tools, or the
 // streaming/max-token fields the client itself controls.
 func mergeSamplingParams(body []byte, params map[string]any) ([]byte, error) {
@@ -619,7 +619,7 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 	// reasoningSeen tracks, per reasoning item id, whether its
 	// summary already arrived as deltas. A reasoning item whose
 	// text never streamed is backfilled once from its done event
-	// (Pi's summaryText || contentText pattern); an item already
+	// (the summaryText || contentText pattern); an item already
 	// seen as deltas is never repeated.
 	reasoningSeen := map[string]bool{}
 	// reasoningPartsText joins one reasoning item's content parts

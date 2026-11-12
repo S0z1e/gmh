@@ -114,7 +114,7 @@ func TestEndpointNormalisation(t *testing.T) {
 }
 
 // SamplingParams merge into the Chat Completions request body,
-// Pi-style; structural keys must never be overridden by them.
+// Structural keys must never be overridden by them.
 func TestStreamChatMergesSamplingParamsAndMaxTokens(t *testing.T) {
 	var body map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

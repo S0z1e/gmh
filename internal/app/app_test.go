@@ -92,8 +92,8 @@ func TestSetupResolvesConfigFile(t *testing.T) {
 	}
 }
 
-// The Pi-shaped models array: per-model api/contextWindow/maxTokens,
-// apiKey "$NAME" resolution, headers, and the Pi defaults when a
+// The models array: per-model api/contextWindow/maxTokens,
+// apiKey "$NAME" resolution, headers, and the defaults when a
 // model omits a value.
 func TestSetupResolvesModelsArray(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -121,7 +121,7 @@ func TestSetupResolvesModelsArray(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Default: the defaultModel entry, Pi spelling normalised.
+	// Default: the defaultModel entry, with the spelling normalised.
 	a, err := Setup(Params{Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
@@ -162,7 +162,7 @@ func TestSetupResolvesModelsArray(t *testing.T) {
 		t.Fatalf("second model: api %q contextLimit %d maxTokens %d", a2.Cfg.Client.API, a2.ContextLimit, a2.Cfg.Client.MaxTokens)
 	}
 	// A provider without an apiKey ref falls back to OPENAI_API_KEY,
-	// and a model that omits limits gets the Pi defaults.
+	// and a model that omits limits gets the defaults.
 	a3, err := Setup(Params{Root: root, MaxSteps: 5, Provider: "openconsole"})
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +172,7 @@ func TestSetupResolvesModelsArray(t *testing.T) {
 		t.Fatalf("openconsole: key %q model %q", a3.Cfg.Client.APIKey, a3.Cfg.Client.Model)
 	}
 	if a3.ContextLimit != 128000 || a3.Cfg.Client.MaxTokens != 16384 {
-		t.Fatalf("Pi defaults: contextLimit %d maxTokens %d", a3.ContextLimit, a3.Cfg.Client.MaxTokens)
+		t.Fatalf("defaults: contextLimit %d maxTokens %d", a3.ContextLimit, a3.Cfg.Client.MaxTokens)
 	}
 	// Unknown model id on a provider with a list is a setup error.
 	if _, err := Setup(Params{Root: root, MaxSteps: 5, Model: "ghost"}); err == nil {

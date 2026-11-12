@@ -102,7 +102,7 @@ func TestLoadRejectsAPIKey(t *testing.T) {
 }
 
 func TestLoadAcceptsSchema(t *testing.T) {
-	p := write(t, t.TempDir(), "c.json", `{"$schema": "https://pi.dev/schemas/models.schema.json", "providers": {"x": {"baseUrl": "https://example.com", "api": "chat"}}}`)
+	p := write(t, t.TempDir(), "c.json", `{"$schema": "https://example.com/schemas/models.schema.json", "providers": {"x": {"baseUrl": "https://example.com", "api": "chat"}}}`)
 	if _, err := Load(p); err != nil {
 		t.Fatalf("$schema should be accepted and ignored: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestMergeModelsReplacesList(t *testing.T) {
 			},
 		},
 	}
-	// A project list replaces the whole list (Pi-style).
+	// A project list replaces the whole list.
 	project := &File{Providers: map[string]Provider{
 		"discovery": {Models: []Model{{ID: "new-model"}}},
 	}}

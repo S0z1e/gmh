@@ -1,8 +1,8 @@
 // Package rpc speaks JSONL over stdio for a GUI: one JSON object per
 // line on stdin (requests) and stdout (responses and events), LF
-// terminated, split on LF only. Pi's rpc mode does the same, and the
-// MyGo demo client already speaks it, so a GUI written against Pi's
-// protocol needs only small changes to talk to this harness.
+// terminated, split on LF only. The MyGo demo client already speaks it,
+// so a GUI written against this protocol needs only small changes to
+// talk to this harness.
 // Diagnostics go to stderr; stdout carries protocol data only.
 package rpc
 

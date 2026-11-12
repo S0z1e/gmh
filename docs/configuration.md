@@ -1,7 +1,7 @@
-# Configuration file (JSON, Pi-style)
+# Configuration file (JSON)
 
 Model setup lives in a JSON file instead of a dozen exports, following
-Pi's `models.json` shape (see pi.dev/docs/latest/models-configuration).
+the `models.json` shape.
 Two files, merged field by field (project wins where it sets a value):
 
 - global: `~/.minimal-harness/config.json`
@@ -43,11 +43,11 @@ setup fails with "no providers configured". A new provider needs a
 `baseUrl` and an `api` at provider or model level.
 
 Each `models` entry's only required field is `id`. The rest is
-optional, with Pi defaults: `contextWindow` 128000 (drives the
+optional, with defaults: `contextWindow` 128000 (drives the
 compact trigger), `maxTokens` 16384, `reasoning` false,
 `input` `["text"]`. The rest has no default: `name`, `api` and
 `baseUrl` (override the provider's), `effort`, `samplingParams`, `headers`.
-`api` accepts Pi spellings and the harness short names:
+`api` accepts the long spellings and the harness short names:
 `openai-completions` = `chat`, `openai-responses` = `responses`,
 `anthropic-messages` = `anthropic`; `google-generative-ai` is
 rejected — the harness has no client for it.
@@ -59,7 +59,7 @@ When a provider sets no `apiKey`, `OPENAI_API_KEY` is used.
 `$NAME` references; auth headers are never taken from them.
 
 `samplingParams` (e.g. `temperature`, `top_p`) is merged into every
-request body of the two OpenAI modes only — Pi's rule; Anthropic
+request body of the two OpenAI modes only; Anthropic
 ignores it. Structural keys (`model`, `messages`, `tools`, `stream`,
 `max_tokens`, …) are never overridden by it.
 
@@ -82,7 +82,7 @@ environment rates. `input` declares what the model accepts
 [images](images.md)).
 
 Merge rules: a project file's `models` list replaces the provider's
-whole list (Pi-style); a `baseUrl`/`headers`-only override keeps the
+whole list; a `baseUrl`/`headers`-only override keeps the
 provider's models. Values are validated on the merged result, not
 per file. Unknown fields are rejected, so a typo fails fast. A
 `"$schema"` key is accepted and ignored. The top-level `baseUrl` /
@@ -92,7 +92,7 @@ the `providers` map. Other top-level knobs: `mode`
 disables backgrounding), `denyInsteadOfPrompt`, `contextLimit`,
 `anthropicMaxTokens`, `tuiTheme`
 (`default|terminal|catppuccin-mocha`). Precedence is flag >
-environment variable > model value > project file > global file > Pi
+environment variable > model value > project file > global file > the
 default, so existing flag/env usage keeps working unchanged.
 
 With that file in place, `harness` needs nothing but the keys — no

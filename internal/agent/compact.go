@@ -32,7 +32,7 @@ func ShouldCompact(lastPromptTokens, contextLimit int) bool {
 }
 
 // BuildCompactPrompt renders the history plus the 6-section summary
-// instructions (Pi-style) used to produce the compaction summary.
+// instructions used to produce the compaction summary.
 // extras are additional instructions from session_before_compact
 // hooks, already prefixed "[plugin <name>] "; they go after section 6
 // and before the conversation, so a plugin can steer what the

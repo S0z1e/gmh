@@ -1,8 +1,8 @@
-// Package config loads the harness JSON configuration file, Pi-style:
+// Package config loads the harness JSON configuration file:
 // a global file plus a project file that overrides it. The model setup
-// follows Pi's models.json shape (see pi.dev/docs/latest/models-configuration):
+// follows the models.json shape:
 // each provider carries a models array; a model entry's only required
-// field is id, the rest have Pi defaults or are unset.
+// field is id, the rest have defaults or are unset.
 //
 // Files:
 //   - global:  ~/.minimal-harness/config.json
@@ -10,8 +10,8 @@
 //
 // A provider must be configured by the user: there is no built-in
 // default provider. A config with no providers is a setup error.
-// A project file's models array replaces the provider's whole list
-// (Pi-style); a baseUrl/headers-only override keeps the models.
+// A project file's models array replaces the provider's whole list;
+// a baseUrl/headers-only override keeps the models.
 //
 // Example:
 //
@@ -43,7 +43,7 @@
 //
 // The top-level baseUrl/api/model fields are a shorthand for a single
 // provider without the providers map. Precedence everywhere is:
-// flag > environment variable > project file > global file > Pi default
+// flag > environment variable > project file > global file > default
 // (contextWindow 128000, maxTokens 16384). The API key is never a
 // literal in a file: provider apiKey is a "$NAME" environment reference.
 package config
@@ -59,8 +59,7 @@ import (
 	"strings"
 )
 
-// Pi defaults for optional model fields, from the models-configuration
-// reference. A model that omits contextWindow/maxTokens gets these.
+// Defaults for optional model fields. A model that omits contextWindow/maxTokens gets these.
 const (
 	DefaultContextWindow = 128000
 	DefaultMaxTokens     = 16384
@@ -92,8 +91,7 @@ func validPluginName(name string) bool {
 	return validPluginNameRe.MatchString(name)
 }
 
-// The four rates are required when a cost object is present (Pi marks
-// them required); a rate of 0 is a free tier, not an absent one. The
+// The four rates are required when a cost object is present; a rate of 0 is a free tier, not an absent one. The
 // harness parses and stores cost; it is not yet wired into the cost
 // estimate (env rates still drive that).
 type ModelCost struct {
@@ -114,8 +112,8 @@ type CostTier struct {
 	CacheWrite       *float64 `json:"cacheWrite"`
 }
 
-// Model is one model on a provider, Pi's models-entry shape. Only ID
-// is required. ContextWindow/MaxTokens are pointers so "unset" (Pi
+// Model is one model on a provider, in the models-entry shape. Only ID
+// is required. ContextWindow/MaxTokens are pointers so "unset" (the
 // default) is distinguishable from an explicit value.
 type Model struct {
 	ID      string `json:"id"`
@@ -123,7 +121,7 @@ type Model struct {
 	API     string `json:"api"`
 	BaseURL string `json:"baseUrl"`
 	// Reasoning reports whether the model supports thinking
-	// (Pi default false). The harness already handles reasoning
+	// (default false). The harness already handles reasoning
 	// content generically; this is metadata for now.
 	Reasoning bool `json:"reasoning"`
 	// Effort is how hard a reasoning model thinks: low, medium or
@@ -139,7 +137,7 @@ type Model struct {
 	SamplingParams map[string]any    `json:"samplingParams"`
 	Headers        map[string]string `json:"headers"`
 	// Input lists the modalities the model accepts ("text", "image").
-	// Pi default ["text"]. The harness is text-only for now; the
+	// Default ["text"]. The harness is text-only for now; the
 	// field is parsed and stored so a vision-capable model can be
 	// declared.
 	Input []string   `json:"input"`
@@ -166,8 +164,8 @@ type Provider struct {
 // (inherit from the other file, the environment, or the default)
 // from an explicitly set value, including 0 and false.
 type File struct {
-	// Schema is accepted and ignored: Pi files carry
-	// "$schema": "https://pi.dev/schemas/models.schema.json"
+	// Schema is accepted and ignored: config files may carry
+	// "$schema": "https://example.com/schemas/models.schema.json"
 	// for editor validation.
 	Schema          string              `json:"$schema"`
 	DefaultProvider string              `json:"defaultProvider"`
@@ -253,7 +251,7 @@ func LoadExplicit(path string) (*File, error) {
 }
 
 // LoadFor loads the global file, then the project file for root on
-// top of it, field by field (Pi's nested-merge behaviour).
+// top of it, field by field (nested-merge behaviour).
 func LoadFor(root string) (*File, error) {
 	global, err := GlobalPath()
 	if err != nil {
@@ -276,7 +274,7 @@ func LoadFor(root string) (*File, error) {
 
 // Merge applies src on top of dst, field by field. A source field
 // only wins when it is set; provider entries merge per field too.
-// A source models list replaces the provider's whole list (Pi-style):
+// A source models list replaces the provider's whole list:
 // a baseUrl/headers-only override keeps the destination's models.
 func Merge(dst, src *File) {
 	if src.Schema != "" {
@@ -418,11 +416,11 @@ func (f *File) HasProviders() bool {
 	return len(f.Providers) > 0 || f.BaseURL != "" || f.API != "" || f.Model != ""
 }
 
-// NormalizeAPI maps a Pi api spelling ("openai-completions",
+// NormalizeAPI maps an api spelling ("openai-completions",
 // "openai-responses", "anthropic-messages") or a harness short name
 // ("chat", "responses", "anthropic") to the canonical short name.
 // An empty value normalises to "chat". Anything else — including
-// Pi's "google-generative-ai", which the harness has no client for —
+// "google-generative-ai", which the harness has no client for —
 // is an error.
 func NormalizeAPI(api string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(api)) {
@@ -454,11 +452,11 @@ func normalizeEffort(effort string) (string, error) {
 // provider's flat model, else the first models entry. When the
 // provider declares a models list, id must match an entry or the
 // flat model; ok is false otherwise. With no list, any id is fine.
-// Input defaults to ["text"] (Pi); ContextWindow/MaxTokens stay nil
+// Input defaults to ["text"]; ContextWindow/MaxTokens stay nil
 // when unset so the caller can fall back to the config global and
-// then the Pi defaults.
+// then the defaults.
 func (p Provider) ResolveModel(id string) (Model, bool) {
-	// The api is stored canonically (Pi spellings normalised):
+	// The api is stored canonically (spellings normalised):
 	// validation already rejected anything unrecognised.
 	api, _ := NormalizeAPI(p.API)
 	m := Model{API: api, BaseURL: p.BaseURL}

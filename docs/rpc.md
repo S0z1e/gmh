@@ -2,8 +2,8 @@
 
 `harness --rpc` is the machine frontend: one JSON object per line on
 stdin (requests) and stdout (responses and events), LF terminated,
-split on LF only — the same framing as `pi --mode rpc`, so a GUI
-written against Pi's protocol needs only small changes. stdout
+split on LF only, so a GUI
+written against this protocol needs only small changes. stdout
 carries protocol data only; diagnostics go to stderr. `-p` conflicts
 with `--rpc`; `--ui` is ignored.
 
@@ -31,7 +31,7 @@ echoed in the response):
   fails any approval waiting on a dialog, so a turn blocked on
   approval can still be stopped.
 - `clear_queue` → `{"cleared":N}`. Drops queued prompts, keeps
-  control items. Send it before `abort` (Pi's Escape recipe):
+  control items. Send it before `abort`:
   `abort` alone lets queued prompts continue after the turn ends.
 - `get_state` → session/model/api/mode/root, `tool_mode`
   (`"default"` or `"plan"`), `streaming`, `queued`, `messages`,
@@ -69,7 +69,7 @@ echoed in the response):
 - `command` `{"name":"plan","message":""}` → `{"ok":true,"output":"..."}`. Runs a plugin command by name (`message` is the raw args string, the text after `/name`); same as typing `/name` in the REPL. A `/name ...` prompt line behaves the same way.
 - `quit` → `{"ok":true}`, then the process exits 0. It waits for the
   current turn; send `abort` first to quit at once. Closing stdin
-  shuts down the same way (orderly, like Pi's Stop).
+  shuts down the same way (orderly).
 
 Events (stdout):
 - `turn_started` `{"text":"<first 200 runes of the task>"}`.

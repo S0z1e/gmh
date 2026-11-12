@@ -12,7 +12,7 @@ import (
 )
 
 // Project context: the two context-file names the major agents agree
-// on (Pi reads AGENTS.md, Claude Code reads CLAUDE.md), plus a git
+// on (AGENTS.md and CLAUDE.md), plus a git
 // snapshot. They are loaded once at Setup and appended to the system
 // prompt; editing a file mid-session needs a restart, like the skills
 // listing. Each file is capped so a huge context file cannot flood

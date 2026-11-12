@@ -293,7 +293,7 @@ func TestAnthropicEndpointNormalisation(t *testing.T) {
 	}
 }
 
-// SamplingParams apply only to OpenAI-compatible APIs (Pi rule):
+// SamplingParams apply only to OpenAI-compatible APIs:
 // the Anthropic body must not carry them.
 func TestAnthropicIgnoresSamplingParams(t *testing.T) {
 	var body map[string]any

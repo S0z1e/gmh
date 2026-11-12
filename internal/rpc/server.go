@@ -171,7 +171,7 @@ func (s *Server) readLoop() {
 			s.handleLine(line)
 		}
 		if err != nil {
-			// EOF or read error: orderly shutdown, like Pi's Stop.
+			// EOF or read error: orderly shutdown.
 			s.shutdown()
 			return
 		}
@@ -379,7 +379,7 @@ func (s *Server) handleAbort(req Request) {
 // and by then the queued prompt it was meant to drop has already
 // started. Drained prompts never settle, so they leave the
 // outstanding count here instead of in runTurn. The running turn
-// is untouched: only abort cancels it (the Pi Escape recipe is
+// is untouched: only abort cancels it (send
 // clear_queue first, then abort).
 func (s *Server) handleClearQueue(req Request) {
 	cleared := s.drainPrompts()

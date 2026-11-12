@@ -17,18 +17,18 @@ import (
 const (
 	// MaxWebfetchBytes caps one fetched page at the transport layer:
 	// nobody should download the whole internet into one tool call
-	// (opencode and Pi both use 5 MB here). The old 64 KiB cap cut
+	// (opencode also uses 5 MB here). The old 64 KiB cap cut
 	// the raw HTML before conversion, so on real doc pages the
 	// model got 64 KiB of navigation junk and never saw the article.
 	MaxWebfetchBytes = 5 << 20
 	// MaxWebfetchPageChars is one page of converted text handed to
-	// the model per call (Pi's default is 30k). The cap applies
+	// the model per call (the default is 30k). The cap applies
 	// AFTER conversion, and offset pages through the rest — so a
 	// long article is readable in slices instead of losing its tail
 	// to the navigation junk up front.
 	MaxWebfetchPageChars = 30000
 	// WebfetchCacheTTL is how long a fetched page is reused (Claude
-	// Code and Pi-web both cache 15 minutes): repeated fetches and
+	// Code's web fetch also caches 15 minutes): repeated fetches and
 	// offset paging do not re-download the page.
 	WebfetchCacheTTL = 15 * time.Minute
 	// MaxWebfetchCacheEntries bounds the in-memory cache; the oldest

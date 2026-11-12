@@ -378,7 +378,7 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.markWorking()
 	case agent.EventThinkingEnd:
 		// The authoritative full text replaces the accumulated
-		// deltas (same rule as Pi's thinking_end).
+		// deltas (same rule as the thinking_end event).
 		m.liveThinking = ev.Text
 		m.markWorking()
 	case agent.EventToolStart:

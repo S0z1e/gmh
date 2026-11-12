@@ -69,7 +69,7 @@ type App struct {
 	Skills       []skills.Skill
 	ContextLimit int
 	Root         string
-	// Model is the resolved model entry (Pi shape): id, api, baseUrl,
+	// Model is the resolved model entry: id, api, baseUrl,
 	// contextWindow, maxTokens, samplingParams, headers, input, cost.
 	Model config.Model
 	// Config is the loaded config file, kept so /model can re-resolve
@@ -186,7 +186,7 @@ func Setup(p Params) (*App, error) {
 	}
 
 	// API shape: flag > env > model/provider. A provider needs an
-	// api at provider or model level (Pi); there is no silent default.
+	// api at provider or model level; there is no silent default.
 	rawAPI := p.API
 	if rawAPI == "" {
 		rawAPI = os.Getenv("OPENAI_API_MODE")
@@ -332,7 +332,7 @@ func Setup(p Params) (*App, error) {
 		deny = true
 	}
 
-	// MaxTokens: env > model > config > Pi default 16384. All three
+	// MaxTokens: env > model > config > default 16384. All three
 	// modes send it now: chat as max_tokens, responses as
 	// max_output_tokens, anthropic as max_tokens.
 	maxTokens := 0
@@ -504,7 +504,7 @@ func (a *App) FindModel(modelID string) (string, bool) {
 }
 
 // SwitchModel rebuilds the client for another provider/model
-// mid-session, Pi-style (/model). History is kept: it is stored
+// mid-session (/model). History is kept: it is stored
 // API-agnostic and replayed through the new model's API on the next
 // turn, like a --resume across providers. Only the model, client,
 // context limit and image-input flag change; session, skills and

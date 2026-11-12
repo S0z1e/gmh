@@ -18,8 +18,8 @@
   consecutive same-role messages merge into one (Anthropic requires
   strict user/assistant alternation), an empty tool result replays as
   `(no output)`, and thinking blocks are skipped on replay (they were
-  never persisted — thinking is display-only). `max_tokens` defaults to 16384
-  (Pi's default), or `ANTHROPIC_MAX_TOKENS`.
+  never persisted — thinking is display-only). `max_tokens` defaults to 16384,
+  or `ANTHROPIC_MAX_TOKENS`.
 - Stream integrity: a chat stream that ends without `[DONE]`, a
   Responses stream without `response.completed`, or an Anthropic
   stream without `message_stop`, is an error, not a silently
