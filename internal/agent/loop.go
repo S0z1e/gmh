@@ -230,8 +230,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		// Send the truncated view to the LLM; the full history stays
 		// in msgs and in the session file. The cap is uniform (see
 		// truncate.go): a result's sent form never changes after
-		// its first send, so the cached prefix stays valid.
+		// its first send, so the cached prefix stays valid. Old tool
+		// results are then pruned to a fixed placeholder once the
+		// history passes the prune threshold, which bounds prompt
+		// growth on long runs; the prune's block boundaries are
+		// frozen, so the sent view stays append-only between prunes.
 		apiMsgs := truncateToolResults(msgs, toolResultMaxChars)
+		apiMsgs = pruneOldToolResults(apiMsgs, pruneThresholdChars, pruneBlockChars, pruneKeepNewestBlocks)
 		err := c.Client.Stream(ctx, apiMsgs, c.Tools, func(s string) {
 			c.emit(Event{Kind: EventTextDelta, Text: s})
 		}, func(m llm.Message, u llm.Usage) {
