@@ -101,6 +101,10 @@ func TestStopHookCapAllowsEnd(t *testing.T) {
 // TestThreeFailedFixAttemptsMarkBlocked: the model calls read on a
 // missing file three turns in a row; the third all-failed step ends
 // the turn with a structured "blocked" reason instead of looping.
+// The turn then makes one blocked-grace call (the 4th LLM call):
+// this fake server answers every call with a tool call, so the
+// grace yields no text and the fallback keeps the empty text —
+// the blocked error and reason are unchanged.
 func TestThreeFailedFixAttemptsMarkBlocked(t *testing.T) {
 	root := t.TempDir()
 	var calls int32
@@ -119,12 +123,15 @@ func TestThreeFailedFixAttemptsMarkBlocked(t *testing.T) {
 	}
 	var events []Event
 	cfg.OnEvent = func(e Event) { events = append(events, e) }
-	_, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "go"}})
+	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "go"}})
 	if err == nil || !strings.Contains(err.Error(), "blocked") {
 		t.Fatalf("err = %v, want a blocked error", err)
 	}
-	if calls != MaxFailedFixAttempts {
-		t.Fatalf("LLM calls = %d, want %d", calls, MaxFailedFixAttempts)
+	if calls != MaxFailedFixAttempts+1 {
+		t.Fatalf("LLM calls = %d, want %d (three failed steps + one grace attempt)", calls, MaxFailedFixAttempts+1)
+	}
+	if text != "" {
+		t.Fatalf("final text = %q, want empty (the grace call answered with a tool call, not text)", text)
 	}
 	if cfg.LastTerminalReason != TerminalBlocked {
 		t.Fatalf("LastTerminalReason = %q, want blocked", cfg.LastTerminalReason)

@@ -14,11 +14,11 @@ import (
 // Short output is returned whole, with the header naming the file.
 func TestFormatBashOutputShort(t *testing.T) {
 	head := []string{"line 1", "line 2"}
-	got := FormatBashOutput(2, 13, false, head, head, "/sessions/s1/bash-output/bash-1-1.log")
+	got := FormatBashOutput(2, 13, false, head, head, "/sessions/s1/bash-output/bash-1-1.log", "/work")
 	if !strings.Contains(got, "line 1\nline 2") {
 		t.Fatalf("short output not whole:\n%s", got)
 	}
-	if !strings.Contains(got, "[bash output: 2 lines, 13 bytes; full output in /sessions/s1/bash-output/bash-1-1.log]") {
+	if !strings.Contains(got, "[bash output: 2 lines, 13 bytes; full output in /sessions/s1/bash-output/bash-1-1.log; cwd: /work]") {
 		t.Fatalf("header missing or wrong:\n%s", got)
 	}
 	if strings.Contains(got, "showing first") {
@@ -35,7 +35,7 @@ func TestFormatBashOutputLong(t *testing.T) {
 	for i := 371; i <= 400; i++ {
 		tail = append(tail, fmt.Sprintf("tail %d", i))
 	}
-	got := FormatBashOutput(400, 4000, false, head, tail, "/sessions/s1/bash-output/bash-1-2.log")
+	got := FormatBashOutput(400, 4000, false, head, tail, "/sessions/s1/bash-output/bash-1-2.log", "/work")
 	if !strings.Contains(got, "head 1") || !strings.Contains(got, "head 30") {
 		t.Fatalf("head missing:\n%s", got)
 	}
@@ -48,15 +48,15 @@ func TestFormatBashOutputLong(t *testing.T) {
 	if !strings.Contains(got, "showing first 30 and last 30 of 400 lines") {
 		t.Fatalf("marker missing:\n%s", got)
 	}
-	if !strings.Contains(got, "400 lines, 4000 bytes; full output in /sessions/s1/bash-output/bash-1-2.log") {
+	if !strings.Contains(got, "400 lines, 4000 bytes; full output in /sessions/s1/bash-output/bash-1-2.log; cwd: /work") {
 		t.Fatalf("header missing:\n%s", got)
 	}
 }
 
 // Empty output is just the header.
 func TestFormatBashOutputEmpty(t *testing.T) {
-	got := FormatBashOutput(0, 0, false, nil, nil, "/sessions/s1/bash-output/bash-1-3.log")
-	if !strings.Contains(got, "[bash output: 0 lines, 0 bytes; full output in /sessions/s1/bash-output/bash-1-3.log]") {
+	got := FormatBashOutput(0, 0, false, nil, nil, "/sessions/s1/bash-output/bash-1-3.log", "/work")
+	if !strings.Contains(got, "[bash output: 0 lines, 0 bytes; full output in /sessions/s1/bash-output/bash-1-3.log; cwd: /work]") {
 		t.Fatalf("empty header wrong:\n%s", got)
 	}
 	if strings.Contains(got, "showing first") {
@@ -67,7 +67,7 @@ func TestFormatBashOutputEmpty(t *testing.T) {
 // One enormous line is capped inline (the file keeps it whole).
 func TestFormatBashOutputHugeLine(t *testing.T) {
 	huge := strings.Repeat("x", 100000)
-	got := FormatBashOutput(1, 100000, false, []string{capLine(huge)}, []string{capLine(huge)}, "/p.log")
+	got := FormatBashOutput(1, 100000, false, []string{capLine(huge)}, []string{capLine(huge)}, "/p.log", "/work")
 	if len(got) > bashOutputInlineMaxChars+1000 {
 		t.Fatalf("inline result = %d chars, want it bounded near %d", len(got), bashOutputInlineMaxChars)
 	}

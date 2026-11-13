@@ -152,8 +152,11 @@ arrived, a later error ends the turn instead. A turn that still fails reports
   carries no `error` string: cancellation is semantic, not an error.
   Any other failure is in `error`. `text` is the turn's final answer
   even when the turn ended in error: on `"max_turns"` it is the
-  step-cap grace summary, on `"error"` or `"blocked"` the model's
-  last message — empty only when the turn produced no text. The GUI waits for this event, never for the
+  step-cap grace summary, on `"blocked"` it is the blocked-grace
+  summary (what was verified, what failed, what is left — the grace
+  prompt names the blocked reason and the last errors), on `"error"`
+  the model's last message — empty only when the turn produced no
+  text and the grace call (if any) failed too. The GUI waits for this event, never for the
   `prompt` response. `tool_mode` is the loop's tool mode at the end
   of the turn, so the GUI knows which tools the next turn offers.
 - `compacted` `{"messages":N,"summary_tokens":N}` — a compaction

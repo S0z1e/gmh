@@ -193,6 +193,11 @@ func (e *Executor) Read(a ReadArgs) (string, error) {
 type WriteArgs struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+	// Overwrite replaces an existing file instead of failing.
+	// Default false: writing to an existing file is an error, and
+	// the model should use edit. Set it only to replace a whole
+	// file; a small change belongs in edit.
+	Overwrite bool `json:"overwrite,omitempty"`
 }
 
 func (e *Executor) Write(a WriteArgs) (string, error) {
@@ -200,7 +205,8 @@ func (e *Executor) Write(a WriteArgs) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := os.Stat(p); err == nil {
+	_, statErr := os.Stat(p)
+	if statErr == nil && !a.Overwrite {
 		return "", fmt.Errorf("file exists, use edit instead: %s", a.Path)
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -208,6 +214,9 @@ func (e *Executor) Write(a WriteArgs) (string, error) {
 	}
 	if err := os.WriteFile(p, []byte(a.Content), 0o644); err != nil {
 		return "", err
+	}
+	if statErr == nil {
+		return "overwrote " + a.Path, nil
 	}
 	return "wrote " + a.Path, nil
 }
@@ -442,6 +451,13 @@ func intsString(ns []int) string {
 type BashArgs struct {
 	Command string `json:"command"`
 	Timeout int    `json:"timeout,omitempty"` // seconds, default 120, max 600
+	// Cwd runs the command in this directory instead of the
+	// workspace root. A relative path resolves against the root.
+	// Every bash call is a fresh shell starting in the root, and
+	// cd does not persist between calls, so a bare `npm run build`
+	// in a nested project fails with "Missing script" — pass cwd
+	// (or prefix the command with `cd <dir> && `) instead.
+	Cwd string `json:"cwd,omitempty"`
 	// Background starts the command in the background and returns
 	// at once with a job id, for commands that will not exit on
 	// their own (dev server, watcher). The result is delivered
@@ -450,6 +466,38 @@ type BashArgs struct {
 	// timeout: a dev server must outlive any cap (a per-call
 	// timeout, when given, is still honored).
 	Background bool `json:"background,omitempty"`
+}
+
+// bashDir resolves the effective working directory for one bash
+// call: the per-call cwd argument, or the workspace root when
+// unset. A relative cwd resolves against the root. It must exist
+// and be a directory; under the sandbox it must also stay inside
+// the root, because only the root is bound into the jail. The
+// shell itself is not jailed outside the sandbox — an approved
+// bash call can cd anywhere — so cwd is validated, not jailed.
+func (e *Executor) bashDir(a BashArgs) (string, error) {
+	dir := e.Root
+	if strings.TrimSpace(a.Cwd) != "" {
+		dir = a.Cwd
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(e.Root, dir)
+		}
+		dir = filepath.Clean(dir)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("invalid cwd %q: %v", a.Cwd, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("invalid cwd %q: not a directory", a.Cwd)
+	}
+	if e.Sandbox {
+		rel, err := filepath.Rel(e.Root, dir)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("invalid cwd %q: outside workspace root (sandbox)", a.Cwd)
+		}
+	}
+	return dir, nil
 }
 
 // bashTimeout resolves the effective timeout for one bash call:
@@ -475,8 +523,13 @@ func (e *Executor) Bash(ctx context.Context, a BashArgs) (string, error) {
 		e.audit(AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
 		return "", fmt.Errorf("denied by policy: %s (this is harm reduction, not a sandbox — see README)", reason)
 	}
+	dir, err := e.bashDir(a)
+	if err != nil {
+		e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
+		return "", err
+	}
 	timeout := e.bashTimeout(a)
-	s, exitCode, err := e.runBashCmd(ctx, a.Command, timeout, e.nextOutputFile())
+	s, exitCode, err := e.runBashCmd(ctx, a.Command, timeout, e.nextOutputFile(), dir)
 	var te *timeoutError
 	switch {
 	case errors.As(err, &te):

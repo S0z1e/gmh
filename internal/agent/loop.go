@@ -92,9 +92,9 @@ func (c *Config) emit(e Event) {
 func ToolDefs() []llm.ToolDef {
 	return []llm.ToolDef{
 		llm.Tool("read", "Read a file (with offset/limit) or list a directory. Image files (png, jpg, gif, webp) are returned as an image you can see, not as text — use read to look at a screenshot or photo.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}`),
-		llm.Tool("write", "Create a NEW file. Fails if the file exists; use edit then.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}`),
+		llm.Tool("write", "Create a file. By default it fails if the file already exists — use edit then. Pass overwrite:true to replace an existing file wholesale; prefer edit for a small change.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["path","content"]}`),
 		llm.Tool("edit", "Replace text in an existing file. Two forms: oldText (replaced exactly once) or startLine/endLine (1-based, inclusive; endLine defaults to startLine) to replace those lines with newText, ignoring oldText. After a read, prefer the line form: line numbers cannot go stale the way oldText can.", `{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}},"required":["path","newText"]}`),
-		llm.Tool("bash", "Run a shell command in the workspace root. Timeout in seconds, default 120, max 600; a background:true job has no timeout unless one is passed. Pass background:true for a command that will not exit on its own (dev server, watcher): it returns at once with a job id, and its output is delivered at the next step. A never-ending job never blocks the turn from ending: the turn ends after a short drain wait, and you can read its partial output from the output file.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"},"background":{"type":"boolean"}},"required":["command"]}`),
+		llm.Tool("bash", "Run a shell command in the workspace root. Each call is a fresh shell; cd does not persist between calls — pass cwd to run in a subdirectory, or prefix the command with `cd <dir> && `. Timeout in seconds, default 120, max 600; a background:true job has no timeout unless one is passed. Pass background:true for a command that will not exit on its own (dev server, watcher): it returns at once with a job id, and its output is delivered at the next step. A never-ending job never blocks the turn from ending: the turn ends after a short drain wait, and you can read its partial output from the output file. Every result header names the directory the call ran in.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"},"background":{"type":"boolean"},"cwd":{"type":"string"}},"required":["command"]}`),
 		llm.Tool("grep", "Search file contents with a regex. Prefer this over bash grep/rg. Returns file:line matches, capped (truncation is marked).", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"},"exclude":{"type":"string"},"context":{"type":"integer"},"maxMatches":{"type":"integer"}},"required":["pattern"]}`),
 		llm.Tool("glob", "List files matching a glob pattern, e.g. **/*.go. Prefer this over bash find/ls for discovering files.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer"}},"required":["pattern"]}`),
 		llm.Tool("load_skill", "Load the full text of an available skill by name when its guidance is needed for the current task. The skill names and one-line descriptions are in the system prompt. Pass reference (a file name from the skill's references/ footer) to read one reference file instead of the whole skill.", `{"type":"object","properties":{"name":{"type":"string"},"reference":{"type":"string"}},"required":["name"]}`),
@@ -621,6 +621,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 	// failed (a step with any success resets it).
 	stopBlocks := 0
 	failedFixes := 0
+	// breaker counts failed tool calls per fingerprint within
+	// this turn (a new breaker per Run: counts never leak into
+	// the next turn). lastErrors keeps the last few failed
+	// observations for the blocked-grace summary.
+	breaker := NewFailureBreaker()
+	var lastErrors []string
 
 	for step := 0; !hasCap || step < steps; step++ {
 		// Finished background jobs report in at the next step,
@@ -811,6 +817,32 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 			argsJSON = useArgs
 			tc.Function.Arguments = argsJSON
 			callKey := CanonicalToolKey(tc.Function.Name, argsJSON)
+			// Repeat-failure circuit breaker: a call that already
+			// failed FailureDenyAfter times this turn is denied
+			// before it runs — repeating it cannot make progress,
+			// and the turn must not burn steps on it. Unlike the
+			// doom-loop denial, this does not end the turn: the
+			// model gets the denial as a tool error and can try
+			// something else. It counts as a failed fix attempt
+			// for the blocked guard (the model did try to fix
+			// something; the harness refused on evidence of prior
+			// failure), unlike a hook/approval denial, which never
+			// executed. Checked before approval, so the user is
+			// never asked about a call that will be denied.
+			if denied, failures := breaker.Check(callKey); denied {
+				obs := RepeatedFailureDeniedMessage(tc.Function.Name, failures)
+				if c.Session != nil {
+					_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool failure denied"})
+				}
+				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: ErrRepeatedToolFailureDenied})
+				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
+				if c.Session != nil {
+					_ = c.Session.Append(msgs[len(msgs)-1])
+				}
+				stepHadExecution = true
+				recordLastError(&lastErrors, obs)
+				continue
+			}
 			if c.needsApproval(tc.Function.Name) {
 				prompt := fmt.Sprintf("Run %s %s?", tc.Function.Name, truncate(tc.Function.Arguments, 200))
 				c.emit(Event{Kind: EventApproval, Text: prompt})
@@ -878,17 +910,28 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 					obs = c.Exec.Plugins.RunToolResultHooks(ctx, tc.Function.Name, argsJSON, obs, err)
 				}
 			}
-			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count})
 			// A finished (not backgrounded) call whose observation
 			// differs from the previous one for the same call is
-			// making progress: the doom-loop streak clears.
+			// making progress: the doom-loop streak clears. A
+			// backgrounded call has no result yet, so neither
+			// guard sees it here — its result surfaces later as a
+			// user message, not a tool result.
 			if job == nil {
 				c.DoomLoop().Observe(callKey, obs)
 				stepHadExecution = true
-				if err == nil && !strings.HasPrefix(obs, "Error:") {
+				failed := err != nil || strings.HasPrefix(obs, "Error:")
+				if failed {
+					failures := breaker.ObserveFailure(callKey)
+					if failures >= FailureWarnAfter {
+						obs += "\n" + FailureNote(tc.Function.Name, failures)
+					}
+					recordLastError(&lastErrors, obs)
+				} else {
 					stepAllFailed = false
+					breaker.ObserveSuccess(callKey)
 				}
 			}
+			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count})
 			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 			if c.Session != nil {
 				_ = c.Session.Append(msgs[len(msgs)-1])
@@ -920,8 +963,24 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				if len(pending) > 0 {
 					_, _ = c.drainPending(ctx, msgs, pending)
 				}
-				c.LastTerminalReason = TerminalBlocked
 				blocked := fmt.Errorf("task blocked: %d consecutive steps ended with only failed tool calls; the last error was not fixed by retrying", MaxFailedFixAttempts)
+				// Blocked-grace summary, mirroring the step-cap
+				// grace: a turn that ends blocked otherwise
+				// settles with whatever text the last tool-call
+				// step had — usually nothing — so the GUI gets
+				// no report at all (the bookstore run's verify
+				// turn settled blocked with an empty text). One
+				// tool-less final call asks for a short summary
+				// of what was verified, what failed and what is
+				// left; it is not persisted, and a failed grace
+				// call changes nothing.
+				if ctx.Err() == nil {
+					if graceText, graceUsage, ok := c.graceCall(ctx, msgs, blockedGracePrompt(blocked, lastErrors)); ok {
+						lastText = graceText
+						total.Add(graceUsage)
+					}
+				}
+				c.LastTerminalReason = TerminalBlocked
 				c.emit(Event{Kind: EventError, Err: blocked, Text: lastText, TerminalReason: TerminalBlocked})
 				return lastText, total, blocked
 			}
@@ -945,7 +1004,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 	// text (and its usage) is the grace answer instead of the last
 	// tool-call step's text. A failed grace call changes nothing.
 	if ctx.Err() == nil {
-		if graceText, graceUsage, ok := c.graceCall(ctx, msgs); ok {
+		if graceText, graceUsage, ok := c.graceCall(ctx, msgs, "You have reached the step limit. Give your best final answer now, summarising what was done and what remains unfinished. Do not call any more tools."); ok {
 			lastText = graceText
 			total.Add(graceUsage)
 		}
@@ -956,14 +1015,17 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 	return lastText, total, capped
 }
 
-// graceCall makes the one tool-less final call after the step cap.
-// It returns the model's final text, its usage, and whether the
-// call succeeded. The call runs under a 60-second timeout.
-func (c *Config) graceCall(ctx context.Context, msgs []llm.Message) (string, llm.Usage, bool) {
+// graceCall makes the one tool-less final call after the step cap
+// (or a blocked turn). It returns the model's final text, its
+// usage, and whether the call succeeded. The call runs under a
+// 60-second timeout. The instruction is the caller's: the cap asks
+// for a best final answer, the blocked turn for a summary of what
+// was verified, what failed and what is left.
+func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction string) (string, llm.Usage, bool) {
 	graceCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	graceMsgs := append(append([]llm.Message{}, msgs...),
-		llm.Message{Role: "user", Content: "You have reached the step limit. Give your best final answer now, summarising what was done and what remains unfinished. Do not call any more tools."})
+		llm.Message{Role: "user", Content: instruction})
 	apiMsgs := truncateToolResults(graceMsgs, toolResultMaxChars)
 	apiMsgs = pruneOldToolResults(apiMsgs, pruneThresholdChars, pruneBlockChars, pruneKeepNewestBlocks)
 	var final llm.Message
@@ -988,6 +1050,32 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message) (string, llm
 	}
 	c.emit(Event{Kind: EventStepUsage, Usage: usage})
 	return final.Content, usage, true
+}
+
+// blockedGracePrompt builds the blocked turn's grace instruction
+// from the blocked error and the last failed observations, so the
+// summary names what actually failed instead of guessing.
+func blockedGracePrompt(blocked error, lastErrors []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "The task was blocked: %v. ", blocked)
+	if len(lastErrors) > 0 {
+		b.WriteString("The last errors were:\n")
+		for _, e := range lastErrors {
+			fmt.Fprintf(&b, "- %s\n", e)
+		}
+	}
+	b.WriteString("Give a short summary: what was verified or completed, what failed and why, and what is left to do. Do not call any more tools.")
+	return b.String()
+}
+
+// recordLastError keeps the last few failed observations for the
+// blocked-grace summary, newest last, each capped so the prompt
+// stays small.
+func recordLastError(errs *[]string, obs string) {
+	*errs = append(*errs, truncate(obs, 500))
+	if len(*errs) > 3 {
+		*errs = (*errs)[len(*errs)-3:]
+	}
 }
 
 func truncate(s string, n int) string {

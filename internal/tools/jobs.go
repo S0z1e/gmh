@@ -264,7 +264,7 @@ func (e *outputCapError) Error() string {
 // runs against a temporary file that is deleted afterwards, and the
 // result is the old in-memory behaviour: whole output capped at
 // MaxOutBytes, no path.
-func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration, outPath string) (string, int, error) {
+func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration, outPath, dir string) (string, int, error) {
 	runCtx := ctx
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -277,11 +277,11 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		if bwrap == "" {
 			bwrap = "bwrap"
 		}
-		args := append(sandboxArgs(e.Root), "--", "bash", "-c", command)
+		args := append(sandboxArgs(e.Root, dir), "--", "bash", "-c", command)
 		cmd = exec.CommandContext(runCtx, bwrap, args...)
 	} else {
 		cmd = exec.CommandContext(runCtx, "bash", "-c", command)
-		cmd.Dir = e.Root
+		cmd.Dir = dir
 	}
 	// Own process group, killed as a whole on timeout/abort (see
 	// Cancel below). Without this, only the direct bash child died
@@ -372,7 +372,7 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	if scanErr != nil {
 		return "", exitCode, scanErr
 	}
-	s := FormatBashOutput(lines, bytes, fileCapped, head, tail, outPath)
+	s := FormatBashOutput(lines, bytes, fileCapped, head, tail, outPath, dir)
 	if capHit.get() {
 		return s, -1, &outputCapError{bytes: bytes}
 	}
@@ -442,6 +442,11 @@ func (e *Executor) BashBackground(ctx context.Context, a BashArgs) (*Job, error)
 		e.audit(AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
 		return nil, fmt.Errorf("denied by policy: %s (this is harm reduction, not a sandbox — see README)", reason)
 	}
+	dir, err := e.bashDir(a)
+	if err != nil {
+		e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
+		return nil, err
+	}
 	timeout := e.bashTimeout(a)
 	if a.Background && a.Timeout == 0 {
 		// Explicit background with no per-call timeout: no
@@ -470,7 +475,7 @@ func (e *Executor) BashBackground(ctx context.Context, a BashArgs) (*Job, error)
 		// the same ctx and cannot be told apart here); they run to
 		// their timeout or completion, and their results surface
 		// at the next turn via the Run-start re-attach.
-		out, exitCode, err := e.runBashCmd(context.Background(), a.Command, timeout, outPath)
+		out, exitCode, err := e.runBashCmd(context.Background(), a.Command, timeout, outPath, dir)
 		var te *timeoutError
 		switch {
 		case errors.As(err, &te):

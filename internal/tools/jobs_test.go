@@ -229,3 +229,61 @@ func procDead(pid int) bool {
 	}
 	return false
 }
+
+// The cwd argument runs the command in that directory (relative
+// paths resolve against the root), the result header names the
+// directory it ran in, and a bad cwd is a clean tool error, never
+// a crash. The default (no cwd) keeps running in the root.
+func TestBashCwd(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "proj")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outDir := filepath.Join(root, "out")
+	e := &Executor{Root: root, OutputDir: outDir}
+
+	out, err := e.Bash(context.Background(), BashArgs{Command: "pwd", Cwd: "proj"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, sub+"\n") && !strings.Contains(out, sub) {
+		t.Fatalf("pwd with cwd=proj:\n%s\nwant it to run in %s", out, sub)
+	}
+	if !strings.Contains(out, "cwd: "+sub) {
+		t.Fatalf("result header has no cwd:\n%s", out)
+	}
+
+	out, err = e.Bash(context.Background(), BashArgs{Command: "pwd", Cwd: sub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "cwd: "+sub) {
+		t.Fatalf("absolute cwd missing from header:\n%s", out)
+	}
+
+	// Default: the root, and the header says so.
+	out, err = e.Bash(context.Background(), BashArgs{Command: "pwd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "cwd: "+root) {
+		t.Fatalf("default cwd missing from header:\n%s", out)
+	}
+
+	// A nonexistent cwd and a cwd that is a file are tool errors.
+	if _, err := e.Bash(context.Background(), BashArgs{Command: "pwd", Cwd: "nope"}); err == nil || !strings.Contains(err.Error(), "invalid cwd") {
+		t.Fatalf("missing cwd error = %v, want an 'invalid cwd' error", err)
+	}
+	f := filepath.Join(root, "a.txt")
+	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Bash(context.Background(), BashArgs{Command: "pwd", Cwd: "a.txt"}); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("file cwd error = %v, want a 'not a directory' error", err)
+	}
+	// A background job with a bad cwd fails at start, never in a goroutine.
+	if _, err := e.BashBackground(context.Background(), BashArgs{Command: "pwd", Cwd: "nope"}); err == nil || !strings.Contains(err.Error(), "invalid cwd") {
+		t.Fatalf("background bad cwd error = %v, want an 'invalid cwd' error", err)
+	}
+}

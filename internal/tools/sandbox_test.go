@@ -11,7 +11,7 @@ import (
 
 func TestSandboxArgs(t *testing.T) {
 	root := "/tmp/ws/root"
-	args := sandboxArgs(root)
+	args := sandboxArgs(root, root)
 	want := []string{
 		"--tmpfs", "/",
 		"--ro-bind", "/usr", "/usr",
@@ -37,6 +37,11 @@ func TestSandboxArgs(t *testing.T) {
 		if args[i] != want[i] {
 			t.Fatalf("sandboxArgs[%d] = %q, want %q", i, args[i], want[i])
 		}
+	}
+	// A cwd inside the root changes only the --chdir.
+	sub := sandboxArgs(root, root+"/proj")
+	if sub[len(sub)-8] != "--chdir" || sub[len(sub)-7] != root+"/proj" {
+		t.Fatalf("sandboxArgs with subdir chdir = %v, want --chdir %s", sub, root+"/proj")
 	}
 }
 

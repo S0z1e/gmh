@@ -169,14 +169,17 @@ func scanOutputFile(path string) (lines int, bytes int64, capped bool, head, tai
 }
 
 // FormatBashOutput renders the inline result for a finished (or
-// timed-out) bash call: a header line with the totals and the
-// output file's path, then the whole output when it is short, else
-// head + tail with a marker. The header comes first so it survives
-// every downstream cap (agent capText and RPC capOutput both keep
-// head + tail).
-func FormatBashOutput(lines int, bytes int64, fileCapped bool, head, tail []string, path string) string {
+// timed-out) bash call: a header line with the totals, the output
+// file's path and the directory the call ran in, then the whole
+// output when it is short, else head + tail with a marker. The
+// header comes first so it survives every downstream cap (agent
+// capText and RPC capOutput both keep head + tail). The cwd is in
+// the header because every call is a fresh shell starting in the
+// workspace root: without it the model cannot tell a bare `npm run
+// build` ran in the wrong directory.
+func FormatBashOutput(lines int, bytes int64, fileCapped bool, head, tail []string, path, cwd string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "[bash output: %d lines, %d bytes; full output in %s]", lines, bytes, path)
+	fmt.Fprintf(&b, "[bash output: %d lines, %d bytes; full output in %s; cwd: %s]", lines, bytes, path, cwd)
 	if fileCapped {
 		fmt.Fprintf(&b, " [output file capped at %d bytes]", OutputFileMaxBytes)
 	}

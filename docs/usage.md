@@ -36,7 +36,10 @@
   instead of re-reading the file) or `startLine`/`endLine` (1-based,
   inclusive; `endLine` defaults to `startLine`) to replace those
   lines with `newText`. After a `read`, prefer the line form: it
-  cannot go stale the way `oldText` can. Run builds and tests bare,
+  cannot go stale the way `oldText` can. `write` takes
+  `overwrite:true` to replace an existing file wholesale (default:
+  it fails if the file exists — use `edit` then); prefer `edit` for
+  a small change. Run builds and tests bare,
   never piped through `head`/`tail`, so the exit code is visible.
 - Skills: put `SKILL.md` files under `.agents/skills/<name>/` in the
   project, or `~/.config/minimal-harness/skills/`. Only name +
@@ -83,7 +86,27 @@
   `-max-steps N` to opt into a hard cap; when a cap hits, the model
   gets one final tool-less call (60s) to summarise what was done,
   then the turn ends `max_turns` — the same shape as OpenCode's
-  final step.
+  final step. A turn that ends `blocked` gets the same treatment:
+  one tool-less call (60s) whose prompt names the blocked reason
+  and the last errors, so the settled text is a short summary of
+  what was verified, what failed and what is left — a blocked turn
+  used to settle with an empty text and no report at all. A failed
+  grace call changes nothing in either case.
+- Repeat-failure circuit breaker (after Qoder's denial circuit
+  breaker, adapted): the doom-loop guard only sees consecutive
+  repeats, so a call that keeps failing with other work in between
+  never trips it. The breaker counts failures per tool call
+  (tool name + canonical arguments) within one turn: the 2nd
+  failure warns in the observation, and the 4th identical attempt
+  is denied before it runs, as a tool error with reason
+  `repeated_tool_failure_denied` — distinct from the doom-loop
+  guard's `repeated_tool_call_denied`, which means the continuation
+  was refused. A success clears the count, and counts reset every
+  turn. A denied call counts as a failed fix attempt for the
+  blocked guard, so three consecutive denied-or-failed steps still
+  end the turn `blocked`. The breaker never touches the LLM retry
+  path (`step_retry`/idle): that counts failed LLM calls, not tool
+  calls, and works independently.
 - Timeouts: a model entry may set `timeoutSeconds` (total per-request
   cap, default 600) and `idleTimeoutSeconds` (silence cap while
   streaming, default 60). A stream that produces no SSE line for the
@@ -108,7 +131,14 @@
   (per-call `timeout`, `bashTimeoutSeconds`, or
   `OPENAI_BASH_TIMEOUT_SECONDS`); a timeout kills the whole
   process group, so a command's grandchildren die with it. Every
-  bash call writes its full stdout+stderr to a per-call file under
+  bash call is a fresh shell starting in the workspace root — `cd`
+  does not persist between calls, so a bare `npm run build` in a
+  nested project fails with "Missing script: build". Pass `cwd` to
+  run in a subdirectory (relative paths resolve against the root),
+  or prefix the command with `cd <dir> && `; an invalid cwd is a
+  tool error. Every bash result header names the directory the call
+  ran in (`cwd: ...`), so a wrong-directory run is visible at once.
+  Every bash call writes its full stdout+stderr to a per-call file under
   the session's `bash-output/` directory; the result shows only the
   first and last 30 lines plus the path. Read the file to see the
   middle, or the partial output of a job that is still running. A

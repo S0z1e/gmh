@@ -32,7 +32,7 @@ import (
 // in-process and are jailed to the root by the harness itself.
 // Tools installed outside /usr (a Go toolchain in your home
 // directory, say) are not visible inside the sandbox.
-func sandboxArgs(root string) []string {
+func sandboxArgs(root, dir string) []string {
 	return []string{
 		"--tmpfs", "/",
 		"--ro-bind", "/usr", "/usr",
@@ -45,7 +45,7 @@ func sandboxArgs(root string) []string {
 		"--dev", "/dev",
 		"--tmpfs", "/tmp",
 		"--bind", root, root,
-		"--chdir", root,
+		"--chdir", dir,
 		"--setenv", "HOME", root,
 		"--unshare-user",
 		"--unshare-ipc",
