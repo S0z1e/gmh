@@ -313,3 +313,99 @@ func TestRunRetriesHonourRetryAfter(t *testing.T) {
 		}
 	}
 }
+
+// idleTestServer returns a server that stalls the first stallCount
+// requests — one text delta, then silence for stallFor — and then
+// answers a valid SSE success.
+func idleTestServer(t *testing.T, stallCount int32, stallFor time.Duration) (*httptest.Server, *int32) {
+	t.Helper()
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if n <= stallCount {
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial-\"}}]}\n\n")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(stallFor) // silence: the idle timeout must fire, not the sleep
+			return
+		}
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &calls
+}
+
+func idleRetryTestConfig(t *testing.T, srv *httptest.Server, events *[]Event, idle time.Duration) *Config {
+	t.Helper()
+	return &Config{
+		Client:   &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat", IdleTimeout: idle, Timeout: 10 * time.Second},
+		Exec:     &tools.Executor{Root: t.TempDir()},
+		Tools:    ToolDefs(),
+		System:   "test system",
+		Mode:     "auto",
+		MaxSteps: 1,
+		OnEvent:  func(e Event) { *events = append(*events, e) },
+	}
+}
+
+// A stream that stalls after a text delta twice, then succeeds: the
+// stalled attempts are discarded and retried exactly like a
+// mid-stream cut-off, and the final text is the replay's text.
+func TestRunRetriesIdleStallAfterOutput(t *testing.T) {
+	srv, calls := idleTestServer(t, 2, 600*time.Millisecond)
+	var events []Event
+	cfg := idleRetryTestConfig(t, srv, &events, 100*time.Millisecond)
+	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "say hello"}})
+	if err != nil {
+		t.Fatalf("Run error = %v, want nil after the discard + retry", err)
+	}
+	if text != "final answer" {
+		t.Fatalf("final text = %q, want \"final answer\"", text)
+	}
+	if got := atomic.LoadInt32(calls); got != 3 {
+		t.Fatalf("LLM calls = %d, want 3 (2 stalls + success)", got)
+	}
+	if got := discardAttempts(events); len(got) != 2 || got[0] != 2 || got[1] != 3 {
+		t.Fatalf("step_discard attempts = %v, want [2 3]", got)
+	}
+	if got := retryAttempts(events); len(got) != 2 || got[0] != 2 || got[1] != 3 {
+		t.Fatalf("step_retry attempts = %v, want [2 3]", got)
+	}
+	if got := eventOrder(events, EventStepDiscard, EventStepRetry); len(got) != 4 || got[0] != EventStepDiscard || got[1] != EventStepRetry || got[2] != EventStepDiscard || got[3] != EventStepRetry {
+		t.Fatalf("discard/retry order = %v, want alternating discard, retry, discard, retry", got)
+	}
+	if cfg.LastTerminalReason != TerminalEndTurn {
+		t.Fatalf("terminal reason = %q, want end_turn", cfg.LastTerminalReason)
+	}
+}
+
+// A stream that stalls on every attempt: the turn fails after
+// exactly 4 attempts, naming the idle timeout.
+func TestRunIdleStallAlwaysFails(t *testing.T) {
+	srv, calls := idleTestServer(t, 100, 600*time.Millisecond)
+	var events []Event
+	cfg := idleRetryTestConfig(t, srv, &events, 100*time.Millisecond)
+	_, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "say hello"}})
+	if err == nil || !strings.Contains(err.Error(), "after 4 attempts") {
+		t.Fatalf("Run error = %v, want it to contain \"after 4 attempts\"", err)
+	}
+	if !strings.Contains(err.Error(), "idle") {
+		t.Fatalf("Run error = %v, want it to name the idle timeout", err)
+	}
+	if got := atomic.LoadInt32(calls); got != 4 {
+		t.Fatalf("LLM calls = %d, want 4", got)
+	}
+	if got := countKind(events, EventStepDiscard); got != 3 {
+		t.Fatalf("step_discard events = %d, want 3", got)
+	}
+	if got := countKind(events, EventStepRetry); got != 3 {
+		t.Fatalf("step_retry events = %d, want 3", got)
+	}
+	if cfg.LastTerminalReason != TerminalError {
+		t.Fatalf("terminal reason = %q, want error", cfg.LastTerminalReason)
+	}
+}

@@ -28,7 +28,6 @@
 package llm
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -261,10 +260,11 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 	if !withBearer {
 		headers["x-api-key"] = c.APIKey
 	}
-	resp, err := c.doPostHeaders(ctx, body, headers, withBearer)
+	resp, cancel, err := c.doPostHeaders(ctx, body, headers, withBearer)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	var msg Message
@@ -285,11 +285,18 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 	accs := map[int]*acc{}
 	order := []int{}
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	lines := newIdleLineScanner(resp.Body, c.idleTimeout(), c.Model)
+	defer lines.close()
 	sawStop := false
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for {
+		raw, ok, scanErr := lines.next()
+		if !ok {
+			if scanErr != nil {
+				return scanErr
+			}
+			break
+		}
+		line := strings.TrimSpace(raw)
 		if line == "" || !strings.HasPrefix(line, "data:") {
 			continue
 		}
@@ -355,9 +362,6 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 		case "message_stop":
 			sawStop = true
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
 	}
 	// A stream that ends without message_stop was cut off mid-reply;
 	// fail loudly instead of running a half-accumulated tool call

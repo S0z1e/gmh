@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -465,5 +466,55 @@ func TestValidatePluginsDisabled(t *testing.T) {
 	f := &File{Plugins: &PluginsConfig{Disabled: []string{"todo", "old_notes2"}}}
 	if err := Validate(f); err != nil {
 		t.Fatalf("valid disabled names rejected: %v", err)
+	}
+}
+
+// Per-model timeout fields: parsed, resolved onto the model, and
+// validated; unset stays nil so the client defaults apply.
+func TestModelTimeoutFields(t *testing.T) {
+	p := write(t, t.TempDir(), "c.json", `{
+		"defaultProvider": "discovery",
+		"defaultModel": "Atria-Dawn",
+		"providers": {
+			"discovery": {
+				"baseUrl": "https://discovery-api.intern-ai.org.cn/v1",
+				"api": "openai-completions",
+				"apiKey": "$DISC_KEY",
+				"models": [
+					{"id": "Atria-Dawn", "contextWindow": 512000, "timeoutSeconds": 900, "idleTimeoutSeconds": 90},
+					{"id": "plain", "contextWindow": 128000}
+				]
+			}
+		}
+	}`)
+	f, err := LoadExplicit(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(f); err != nil {
+		t.Fatalf("Validate = %v, want nil", err)
+	}
+	prov, _ := f.Select("")
+	m, ok := prov.ResolveModel("Atria-Dawn")
+	if !ok || m.TimeoutSeconds == nil || *m.TimeoutSeconds != 900 || m.IdleTimeoutSeconds == nil || *m.IdleTimeoutSeconds != 90 {
+		t.Fatalf("Atria-Dawn timeouts = %+v ok=%v", m, ok)
+	}
+	m, ok = prov.ResolveModel("plain")
+	if !ok || m.TimeoutSeconds != nil || m.IdleTimeoutSeconds != nil {
+		t.Fatalf("plain timeouts = %+v ok=%v, want nil (defaults apply)", m, ok)
+	}
+	for _, bad := range []string{
+		`{"id": "x", "timeoutSeconds": 0}`,
+		`{"id": "x", "timeoutSeconds": -5}`,
+		`{"id": "x", "idleTimeoutSeconds": 0}`,
+		`{"id": "x", "idleTimeoutSeconds": -5}`,
+	} {
+		var mdl Model
+		if err := json.Unmarshal([]byte(bad), &mdl); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateModel("discovery", mdl); err == nil {
+			t.Fatalf("validateModel(%s) = nil, want an error", bad)
+		}
 	}
 }

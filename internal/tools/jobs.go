@@ -53,6 +53,13 @@ type Job struct {
 // Done closes when the command finishes (success, failure or timeout).
 func (j *Job) Done() <-chan struct{} { return j.done }
 
+// FinishedAt reports when the job finished; ok is false while running.
+func (j *Job) FinishedAt() (time.Time, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.finishedAt, j.finished
+}
+
 // Status reports running or done.
 func (j *Job) Status() JobStatus {
 	j.mu.Lock()

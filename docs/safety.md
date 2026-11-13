@@ -10,7 +10,7 @@ approve, and the turn continues with the denial as an observation.
 What is enforced:
 - read/write/edit/grep/glob paths are jailed to the workspace root
   (`..` escapes refused); bash starts in the root.
-- bash has a timeout (default 60s, per-call up to 300s,
+- bash has a timeout (default 120s, per-call up to 600s,
   `-bash-timeout` / `OPENAI_BASH_TIMEOUT_SECONDS`) and a 64 KiB
   output cap.
 - A denylist refuses the obvious catastrophes before they run:

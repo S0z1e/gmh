@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -86,7 +87,7 @@ func ToolDefs() []llm.ToolDef {
 		llm.Tool("read", "Read a file (with offset/limit) or list a directory. Image files (png, jpg, gif, webp) are returned as an image you can see, not as text — use read to look at a screenshot or photo.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}`),
 		llm.Tool("write", "Create a NEW file. Fails if the file exists; use edit then.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}`),
 		llm.Tool("edit", "Replace text in an existing file. Two forms: oldText (replaced exactly once) or startLine/endLine (1-based, inclusive; endLine defaults to startLine) to replace those lines with newText, ignoring oldText. After a read, prefer the line form: line numbers cannot go stale the way oldText can.", `{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}},"required":["path","newText"]}`),
-		llm.Tool("bash", "Run a shell command in the workspace root. Timeout in seconds, default 60, max 300.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]}`),
+		llm.Tool("bash", "Run a shell command in the workspace root. Timeout in seconds, default 120, max 600. Pass background:true for a command that will not exit on its own (dev server, watcher): it returns at once with a job id, and its output is delivered at the next step.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"},"background":{"type":"boolean"}},"required":["command"]}`),
 		llm.Tool("grep", "Search file contents with a regex. Prefer this over bash grep/rg. Returns file:line matches, capped (truncation is marked).", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"},"exclude":{"type":"string"},"context":{"type":"integer"},"maxMatches":{"type":"integer"}},"required":["pattern"]}`),
 		llm.Tool("glob", "List files matching a glob pattern, e.g. **/*.go. Prefer this over bash find/ls for discovering files.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer"}},"required":["pattern"]}`),
 		llm.Tool("load_skill", "Load the full text of an available skill by name when its guidance is needed for the current task. The skill names and one-line descriptions are in the system prompt. Pass reference (a file name from the skill's references/ footer) to read one reference file instead of the whole skill.", `{"type":"object","properties":{"name":{"type":"string"},"reference":{"type":"string"}},"required":["name"]}`),
@@ -196,6 +197,8 @@ func toolOffered(tools []llm.ToolDef, name string) bool {
 // and, when backgrounded, the job so Run can feed its result back
 // later. A call that finishes within the threshold (or with
 // backgrounding disabled) returns a nil job and a normal observation.
+// A call with background:true backgrounds at once, without waiting
+// out the threshold, for commands that never exit on their own.
 func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (string, *tools.Job) {
 	threshold := time.Duration(0)
 	if c.Exec != nil {
@@ -204,6 +207,24 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (string, *tools.
 	var a tools.BashArgs
 	if err := json.Unmarshal([]byte(tc.Function.Arguments), &a); err != nil {
 		return fmt.Sprintf("Error: bad bash args: %v\nOutput:\n", err), nil
+	}
+	// backgrounded returns the observation for a job that keeps
+	// running, and the job itself so Run can feed its result back
+	// at the next step boundary.
+	backgrounded := func(job *tools.Job) (string, *tools.Job) {
+		c.emit(Event{Kind: EventToolBackgrounded, ToolName: "bash", ToolArgs: tc.Function.Arguments, JobID: job.ID})
+		return fmt.Sprintf("Command is still running in the background (job %s). Continue with other work; its output will be delivered automatically when it finishes. Do not re-run the command, and do not wait for it with sleep or polling.", job.ID), job
+	}
+	if a.Background {
+		// Explicit background, chosen by the model: start and
+		// return at once, without waiting out the threshold.
+		// For servers and watchers that never exit on their own.
+		job, err := c.Exec.BashBackground(ctx, a)
+		if err != nil {
+			// Start failure (denylist): an observation, never a job.
+			return fmt.Sprintf("Error: %v\nOutput:\n", err), nil
+		}
+		return backgrounded(job)
 	}
 	if threshold <= 0 {
 		out, err := c.Exec.Bash(ctx, a)
@@ -236,9 +257,52 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (string, *tools.
 		if _, ok := job.Result(); ok {
 			return deliver()
 		}
-		c.emit(Event{Kind: EventToolBackgrounded, ToolName: "bash", ToolArgs: tc.Function.Arguments, JobID: job.ID})
-		return fmt.Sprintf("Command is still running in the background (job %s). Continue with other work; its output will be delivered automatically when it finishes. Do not re-run the command, and do not wait for it with sleep or polling.", job.ID), job
+		return backgrounded(job)
 	}
+}
+
+// jobResultMessage renders a finished background job the way
+// drainPending does: exit code, error if any, and capped output.
+// It is a user message, never a second tool message for the same
+// call id — the API rejects that with 400.
+func jobResultMessage(job *tools.Job, res tools.JobResult) (string, error) {
+	if res.Err != nil {
+		return fmt.Sprintf("Background job %s finished with error: %v (exit %d).\nOutput:\n%s", job.ID, res.Err, res.ExitCode, capText(res.Output, 32*1024)), res.Err
+	}
+	return fmt.Sprintf("Background job %s finished (exit %d).\nOutput:\n%s", job.ID, res.ExitCode, capText(res.Output, 32*1024)), nil
+}
+
+// collectFinishedJobs appends a user message for each pending job
+// that finished since the last step, in completion order, and drops
+// them from pending. It never blocks: a still-running job stays
+// pending for a later step or the turn-end drain.
+func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) ([]llm.Message, []pendingJob) {
+	var done, rest []pendingJob
+	for _, p := range pending {
+		if _, ok := p.job.Result(); ok {
+			done = append(done, p)
+		} else {
+			rest = append(rest, p)
+		}
+	}
+	if len(done) == 0 {
+		return msgs, pending
+	}
+	sort.Slice(done, func(i, j int) bool {
+		ti, _ := done[i].job.FinishedAt()
+		tj, _ := done[j].job.FinishedAt()
+		return ti.Before(tj)
+	})
+	for _, p := range done {
+		res, _ := p.job.Result()
+		obs, toolErr := jobResultMessage(p.job, res)
+		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID})
+		msgs = append(msgs, llm.Message{Role: "user", Content: obs})
+		if c.Session != nil {
+			_ = c.Session.Append(msgs[len(msgs)-1])
+		}
+	}
+	return msgs, rest
 }
 
 // pendingJob is one backgrounded bash call waiting for its result.
@@ -275,25 +339,29 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 	if waiting {
 		c.emit(Event{Kind: EventBackgroundWait, Text: strings.Join(jobIDs, ", ")})
 	}
+	// Deliver in completion order, not submission order: a slow
+	// job must not hold back results that are already ready. One
+	// goroutine per job signals a shared channel when its job
+	// finishes; the goroutines outlive a cancelled wait only until
+	// their (timeout-bounded) jobs finish.
+	done := make(chan *tools.Job, len(jobs))
 	for _, job := range jobs {
+		go func(j *tools.Job) { <-j.Done(); done <- j }(job)
+	}
+	remaining := len(jobs)
+	for remaining > 0 {
 		select {
-		case <-job.Done():
+		case job := <-done:
+			res, _ := job.Result()
+			obs, toolErr := jobResultMessage(job, res)
+			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID})
+			msgs = append(msgs, llm.Message{Role: "user", Content: obs})
+			if c.Session != nil {
+				_ = c.Session.Append(msgs[len(msgs)-1])
+			}
+			remaining--
 		case <-ctx.Done():
 			return msgs, ctx.Err()
-		}
-		res, _ := job.Result()
-		var obs string
-		var toolErr error
-		if res.Err != nil {
-			obs = fmt.Sprintf("Background job %s finished with error: %v (exit %d).\nOutput:\n%s", job.ID, res.Err, res.ExitCode, capText(res.Output, 32*1024))
-			toolErr = res.Err
-		} else {
-			obs = fmt.Sprintf("Background job %s finished (exit %d).\nOutput:\n%s", job.ID, res.ExitCode, capText(res.Output, 32*1024))
-		}
-		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID})
-		msgs = append(msgs, llm.Message{Role: "user", Content: obs})
-		if c.Session != nil {
-			_ = c.Session.Append(msgs[len(msgs)-1])
 		}
 	}
 	return msgs, nil
@@ -438,6 +506,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 	failedFixes := 0
 
 	for step := 0; step < steps; step++ {
+		// Finished background jobs report in at the next step,
+		// in completion order — the model sees results as soon
+		// as they are ready, not only when the turn would end.
+		msgs, pending = c.collectFinishedJobs(msgs, pending)
 		var assistant llm.Message
 		var usage llm.Usage
 		// thinking accumulates this step's thinking text. It is

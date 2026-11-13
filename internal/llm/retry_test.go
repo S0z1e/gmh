@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"testing"
@@ -37,6 +38,7 @@ func TestIsRetryable(t *testing.T) {
 		{"504 retryable", &APIError{StatusCode: 504, Status: "504 Gateway Timeout", Body: "boom"}, true},
 		{"context canceled never", context.Canceled, false},
 		{"context deadline never", context.DeadlineExceeded, false},
+		{"idle timeout retryable", fmt.Errorf("%w: no stream data for 60s from model %q", ErrIdleTimeout, "m"), true},
 		{"url error wrapping canceled never", urlErr(context.Canceled), false},
 		{"url error retryable", urlErr(errors.New("connection reset")), true},
 		{"EOF retryable", io.EOF, true},

@@ -16,11 +16,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -231,6 +233,18 @@ type Client struct {
 	// effortThinkingBudget). A model that does not reason ignores
 	// it.
 	Effort string
+	// Timeout is the total per-request cap (http.Client.Timeout):
+	// 0 = DefaultTotalTimeout. It is a backstop for a request that
+	// never finishes at all; a slow-but-alive stream is governed
+	// by IdleTimeout instead, so a larger total is safe.
+	Timeout time.Duration
+	// IdleTimeout is the silence cap while streaming: if no SSE
+	// line arrives for this long, the stream is treated as stalled
+	// and aborted with ErrIdleTimeout (retryable, like a cut-off).
+	// Any scanned line counts as activity — text, thinking deltas,
+	// even heartbeat/empty lines — because a line proves the
+	// connection is alive. 0 = DefaultIdleTimeout.
+	IdleTimeout time.Duration
 	// PromptCacheKey is a stable per-session routing hint for prefix
 	// caching: chat completions send it as prompt_cache_key, the
 	// session id, the same value on every request of the session.
@@ -301,10 +315,126 @@ func (c *Client) httpClient() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
 	}
-	return &http.Client{Timeout: 180 * time.Second}
+	return &http.Client{Timeout: c.totalTimeout()}
 }
 
-func (c *Client) doPost(ctx context.Context, body []byte) (*http.Response, error) {
+// DefaultTotalTimeout is the per-request backstop when the model
+// sets no timeoutSeconds: 600s, up from the old hardcoded 180s.
+// The idle guard catches a truly stuck stream within 60s, so a
+// larger total is safe — it only fires on a request that never
+// finishes at all.
+const DefaultTotalTimeout = 600 * time.Second
+
+// DefaultIdleTimeout is the silence cap when the model sets no
+// idleTimeoutSeconds: 60s with no SSE line means the stream
+// stalled.
+const DefaultIdleTimeout = 60 * time.Second
+
+func (c *Client) totalTimeout() time.Duration {
+	if c.Timeout <= 0 {
+		return DefaultTotalTimeout
+	}
+	return c.Timeout
+}
+
+func (c *Client) idleTimeout() time.Duration {
+	if c.IdleTimeout <= 0 {
+		return DefaultIdleTimeout
+	}
+	return c.IdleTimeout
+}
+
+// ErrIdleTimeout is returned by Stream when a streaming response
+// produces no SSE line for the idle timeout: the model stopped
+// sending data mid-reply. It is a cut-off, not a cancellation:
+// IsRetryable reports true, so streamStep discards the partial
+// reply and replays the call. It is distinct from
+// context.DeadlineExceeded (the total-timeout backstop, and the
+// user aborting), which stays non-retryable.
+var ErrIdleTimeout = errors.New("llm stream idle timeout")
+
+// idleLineScanner pumps bufio.Scanner lines over a channel so the
+// consumer can tell a slow stream from a stuck one: next returns
+// the next line, or ErrIdleTimeout when no line arrives within
+// idle. Every scanned line counts as activity — text, thinking
+// deltas, heartbeat/empty lines — because a line proves the
+// connection is alive. Close releases the pump goroutine; the
+// caller must call it (defer) and close the response body.
+type idleLineScanner struct {
+	lines chan string
+	errs  chan error
+	stop  chan struct{}
+	once  sync.Once
+	idle  time.Duration
+	model string
+}
+
+func newIdleLineScanner(body io.Reader, idle time.Duration, model string) *idleLineScanner {
+	s := &idleLineScanner{
+		lines: make(chan string, 1),
+		errs:  make(chan error, 1),
+		stop:  make(chan struct{}),
+		idle:  idle,
+		model: model,
+	}
+	go func() {
+		defer close(s.lines)
+		sc := bufio.NewScanner(body)
+		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		for sc.Scan() {
+			line := sc.Text()
+			select {
+			case s.lines <- line:
+			case <-s.stop:
+				return
+			}
+		}
+		s.errs <- sc.Err()
+	}()
+	return s
+}
+
+// close stops the pump goroutine. Safe to call more than once.
+func (s *idleLineScanner) close() {
+	s.once.Do(func() { close(s.stop) })
+}
+
+// next returns the next scanned line. ok=false ends the stream:
+// err nil means clean EOF, non-nil the read or idle failure.
+func (s *idleLineScanner) next() (line string, ok bool, err error) {
+	if s.idle > 0 {
+		timer := time.NewTimer(s.idle)
+		defer timer.Stop()
+		select {
+		case l, open := <-s.lines:
+			if !open {
+				return "", false, s.terminalErr()
+			}
+			return l, true, nil
+		case <-timer.C:
+			return "", false, fmt.Errorf("%w: no stream data for %s from model %q", ErrIdleTimeout, s.idle, s.model)
+		}
+	}
+	l, open := <-s.lines
+	if !open {
+		return "", false, s.terminalErr()
+	}
+	return l, true, nil
+}
+
+// terminalErr returns the pump's final scanner error, if any. The
+// pump sends it before closing the lines channel, so a
+// non-blocking receive here is exact.
+func (s *idleLineScanner) terminalErr() error {
+	select {
+	case err := <-s.errs:
+		return err
+	default:
+		return nil
+	}
+}
+
+func (c *Client) doPost(ctx context.Context, body []byte) (*http.Response, context.CancelFunc, error) {
 	return c.doPostHeaders(ctx, body, nil, true)
 }
 
@@ -315,10 +445,21 @@ func (c *Client) doPost(ctx context.Context, body []byte) (*http.Response, error
 // Config headers (Client.Headers) are sent too, except auth and
 // framing headers, which this function owns; the per-call headers
 // win over config headers.
-func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[string]string, withBearer bool) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(), bytes.NewReader(body))
+// It also returns the request context's cancel func: the caller
+// owns cancel and must defer it AFTER deferring the body close
+// (LIFO: the body closes first, then the context is cancelled —
+// cancelling first would close the body mid-stream). On any error
+// the cancel is already called and nil is returned.
+func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[string]string, withBearer bool) (*http.Response, context.CancelFunc, error) {
+	// The request runs on a derived context so the first-byte idle
+	// deadline can abort it: if the server sends no response
+	// headers within the idle timeout, the stream is stalled before
+	// it started.
+	reqCtx, cancel := context.WithCancel(ctx)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.endpoint(), bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if withBearer {
@@ -335,21 +476,45 @@ func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[str
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Accept", "text/event-stream")
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		return nil, err
+	// Do waits for the response headers; without a deadline of its
+	// own, a server that never answers hangs until the total
+	// timeout. Race it against the idle timeout instead: silence
+	// before the first byte is a stall like any other.
+	type doResult struct {
+		resp *http.Response
+		err  error
+	}
+	ch := make(chan doResult, 1)
+	go func() {
+		resp, err := c.httpClient().Do(req)
+		ch <- doResult{resp, err}
+	}()
+	timer := time.NewTimer(c.idleTimeout())
+	defer timer.Stop()
+	var resp *http.Response
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			cancel()
+			return nil, nil, r.err
+		}
+		resp = r.resp
+	case <-timer.C:
+		cancel()
+		return nil, nil, fmt.Errorf("%w: no response headers for %s from model %q", ErrIdleTimeout, c.idleTimeout(), c.Model)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return nil, &APIError{
+		cancel()
+		return nil, nil, &APIError{
 			StatusCode: resp.StatusCode,
 			Status:     resp.Status,
 			Body:       strings.TrimSpace(string(b)),
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
 		}
 	}
-	return resp, nil
+	return resp, cancel, nil
 }
 
 // Chat is a non-streaming convenience wrapper around Stream.
@@ -437,10 +602,11 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 	if err != nil {
 		return err
 	}
-	resp, err := c.doPost(ctx, body)
+	resp, cancel, err := c.doPost(ctx, body)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	var msg Message
@@ -454,11 +620,18 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 	accs := map[int]*acc{}
 	order := []int{}
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	lines := newIdleLineScanner(resp.Body, c.idleTimeout(), c.Model)
+	defer lines.close()
 	sawDone := false
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for {
+		raw, ok, scanErr := lines.next()
+		if !ok {
+			if scanErr != nil {
+				return scanErr
+			}
+			break
+		}
+		line := strings.TrimSpace(raw)
 		if line == "" || !strings.HasPrefix(line, "data:") {
 			continue
 		}
@@ -503,9 +676,6 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 				a.args.WriteString(tc.Function.Arguments)
 			}
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
 	}
 	// A stream that ends without [DONE] was cut off mid-reply; a
 	// half-accumulated tool call would otherwise run as if it were
@@ -617,10 +787,11 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 	if err != nil {
 		return err
 	}
-	resp, err := c.doPost(ctx, body)
+	resp, cancel, err := c.doPost(ctx, body)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	var msg Message
@@ -654,14 +825,21 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 		}
 		return strings.Join(texts, "\n")
 	}
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	lines := newIdleLineScanner(resp.Body, c.idleTimeout(), c.Model)
+	defer lines.close()
 	// OpenConsole's Responses stream ends with response.completed and
 	// no [DONE] (verified live), so completion — not [DONE] — is the
 	// terminal marker here.
 	sawCompleted := false
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for {
+		raw, ok, scanErr := lines.next()
+		if !ok {
+			if scanErr != nil {
+				return scanErr
+			}
+			break
+		}
+		line := strings.TrimSpace(raw)
 		if line == "" || !strings.HasPrefix(line, "data:") {
 			continue
 		}
@@ -824,9 +1002,6 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 				usage = Usage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens, CachedTokens: u.InputTokensDetails.CachedTokens, ReasoningTokens: u.OutputTokensDetails.ReasoningTokens}
 			}
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
 	}
 	// A stream that ends without response.completed was cut off
 	// mid-reply; fail loudly instead of running a half-accumulated

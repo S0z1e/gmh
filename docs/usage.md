@@ -74,6 +74,27 @@
   automatically when the last call's context reaches 70% of the
   window (`-context-limit`, default: the model's `contextWindow`,
   else 128000).
+- Timeouts: a model entry may set `timeoutSeconds` (total per-request
+  cap, default 600) and `idleTimeoutSeconds` (silence cap while
+  streaming, default 60). A stream that produces no SSE line for the
+  idle period — no text, no thinking delta, not even a heartbeat —
+  is treated as stalled: the partial reply is discarded
+  (`step_discard`), the call is retried (`step_retry`, same
+  4-attempt budget as other transient failures), and the replay is
+  identical. The same idle deadline applies before the first byte:
+  a server that sends no response headers within the idle period
+  is a stall too. A slow-but-alive stream is never disturbed: any
+  line resets the idle timer. The total timeout stays a
+  non-retryable backstop.
+- Background jobs: a bash call running longer than 120s goes to the
+  background (job bg-N) and the loop keeps working; finished jobs
+  report in at the next step, in completion order, as user messages
+  — never only when the turn ends. Pass `background:true` for a
+  command that will not exit on its own (dev server, watcher): it
+  returns at once with a job id, and its output is delivered the
+  same way. The bash timeout is 120s by default, 600s max
+  (per-call `timeout`, `bashTimeoutSeconds`, or
+  `OPENAI_BASH_TIMEOUT_SECONDS`).
 - Events: the agent loop emits an event stream (`text_delta`,
   `step_usage`, `tool_start`, `tool_end`, `done`, `error`); the CLI
   is one renderer of it, the TUI and the RPC server are two more. The

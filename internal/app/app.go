@@ -47,12 +47,12 @@ type Params struct {
 	// or the config sandbox field turn it on; Setup fails fast when
 	// bwrap is missing or cannot create a sandbox here.
 	Sandbox bool
-	// BashTimeoutSeconds overrides the default 60s bash timeout
+	// BashTimeoutSeconds overrides the default 120s bash timeout
 	// (0 = default, or OPENAI_BASH_TIMEOUT_SECONDS).
 	BashTimeoutSeconds int
 	// BackgroundThresholdSeconds is how long a bash call runs before
 	// the loop backgrounds it: -1 = unset (env OPENAI_BG_THRESHOLD_SECONDS
-	// or the 10s default), 0 = never background, >0 = seconds.
+	// or the 120s default), 0 = never background, >0 = seconds.
 	BackgroundThresholdSeconds int
 	// DisableBackground turns backgrounding off entirely. -p print
 	// mode sets it: a one-shot run stays synchronous.
@@ -275,7 +275,7 @@ func Setup(p Params) (*App, error) {
 	}
 	executor.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 
-	// Background threshold: flag wins, else env, else the 10s default.
+	// Background threshold: flag wins, else env, else the 120s default.
 	// 0 disables backgrounding; -p disables it outright.
 	bgThreshold := tools.DefaultBackgroundThreshold
 	if p.BackgroundThresholdSeconds == 0 {
@@ -375,8 +375,9 @@ func Setup(p Params) (*App, error) {
 	// The tool mode starts at default, with the full tool list.
 	a.toolMode = agent.ToolModeDefault
 	a.allTools = append(agent.ToolDefs(), pluginTools...)
+	timeout, idle := clientTimeouts(mdl)
 	a.Cfg = &agent.Config{
-		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort, PromptCacheKey: a.sessionID()},
+		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort, PromptCacheKey: a.sessionID(), Timeout: timeout, IdleTimeout: idle},
 		Exec:                executor,
 		Tools:               a.allTools,
 		System:              system,
@@ -516,6 +517,19 @@ func (a *App) FindModel(modelID string) (string, bool) {
 // ANTHROPIC_MAX_TOKENS or the entry, and the context limit from
 // OPENAI_CONTEXT_LIMIT or the entry. It returns the resolved
 // provider, model id and api shape.
+// clientTimeouts resolves a model's timeout settings into the
+// llm.Client durations: nil means "use the client's defaults"
+// (total 600s, idle 60s).
+func clientTimeouts(mdl config.Model) (timeout, idle time.Duration) {
+	if mdl.TimeoutSeconds != nil {
+		timeout = time.Duration(*mdl.TimeoutSeconds) * time.Second
+	}
+	if mdl.IdleTimeoutSeconds != nil {
+		idle = time.Duration(*mdl.IdleTimeoutSeconds) * time.Second
+	}
+	return timeout, idle
+}
+
 func (a *App) SwitchModel(provider, model string) (provName, modelID, api string, err error) {
 	if a.Config == nil || a.Cfg == nil {
 		return "", "", "", fmt.Errorf("no config loaded")
@@ -627,7 +641,8 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 	if contextLimit <= 0 {
 		contextLimit = config.DefaultContextWindow
 	}
-	a.Cfg.Client = &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort, PromptCacheKey: a.sessionID()}
+	timeout, idle := clientTimeouts(mdl)
+	a.Cfg.Client = &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort, PromptCacheKey: a.sessionID(), Timeout: timeout, IdleTimeout: idle}
 	a.Cfg.Exec.ImageInput = slices.Contains(mdl.Input, "image")
 	a.Model = mdl
 	a.Provider = provName

@@ -24,17 +24,20 @@ import (
 const (
 	MaxReadBytes       = 1 << 20 // 1 MiB per read
 	MaxOutBytes        = 64 << 10
-	DefaultBashTimeout = 60 * time.Second
-	MaxBashTimeout     = 300 * time.Second
+	DefaultBashTimeout = 120 * time.Second
+	MaxBashTimeout     = 600 * time.Second
 	// DefaultBackgroundThreshold is how long a bash call runs before
 	// the loop backgrounds it instead of blocking (0 = disabled).
-	DefaultBackgroundThreshold = 10 * time.Second
+	// 120s is the industry consensus (Claude Code, OpenCode): a
+	// normal install, build or test stays foreground and returns
+	// its result directly; only the truly long tail backgrounds.
+	DefaultBackgroundThreshold = 120 * time.Second
 )
 
 type Executor struct {
 	Root string
-	// BashTimeout overrides the default 60s bash timeout (0 = default).
-	// The per-call timeout argument still caps at 300s.
+	// BashTimeout overrides the default 120s bash timeout (0 = default).
+	// The per-call timeout argument still caps at 600s.
 	BashTimeout time.Duration
 	// BackgroundThreshold is how long a bash call may run before the
 	// loop backgrounds it (0 = never background; DefaultBackgroundThreshold
@@ -422,11 +425,16 @@ func intsString(ns []int) string {
 
 type BashArgs struct {
 	Command string `json:"command"`
-	Timeout int    `json:"timeout,omitempty"` // seconds, default 60, max 300
+	Timeout int    `json:"timeout,omitempty"` // seconds, default 120, max 600
+	// Background starts the command in the background and returns
+	// at once with a job id, for commands that will not exit on
+	// their own (dev server, watcher). The result is delivered
+	// at the next step boundary, like any backgrounded job.
+	Background bool `json:"background,omitempty"`
 }
 
 // bashTimeout resolves the effective timeout for one bash call:
-// per-call argument (capped at 300s), else the executor default.
+// per-call argument (capped at 600s), else the executor default.
 func (e *Executor) bashTimeout(a BashArgs) time.Duration {
 	timeout := DefaultBashTimeout
 	if e.BashTimeout > 0 {

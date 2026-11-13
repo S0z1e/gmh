@@ -53,6 +53,14 @@ func IsRetryable(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
+	// An idle stream is a cut-off, not a cancellation: the model
+	// stopped sending data, and replaying the call may succeed (a
+	// silent gateway stall is transient, like the 403 waves). The
+	// total timeout (context.DeadlineExceeded above) stays
+	// non-retryable.
+	if errors.Is(err, ErrIdleTimeout) {
+		return true
+	}
 	var api *APIError
 	if errors.As(err, &api) {
 		switch api.StatusCode {

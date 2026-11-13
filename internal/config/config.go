@@ -44,8 +44,9 @@
 // The top-level baseUrl/api/model fields are a shorthand for a single
 // provider without the providers map. Precedence everywhere is:
 // flag > environment variable > project file > global file > default
-// (contextWindow 128000, maxTokens 16384). The API key is never a
-// literal in a file: provider apiKey is a "$NAME" environment reference.
+// (contextWindow 128000, maxTokens 16384, timeoutSeconds 600,
+// idleTimeoutSeconds 60). The API key is never a literal in a file:
+// provider apiKey is a "$NAME" environment reference.
 package config
 
 import (
@@ -131,11 +132,20 @@ type Model struct {
 	// (at least 1024 tokens, always below maxTokens). A model that
 	// does not reason ignores it; a non-reasoning model should
 	// leave it unset.
-	Effort         string            `json:"effort"`
-	ContextWindow  *int              `json:"contextWindow"`
-	MaxTokens      *int              `json:"maxTokens"`
-	SamplingParams map[string]any    `json:"samplingParams"`
-	Headers        map[string]string `json:"headers"`
+	Effort        string `json:"effort"`
+	ContextWindow *int   `json:"contextWindow"`
+	MaxTokens     *int   `json:"maxTokens"`
+	// TimeoutSeconds is the total per-request cap in seconds (nil =
+	// 600): a backstop for a request that never finishes at all.
+	// IdleTimeoutSeconds is the silence cap in seconds while
+	// streaming (nil = 60): if no SSE line arrives for this long,
+	// the stream is treated as stalled — the partial reply is
+	// discarded and the call retried as a cut-off. Any line counts
+	// as activity, including thinking deltas.
+	TimeoutSeconds     *int              `json:"timeoutSeconds"`
+	IdleTimeoutSeconds *int              `json:"idleTimeoutSeconds"`
+	SamplingParams     map[string]any    `json:"samplingParams"`
+	Headers            map[string]string `json:"headers"`
 	// Input lists the modalities the model accepts ("text", "image").
 	// Default ["text"]. The harness is text-only for now; the
 	// field is parsed and stored so a vision-capable model can be
@@ -496,6 +506,8 @@ func (p Provider) ResolveModel(id string) (Model, bool) {
 		}
 		m.ContextWindow = e.ContextWindow
 		m.MaxTokens = e.MaxTokens
+		m.TimeoutSeconds = e.TimeoutSeconds
+		m.IdleTimeoutSeconds = e.IdleTimeoutSeconds
 		m.SamplingParams = e.SamplingParams
 		m.Headers = e.Headers
 		m.Input = e.Input
@@ -633,6 +645,12 @@ func validateModel(provider string, m Model) error {
 	}
 	if m.MaxTokens != nil && *m.MaxTokens <= 0 {
 		return fmt.Errorf("provider %q model %q: maxTokens must be > 0", provider, m.ID)
+	}
+	if m.TimeoutSeconds != nil && *m.TimeoutSeconds <= 0 {
+		return fmt.Errorf("provider %q model %q: timeoutSeconds must be > 0", provider, m.ID)
+	}
+	if m.IdleTimeoutSeconds != nil && *m.IdleTimeoutSeconds <= 0 {
+		return fmt.Errorf("provider %q model %q: idleTimeoutSeconds must be > 0", provider, m.ID)
 	}
 	for _, in := range m.Input {
 		if in != "text" && in != "image" {
