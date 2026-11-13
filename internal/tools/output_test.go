@@ -77,13 +77,11 @@ func TestFormatBashOutputHugeLine(t *testing.T) {
 }
 
 // The sink splits lines correctly across Write boundaries and keeps
-// head + tail while a stream is still open.
+// head + tail while a stream is still open. It no longer writes a
+// file itself (the child writes straight to the file); the file
+// round-trip is covered by TestScanOutputFile below.
 func TestBashOutputSinkSplitWrites(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "out.log")
-	sink, err := newBashOutputSink(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sink := newBashOutputSink()
 	// Deliberately split mid-line and mid-word.
 	for _, chunk := range []string{"li", "ne 1\nline", " 2\nlin", "e 3\npartial"} {
 		if _, err := sink.Write([]byte(chunk)); err != nil {
@@ -107,23 +105,49 @@ func TestBashOutputSinkSplitWrites(t *testing.T) {
 	if lines != 4 {
 		t.Fatalf("lines after Close = %d, want 4 (trailing partial line)", lines)
 	}
-	data, err := os.ReadFile(path)
+}
+
+// scanOutputFile re-derives the accounting from a file the child
+// wrote directly: totals, head and tail, including a trailing
+// partial line; a missing file is an error.
+func TestScanOutputFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.log")
+	var want strings.Builder
+	for i := 1; i <= 100; i++ {
+		fmt.Fprintf(&want, "line %d\n", i)
+	}
+	want.WriteString("partial")
+	if err := os.WriteFile(path, []byte(want.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lines, bytes, capped, head, tail, err := scanOutputFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "line 1\nline 2\nline 3\npartial" {
-		t.Fatalf("file = %q", string(data))
+	if lines != 101 {
+		t.Fatalf("lines = %d, want 101", lines)
+	}
+	if bytes != int64(len(want.String())) {
+		t.Fatalf("bytes = %d, want %d", bytes, len(want.String()))
+	}
+	if capped {
+		t.Fatal("capped should be false for a small file")
+	}
+	if len(head) != 30 || head[0] != "line 1" || head[29] != "line 30" {
+		t.Fatalf("head = %v", head)
+	}
+	if len(tail) != 30 || tail[0] != "line 72" || tail[29] != "partial" {
+		t.Fatalf("tail = %v", tail)
+	}
+	if _, _, _, _, _, err := scanOutputFile(filepath.Join(t.TempDir(), "missing.log")); err == nil {
+		t.Fatal("scanning a missing file should fail")
 	}
 }
 
-// Concurrent stdout/stderr writers must not corrupt the file or the
-// line accounting.
+// Concurrent stdout/stderr writers must not corrupt the line
+// accounting.
 func TestBashOutputSinkConcurrent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "out.log")
-	sink, err := newBashOutputSink(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sink := newBashOutputSink()
 	var wg sync.WaitGroup
 	for w := 0; w < 4; w++ {
 		wg.Add(1)
@@ -141,13 +165,6 @@ func TestBashOutputSinkConcurrent(t *testing.T) {
 	lines, _, _, _, _ := sink.snapshot()
 	if lines != 100 {
 		t.Fatalf("lines = %d, want 100", lines)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := len(strings.Split(strings.TrimRight(string(data), "\n"), "\n")); got != 100 {
-		t.Fatalf("file lines = %d, want 100", got)
 	}
 }
 

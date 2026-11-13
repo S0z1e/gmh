@@ -44,6 +44,13 @@ type Config struct {
 	// transient failures (0 = default 4: the first attempt plus up
 	// to 3 retries; 1 = no retry).
 	MaxLLMAttempts int
+	// DrainTimeout bounds how long drainPending waits for still-
+	// running background jobs when a turn would otherwise end
+	// (0 = default 30s). After the bound the turn ends with the
+	// jobs still running, and their output paths are reported so
+	// the model can read partial output; a job already reported
+	// still-running in an earlier turn is not waited on again.
+	DrainTimeout time.Duration
 	// AskQuestion is the structured-question seam for the ask_user
 	// tool: it asks the user the request's questions and returns
 	// their answers. Nil means nobody can be asked (headless): the
@@ -87,7 +94,7 @@ func ToolDefs() []llm.ToolDef {
 		llm.Tool("read", "Read a file (with offset/limit) or list a directory. Image files (png, jpg, gif, webp) are returned as an image you can see, not as text — use read to look at a screenshot or photo.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}`),
 		llm.Tool("write", "Create a NEW file. Fails if the file exists; use edit then.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}`),
 		llm.Tool("edit", "Replace text in an existing file. Two forms: oldText (replaced exactly once) or startLine/endLine (1-based, inclusive; endLine defaults to startLine) to replace those lines with newText, ignoring oldText. After a read, prefer the line form: line numbers cannot go stale the way oldText can.", `{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}},"required":["path","newText"]}`),
-		llm.Tool("bash", "Run a shell command in the workspace root. Timeout in seconds, default 120, max 600. Pass background:true for a command that will not exit on its own (dev server, watcher): it returns at once with a job id, and its output is delivered at the next step.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"},"background":{"type":"boolean"}},"required":["command"]}`),
+		llm.Tool("bash", "Run a shell command in the workspace root. Timeout in seconds, default 120, max 600; a background:true job has no timeout unless one is passed. Pass background:true for a command that will not exit on its own (dev server, watcher): it returns at once with a job id, and its output is delivered at the next step. A never-ending job never blocks the turn from ending: the turn ends after a short drain wait, and you can read its partial output from the output file.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"},"background":{"type":"boolean"}},"required":["command"]}`),
 		llm.Tool("grep", "Search file contents with a regex. Prefer this over bash grep/rg. Returns file:line matches, capped (truncation is marked).", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"},"exclude":{"type":"string"},"context":{"type":"integer"},"maxMatches":{"type":"integer"}},"required":["pattern"]}`),
 		llm.Tool("glob", "List files matching a glob pattern, e.g. **/*.go. Prefer this over bash find/ls for discovering files.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer"}},"required":["pattern"]}`),
 		llm.Tool("load_skill", "Load the full text of an available skill by name when its guidance is needed for the current task. The skill names and one-line descriptions are in the system prompt. Pass reference (a file name from the skill's references/ footer) to read one reference file instead of the whole skill.", `{"type":"object","properties":{"name":{"type":"string"},"reference":{"type":"string"}},"required":["name"]}`),
@@ -271,6 +278,15 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (string, *tools.
 // call id — the API rejects that with 400.
 func jobResultMessage(job *tools.Job, res tools.JobResult) (string, error) {
 	if res.Err != nil {
+		// A timeout kill is not a failure of the command itself:
+		// say so, and point at the output file (a killed dev
+		// server's partial output is still worth reading).
+		if tools.IsTimeout(res.Err) {
+			if job.OutputFile != "" {
+				return fmt.Sprintf("Background job %s was killed by its timeout: %v. Its partial output is in %s.\nOutput:\n%s", job.ID, res.Err, job.OutputFile, capText(res.Output, 32*1024)), res.Err
+			}
+			return fmt.Sprintf("Background job %s was killed by its timeout: %v.\nOutput:\n%s", job.ID, res.Err, capText(res.Output, 32*1024)), res.Err
+		}
 		return fmt.Sprintf("Background job %s finished with error: %v (exit %d).\nOutput:\n%s", job.ID, res.Err, res.ExitCode, capText(res.Output, 32*1024)), res.Err
 	}
 	return fmt.Sprintf("Background job %s finished (exit %d).\nOutput:\n%s", job.ID, res.ExitCode, capText(res.Output, 32*1024)), nil
@@ -301,6 +317,7 @@ func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) (
 		res, _ := p.job.Result()
 		obs, toolErr := jobResultMessage(p.job, res)
 		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID})
+		p.job.MarkDelivered()
 		msgs = append(msgs, llm.Message{Role: "user", Content: obs})
 		if c.Session != nil {
 			_ = c.Session.Append(msgs[len(msgs)-1])
@@ -317,6 +334,19 @@ type pendingJob struct {
 	job    *tools.Job
 }
 
+// drainTimeout returns the bound for one drainPending wait
+// (0 = default 30s). 30s is long enough for a job in its final
+// seconds to finish — builds and tests usually land within seconds
+// of the model stopping — and short enough that a hung turn ends
+// promptly. The bound is paid at most once per job: a job already
+// reported still-running is never waited on again (see below).
+func (c *Config) drainTimeout() time.Duration {
+	if c.DrainTimeout > 0 {
+		return c.DrainTimeout
+	}
+	return 30 * time.Second
+}
+
 // drainPending waits for the jobs still running and feeds each result
 // back as a user message (appended to msgs and the session), then
 // returns the extended msgs. The result is a user message, NOT a
@@ -325,6 +355,15 @@ type pendingJob struct {
 // with the same id is a 400 from the API (verified live, P2-8). The
 // output is capped like a recent tool result: the fed-back message is
 // a user message, so truncateToolResults never trims it.
+//
+// The wait is BOUNDED (see drainTimeout): a job that never finishes
+// — a dev server, a watcher — must not block turn end forever (the
+// café deadlock). After the bound the turn ends with the jobs still
+// running, and a user message lists them with their output file
+// paths, so the model can read partial output. Their results surface
+// at the next turn: Run re-attaches unfinished jobs from the
+// registry, and collectFinishedJobs delivers them when they finish.
+// A job already reported still-running is not waited on again.
 func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending []pendingJob) ([]llm.Message, error) {
 	jobs := make([]*tools.Job, 0, len(pending))
 	jobIDs := make([]string, 0, len(pending))
@@ -332,38 +371,94 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 		jobs = append(jobs, p.job)
 		jobIDs = append(jobIDs, p.job.ID)
 	}
-	// Only announce the wait when something is actually still running.
-	waiting := false
+	// Deliver jobs that already finished, in completion order.
+	// Jobs already reported still-running in an earlier turn are
+	// never waited on again: the model already knows about them,
+	// so they must not make the next turn pay the bound too.
+	var doneJobs, freshJobs, oldJobs []*tools.Job
 	for _, job := range jobs {
-		if _, ok := job.Result(); !ok {
-			waiting = true
-			break
+		if _, ok := job.Result(); ok {
+			doneJobs = append(doneJobs, job)
+		} else if job.Reported() {
+			oldJobs = append(oldJobs, job)
+		} else {
+			freshJobs = append(freshJobs, job)
 		}
 	}
-	if waiting {
-		c.emit(Event{Kind: EventBackgroundWait, Text: strings.Join(jobIDs, ", ")})
+	sort.Slice(doneJobs, func(i, j int) bool {
+		ti, _ := doneJobs[i].FinishedAt()
+		tj, _ := doneJobs[j].FinishedAt()
+		return ti.Before(tj)
+	})
+	for _, job := range doneJobs {
+		res, _ := job.Result()
+		obs, toolErr := jobResultMessage(job, res)
+		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID})
+		job.MarkDelivered()
+		msgs = append(msgs, llm.Message{Role: "user", Content: obs})
+		if c.Session != nil {
+			_ = c.Session.Append(msgs[len(msgs)-1])
+		}
 	}
+	if len(freshJobs) == 0 {
+		// Nothing new to wait for: the only unfinished jobs are
+		// ones the model was already told about.
+		return msgs, nil
+	}
+	c.emit(Event{Kind: EventBackgroundWait, Text: strings.Join(jobIDs, ", ")})
 	// Deliver in completion order, not submission order: a slow
 	// job must not hold back results that are already ready. One
 	// goroutine per job signals a shared channel when its job
-	// finishes; the goroutines outlive a cancelled wait only until
-	// their (timeout-bounded) jobs finish.
-	done := make(chan *tools.Job, len(jobs))
-	for _, job := range jobs {
+	// finishes.
+	done := make(chan *tools.Job, len(freshJobs))
+	for _, job := range freshJobs {
 		go func(j *tools.Job) { <-j.Done(); done <- j }(job)
 	}
-	remaining := len(jobs)
+	bound := c.drainTimeout()
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	remaining := len(freshJobs)
 	for remaining > 0 {
 		select {
 		case job := <-done:
 			res, _ := job.Result()
 			obs, toolErr := jobResultMessage(job, res)
 			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID})
+			job.MarkDelivered()
 			msgs = append(msgs, llm.Message{Role: "user", Content: obs})
 			if c.Session != nil {
 				_ = c.Session.Append(msgs[len(msgs)-1])
 			}
 			remaining--
+		case <-timer.C:
+			// Bound reached: end the turn with the jobs still
+			// running instead of waiting forever. Report each
+			// one with its output file path so the model can
+			// read partial output; mark them reported so the
+			// next turn's drain does not wait on them again.
+			var still []*tools.Job
+			for _, job := range freshJobs {
+				if _, ok := job.Result(); !ok {
+					still = append(still, job)
+				}
+			}
+			if len(still) > 0 {
+				var b strings.Builder
+				fmt.Fprintf(&b, "Background jobs still running after the %s drain bound; the turn ends with them running. Their results will be delivered when they finish.", bound)
+				for _, job := range still {
+					job.MarkReported()
+					if job.OutputFile != "" {
+						fmt.Fprintf(&b, "\n- %s (job %s): read its partial output so far with read %q.", job.Command, job.ID, job.OutputFile)
+					} else {
+						fmt.Fprintf(&b, "\n- %s (job %s): still running.", job.Command, job.ID)
+					}
+				}
+				msgs = append(msgs, llm.Message{Role: "user", Content: b.String()})
+				if c.Session != nil {
+					_ = c.Session.Append(msgs[len(msgs)-1])
+				}
+			}
+			return msgs, nil
 		case <-ctx.Done():
 			return msgs, ctx.Err()
 		}
@@ -493,9 +588,12 @@ func (c *Config) streamStep(ctx context.Context, apiMsgs []llm.Message, tools []
 // and returns the assistant's final text, total tokens used, and error.
 func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Usage, error) {
 	steps := c.MaxSteps
-	if steps <= 0 {
-		steps = 50
-	}
+	// MaxSteps <= 0 means unlimited (the mainstream default): the turn
+	// runs until the model stops calling tools, an error ends it, or
+	// the task is blocked. The bounds are then auto-compaction at 70%
+	// of the context window plus the doom-loop / blocked guards. A
+	// positive MaxSteps opts into a hard cap with the grace summary.
+	hasCap := steps > 0
 	msgs := append([]llm.Message{{Role: "system", Content: c.System}}, history...)
 	var total llm.Usage
 	var lastText string
@@ -503,13 +601,28 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 	// fed back as user messages when the turn would otherwise end
 	// (see drainPending).
 	var pending []pendingJob
+	// Re-attach jobs from earlier turns whose results were never
+	// delivered: a job that finished after its turn ended — or
+	// after a bounded drain gave up on it — still owes the model
+	// its result, and a job still running may finish mid-turn, in
+	// which case collectFinishedJobs delivers it at the next step
+	// boundary. Delivered jobs are not re-attached (their result
+	// is already in history), and a job already reported
+	// still-running is never waited on again by the drain.
+	if c.Exec != nil {
+		for _, job := range c.Exec.Jobs() {
+			if !job.Delivered() {
+				pending = append(pending, pendingJob{callID: "", job: job})
+			}
+		}
+	}
 	// stopBlocks counts consecutive turn-end vetoes in this turn;
 	// failedFixes counts consecutive steps whose tool calls all
 	// failed (a step with any success resets it).
 	stopBlocks := 0
 	failedFixes := 0
 
-	for step := 0; step < steps; step++ {
+	for step := 0; !hasCap || step < steps; step++ {
 		// Finished background jobs report in at the next step,
 		// in completion order — the model sees results as soon
 		// as they are ready, not only when the turn would end.
@@ -816,6 +929,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 	}
 	// The step cap hit with jobs still running: deliver their results
 	// before reporting the cap, so the work is not silently lost.
+	// A job that is still running is left running: drainPending's
+	// bound applies here too, and the job's result is delivered at
+	// the next turn via the Run-start re-attach.
 	if len(pending) > 0 {
 		_, _ = c.drainPending(ctx, msgs, pending)
 	}

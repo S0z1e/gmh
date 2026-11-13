@@ -74,6 +74,16 @@
   automatically when the last call's context reaches 70% of the
   window (`-context-limit`, default: the model's `contextWindow`,
   else 128000).
+- Step budget: steps are unlimited by default (like Claude Code,
+  Codex, Gemini, Qwen, OpenCode and Pi): a turn runs until the model
+  stops calling tools, an error ends it, or the task is blocked
+  (3 consecutive all-failed steps). The bounds are auto-compaction
+  at 70% of the window plus the doom-loop guard (5 consecutive
+  identical calls) and the stop-hook veto cap (8). Pass
+  `-max-steps N` to opt into a hard cap; when a cap hits, the model
+  gets one final tool-less call (60s) to summarise what was done,
+  then the turn ends `max_turns` — the same shape as OpenCode's
+  final step.
 - Timeouts: a model entry may set `timeoutSeconds` (total per-request
   cap, default 600) and `idleTimeoutSeconds` (silence cap while
   streaming, default 60). A stream that produces no SSE line for the
@@ -92,13 +102,26 @@
   — never only when the turn ends. Pass `background:true` for a
   command that will not exit on its own (dev server, watcher): it
   returns at once with a job id, and its output is delivered the
-  same way. The bash timeout is 120s by default, 600s max
+  same way. An explicit `background:true` job has NO timeout unless
+  a per-call `timeout` is given — a dev server must outlive any
+  cap. The bash timeout is 120s by default, 600s max
   (per-call `timeout`, `bashTimeoutSeconds`, or
-  `OPENAI_BASH_TIMEOUT_SECONDS`). Every bash call writes its full
-  stdout+stderr to a per-call file under the session's
-  `bash-output/` directory; the result shows only the first and
-  last 30 lines plus the path. Read the file to see the middle, or
-  the partial output of a job that is still running.
+  `OPENAI_BASH_TIMEOUT_SECONDS`); a timeout kills the whole
+  process group, so a command's grandchildren die with it. Every
+  bash call writes its full stdout+stderr to a per-call file under
+  the session's `bash-output/` directory; the result shows only the
+  first and last 30 lines plus the path. Read the file to see the
+  middle, or the partial output of a job that is still running. A
+  job that never finishes never blocks the turn from ending: after
+  a 30s drain the turn ends with the job still running, the turn
+  message gives the output file path so you can read its partial
+  output, and the result is delivered at the next turn when the
+  job finishes. A background job outlives its turn: it keeps
+  running after the turn settles (and after quit, orphaned) until
+  it exits on its own or its timeout kills it — so a dev server
+  started in one turn is still serving in the next. Output files
+  cap at 64 MiB: past that the run is killed and the call fails, so
+  a spewing command cannot fill the disk.
 - Events: the agent loop emits an event stream (`text_delta`,
   `step_usage`, `tool_start`, `tool_end`, `done`, `error`); the CLI
   is one renderer of it, the TUI and the RPC server are two more. The

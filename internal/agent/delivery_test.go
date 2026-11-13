@@ -176,3 +176,87 @@ func TestDrainPendingDeliversInCompletionOrder(t *testing.T) {
 		t.Fatalf("second delivered message = %q, want the slow job second", msgs[1].Content)
 	}
 }
+
+// A never-ending background job must not block turn end: the drain
+// gives up after its bound and the turn ends with the job still
+// running, its output path reported so the model can read it.
+// (The café deadlock: a dev server started as a background job
+// blocked the turn forever because drainPending waited without
+// a bound.)
+func TestDrainPendingEndsWithNeverEndingJob(t *testing.T) {
+	root := t.TempDir()
+	outDir := t.TempDir()
+	toolCall := func(id, name string, args map[string]any) string {
+		ab, err := json.Marshal(args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Sprintf("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":%s,\"function\":{\"name\":%s,\"arguments\":%s}}]}}]}\n\n",
+			strconv.Quote(id), strconv.Quote(name), strconv.Quote(string(ab)))
+	}
+	textReply := func(text string) string {
+		return fmt.Sprintf("data: {\"choices\":[{\"delta\":{\"content\":%s}}]}\n\n", strconv.Quote(text))
+	}
+	usage := "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n"
+
+	var calls int32
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := atomic.AddInt32(&calls, 1)
+		switch n {
+		case 1:
+			fmt.Fprint(w, toolCall("call_1", "bash", map[string]any{
+				"command": "sleep 120", "background": true,
+			}))
+		case 2:
+			fmt.Fprint(w, textReply("wrapping up"))
+		default:
+			fmt.Fprint(w, textReply("all done"))
+		}
+		fmt.Fprint(w, usage)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &Config{
+		Client:       &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
+		Exec:         &tools.Executor{Root: root, OutputDir: outDir, BackgroundThreshold: tools.DefaultBackgroundThreshold},
+		Tools:        ToolDefs(),
+		System:       "test system",
+		Mode:         "auto",
+		MaxSteps:     10,
+		DrainTimeout: 200 * time.Millisecond,
+	}
+	type result struct {
+		text string
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "start a server in the background, then finish"}})
+		done <- result{text, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("Run error = %v", r.err)
+		}
+		if r.text != "all done" {
+			t.Fatalf("final text = %q, want %q", r.text, "all done")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run never returned: the drain waited forever on the never-ending job")
+	}
+	if len(bodies) < 3 {
+		t.Fatalf("saw %d LLM calls, want at least 3", len(bodies))
+	}
+	// The third request must already carry the still-running notice
+	// with the job's output file path: the turn ended with the job
+	// running instead of waiting for it.
+	if !strings.Contains(bodies[2], "still running") || !strings.Contains(bodies[2], outDir) {
+		t.Fatalf("step-3 request lacks the still-running notice with the output path; bodies:\n%s", strings.Join(bodies, "\n---\n"))
+	}
+}

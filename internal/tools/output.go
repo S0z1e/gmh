@@ -12,6 +12,7 @@ package tools
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,51 +38,43 @@ const (
 	OutputFileMaxBytes = 64 << 20
 )
 
-// bashOutputSink streams combined stdout+stderr to a file while
-// keeping the first BashOutputHeadLines lines, the last
-// BashOutputTailLines lines, and the line/byte totals in memory,
-// so the inline result can be formatted without re-reading the
-// file. It is safe for concurrent use: os/exec copies stdout and
-// stderr in separate goroutines.
+// bashOutputSink keeps the first BashOutputHeadLines lines, the
+// last BashOutputTailLines lines, and the line/byte totals for one
+// bash output, so the inline result can be formatted without
+// re-reading the file. It is fed bytes (usually by scanOutputFile,
+// which streams the output file through it) — it is NOT the child's
+// stdout: a custom Writer there would force os/exec to build a pipe,
+// and cmd.Wait() would block until every grandchild holding that
+// pipe closed it (the café deadlock: a dev server started with `&`
+// blocked turn end forever). The child writes straight to the file
+// (an *os.File), and the accounting is re-derived from the file
+// after the child exits. It is safe for concurrent use.
 type bashOutputSink struct {
 	mu      sync.Mutex
-	f       *os.File
 	pending []byte // bytes of the current, unterminated line
 	lines   int
 	bytes   int64
 	head    []string
 	tail    []string // ring: last BashOutputTailLines lines
-	capped  bool     // file stopped growing at OutputFileMaxBytes
+	capped  bool     // fed more than OutputFileMaxBytes
 	closed  bool
 }
 
-func newBashOutputSink(path string) (*bashOutputSink, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	return &bashOutputSink{f: f}, nil
+func newBashOutputSink() *bashOutputSink {
+	return &bashOutputSink{}
 }
 
-// Write appends p to the file (until the cap) and feeds it through
-// the line splitter. A line is text terminated by '\n'; a trailing
-// partial line is counted when Close flushes it.
+// Write feeds p through the line splitter. A line is text
+// terminated by '\n'; a trailing partial line is counted when
+// Close flushes it.
 func (s *bashOutputSink) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return len(p), nil
 	}
-	if !s.capped {
-		if s.bytes+int64(len(p)) > OutputFileMaxBytes {
-			room := OutputFileMaxBytes - s.bytes
-			if room > 0 {
-				_, _ = s.f.Write(p[:room])
-			}
-			s.capped = true
-		} else {
-			_, _ = s.f.Write(p)
-		}
+	if !s.capped && s.bytes+int64(len(p)) > OutputFileMaxBytes {
+		s.capped = true
 	}
 	s.bytes += int64(len(p))
 	s.pending = append(s.pending, p...)
@@ -126,8 +119,8 @@ func capLine(line string) string {
 	return line[:bashOutputMaxLineChars] + "… [line truncated]"
 }
 
-// Close flushes a trailing partial line as a line (when non-empty)
-// and closes the file. It is safe to call twice.
+// Close flushes a trailing partial line as a line (when non-empty).
+// It is safe to call twice.
 func (s *bashOutputSink) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -139,7 +132,7 @@ func (s *bashOutputSink) Close() error {
 		s.addLine(string(s.pending))
 		s.pending = nil
 	}
-	return s.f.Close()
+	return nil
 }
 
 // snapshot returns the totals and the head/tail lines for formatting.
@@ -149,6 +142,30 @@ func (s *bashOutputSink) snapshot() (lines int, bytes int64, capped bool, head, 
 	head = append([]string(nil), s.head...)
 	tail = append([]string(nil), s.tail...)
 	return s.lines, s.bytes, s.capped, head, tail
+}
+
+// scanOutputFile re-derives a finished output file's accounting by
+// streaming it through a fresh sink: line/byte totals plus head and
+// tail. The child writes straight to the file, so the scan runs
+// after Wait returns; a grandchild may still be appending (a dev
+// server's logs), which is fine — the scan is a point-in-time view
+// and the file keeps growing for later reads.
+func scanOutputFile(path string) (lines int, bytes int64, capped bool, head, tail []string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0, false, nil, nil, err
+	}
+	defer f.Close()
+	sink := newBashOutputSink()
+	buf := make([]byte, 32*1024)
+	if _, err := io.CopyBuffer(sink, f, buf); err != nil {
+		return 0, 0, false, nil, nil, err
+	}
+	if err := sink.Close(); err != nil {
+		return 0, 0, false, nil, nil, err
+	}
+	lines, bytes, capped, head, tail = sink.snapshot()
+	return lines, bytes, capped, head, tail, nil
 }
 
 // FormatBashOutput renders the inline result for a finished (or

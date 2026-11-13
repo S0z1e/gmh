@@ -446,6 +446,9 @@ type BashArgs struct {
 	// at once with a job id, for commands that will not exit on
 	// their own (dev server, watcher). The result is delivered
 	// at the next step boundary, like any backgrounded job.
+	// With no per-call timeout, an explicit background job has NO
+	// timeout: a dev server must outlive any cap (a per-call
+	// timeout, when given, is still honored).
 	Background bool `json:"background,omitempty"`
 }
 

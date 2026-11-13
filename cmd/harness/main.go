@@ -29,7 +29,7 @@ func main() {
 		api       = flag.String("api", "", "chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages (default OPENAI_API_MODE or config)")
 		provider  = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
 		config    = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
-		maxSteps  = flag.Int("max-steps", 50, "max agent steps")
+		maxSteps  = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
 		resume    = flag.String("resume", "", "resume session id")
 		sessionID = flag.String("session", "", "session id (default: timestamp)")
 		ctxLimit  = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")

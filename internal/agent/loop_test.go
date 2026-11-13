@@ -748,3 +748,66 @@ func TestRunWebfetch(t *testing.T) {
 		t.Fatalf("second request has no fetched text: %s", secondBody)
 	}
 }
+
+// MaxSteps 0 means unlimited (the mainstream default): a turn that
+// needs more than the old 50-step default must run to completion
+// instead of dying at the cap. The fake model reads two files in
+// alternation for 60 steps, then answers — alternating arguments keep
+// the doom-loop guard (5 consecutive identical calls) out of the way.
+func TestRunUnlimitedStepsPastOldDefault(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("aaa\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.txt"), []byte("bbb\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var calls int32
+	var usageEvents int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := atomic.AddInt32(&calls, 1)
+		if n <= 60 {
+			name := "a.txt"
+			if n%2 == 0 {
+				name = "b.txt"
+			}
+			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_%d\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]}}]}\n\n", n)
+			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"%s\\\"}\"}}]}}]}\n\n", name)
+			fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":3,\"total_tokens\":23}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &Config{
+		Client:   &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
+		Exec:     &tools.Executor{Root: root},
+		Tools:    ToolDefs(),
+		System:   "test system",
+		Mode:     "auto",
+		MaxSteps: 0,
+		OnEvent: func(e Event) {
+			if e.Kind == EventStepUsage {
+				atomic.AddInt32(&usageEvents, 1)
+			}
+		},
+	}
+	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "read a.txt and b.txt alternately"}})
+	if err != nil {
+		t.Fatalf("unlimited run failed: %v", err)
+	}
+	if text != "done" {
+		t.Fatalf("final text = %q, want %q", text, "done")
+	}
+	if got := atomic.LoadInt32(&calls); got != 61 {
+		t.Fatalf("LLM calls = %d, want 61 (60 tool steps + final answer)", got)
+	}
+	if got := atomic.LoadInt32(&usageEvents); got != 61 {
+		t.Fatalf("step usage events = %d, want 61", got)
+	}
+}
