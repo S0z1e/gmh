@@ -131,6 +131,8 @@ func main() {
 		switch ev.Kind {
 		case agent.EventStopBlocked:
 			fmt.Printf("stop hook blocked the turn end: %s\n", ev.Text)
+		case agent.EventStepRetry:
+			fmt.Printf("… LLM call failed, retrying: %s\n", ev.Text)
 		case agent.EventToolBackgrounded:
 			fmt.Printf("… bash running in background (%s)\n", ev.JobID)
 		case agent.EventBackgroundWait:

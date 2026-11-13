@@ -342,7 +342,12 @@ func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[str
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return nil, fmt.Errorf("LLM API %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+			Body:       strings.TrimSpace(string(b)),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 	return resp, nil
 }

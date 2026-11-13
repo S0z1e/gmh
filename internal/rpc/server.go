@@ -814,6 +814,8 @@ func (s *Server) onEvent(ev agent.Event) {
 		s.turnOutcome = &turnOutcome{text: ev.Text, err: ev.Err, reason: ev.TerminalReason}
 	case agent.EventStopBlocked:
 		s.writeEvent(Event{Type: "stop_blocked", Text: ev.Text})
+	case agent.EventStepRetry:
+		s.writeEvent(Event{Type: "step_retry", Text: ev.Text})
 	}
 }
 

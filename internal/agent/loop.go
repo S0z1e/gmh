@@ -39,6 +39,10 @@ type Config struct {
 	ConfirmContinuation func(req ContinuationRequest) (ContinuationDecision, error)
 	// DoomLoopThreshold overrides RepeatedToolCallThreshold (0 = default).
 	DoomLoopThreshold int
+	// MaxLLMAttempts caps LLM calls per step, including retries of
+	// transient failures (0 = default 4: the first attempt plus up
+	// to 3 retries; 1 = no retry).
+	MaxLLMAttempts int
 	// AskQuestion is the structured-question seam for the ask_user
 	// tool: it asks the user the request's questions and returns
 	// their answers. Nil means nobody can be asked (headless): the
@@ -307,6 +311,92 @@ const MaxStopBlocks = 8
 // guard's job) and every attempt failed.
 const MaxFailedFixAttempts = 3
 
+// maxLLMAttempts returns the per-step LLM attempt budget.
+func (c *Config) maxLLMAttempts() int {
+	if c.MaxLLMAttempts <= 0 {
+		return 4
+	}
+	return c.MaxLLMAttempts
+}
+
+// retryDelay is the backoff before attempt `attempt+1`, after
+// attempt `attempt` failed: exponential 2s, 4s, 8s, capped at 16s.
+// A Retry-After delay from the provider replaces the backoff,
+// capped at 60s.
+func retryDelay(attempt int, retryAfter time.Duration) time.Duration {
+	if retryAfter > 0 {
+		if retryAfter > 60*time.Second {
+			return 60 * time.Second
+		}
+		return retryAfter
+	}
+	d := time.Duration(1<<uint(attempt)) * time.Second
+	if d > 16*time.Second {
+		return 16 * time.Second
+	}
+	return d
+}
+
+// sleepCtx sleeps for d unless the context dies first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// streamStep wraps Client.Stream with bounded retries of transient
+// LLM failures (a flapping gateway's 403/429/5xx, a dropped
+// connection): one failed call must not end the turn. It returns
+// the number of attempts used and the final error (nil on success).
+// It NEVER retries once any output was exposed — text, thinking or
+// the done message — because replaying the call would duplicate
+// streamed text the GUI already showed. It never retries a
+// cancelled context or a non-retryable error, and each retry is
+// announced with an EventStepRetry.
+func (c *Config) streamStep(ctx context.Context, apiMsgs []llm.Message, tools []llm.ToolDef, onText func(string), onDone func(llm.Message, llm.Usage), onThinking func(string)) (int, error) {
+	attempts := c.maxLLMAttempts()
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		outputSeen := false
+		wrappedText := func(s string) {
+			outputSeen = true
+			if onText != nil {
+				onText(s)
+			}
+		}
+		wrappedDone := func(m llm.Message, u llm.Usage) {
+			outputSeen = true
+			if onDone != nil {
+				onDone(m, u)
+			}
+		}
+		wrappedThinking := func(s string) {
+			outputSeen = true
+			if onThinking != nil {
+				onThinking(s)
+			}
+		}
+		err = c.Client.Stream(ctx, apiMsgs, tools, wrappedText, wrappedDone, wrappedThinking)
+		if err == nil {
+			return attempt, nil
+		}
+		if outputSeen || ctx.Err() != nil || !llm.IsRetryable(err) || attempt == attempts {
+			return attempt, err
+		}
+		delay := retryDelay(attempt, llm.RetryAfter(err))
+		c.emit(Event{Kind: EventStepRetry, Text: fmt.Sprintf("LLM call failed (attempt %d/%d): %v; retrying in %s", attempt, attempts, err, delay), RetryAttempt: attempt + 1})
+		if !sleepCtx(ctx, delay) {
+			return attempt, err
+		}
+	}
+	return attempts, err
+}
+
 // Run executes one user turn. It appends messages to the session store
 // and returns the assistant's final text, total tokens used, and error.
 func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Usage, error) {
@@ -345,7 +435,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		// frozen, so the sent view stays append-only between prunes.
 		apiMsgs := truncateToolResults(msgs, toolResultMaxChars)
 		apiMsgs = pruneOldToolResults(apiMsgs, pruneThresholdChars, pruneBlockChars, pruneKeepNewestBlocks)
-		err := c.Client.Stream(ctx, apiMsgs, c.Tools, func(s string) {
+		attempts, err := c.streamStep(ctx, apiMsgs, c.Tools, func(s string) {
 			c.emit(Event{Kind: EventTextDelta, Text: s})
 		}, func(m llm.Message, u llm.Usage) {
 			assistant = m
@@ -359,6 +449,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		})
 		if err != nil {
 			wrapped := fmt.Errorf("step %d: %w", step+1, err)
+			if attempts > 1 {
+				wrapped = fmt.Errorf("step %d: %w (after %d attempts)", step+1, err, attempts)
+			}
 			// The turn is over, but a running job's result is still
 			// the user's data: deliver it before reporting the error
 			// so it is not silently lost.
@@ -659,7 +752,7 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message) (string, llm
 	var final llm.Message
 	var usage llm.Usage
 	var thinking strings.Builder
-	err := c.Client.Stream(graceCtx, apiMsgs, nil, func(s string) {
+	_, err := c.streamStep(graceCtx, apiMsgs, nil, func(s string) {
 		c.emit(Event{Kind: EventTextDelta, Text: s})
 	}, func(m llm.Message, u llm.Usage) {
 		final = m

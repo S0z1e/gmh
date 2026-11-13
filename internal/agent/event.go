@@ -47,6 +47,10 @@ const (
 	// Text is the hook's block reason; the loop feeds it back to
 	// the model and continues, up to MaxStopBlocks times.
 	EventStopBlocked EventKind = "stop_blocked"
+	// EventStepRetry fires before a retry of a failed LLM call.
+	// Text says which attempt failed and how long the wait is;
+	// RetryAttempt is the attempt number about to run.
+	EventStepRetry EventKind = "step_retry"
 )
 
 // TerminalReason is why a turn ended, as a structured value —
@@ -109,4 +113,7 @@ type Event struct {
 	// TerminalReason says why the turn ended, for Done and Error.
 	// Empty for all other events.
 	TerminalReason TerminalReason
+	// RetryAttempt is the attempt number about to run, for
+	// EventStepRetry. 0 for all other events.
+	RetryAttempt int
 }
