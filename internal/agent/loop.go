@@ -213,7 +213,11 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (string, *tools.
 	// at the next step boundary.
 	backgrounded := func(job *tools.Job) (string, *tools.Job) {
 		c.emit(Event{Kind: EventToolBackgrounded, ToolName: "bash", ToolArgs: tc.Function.Arguments, JobID: job.ID})
-		return fmt.Sprintf("Command is still running in the background (job %s). Continue with other work; its output will be delivered automatically when it finishes. Do not re-run the command, and do not wait for it with sleep or polling.", job.ID), job
+		msg := fmt.Sprintf("Command is still running in the background (job %s). Continue with other work; its output will be delivered automatically when it finishes. Do not re-run the command, and do not wait for it with sleep or polling.", job.ID)
+		if job.OutputFile != "" {
+			msg += fmt.Sprintf(" You can read its partial output so far with read %q.", job.OutputFile)
+		}
+		return msg, job
 	}
 	if a.Background {
 		// Explicit background, chosen by the model: start and

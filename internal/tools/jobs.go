@@ -41,7 +41,10 @@ type JobResult struct {
 type Job struct {
 	ID      string
 	Command string
-	Started time.Time
+	// OutputFile is the per-call file holding the full stdout+stderr
+	// ("" when OutputDir was unset); it grows while the job runs.
+	OutputFile string
+	Started    time.Time
 
 	mu         sync.Mutex
 	done       chan struct{}
@@ -165,13 +168,20 @@ func (r *JobRegistry) forget(j *Job) {
 func (e *Executor) ForgetJob(j *Job) { e.registry().forget(j) }
 
 // runBashCmd runs one bash -c command with the given timeout and
-// returns the (capped) combined output, exit code and error. A timeout
-// is reported as a *timeoutError; a non-zero exit as an error wrapped
-// with "exit: ". Shared by Bash and BashBackground so both audit the
-// same outcomes. With Sandbox on, the command runs under bwrap (see
-// sandbox.go); killing the bwrap process kills the sandbox too
-// (--die-with-parent).
-func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration) (string, int, error) {
+// returns the inline (head+tail) result, exit code and error. A
+// timeout is reported as a *timeoutError; a non-zero exit as an
+// error wrapped with "exit: ". Shared by Bash and BashBackground so
+// both audit the same outcomes. With Sandbox on, the command runs
+// under bwrap (see sandbox.go); killing the bwrap process kills the
+// sandbox too (--die-with-parent).
+//
+// When outPath is set, combined stdout+stderr streams to that file
+// as it is produced (so a background job's file grows while it
+// runs) and the returned string is FormatBashOutput's head+tail
+// view plus the path. When outPath is "" (no OutputDir), the old
+// in-memory behaviour applies: CombinedOutput capped at
+// MaxOutBytes, no path.
+func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration, outPath string) (string, int, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var cmd *exec.Cmd
@@ -185,6 +195,31 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	} else {
 		cmd = exec.CommandContext(ctx, "bash", "-c", command)
 		cmd.Dir = e.Root
+	}
+	if outPath != "" {
+		sink, err := newBashOutputSink(outPath)
+		if err == nil {
+			cmd.Stdout = sink
+			cmd.Stderr = sink
+			runErr := cmd.Run()
+			_ = sink.Close()
+			lines, bytes, fileCapped, head, tail := sink.snapshot()
+			s := FormatBashOutput(lines, bytes, fileCapped, head, tail, outPath)
+			exitCode := -1
+			if cmd.ProcessState != nil {
+				exitCode = cmd.ProcessState.ExitCode()
+			}
+			if ctx.Err() == context.DeadlineExceeded {
+				return s, -1, &timeoutError{timeout}
+			}
+			if runErr != nil {
+				return s, exitCode, fmt.Errorf("exit: %w", runErr)
+			}
+			return s, exitCode, nil
+		}
+		// Unwritable output file must not fail the command: fall
+		// through to the in-memory path in this same invocation
+		// (never re-run the command).
 	}
 	out, err := cmd.CombinedOutput()
 	s := truncate(string(out), MaxOutBytes)
@@ -213,10 +248,11 @@ func (e *Executor) BashBackground(ctx context.Context, a BashArgs) (*Job, error)
 		return nil, fmt.Errorf("denied by policy: %s (this is harm reduction, not a sandbox — see README)", reason)
 	}
 	timeout := e.bashTimeout(a)
-	job := &Job{Command: a.Command, Started: time.Now(), done: make(chan struct{})}
+	outPath := e.nextOutputFile()
+	job := &Job{Command: a.Command, OutputFile: outPath, Started: time.Now(), done: make(chan struct{})}
 	e.registry().add(job)
 	go func() {
-		out, exitCode, err := e.runBashCmd(ctx, a.Command, timeout)
+		out, exitCode, err := e.runBashCmd(ctx, a.Command, timeout, outPath)
 		var te *timeoutError
 		switch {
 		case errors.As(err, &te):

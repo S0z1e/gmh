@@ -94,7 +94,11 @@
   returns at once with a job id, and its output is delivered the
   same way. The bash timeout is 120s by default, 600s max
   (per-call `timeout`, `bashTimeoutSeconds`, or
-  `OPENAI_BASH_TIMEOUT_SECONDS`).
+  `OPENAI_BASH_TIMEOUT_SECONDS`). Every bash call writes its full
+  stdout+stderr to a per-call file under the session's
+  `bash-output/` directory; the result shows only the first and
+  last 30 lines plus the path. Read the file to see the middle, or
+  the partial output of a job that is still running.
 - Events: the agent loop emits an event stream (`text_delta`,
   `step_usage`, `tool_start`, `tool_end`, `done`, `error`); the CLI
   is one renderer of it, the TUI and the RPC server are two more. The

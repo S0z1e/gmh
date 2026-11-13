@@ -4,7 +4,7 @@ Tools you can use: read, write, edit, bash, grep, glob, load_skill, ask_user.
 - read: read a file (with line ranges) or list a directory. Use it before editing.
 - write: create a new file only. Never overwrite with write; use edit for existing files.
 - edit: replace exact oldText with newText (must match exactly once), or replace lines startLine–endLine with newText. After a read, prefer the line form — it cannot go stale.
-- bash: run a shell command with a timeout (default 120s, max 600s). Pass background:true for a command that will not exit on its own (dev server, watcher): it returns at once with a job id and its output is delivered at the next step. Never run destructive commands without approval.
+- bash: run a shell command with a timeout (default 120s, max 600s). Pass background:true for a command that will not exit on its own (dev server, watcher): it returns at once with a job id and its output is delivered at the next step. Every bash call writes its full output to a file; the result shows only the head and tail plus the path — read the file to see the middle, or the partial output of a still-running job. Never run destructive commands without approval.
 - grep: search file contents with a regex. Use this instead of bash grep/rg.
 - glob: list files matching a glob pattern. Use this instead of bash find/ls to discover files.
 - load_skill: load the full text of an available skill by name. When a task matches a skill listed below, call load_skill first and follow its instructions instead of guessing. If the skill lists reference files and you need one, load just that file with load_skill {name, reference} instead of guessing its contents.

@@ -65,6 +65,11 @@ type Executor struct {
 	// LookupIP resolves hosts for webfetch's SSRF check (nil = the
 	// system resolver). Tests inject a fake.
 	LookupIP func(ctx context.Context, host string) ([]net.IP, error)
+	// OutputDir is where bash output files go (session-scoped, set
+	// by app.Setup; "" = disabled, bash falls back to the in-memory
+	// result). Read allows absolute paths under it even though they
+	// sit outside the workspace root; Write/Edit/Glob/Grep do not.
+	OutputDir string
 	// Plugins runs plugin-registered tools (nil = no plugins loaded).
 	// The interface keeps this package free of the moejs dependency:
 	// app.Setup sets it to the loaded *plugins.Registry. A plugin
@@ -74,6 +79,9 @@ type Executor struct {
 
 	jobsMu sync.Mutex
 	jobs   *JobRegistry
+
+	outMu  sync.Mutex
+	outSeq int
 
 	cacheOnce  sync.Once
 	fetchCache *webfetchCache
@@ -127,9 +135,17 @@ type ReadArgs struct {
 }
 
 func (e *Executor) Read(a ReadArgs) (string, error) {
+	// Narrow exception: bash output files live in the session
+	// directory, outside the workspace root, and the model reads
+	// them by their absolute path. Only Read has this exception;
+	// Write/Edit/Glob/Grep go through resolve and stay jailed.
 	p, err := e.resolve(a.Path)
 	if err != nil {
-		return "", err
+		q, ok := e.outputDirPath(a.Path)
+		if !ok {
+			return "", err
+		}
+		p = q
 	}
 	info, err := os.Stat(p)
 	if err != nil {
@@ -457,7 +473,7 @@ func (e *Executor) Bash(ctx context.Context, a BashArgs) (string, error) {
 		return "", fmt.Errorf("denied by policy: %s (this is harm reduction, not a sandbox — see README)", reason)
 	}
 	timeout := e.bashTimeout(a)
-	s, exitCode, err := e.runBashCmd(ctx, a.Command, timeout)
+	s, exitCode, err := e.runBashCmd(ctx, a.Command, timeout, e.nextOutputFile())
 	var te *timeoutError
 	switch {
 	case errors.As(err, &te):
