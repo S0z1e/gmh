@@ -91,6 +91,9 @@ func TestRunRetriesTransient403(t *testing.T) {
 	if got := retryAttempts(events); len(got) != 2 || got[0] != 2 || got[1] != 3 {
 		t.Fatalf("step_retry attempts = %v, want [2 3]", got)
 	}
+	if got := countKind(events, EventStepDiscard); got != 0 {
+		t.Fatalf("step_discard events = %d, want 0: nothing was streamed before the 403s", got)
+	}
 	if cfg.LastTerminalReason != TerminalEndTurn {
 		t.Fatalf("terminal reason = %q, want end_turn", cfg.LastTerminalReason)
 	}
@@ -111,6 +114,9 @@ func TestRunRetriesExhausted(t *testing.T) {
 	}
 	if got := countKind(events, EventStepRetry); got != 3 {
 		t.Fatalf("step_retry events = %d, want 3", got)
+	}
+	if got := countKind(events, EventStepDiscard); got != 0 {
+		t.Fatalf("step_discard events = %d, want 0: nothing was streamed before the 403s", got)
 	}
 	if cfg.LastTerminalReason != TerminalError {
 		t.Fatalf("terminal reason = %q, want error", cfg.LastTerminalReason)
@@ -134,34 +140,149 @@ func TestRunNeverRetries401(t *testing.T) {
 	}
 }
 
-// A stream that emits one text delta and then closes without [DONE]
-// is never retried: the text was already exposed.
-func TestRunNeverRetriesAfterOutput(t *testing.T) {
+// cutoffTestServer returns a server that cuts off the first
+// cutCount requests after one delta, then answers a valid SSE
+// success. When thinking is true the cut-off delta is a
+// reasoning_content delta ("partial-thinking") and the success
+// streams thinking ("real-thinking") before its text; otherwise the
+// cut-off delta is text ("partial-") and the success is text only.
+func cutoffTestServer(t *testing.T, cutCount int32, thinking bool) (*httptest.Server, *int32) {
+	t.Helper()
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
+		n := atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
+		if n <= cutCount {
+			if thinking {
+				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial-thinking\"}}]}\n\n")
+			} else {
+				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial-\"}}]}\n\n")
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			// Close without [DONE]: a mid-stream cut-off.
+			return
 		}
-		// Close without [DONE].
+		if thinking {
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"real-thinking\"}}]}\n\n")
+		}
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv, &calls
+}
+
+func discardAttempts(events []Event) []int {
+	var out []int
+	for _, e := range events {
+		if e.Kind == EventStepDiscard {
+			out = append(out, e.RetryAttempt)
+		}
+	}
+	return out
+}
+
+func eventOrder(events []Event, kinds ...EventKind) []EventKind {
+	var out []EventKind
+	for _, e := range events {
+		for _, k := range kinds {
+			if e.Kind == k {
+				out = append(out, e.Kind)
+			}
+		}
+	}
+	return out
+}
+
+// A stream that emits one text delta and then cuts off IS retried:
+// the partial reply is discarded first, then the replay succeeds.
+// The final text is exactly the replay's text — "partial-" never
+// becomes part of the answer.
+func TestRunRetriesCutOffAfterOutput(t *testing.T) {
+	srv, calls := cutoffTestServer(t, 1, false)
 	var events []Event
 	cfg := retryTestConfig(t, srv, &events)
 	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "say hello"}})
-	if err == nil || !strings.Contains(err.Error(), "stream ended without [DONE]") {
-		t.Fatalf("Run error = %v, want the cut-off stream error", err)
+	if err != nil {
+		t.Fatalf("Run error = %v, want nil after the discard + retry", err)
 	}
-	if text != "" {
-		t.Fatalf("final text = %q, want empty: the partial text never became an answer", text)
+	if text != "final answer" {
+		t.Fatalf("final text = %q, want \"final answer\"", text)
 	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("LLM calls = %d, want 1", got)
+	if got := atomic.LoadInt32(calls); got != 2 {
+		t.Fatalf("LLM calls = %d, want 2 (1 cut-off + success)", got)
 	}
-	if got := countKind(events, EventStepRetry); got != 0 {
-		t.Fatalf("step_retry events = %d, want 0", got)
+	if got := discardAttempts(events); len(got) != 1 || got[0] != 2 {
+		t.Fatalf("step_discard attempts = %v, want [2]", got)
+	}
+	if got := retryAttempts(events); len(got) != 1 || got[0] != 2 {
+		t.Fatalf("step_retry attempts = %v, want [2]", got)
+	}
+	// The discard must precede the retry: a renderer drops the
+	// partial text before the replay's deltas arrive.
+	order := eventOrder(events, EventStepDiscard, EventStepRetry)
+	if len(order) != 2 || order[0] != EventStepDiscard || order[1] != EventStepRetry {
+		t.Fatalf("discard/retry order = %v, want [step_discard step_retry]", order)
+	}
+	if cfg.LastTerminalReason != TerminalEndTurn {
+		t.Fatalf("terminal reason = %q, want end_turn", cfg.LastTerminalReason)
+	}
+}
+
+// A stream that always cuts off after a delta: the turn fails after
+// exactly 4 attempts, with a discard before each retry.
+func TestRunCutOffAlwaysFails(t *testing.T) {
+	srv, calls := cutoffTestServer(t, 100, false)
+	var events []Event
+	cfg := retryTestConfig(t, srv, &events)
+	_, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "say hello"}})
+	if err == nil || !strings.Contains(err.Error(), "after 4 attempts") {
+		t.Fatalf("Run error = %v, want it to contain \"after 4 attempts\"", err)
+	}
+	if got := atomic.LoadInt32(calls); got != 4 {
+		t.Fatalf("LLM calls = %d, want 4", got)
+	}
+	if got := countKind(events, EventStepDiscard); got != 3 {
+		t.Fatalf("step_discard events = %d, want 3", got)
+	}
+	if got := countKind(events, EventStepRetry); got != 3 {
+		t.Fatalf("step_retry events = %d, want 3", got)
+	}
+	if cfg.LastTerminalReason != TerminalError {
+		t.Fatalf("terminal reason = %q, want error", cfg.LastTerminalReason)
+	}
+}
+
+// A cut-off after a thinking delta: the discarded attempt's thinking
+// must not leak into the replay's ThinkingEnd.
+func TestRunCutOffResetsThinking(t *testing.T) {
+	srv, calls := cutoffTestServer(t, 1, true)
+	var events []Event
+	cfg := retryTestConfig(t, srv, &events)
+	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "say hello"}})
+	if err != nil {
+		t.Fatalf("Run error = %v, want nil after the discard + retry", err)
+	}
+	if text != "final answer" {
+		t.Fatalf("final text = %q, want \"final answer\"", text)
+	}
+	if got := atomic.LoadInt32(calls); got != 2 {
+		t.Fatalf("LLM calls = %d, want 2 (1 cut-off + success)", got)
+	}
+	var thinkingEnds []string
+	for _, e := range events {
+		if e.Kind == EventThinkingEnd {
+			thinkingEnds = append(thinkingEnds, e.Text)
+		}
+	}
+	if len(thinkingEnds) != 1 || thinkingEnds[0] != "real-thinking" {
+		t.Fatalf("thinking_end texts = %q, want exactly [\"real-thinking\"]", thinkingEnds)
+	}
+	if got := countKind(events, EventStepDiscard); got != 1 {
+		t.Fatalf("step_discard events = %d, want 1", got)
 	}
 }
 

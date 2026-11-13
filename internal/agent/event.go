@@ -51,6 +51,14 @@ const (
 	// Text says which attempt failed and how long the wait is;
 	// RetryAttempt is the attempt number about to run.
 	EventStepRetry EventKind = "step_retry"
+	// EventStepDiscard fires before a retry of an LLM call whose
+	// stream was cut off after partial output: it tells every
+	// renderer to drop everything streamed for the current step
+	// so far — text deltas and thinking deltas — because the
+	// stream is being replayed from scratch. Nothing from the
+	// discarded attempt enters history or the session. RetryAttempt
+	// is the attempt number about to run, like EventStepRetry.
+	EventStepDiscard EventKind = "step_discard"
 )
 
 // TerminalReason is why a turn ended, as a structured value —
@@ -114,6 +122,6 @@ type Event struct {
 	// Empty for all other events.
 	TerminalReason TerminalReason
 	// RetryAttempt is the attempt number about to run, for
-	// EventStepRetry. 0 for all other events.
+	// EventStepRetry and EventStepDiscard. 0 for all other events.
 	RetryAttempt int
 }

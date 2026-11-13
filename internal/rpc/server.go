@@ -816,6 +816,8 @@ func (s *Server) onEvent(ev agent.Event) {
 		s.writeEvent(Event{Type: "stop_blocked", Text: ev.Text})
 	case agent.EventStepRetry:
 		s.writeEvent(Event{Type: "step_retry", Text: ev.Text})
+	case agent.EventStepDiscard:
+		s.writeEvent(Event{Type: "step_discard", Text: ev.Text})
 	}
 }
 

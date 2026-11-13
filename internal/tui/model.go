@@ -85,8 +85,15 @@ type Model struct {
 	// accumulated like live. It is display-only: it never enters
 	// the assistant message or the session.
 	liveThinking string
-	liveTool     string // tool currently running, "" when idle
-	liveToolArgs string // JSON args of the running tool (ToolEnd
+	// stepEndLiveLen / stepEndThinkingLen mark the end of the last
+	// completed LLM call inside live / liveThinking: a step_discard
+	// truncates back to them, dropping only the current step's
+	// partial text. Saved at StepUsage, reset when live is cleared
+	// (Done) or when the in-flight step ends in error.
+	stepEndLiveLen     int
+	stepEndThinkingLen int
+	liveTool           string // tool currently running, "" when idle
+	liveToolArgs       string // JSON args of the running tool (ToolEnd
 	// carries no args, so the summary is built from these)
 	working bool
 	// workingSince is when the current turn started working; the
@@ -403,6 +410,25 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 	case agent.EventStepUsage:
 		// Usage lines are printed by the runner via PrintMsg, through
 		// the same queue, so they land after the reply text.
+		// This also marks the end of a completed LLM call: any
+		// text/thinking streamed after here belongs to the next
+		// step, so a later step_discard truncates back to here.
+		m.stepEndLiveLen = len(m.live)
+		m.stepEndThinkingLen = len(m.liveThinking)
+	case agent.EventStepDiscard:
+		// The stream was cut off after showing partial output and
+		// the call is being replayed: drop only the current step's
+		// partial text and thinking. live is only ever appended to
+		// between step ends, so the cut lands on a delta boundary.
+		// Clamp defensively: a stale marker must never panic the
+		// slice.
+		if m.stepEndLiveLen < len(m.live) {
+			m.live = m.live[:m.stepEndLiveLen]
+		}
+		if m.stepEndThinkingLen < len(m.liveThinking) {
+			m.liveThinking = m.liveThinking[:m.stepEndThinkingLen]
+		}
+		return m, tea.Println(styleWarning.Render("… ") + styleBase.Render("discarded partial reply, retrying"))
 	case agent.EventToolBackgrounded:
 		// The tool keeps running as a job; it no longer blocks the
 		// live region. Tell the scrollback, like a finished turn.
@@ -438,6 +464,8 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.pendingThinking = strings.TrimRight(m.liveThinking, "\n")
 		m.live = ""
 		m.liveThinking = ""
+		m.stepEndLiveLen = 0
+		m.stepEndThinkingLen = 0
 		m.liveTool = ""
 		m.liveToolArgs = ""
 		m.working = false
@@ -446,6 +474,8 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.liveTool = ""
 		m.liveToolArgs = ""
 		m.liveThinking = ""
+		m.stepEndLiveLen = len(m.live)
+		m.stepEndThinkingLen = 0
 		m.working = false
 		m.workingSince = time.Time{}
 		// The error line itself is printed by the runner.

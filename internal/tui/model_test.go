@@ -205,6 +205,30 @@ func TestModelStreamsTextIntoLiveRegion(t *testing.T) {
 	}
 }
 
+// A step_discard drops only the current step's partial text and
+// thinking, back to the last completed call (marked by StepUsage) —
+// earlier steps' uncommitted text in the same turn survives, and the
+// replay's deltas append after it instead of after the half-reply.
+func TestModelDiscardsPartialStepOnStepDiscard(t *testing.T) {
+	m := NewModel("")
+	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventTextDelta, Text: "first step "}})
+	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventThinkingDelta, Text: "first thought"}})
+	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventStepUsage}})
+	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventTextDelta, Text: "partial-"}})
+	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventThinkingDelta, Text: "partial-thought"}})
+	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventStepDiscard, Text: "cut off"}})
+	if m.live != "first step " {
+		t.Fatalf("live = %q, want %q", m.live, "first step ")
+	}
+	if m.liveThinking != "first thought" {
+		t.Fatalf("liveThinking = %q, want %q", m.liveThinking, "first thought")
+	}
+	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventTextDelta, Text: "replayed"}})
+	if m.live != "first step replayed" {
+		t.Fatalf("live = %q, want %q", m.live, "first step replayed")
+	}
+}
+
 func TestModelFlushesLiveOnDone(t *testing.T) {
 	m := NewModel("")
 	m = apply(t, m, EventMsg{Event: agent.Event{Kind: agent.EventTextDelta, Text: "done text"}})

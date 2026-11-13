@@ -125,16 +125,19 @@ Events (stdout):
 - `question_request` `{"id":"quest-1","questions":[{"question":"Which database?","header":"DB","options":[{"label":"Postgres","description":"..."}],"multi_select":false}]}` — the model's `ask_user` tool: up to 4 questions, 2–4 options each. The agent blocks until the GUI answers with `question_response`. The answers reach the model as a tool observation; in a headless run there is nobody to ask, so the model gets an observation telling it to proceed with its best judgement and state its assumptions. The TUI does not ask either (same headless observation).
 - `stop_blocked` `{"text":"go test failed"}` — a plugin `stop` hook vetoed the turn end (see `docs/plugins.md`). The turn continues; the GUI should show the reason as a notice, not as a failure. After 8 consecutive vetoes the turn is allowed to end anyway.
 - `step_retry` `{"text":"LLM call failed (attempt 1/4): LLM API 403 Forbidden: ...; retrying in 2s"}` — a transient LLM failure is being retried; the turn continues. The GUI should show it as a notice, not as a failure.
+- `step_discard` `{"text":"LLM stream cut off after partial output (...); discarding the partial reply"}` — the stream was cut off after showing partial text/thinking, and the call is being replayed from scratch. The GUI must drop everything it showed for the current step (text and thinking deltas since the last `step_usage`) before the replay's deltas arrive, or the half-reply will be duplicated.
 
 Transient LLM failures are retried, not fatal: a failed LLM call is
 retried up to 4 attempts in total (the first attempt plus up to 3
 retries) when the failure is transient — HTTP 403, 429, 500, 502,
-503 or 504, a dropped connection, or a stream cut off before any
-output — with exponential backoff of 2s, 4s, 8s (a provider
+503 or 504, a dropped connection, or a stream cut off mid-reply —
+with exponential backoff of 2s, 4s, 8s (a provider
 `Retry-After` header replaces the backoff, capped at 60s). 401 and
-other 4xx are never retried, and a call is never retried once any
-text, thinking or done output was already exposed, so streamed text
-is never duplicated. A turn that still fails reports
+other 4xx are never retried. A cut-off stream is retried too: the
+partial reply is discarded first (a `step_discard` event tells the
+GUI to drop it), so streamed text is never duplicated. Only a
+completed message is never replayed: once the done message has
+arrived, a later error ends the turn instead. A turn that still fails reports
 `(after 4 attempts)` in the step error.
 - `agent_settled` — exactly one per turn, whatever happened:
   `{"text":"...","usage":{...},"session_usage":{...},"cost_usd":null|N,"session_cost_usd":null|N,"fee":"...","aborted":false,"reason":"end_turn"|"max_turns"|"abort"|"error"|"repeated_tool_call_denied"|"blocked","error":null|"...","tool_mode":"default"|"plan"}`.

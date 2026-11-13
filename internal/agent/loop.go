@@ -351,18 +351,24 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 
 // streamStep wraps Client.Stream with bounded retries of transient
 // LLM failures (a flapping gateway's 403/429/5xx, a dropped
-// connection): one failed call must not end the turn. It returns
-// the number of attempts used and the final error (nil on success).
-// It NEVER retries once any output was exposed — text, thinking or
-// the done message — because replaying the call would duplicate
-// streamed text the GUI already showed. It never retries a
-// cancelled context or a non-retryable error, and each retry is
-// announced with an EventStepRetry.
-func (c *Config) streamStep(ctx context.Context, apiMsgs []llm.Message, tools []llm.ToolDef, onText func(string), onDone func(llm.Message, llm.Usage), onThinking func(string)) (int, error) {
+// connection, a stream cut off mid-reply): one failed call must not
+// end the turn. It returns the number of attempts used and the final
+// error (nil on success). It never retries a cancelled context or a
+// non-retryable error, and each retry is announced with an
+// EventStepRetry. A completed message is never replayed: once onDone
+// has run (doneSeen), the reply already exists, so the call is not
+// retried even if it then errors. A stream cut off after partial
+// output IS retried: the partial reply is discarded first — an
+// EventStepDiscard tells every renderer to drop what it showed for
+// this step, and onRetry resets the caller's per-attempt state —
+// then the call is replayed from scratch, so the GUI never shows
+// the half-reply followed by the replay.
+func (c *Config) streamStep(ctx context.Context, apiMsgs []llm.Message, tools []llm.ToolDef, onText func(string), onDone func(llm.Message, llm.Usage), onThinking func(string), onRetry func()) (int, error) {
 	attempts := c.maxLLMAttempts()
 	var err error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		outputSeen := false
+		doneSeen := false
 		wrappedText := func(s string) {
 			outputSeen = true
 			if onText != nil {
@@ -371,6 +377,7 @@ func (c *Config) streamStep(ctx context.Context, apiMsgs []llm.Message, tools []
 		}
 		wrappedDone := func(m llm.Message, u llm.Usage) {
 			outputSeen = true
+			doneSeen = true
 			if onDone != nil {
 				onDone(m, u)
 			}
@@ -385,8 +392,21 @@ func (c *Config) streamStep(ctx context.Context, apiMsgs []llm.Message, tools []
 		if err == nil {
 			return attempt, nil
 		}
-		if outputSeen || ctx.Err() != nil || !llm.IsRetryable(err) || attempt == attempts {
+		if doneSeen || ctx.Err() != nil || !llm.IsRetryable(err) || attempt == attempts {
 			return attempt, err
+		}
+		if outputSeen {
+			// The stream was cut off after showing partial output:
+			// discard the partial reply before replaying. The
+			// assistant message and usage need no reset here: they
+			// are only written by onDone, which sets doneSeen and
+			// blocks the retry above. Only the caller's thinking
+			// accumulator holds per-attempt state, and onRetry
+			// resets it.
+			c.emit(Event{Kind: EventStepDiscard, Text: fmt.Sprintf("LLM stream cut off after partial output (%v); discarding the partial reply", err), RetryAttempt: attempt + 1})
+			if onRetry != nil {
+				onRetry()
+			}
 		}
 		delay := retryDelay(attempt, llm.RetryAfter(err))
 		c.emit(Event{Kind: EventStepRetry, Text: fmt.Sprintf("LLM call failed (attempt %d/%d): %v; retrying in %s", attempt, attempts, err, delay), RetryAttempt: attempt + 1})
@@ -446,6 +466,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		}, func(s string) {
 			thinking.WriteString(s)
 			c.emit(Event{Kind: EventThinkingDelta, Text: s})
+		}, func() {
+			// A discarded attempt's thinking must not leak into
+			// the replay's ThinkingEnd: the builder holds only
+			// this step's thinking, and the discard drops it.
+			thinking.Reset()
 		})
 		if err != nil {
 			wrapped := fmt.Errorf("step %d: %w", step+1, err)
@@ -763,6 +788,8 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message) (string, llm
 	}, func(s string) {
 		thinking.WriteString(s)
 		c.emit(Event{Kind: EventThinkingDelta, Text: s})
+	}, func() {
+		thinking.Reset()
 	})
 	if err != nil || final.Content == "" {
 		return "", llm.Usage{}, false

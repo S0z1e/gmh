@@ -43,8 +43,9 @@ func parseRetryAfter(h string) time.Duration {
 // a transient provider failure, not a bad request or a dead key.
 // Context errors are never retryable: a cancelled turn must end,
 // not loop. Whether a retryable error is actually retried is the
-// caller's decision: agent.streamStep never retries once any output
-// was already exposed, even for a retryable error.
+// caller's decision: agent.streamStep replays a cut-off stream
+// only after emitting a step_discard event (so renderers drop the
+// partial output first), and never replays a completed message.
 func IsRetryable(err error) bool {
 	if err == nil {
 		return false
