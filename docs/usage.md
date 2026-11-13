@@ -31,6 +31,13 @@
   turn reports 0 tokens.
 - Modes: `-mode suggest` (default, ask before write/edit/bash),
   `-mode auto` (no prompts, use only on a disposable copy).
+- Editing: `edit` takes either `oldText` (must match exactly once —
+  a failed match names the closest lines, so the call can be fixed
+  instead of re-reading the file) or `startLine`/`endLine` (1-based,
+  inclusive; `endLine` defaults to `startLine`) to replace those
+  lines with `newText`. After a `read`, prefer the line form: it
+  cannot go stale the way `oldText` can. Run builds and tests bare,
+  never piped through `head`/`tail`, so the exit code is visible.
 - Skills: put `SKILL.md` files under `.agents/skills/<name>/` in the
   project, or `~/.config/minimal-harness/skills/`. Only name +
   description are loaded at startup; the full text loads on demand

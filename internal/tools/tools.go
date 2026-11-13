@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -196,6 +197,29 @@ type EditArgs struct {
 	Path    string `json:"path"`
 	OldText string `json:"oldText"`
 	NewText string `json:"newText"`
+	// StartLine/EndLine are the line-range form (1-based, inclusive):
+	// when StartLine > 0 the edit replaces exactly those lines with
+	// NewText and ignores OldText. EndLine 0 means StartLine (one
+	// line). Line numbers come from read, which prints them, and
+	// cannot go stale the way oldText can.
+	StartLine int `json:"startLine,omitempty"`
+	EndLine   int `json:"endLine,omitempty"`
+}
+
+// splitFileLines splits file content into lines without terminators.
+// A trailing newline does not create an extra line: "a\nb\n" is 2
+// lines, and the returned parts keep the trailing "" sentinel so a
+// rejoin preserves it.
+func splitFileLines(s string) ([]string, int) {
+	if s == "" {
+		return nil, 0
+	}
+	parts := strings.Split(s, "\n")
+	n := len(parts)
+	if strings.HasSuffix(s, "\n") {
+		n--
+	}
+	return parts, n
 }
 
 func (e *Executor) Edit(a EditArgs) (string, error) {
@@ -208,13 +232,192 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 		return "", err
 	}
 	s := string(data)
+	if a.StartLine > 0 {
+		return e.editLines(p, s, a)
+	}
+	if a.StartLine < 0 {
+		return "", fmt.Errorf("startLine must be >= 1, got %d in %s", a.StartLine, a.Path)
+	}
 	if n := strings.Count(s, a.OldText); n != 1 {
-		return "", fmt.Errorf("oldText must match exactly once, got %d matches in %s", n, a.Path)
+		return "", editMatchError(a.Path, s, a.OldText, n)
 	}
 	if err := os.WriteFile(p, []byte(strings.Replace(s, a.OldText, a.NewText, 1)), 0o644); err != nil {
 		return "", err
 	}
 	return "edited " + a.Path, nil
+}
+
+// editLines replaces lines StartLine..EndLine (1-based, inclusive)
+// with NewText. The file's trailing-newline behaviour is preserved:
+// the split keeps the trailing "" sentinel, and NewText's own
+// trailing newline is honoured the same way.
+func (e *Executor) editLines(p, s string, a EditArgs) (string, error) {
+	parts, n := splitFileLines(s)
+	end := a.EndLine
+	if end == 0 {
+		end = a.StartLine
+	}
+	switch {
+	case a.StartLine < 1:
+		return "", fmt.Errorf("startLine must be >= 1, got %d in %s (file has %d lines)", a.StartLine, a.Path, n)
+	case end < a.StartLine:
+		return "", fmt.Errorf("endLine %d is before startLine %d in %s (file has %d lines)", end, a.StartLine, a.Path, n)
+	case end > n:
+		return "", fmt.Errorf("endLine %d is beyond the last line (%d) in %s", end, n, a.Path)
+	}
+	newParts := make([]string, 0, len(parts)+1)
+	newParts = append(newParts, parts[:a.StartLine-1]...)
+	newParts = append(newParts, strings.Split(a.NewText, "\n")...)
+	newParts = append(newParts, parts[end:]...)
+	if err := os.WriteFile(p, []byte(strings.Join(newParts, "\n")), 0o644); err != nil {
+		return "", err
+	}
+	return "edited " + a.Path, nil
+}
+
+// editMatchError is the oldText failure: the existing greppable
+// prefix, plus a diagnostic naming where to look, so the caller can
+// fix the call instead of re-reading the whole file blind. The
+// diagnostic is capped so a huge file cannot bloat the observation.
+func editMatchError(path, content, oldText string, n int) error {
+	base := fmt.Sprintf("oldText must match exactly once, got %d matches in %s", n, path)
+	if strings.TrimSpace(oldText) == "" {
+		return errors.New(base)
+	}
+	var diag string
+	if n == 0 {
+		diag = editNoMatchDiag(content, oldText)
+	} else {
+		diag = editMultiMatchDiag(content, oldText, n)
+	}
+	if diag == "" {
+		return errors.New(base)
+	}
+	if r := []rune(diag); len(r) > 800 {
+		diag = string(r[:800]) + "… [diagnostic truncated]"
+	}
+	return fmt.Errorf("%s; %s", base, diag)
+}
+
+// editNoMatchDiag locates a 0-match oldText: first, whether its first
+// non-empty line occurs anywhere in the file (even as a substring);
+// otherwise the closest-matching region by trimmed-line comparison.
+func editNoMatchDiag(content, oldText string) string {
+	var first string
+	for _, l := range strings.Split(oldText, "\n") {
+		if strings.TrimSpace(l) != "" {
+			first = strings.TrimSpace(l)
+			break
+		}
+	}
+	if first != "" {
+		var at []int
+		for i, l := range strings.Split(content, "\n") {
+			if strings.Contains(l, first) {
+				at = append(at, i+1)
+				if len(at) >= 10 {
+					break
+				}
+			}
+		}
+		if len(at) > 0 {
+			return fmt.Sprintf("first line %q occurs at line(s) %s — use those lines (startLine/endLine) or copy oldText from there", first, intsString(at))
+		}
+	}
+	return editClosestRegion(content, oldText)
+}
+
+// editClosestRegion finds the longest run of oldText's lines (leading
+// whitespace ignored on both sides) occurring contiguously in the
+// file, and shows that region with line numbers.
+func editClosestRegion(content, oldText string) string {
+	trim := func(lines []string) []string {
+		out := make([]string, len(lines))
+		for i, l := range lines {
+			out[i] = strings.TrimLeft(l, " \t")
+		}
+		return out
+	}
+	raw, n := splitFileLines(content)
+	fileLines := trim(raw[:n])
+	oldLines := trim(strings.Split(oldText, "\n"))
+	// Longest contiguous run of oldText's lines (at any offset in
+	// oldText) occurring in the file: the region the caller almost
+	// wrote. A run must start at oldLines[j], not only at oldLines[0]
+	// — a stale oldText usually matches from the second line on.
+	bestStart, bestRun := -1, 0
+	for i := 0; i < len(fileLines); i++ {
+		for j := 0; j < len(oldLines); j++ {
+			run := 0
+			for k := 0; j+k < len(oldLines) && i+k < len(fileLines); k++ {
+				if fileLines[i+k] != oldLines[j+k] {
+					break
+				}
+				run++
+			}
+			if run > bestRun {
+				bestRun, bestStart = run, i
+			}
+		}
+	}
+	if bestRun == 0 {
+		return fmt.Sprintf("no line of oldText matches any line in the file (%d lines total)", n)
+	}
+	lo := bestStart - 1
+	if lo < 0 {
+		lo = 0
+	}
+	hi := bestStart + bestRun + 1
+	if hi-lo > 10 {
+		hi = lo + 10
+	}
+	if hi > n {
+		hi = n
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "closest match (%d of %d lines) around line %d:\n", bestRun, len(oldLines), bestStart+1)
+	for i := lo; i < hi; i++ {
+		line := raw[i]
+		if len(line) > 120 {
+			line = line[:120] + "…"
+		}
+		fmt.Fprintf(&b, "%d: %s\n", i+1, line)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// editMultiMatchDiag lists the lines where oldText matches, so the
+// caller can disambiguate with a longer oldText or a line range.
+func editMultiMatchDiag(content, oldText string, n int) string {
+	var at []int
+	for off := 0; ; {
+		i := strings.Index(content[off:], oldText)
+		if i < 0 {
+			break
+		}
+		abs := off + i
+		at = append(at, strings.Count(content[:abs], "\n")+1)
+		off = abs + len(oldText)
+		if len(at) >= 20 {
+			break
+		}
+	}
+	if len(at) == 0 {
+		return ""
+	}
+	s := "matches at line(s) " + intsString(at)
+	if n > len(at) {
+		s += fmt.Sprintf(" (and %d more)", n-len(at))
+	}
+	return s
+}
+
+func intsString(ns []int) string {
+	parts := make([]string, len(ns))
+	for i, v := range ns {
+		parts[i] = strconv.Itoa(v)
+	}
+	return strings.Join(parts, ", ")
 }
 
 type BashArgs struct {
@@ -381,11 +584,29 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (ToolRes
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 			return ToolResult{}, fmt.Errorf("bad edit args: %w", err)
 		}
+		// For a line edit the diff needs the removed lines, which
+		// Edit overwrites: read them first (cheap, local, and the
+		// bounds are re-checked by Edit itself).
+		removed := a.OldText
+		if a.StartLine > 0 {
+			if p, rerr := e.resolve(a.Path); rerr == nil {
+				if data, rerr := os.ReadFile(p); rerr == nil {
+					lines, n := splitFileLines(string(data))
+					end := a.EndLine
+					if end == 0 {
+						end = a.StartLine
+					}
+					if a.StartLine >= 1 && end >= a.StartLine && end <= n {
+						removed = strings.Join(lines[a.StartLine-1:end], "\n")
+					}
+				}
+			}
+		}
 		out, err := e.Edit(a)
 		if err != nil {
 			return ToolResult{Text: out}, err
 		}
-		return ToolResult{Text: out, Detail: diffDetail(a.OldText, a.NewText)}, nil
+		return ToolResult{Text: out, Detail: diffDetail(removed, a.NewText)}, nil
 	case "bash":
 		var a BashArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
