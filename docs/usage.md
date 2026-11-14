@@ -77,7 +77,11 @@
   saved to `<session>-pre-compact-<time>.jsonl`. It also triggers
   inside the tool loop, before the next model call, when measured
   usage plus new content reaches 70% of the window (`-context-limit`, default: the model's `contextWindow`,
-  else 128000).
+  else 128000). Summary requests use the same bounded retry policy as normal
+  steps (four attempts by default, with backoff and `Retry-After` support).
+  Retries are labelled `Compaction` in `step_retry` events. Failed or truncated
+  summaries never replace history. If retries are exhausted, the turn stops
+  with an explicit failure report rather than an empty answer.
 - Step budget: steps are unlimited by default (like Claude Code,
   Codex, Gemini, Qwen, OpenCode and Pi): a turn runs until the model
   stops calling tools, an error ends it, or the task is blocked

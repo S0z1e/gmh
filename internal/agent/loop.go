@@ -537,15 +537,15 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // this step, and onRetry resets the caller's per-attempt state —
 // then the call is replayed from scratch, so the GUI never shows
 // the half-reply followed by the replay.
-func (c *Config) streamStep(ctx context.Context, apiMsgs []llm.Message, tools []llm.ToolDef, onText func(string), onDone func(llm.Message, llm.Usage), onThinking func(string), onRetry func()) (int, error) {
+func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm.Message, tools []llm.ToolDef, onText func(string), onDone func(llm.Message, llm.Usage), onThinking func(string), onRetry func()) (int, error) {
 	attempts := c.maxLLMAttempts()
 	var err error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		outputSeen := false
 		doneSeen := false
 		wrappedText := func(s string) {
-			outputSeen = true
 			if onText != nil {
+				outputSeen = true
 				onText(s)
 			}
 		}
@@ -557,8 +557,8 @@ func (c *Config) streamStep(ctx context.Context, apiMsgs []llm.Message, tools []
 			}
 		}
 		wrappedThinking := func(s string) {
-			outputSeen = true
 			if onThinking != nil {
+				outputSeen = true
 				onThinking(s)
 			}
 		}
@@ -583,7 +583,7 @@ func (c *Config) streamStep(ctx context.Context, apiMsgs []llm.Message, tools []
 			}
 		}
 		delay := retryDelay(attempt, llm.RetryAfter(err))
-		c.emit(Event{Kind: EventStepRetry, Text: fmt.Sprintf("LLM call failed (attempt %d/%d): %v; retrying in %s", attempt, attempts, err, delay), RetryAttempt: attempt + 1})
+		c.emit(Event{Kind: EventStepRetry, Text: fmt.Sprintf("%s failed (attempt %d/%d): %v; retrying in %s", operation, attempt, attempts, err, delay), RetryAttempt: attempt + 1})
 		if !sleepCtx(ctx, delay) {
 			return attempt, err
 		}
@@ -676,7 +676,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			c.emit(Event{Kind: EventStepUsage, Usage: usage})
 			if err != nil {
 				c.LastTerminalReason = TerminalError
-				c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: TerminalError})
+				if ctx.Err() != nil {
+					c.LastTerminalReason = TerminalAbort
+				} else {
+					lastText = stoppedReport(lastText, err)
+				}
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: c.LastTerminalReason})
 				return lastText, total, err
 			}
 			msgs = compacted
@@ -688,7 +693,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 		}
 		apiMsgs := c.promptView(msgs)
-		attempts, err := c.streamStep(ctx, apiMsgs, c.Tools, func(s string) {
+		attempts, err := c.streamStep(ctx, "LLM call", apiMsgs, c.Tools, func(s string) {
 			c.emit(Event{Kind: EventTextDelta, Text: s})
 		}, func(m llm.Message, u llm.Usage) {
 			assistant = m
@@ -722,6 +727,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			c.LastTerminalReason = TerminalError
 			if ctx.Err() != nil {
 				c.LastTerminalReason = TerminalAbort
+			} else {
+				lastText = stoppedReport(lastText, wrapped)
 			}
 			c.emit(Event{Kind: EventError, Err: wrapped, Text: lastText, TerminalReason: c.LastTerminalReason})
 			return lastText, total, wrapped
@@ -1086,7 +1093,7 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	var final llm.Message
 	var usage llm.Usage
 	var thinking strings.Builder
-	_, err := c.streamStep(graceCtx, apiMsgs, nil, func(s string) {
+	_, err := c.streamStep(graceCtx, "LLM call", apiMsgs, nil, func(s string) {
 		c.emit(Event{Kind: EventTextDelta, Text: s})
 	}, func(m llm.Message, u llm.Usage) {
 		final = m
@@ -1111,6 +1118,15 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	}
 	c.emit(Event{Kind: EventStepUsage, Usage: usage})
 	return final.Content, usage, true
+}
+
+// stoppedReport gives callers a usable failure report even if the last tool-call
+// response contained only whitespace. It makes no claims about work verification.
+func stoppedReport(lastText string, err error) string {
+	if strings.TrimSpace(lastText) != "" {
+		return lastText
+	}
+	return fmt.Sprintf("The turn stopped before a final response: %v.\nNo final verification report was produced; completed actions have not been rolled back. Check the current state before resuming.", err)
 }
 
 // blockedGracePrompt builds the blocked turn's grace instruction

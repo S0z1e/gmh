@@ -1,7 +1,12 @@
 package agent
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"minimalharness/internal/llm"
@@ -23,6 +28,73 @@ func TestShouldCompact(t *testing.T) {
 		if got := ShouldCompact(c.lastPrompt, c.limit); got != c.want {
 			t.Errorf("ShouldCompact(%d, %d) = %v, want %v", c.lastPrompt, c.limit, got, c.want)
 		}
+	}
+}
+
+func TestSummarizeRetryPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		calls  int32
+	}{
+		{"transient failure exhausts the configured budget", http.StatusForbidden, 2},
+		{"invalid credentials are not retried", http.StatusUnauthorized, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, calls := retryTestServer(t, 100, tc.status, "1")
+			var events []Event
+			cfg := &Config{Client: &llm.Client{BaseURL: srv.URL, APIKey: "test", Model: "mock"}, MaxLLMAttempts: 2, OnEvent: func(e Event) { events = append(events, e) }}
+			_, _, err := cfg.Summarize(context.Background(), []llm.Message{{Role: "user", Content: "task"}}, nil)
+			if err == nil || atomic.LoadInt32(calls) != tc.calls || countKind(events, EventStepRetry) != int(tc.calls-1) {
+				t.Fatalf("error = %v, calls = %d, events = %+v", err, atomic.LoadInt32(calls), events)
+			}
+			if tc.calls > 1 && (!strings.Contains(err.Error(), "after 2 attempts") || !strings.Contains(events[0].Text, "Compaction failed")) {
+				t.Fatalf("retry cause/budget missing: %v; %+v", err, events)
+			}
+		})
+	}
+}
+
+func TestSummarizeRetriesPrivateDraftWithoutDiscardingVisibleOutput(t *testing.T) {
+	srv, calls := cutoffTestServer(t, 1, true)
+	var events []Event
+	cfg := &Config{Client: &llm.Client{BaseURL: srv.URL, APIKey: "test", Model: "mock"}, OnEvent: func(e Event) { events = append(events, e) }}
+	summary, _, err := cfg.Summarize(context.Background(), []llm.Message{{Role: "user", Content: "task"}}, nil)
+	if err != nil || summary != "final answer" || atomic.LoadInt32(calls) != 2 {
+		t.Fatalf("summary = %q, error = %v, calls = %d", summary, err, atomic.LoadInt32(calls))
+	}
+	if len(events) != 1 || events[0].Kind != EventStepRetry {
+		t.Fatalf("private summary drafts leaked UI events: %+v", events)
+	}
+}
+
+func TestSummarizeCancelledBackoffDoesNotRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv, calls := retryTestServer(t, 100, http.StatusForbidden, "1")
+	cfg := &Config{Client: &llm.Client{BaseURL: srv.URL, APIKey: "test", Model: "mock"}, OnEvent: func(e Event) {
+		if e.Kind == EventStepRetry {
+			cancel()
+		}
+	}}
+	_, _, err := cfg.Summarize(ctx, []llm.Message{{Role: "user", Content: "task"}}, nil)
+	if err == nil || atomic.LoadInt32(calls) != 1 {
+		t.Fatalf("cancelled summary retried: error = %v, calls = %d", err, atomic.LoadInt32(calls))
+	}
+}
+
+func TestSummarizeRejectsTruncatedSummaryWithoutRetry(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]}`+"\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	cfg := &Config{Client: &llm.Client{BaseURL: srv.URL, APIKey: "test", Model: "mock"}}
+	_, _, err := cfg.Summarize(context.Background(), []llm.Message{{Role: "user", Content: "task"}}, nil)
+	if err == nil || !strings.Contains(err.Error(), "truncated") || calls.Load() != 1 {
+		t.Fatalf("truncated summary = %v, calls = %d", err, calls.Load())
 	}
 }
 

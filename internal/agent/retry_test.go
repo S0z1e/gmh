@@ -389,12 +389,15 @@ func TestRunIdleStallAlwaysFails(t *testing.T) {
 	srv, calls := idleTestServer(t, 100, 600*time.Millisecond)
 	var events []Event
 	cfg := idleRetryTestConfig(t, srv, &events, 100*time.Millisecond)
-	_, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "say hello"}})
+	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "say hello"}})
 	if err == nil || !strings.Contains(err.Error(), "after 4 attempts") {
 		t.Fatalf("Run error = %v, want it to contain \"after 4 attempts\"", err)
 	}
 	if !strings.Contains(err.Error(), "idle") {
 		t.Fatalf("Run error = %v, want it to name the idle timeout", err)
+	}
+	if !strings.Contains(text, "after 4 attempts") || !strings.Contains(text, "No final verification report") {
+		t.Fatalf("exhausted retry returned no useful failure report: %q", text)
 	}
 	if got := atomic.LoadInt32(calls); got != 4 {
 		t.Fatalf("LLM calls = %d, want 4", got)

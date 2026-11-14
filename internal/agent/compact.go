@@ -87,12 +87,25 @@ func truncateForSummary(s string) string {
 // with no tools; the caller replaces history with the returned summary.
 // extras are passed through to BuildCompactPrompt.
 func Compact(ctx context.Context, client *llm.Client, history []llm.Message, extras []string) (string, llm.Usage, error) {
+	return (&Config{Client: client}).Summarize(ctx, history, extras)
+}
+
+// Summarize generates a summary using the same bounded retry policy as a step.
+// Summary drafts stay private: retries must not discard the turn's visible text.
+func (c *Config) Summarize(ctx context.Context, history []llm.Message, extras []string) (string, llm.Usage, error) {
 	msgs := []llm.Message{
 		{Role: "system", Content: "You write compact conversation summaries for a coding agent. Follow the requested sections exactly."},
 		{Role: "user", Content: BuildCompactPrompt(history, extras)},
 	}
-	msg, usage, err := client.Chat(ctx, msgs, nil, nil)
+	var msg llm.Message
+	var usage llm.Usage
+	attempts, err := c.streamStep(ctx, "Compaction", msgs, nil, nil, func(m llm.Message, u llm.Usage) {
+		msg, usage = m, u
+	}, nil, nil)
 	if err != nil {
+		if attempts > 1 {
+			err = fmt.Errorf("%w (after %d attempts)", err, attempts)
+		}
 		return "", usage, err
 	}
 	if msg.FinishReason == "length" || msg.FinishReason == "max_tokens" || msg.FinishReason == "incomplete" {
@@ -160,7 +173,7 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 	if c.CompactHistory != nil {
 		summary, usage, err = c.CompactHistory(ctx, history)
 	} else {
-		summary, usage, err = Compact(ctx, c.Client, history, nil)
+		summary, usage, err = c.Summarize(ctx, history, nil)
 	}
 	if err != nil {
 		return nil, usage, fmt.Errorf("compact before next model call: %w", err)

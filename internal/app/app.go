@@ -1413,5 +1413,5 @@ func (r *Runner) compactHistory(ctx context.Context, history []llm.Message) (str
 	if r.App.Plugins != nil {
 		extras = r.App.Plugins.RunSessionBeforeCompactHooks(ctx, r.App.sessionID(), len(history))
 	}
-	return agent.Compact(ctx, r.App.Cfg.Client, history, extras)
+	return r.App.Cfg.Summarize(ctx, history, extras)
 }
