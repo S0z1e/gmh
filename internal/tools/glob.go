@@ -58,7 +58,11 @@ func (e *Executor) Glob(ctx context.Context, a GlobArgs) (string, int, error) {
 func (e *Executor) globRg(ctx context.Context, dir, pattern string, limit int) (string, int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "rg", "--files", "-g", pattern, "--", dir)
+	rel, err := filepath.Rel(e.Root, dir)
+	if err != nil {
+		return "", 0, err
+	}
+	cmd := exec.CommandContext(ctx, "rg", "--files", "-g", pattern, "--", rel)
 	cmd.Dir = e.Root
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -74,6 +78,9 @@ func (e *Executor) globRg(ctx context.Context, dir, pattern string, limit int) (
 		p := strings.TrimSpace(scanner.Text())
 		if p == "" {
 			continue
+		}
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(e.Root, p)
 		}
 		rel, rerr := filepath.Rel(e.Root, p)
 		if rerr != nil {
@@ -110,6 +117,9 @@ func (e *Executor) globWalk(dir, pattern string, limit int) (string, int, error)
 				return filepath.SkipDir
 			}
 			return nil
+		}
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(e.Root, p)
 		}
 		rel, rerr := filepath.Rel(e.Root, p)
 		if rerr != nil {

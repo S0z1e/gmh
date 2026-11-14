@@ -8,10 +8,12 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"minimalharness/internal/fileguard"
 	"minimalharness/internal/llm"
 )
 
@@ -69,7 +71,16 @@ func (e *Executor) LoadImage(path string) (llm.Image, error) {
 // dimensions. diskPath is where the bytes live; displayPath is the
 // path recorded on the image (and shown to the model).
 func (e *Executor) loadImageFile(diskPath, displayPath, mt string) (llm.Image, error) {
-	info, err := os.Stat(diskPath)
+	f, err := os.Open(diskPath)
+	if err != nil {
+		return llm.Image{}, err
+	}
+	defer f.Close()
+	return e.loadImage(f, displayPath, mt)
+}
+
+func (e *Executor) loadImage(f *os.File, displayPath, mt string) (llm.Image, error) {
+	info, err := f.Stat()
 	if err != nil {
 		return llm.Image{}, err
 	}
@@ -79,9 +90,12 @@ func (e *Executor) loadImageFile(diskPath, displayPath, mt string) (llm.Image, e
 	if info.Size() > MaxImageBytes {
 		return llm.Image{}, fmt.Errorf("image %s is %d bytes, over the %d-byte cap", displayPath, info.Size(), MaxImageBytes)
 	}
-	data, err := os.ReadFile(diskPath)
+	data, err := io.ReadAll(io.LimitReader(f, MaxImageBytes+1))
 	if err != nil {
 		return llm.Image{}, err
+	}
+	if len(data) > MaxImageBytes {
+		return llm.Image{}, fmt.Errorf("image exceeds size cap")
 	}
 	img := llm.Image{
 		Path:      displayPath,
@@ -93,4 +107,24 @@ func (e *Executor) loadImageFile(diskPath, displayPath, mt string) (llm.Image, e
 		img.Width, img.Height = cfg.Width, cfg.Height
 	}
 	return img, nil
+}
+
+// ReadImage loads a model-selected image through the workspace root. The source
+// is persisted so reloading a transcript cannot turn it into an unrestricted read.
+func (e *Executor) ReadImage(path string) (llm.Image, error) {
+	if !e.ImageInput {
+		return llm.Image{}, fmt.Errorf("image input is not enabled for this model")
+	}
+	mt, ok := MediaTypeForPath(path)
+	if !ok {
+		return llm.Image{}, fmt.Errorf("unsupported image type: %s", path)
+	}
+	f, err := fileguard.Open(e.Root, path)
+	if err != nil {
+		return llm.Image{}, err
+	}
+	defer f.Close()
+	img, err := e.loadImage(f, path, mt)
+	img.Workspace = true
+	return img, err
 }

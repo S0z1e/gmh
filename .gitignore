@@ -1,4 +1,4 @@
 .env
-harness
+/harness
 /tmp/
 .agents/plugins/*/data/

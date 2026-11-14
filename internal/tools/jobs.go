@@ -15,7 +15,6 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -49,6 +48,8 @@ type Job struct {
 	// ("" when OutputDir was unset); it grows while the job runs.
 	OutputFile string
 	Started    time.Time
+	cancel     context.CancelFunc
+	stopParent func() bool
 
 	mu         sync.Mutex
 	done       chan struct{}
@@ -105,6 +106,10 @@ func (j *Job) Elapsed() time.Duration {
 
 func (j *Job) finish(r JobResult) {
 	j.mu.Lock()
+	if j.stopParent != nil {
+		j.stopParent()
+		j.stopParent = nil
+	}
 	j.result = r
 	j.finished = true
 	j.finishedAt = time.Now()
@@ -286,19 +291,8 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	// Own process group, killed as a whole on timeout/abort (see
 	// Cancel below). Without this, only the direct bash child died
 	// and grandchildren lingered as orphans.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
-			if errors.Is(err, syscall.ESRCH) {
-				return os.ErrProcessDone
-			}
-			return err
-		}
-		return nil
-	}
+	configureProcess(cmd)
+	cmd.Cancel = func() error { return killProcessTree(cmd) }
 
 	legacy := outPath == ""
 	filePath := outPath
@@ -312,11 +306,7 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	}
 	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
-		// The file path is unusable (disk full, bad permissions):
-		// fall back to the in-memory pipe path. The group kill
-		// still bounds the timeout; a grandchild outliving the
-		// direct child can still delay the wait there.
-		return e.runBashCmdPipe(runCtx, cmd, timeout)
+		return "", -1, fmt.Errorf("open bash output: %w", err)
 	}
 	cmd.Stdout = f
 	cmd.Stderr = f
@@ -339,9 +329,7 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 			case <-ticker.C:
 				if st, err := f.Stat(); err == nil && st.Size() > OutputFileMaxBytes {
 					capHit.set(true)
-					if cmd.Process != nil {
-						_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-					}
+					_ = killProcessTree(cmd)
 					return
 				}
 			}
@@ -363,6 +351,9 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		if runCtx.Err() == context.DeadlineExceeded {
 			return s, -1, &timeoutError{timeout}
 		}
+		if runCtx.Err() != nil {
+			return s, -1, runCtx.Err()
+		}
 		if runErr != nil {
 			return s, exitCode, fmt.Errorf("exit: %w", runErr)
 		}
@@ -378,6 +369,9 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	}
 	if runCtx.Err() == context.DeadlineExceeded {
 		return s, -1, &timeoutError{timeout}
+	}
+	if runCtx.Err() != nil {
+		return s, -1, runCtx.Err()
 	}
 	if runErr != nil {
 		return s, exitCode, fmt.Errorf("exit: %w", runErr)
@@ -408,39 +402,25 @@ func readFileHead(path string, max int) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(f, int64(max)))
 }
 
-// runBashCmdPipe is the fallback when no output file can be used:
-// the old in-memory behaviour (CombinedOutput capped at
-// MaxOutBytes). The group kill still bounds the timeout, but a
-// grandchild outliving the direct child can delay the wait —
-// the pipe trap survives here, by necessity, not by choice.
-func (e *Executor) runBashCmdPipe(ctx context.Context, cmd *exec.Cmd, timeout time.Duration) (string, int, error) {
-	out, err := cmd.CombinedOutput()
-	s := truncate(string(out), MaxOutBytes)
-	exitCode := -1
-	if cmd.ProcessState != nil {
-		exitCode = cmd.ProcessState.ExitCode()
-	}
-	if ctx.Err() == context.DeadlineExceeded {
-		return s, -1, &timeoutError{timeout}
-	}
-	if err != nil {
-		return s, exitCode, fmt.Errorf("exit: %w", err)
-	}
-	return s, exitCode, nil
+// BashBackground starts a session-owned job. Cancellation of the turn does
+// not stop a job after the loop has handed it to the session.
+func (e *Executor) BashBackground(ctx context.Context, a BashArgs) (*Job, error) {
+	return e.startBashJob(ctx, a, false)
 }
 
-// BashBackground starts a bash command in a goroutine and returns its
-// Job immediately. The denylist is checked before anything runs (a
-// denied command returns an error, never a job); the timeout, output
-// cap and audit entries are the same as a synchronous Bash call, and
-// the audit entry is written when the command finishes, with its real
-// exit code. The job runs detached from the caller's ctx (the ctx
-// argument is accepted but not used): a background job outlives its
-// turn, and the turn ctx is cancelled after every turn.
-func (e *Executor) BashBackground(ctx context.Context, a BashArgs) (*Job, error) {
+// BashForeground starts a cancellable command that can later be detached
+// when the foreground threshold expires.
+func (e *Executor) BashForeground(ctx context.Context, a BashArgs) (*Job, error) {
+	return e.startBashJob(ctx, a, true)
+}
+
+func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool) (*Job, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if reason := DeniedCommand(a.Command); reason != "" {
 		e.audit(AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
-		return nil, fmt.Errorf("denied by policy: %s (this is harm reduction, not a sandbox — see README)", reason)
+		return nil, fmt.Errorf("denied by policy: %s", reason)
 	}
 	dir, err := e.bashDir(a)
 	if err != nil {
@@ -449,45 +429,69 @@ func (e *Executor) BashBackground(ctx context.Context, a BashArgs) (*Job, error)
 	}
 	timeout := e.bashTimeout(a)
 	if a.Background && a.Timeout == 0 {
-		// Explicit background with no per-call timeout: no
-		// deadline. A dev server or watcher must outlive any cap —
-		// the old 120s default killed it mid-session, which is
-		// part of this bug: a never-ending job was given a
-		// finite life. A per-call timeout, when given, is still
-		// honored (and capped at 600s by bashTimeout).
 		timeout = 0
 	}
 	outPath := e.nextOutputFile()
-	job := &Job{Command: a.Command, OutputFile: outPath, Started: time.Now(), done: make(chan struct{})}
+	runCtx, cancel := context.WithCancel(context.Background())
+	job := &Job{Command: a.Command, OutputFile: outPath, Started: time.Now(), done: make(chan struct{}), cancel: cancel}
+	if foreground {
+		job.stopParent = context.AfterFunc(ctx, cancel)
+	}
+	// Capture the audit destination: a later session switch must not redirect it.
+	audit := e.Audit
 	e.registry().add(job)
+	// Close the race with an abort that ran its registry snapshot just
+	// before this job was registered.
+	if ctx.Err() != nil {
+		job.Cancel()
+	}
 	go func() {
-		// Detached from the caller's ctx: a background job outlives
-		// its turn by design, and the turn ctx is cancelled after
-		// EVERY turn (runTurn calls cancel() after Handle, even on
-		// a normally settled turn). Tied to that ctx, the exec
-		// watcher fired cmd.Cancel at turn end — and the group kill
-		// then killed the whole tree, so a dev server died the
-		// moment its turn settled (proven live, and by
-		// TestBashBackgroundSurvivesContextCancel). The per-call
-		// timeout still works: runBashCmd derives it from this
-		// base ctx. Trade-off: aborting a turn no longer kills
-		// background jobs either (abort and turn-end cleanup cancel
-		// the same ctx and cannot be told apart here); they run to
-		// their timeout or completion, and their results surface
-		// at the next turn via the Run-start re-attach.
-		out, exitCode, err := e.runBashCmd(context.Background(), a.Command, timeout, outPath, dir)
-		var te *timeoutError
-		switch {
-		case errors.As(err, &te):
-			e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: fmt.Sprintf("timed out after %s", timeout)})
-		case err != nil:
-			e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: exitCode, Error: err.Error()})
-		default:
-			e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: exitCode})
+		defer cancel()
+		out, code, err := e.runBashCmd(runCtx, a.Command, timeout, outPath, dir)
+		if audit != nil {
+			entry := AuditEntry{TS: time.Now(), Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
+			if err != nil {
+				entry.Error = err.Error()
+			}
+			audit(entry)
 		}
-		job.finish(JobResult{Output: out, Err: err, ExitCode: exitCode})
+		job.finish(JobResult{Output: out, Err: err, ExitCode: code})
 	}()
 	return job, nil
+}
+
+// Detach transfers cancellation ownership from the turn to the session.
+func (j *Job) Detach() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.stopParent != nil {
+		j.stopParent()
+		j.stopParent = nil
+	}
+}
+
+func (j *Job) Cancel() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.cancel != nil {
+		j.cancel()
+	}
+}
+
+// CancelJobs is used for an explicit abort, independently of normal turn cleanup.
+func (e *Executor) CancelJobs() {
+	e.SessionCanceller()()
+}
+
+// SessionCanceller captures the owning registry, so a delayed abort can never
+// cancel commands from a subsequently selected session.
+func (e *Executor) SessionCanceller() func() {
+	r := e.registry()
+	return func() {
+		for _, job := range r.List() {
+			job.Cancel()
+		}
+	}
 }
 
 // Jobs returns a snapshot of all background jobs for this Executor.

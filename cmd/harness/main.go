@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
@@ -290,7 +289,7 @@ func execTUI(root, mode, model, api, provider, config string, maxSteps int, resu
 	if err != nil {
 		return err
 	}
-	sibling := filepath.Join(filepath.Dir(self), "harness-tui")
+	sibling := filepath.Join(filepath.Dir(self), tuiBinaryName)
 	if _, err := os.Stat(sibling); err != nil {
 		return fmt.Errorf("no harness-tui next to %s (build it with: go build -o <dir>/harness-tui ./cmd/harness-tui)", self)
 	}
@@ -314,7 +313,7 @@ func execTUI(root, mode, model, api, provider, config string, maxSteps int, resu
 	for _, img := range images {
 		args = append(args, "-image", img)
 	}
-	return syscall.Exec(sibling, args, os.Environ())
+	return runTUIProcess(sibling, args)
 }
 
 // stringList is a repeatable -image flag: each occurrence appends one path.

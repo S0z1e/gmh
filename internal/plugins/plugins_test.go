@@ -1026,3 +1026,32 @@ harness.on("session_start", () => {});
 		t.Fatal("two session_start handlers loaded without an error")
 	}
 }
+
+func TestStoreRejectsSymlinkEscape(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	writePlugin(t, root, "store", "", "s.js", `
+harness.registerTool("store_read", "Read.", {type:"object"}, () => harness.readFile("escape/secret"));
+harness.registerTool("store_write", "Write.", {type:"object"}, () => {harness.writeFile("escape/secret", "bad"); return "ok";});`)
+	data := filepath.Join(root, ".agents", "plugins", "store", "data")
+	if err := os.MkdirAll(data, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("safe"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(data, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	for _, tool := range []string{"store_read", "store_write"} {
+		if _, err := reg.Call(context.Background(), tool, `{}`); err == nil {
+			t.Fatalf("%s escaped store", tool)
+		}
+	}
+	if raw, err := os.ReadFile(filepath.Join(outside, "secret")); err != nil || string(raw) != "safe" {
+		t.Fatalf("outside file = %q, %v", raw, err)
+	}
+}

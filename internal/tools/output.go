@@ -238,23 +238,22 @@ func (e *Executor) nextOutputFile() string {
 	return path
 }
 
-// outputDirPath resolves p for the read tool's narrow exception:
+// outputDirBase resolves p for the read tool's narrow exception:
 // an absolute path inside OutputDir is readable even though it
 // sits outside the workspace root. It returns ("", false) when
 // OutputDir is unset or p is not under it. Only Read uses this;
 // Write, Edit, Glob and Grep keep the workspace jail, so the model
 // can never write into the session directory.
-func (e *Executor) outputDirPath(p string) (string, bool) {
-	if e.OutputDir == "" {
-		return "", false
-	}
+func (e *Executor) outputDirBase(p string) (string, bool) {
 	clean := filepath.Clean(p)
 	if !filepath.IsAbs(clean) {
 		return "", false
 	}
-	rel, err := filepath.Rel(e.OutputDir, clean)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", false
+	if e.OutputDir != "" {
+		rel, err := filepath.Rel(e.OutputDir, clean)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return e.OutputDir, true
+		}
 	}
-	return clean, true
+	return "", false
 }

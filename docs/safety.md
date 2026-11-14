@@ -9,7 +9,10 @@ approve, and the turn continues with the denial as an observation.
 
 What is enforced:
 - read/write/edit/grep/glob paths are jailed to the workspace root
-  (`..` escapes refused); bash starts in the root.
+  (`..` and symlink escapes refused). File and image operations use
+  `os.Root`, which also protects the open/write operation against symlink
+  swaps. Search subprocess paths are checked before launch; bash starts
+  in the root.
 - bash has a timeout (default 120s, per-call up to 600s,
   `-bash-timeout` / `OPENAI_BASH_TIMEOUT_SECONDS`) and a 64 KiB
   output cap.
@@ -52,3 +55,10 @@ a container):
   bash from writing.
 - There is no OS sandbox by default; the denylist and jail are harm
   reduction, not isolation. `--sandbox` adds one for bash only.
+
+Cancellation stops a foreground bash process tree. Explicit abort also cancels
+background jobs; normal turn cleanup leaves them running.
+
+Search subprocesses are not an OS sandbox: a concurrent path replacement
+after validation remains a race. Use the sandbox or a disposable workspace
+when files may be changed by untrusted processes.

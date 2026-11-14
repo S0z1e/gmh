@@ -4,8 +4,10 @@ package skills
 
 import (
 	"fmt"
+	"minimalharness/internal/fileguard"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -126,13 +128,19 @@ type Reference struct {
 // An absent directory is not an error: it just means no references.
 func (s Skill) References() ([]Reference, error) {
 	dir := filepath.Join(filepath.Dir(s.Path), "references")
-	entries, err := os.ReadDir(dir)
+	f, err := fileguard.Open(filepath.Dir(s.Path), dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
+	defer f.Close()
+	entries, err := f.ReadDir(-1)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	var out []Reference
 	for _, en := range entries {
 		if en.IsDir() {
@@ -162,7 +170,7 @@ func (s Skill) LoadReference(rel string) (string, error) {
 	if rel2, err := filepath.Rel(base, clean); err != nil || rel2 == ".." || strings.HasPrefix(rel2, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("reference outside references/: %s", rel)
 	}
-	data, err := os.ReadFile(clean)
+	data, err := fileguard.ReadFile(filepath.Dir(s.Path), clean)
 	if err != nil {
 		return "", fmt.Errorf("cannot read reference %q: %w", rel, err)
 	}

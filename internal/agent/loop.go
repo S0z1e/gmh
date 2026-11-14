@@ -244,7 +244,7 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (string, *tools.
 		}
 		return out, nil
 	}
-	job, err := c.Exec.BashBackground(ctx, a)
+	job, err := c.Exec.BashForeground(ctx, a)
 	if err != nil {
 		// Start failure (denylist): an observation, never a job.
 		return fmt.Sprintf("Error: %v\nOutput:\n", err), nil
@@ -260,6 +260,10 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (string, *tools.
 		return res.Output, nil
 	}
 	select {
+	case <-ctx.Done():
+		job.Cancel()
+		<-job.Done()
+		return deliver()
 	case <-job.Done():
 		return deliver()
 	case <-time.After(threshold):
@@ -268,6 +272,7 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (string, *tools.
 		if _, ok := job.Result(); ok {
 			return deliver()
 		}
+		job.Detach()
 		return backgrounded(job)
 	}
 }
@@ -587,6 +592,10 @@ func (c *Config) streamStep(ctx context.Context, apiMsgs []llm.Message, tools []
 // Run executes one user turn. It appends messages to the session store
 // and returns the assistant's final text, total tokens used, and error.
 func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Usage, error) {
+	if c.Exec != nil {
+		stop := context.AfterFunc(ctx, c.Exec.SessionCanceller())
+		defer stop()
+	}
 	steps := c.MaxSteps
 	// MaxSteps <= 0 means unlimited (the mainstream default): the turn
 	// runs until the model stops calling tools, an error ends it, or
@@ -743,6 +752,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		stepHadExecution := false
 		stepAllFailed := true
 		for _, tc := range assistant.ToolCalls {
+			if err := ctx.Err(); err != nil {
+				c.LastTerminalReason = TerminalAbort
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: TerminalAbort})
+				return lastText, total, err
+			}
 			c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments})
 			// Plugin tool_call hooks run before approval: a denied
 			// call never prompts the user, and the approval flow

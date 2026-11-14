@@ -1,7 +1,7 @@
 # Background bash (long commands don't block the loop)
 
 A bash call that runs longer than the background threshold (default
-10s, `-bg-threshold` / `OPENAI_BG_THRESHOLD_SECONDS`; `0` disables
+120s, `-bg-threshold` / `OPENAI_BG_THRESHOLD_SECONDS`; `0` disables
 it) keeps running as a job instead of blocking the model: the model
 gets a "still running in the background (job bg-1)" observation and
 continues with other work. When the model stops calling tools, the
@@ -19,3 +19,7 @@ the API call fails) with jobs still running, their results are still
 delivered to the session before the error is reported, capped at
 32 KiB head+tail; quitting with jobs running warns that they are
 abandoned (their child processes keep running, orphaned).
+
+Foreground commands follow turn cancellation until handed to the session as
+background jobs. Explicit abort cancels the current session's jobs; finishing
+a turn normally does not.

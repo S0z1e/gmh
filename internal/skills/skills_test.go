@@ -112,3 +112,20 @@ func TestMatchKeywords(t *testing.T) {
 		}
 	}
 }
+
+func TestReferenceRejectsSymlinkEscape(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.md"), []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "references")); err != nil {
+		t.Fatal(err)
+	}
+	sk := Skill{Path: filepath.Join(dir, "SKILL.md")}
+	if _, err := sk.LoadReference("secret.md"); err == nil {
+		t.Fatal("escaped reference directory")
+	}
+	if _, err := sk.References(); err == nil {
+		t.Fatal("listed outside reference directory")
+	}
+}

@@ -10,7 +10,9 @@ import (
 // and the bytes are re-read from disk on --resume. Data holds the
 // base64 bytes in memory only (json:"-" keeps them out of the file).
 type Image struct {
-	Path      string `json:"path"`
+	Path string `json:"path"`
+	// Workspace marks images chosen by a tool, which stay jailed on reload.
+	Workspace bool   `json:"workspace,omitempty"`
 	MediaType string `json:"media_type"`
 	Data      string `json:"-"`
 	Width     int    `json:"width,omitempty"`

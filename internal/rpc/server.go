@@ -412,6 +412,7 @@ func (s *Server) handleAbort(req Request) {
 	if cancel != nil {
 		s.turnAborted = true
 		cancel()
+		s.app.Cfg.Exec.CancelJobs()
 	}
 	s.turnMu.Unlock()
 	s.failApprovals(errAborted)

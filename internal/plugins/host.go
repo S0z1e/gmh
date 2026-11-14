@@ -3,6 +3,7 @@ package plugins
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -306,7 +307,18 @@ func (p *Plugin) nativeReadFile(r *moejs.Realm, _ moejs.Value, args []moejs.Valu
 	if err != nil {
 		return moejs.Undefined(), err
 	}
-	data, err := os.ReadFile(full)
+	store, err := p.openStore(false)
+	if err != nil {
+		return moejs.Undefined(), err
+	}
+	defer store.Close()
+	rel, _ := filepath.Rel(p.DataDir, full)
+	f, err := store.Open(rel)
+	if err != nil {
+		return moejs.Undefined(), fmt.Errorf("readFile %q: %w", path, err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, MaxStoreBytes+1))
 	if err != nil {
 		return moejs.Undefined(), fmt.Errorf("readFile %q: %w", path, err)
 	}
@@ -334,10 +346,13 @@ func (p *Plugin) nativeWriteFile(r *moejs.Realm, _ moejs.Value, args []moejs.Val
 	if err != nil {
 		return moejs.Undefined(), err
 	}
-	if err := os.MkdirAll(p.DataDir, 0o755); err != nil {
+	store, err := p.openStore(true)
+	if err != nil {
 		return moejs.Undefined(), fmt.Errorf("writeFile %q: %w", path, err)
 	}
-	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+	defer store.Close()
+	rel, _ := filepath.Rel(p.DataDir, full)
+	if err := store.WriteFile(rel, []byte(content), 0o644); err != nil {
 		return moejs.Undefined(), fmt.Errorf("writeFile %q: %w", path, err)
 	}
 	return moejs.Undefined(), nil
@@ -370,4 +385,18 @@ func jsValueString(r *moejs.Realm, v moejs.Value) string {
 		}
 		return string(b)
 	}
+}
+
+func (p *Plugin) openStore(create bool) (*os.Root, error) {
+	root, err := os.OpenRoot(p.Dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	if create {
+		if err := root.MkdirAll("data", 0755); err != nil {
+			return nil, err
+		}
+	}
+	return root.OpenRoot("data")
 }
