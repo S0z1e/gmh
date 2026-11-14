@@ -140,7 +140,7 @@ completed message is never replayed: once the done message has
 arrived, a later error ends the turn instead. A turn that still fails reports
 `(after 4 attempts)` in the step error.
 - `agent_settled` — exactly one per turn, whatever happened:
-  `{"text":"...","usage":{...},"session_usage":{...},"cost_usd":null|N,"session_cost_usd":null|N,"fee":"...","aborted":false,"reason":"end_turn"|"max_turns"|"abort"|"error"|"repeated_tool_call_denied"|"blocked","error":null|"...","tool_mode":"default"|"plan"}`.
+  `{"text":"...","usage":{...},"session_usage":{...},"cost_usd":null|N,"session_cost_usd":null|N,"fee":"...","aborted":false,"reason":"end_turn"|"output_limit"|"max_turns"|"abort"|"error"|"repeated_tool_call_denied"|"blocked","error":null|"...","tool_mode":"default"|"plan"}`.
   `reason` is the structured terminal reason: `"end_turn"` (the model
   finished), `"max_turns"` (step cap), `"abort"` (the GUI aborted the
   turn), `"error"` (LLM/provider failure),
@@ -160,7 +160,7 @@ arrived, a later error ends the turn instead. A turn that still fails reports
   `prompt` response. `tool_mode` is the loop's tool mode at the end
   of the turn, so the GUI knows which tools the next turn offers.
 - `compacted` `{"messages":N,"summary_tokens":N}` — a compaction
-  succeeded (manual `/compact` or automatic after a turn): the
+  succeeded (manual `/compact` or automatic inside the tool loop): the
   history was replaced by a summary, `messages` is the new message
   count, `summary_tokens` is the summary's token count (the
   completion tokens of the compact call, which generated it). The
@@ -170,3 +170,10 @@ arrived, a later error ends the turn instead. A turn that still fails reports
 - `error` `{"error":"..."}` — protocol-level errors only (a malformed
   line, an unknown request type). Turn errors go through
   `agent_settled`.
+
+`tool_end` and `tool_background_done` include `status` (`success`, `error`,
+`background`), and bash results include `exit_code` and `output_file` when
+available. `exit_code: 0` is preserved. `agent_settled.reason: output_limit`
+means the provider stopped with incomplete output; unfinished tool arguments
+are never executed. History messages may carry `kind`, `tool_error` and
+`finish_reason` metadata; these fields are not forwarded as provider inputs.

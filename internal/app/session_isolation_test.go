@@ -66,6 +66,9 @@ func TestSessionPlanAndReadSnapshotsStayIsolated(t *testing.T) {
 	if out, err := a.Plugins.Call(ctx, "plan_show", `{}`); err != nil || out != "No plan yet." {
 		t.Fatalf("new plan = %q, %v", out, err)
 	}
+	if _, err := a.Cfg.Exec.Edit(tools.EditArgs{Path: "edit.txt", StartLine: 1, NewText: "after"}); err == nil {
+		t.Fatal("new session inherited read snapshot")
+	}
 	if _, err := a.LoadSession(old); err != nil {
 		t.Fatal(err)
 	}

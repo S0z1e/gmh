@@ -29,6 +29,7 @@ func TestEditLineRangeReplacesLines(t *testing.T) {
 	root := t.TempDir()
 	ex := &Executor{Root: root}
 	writeEditFile(t, root, "x.txt", "alpha\nbeta\ngamma\ndelta\n")
+	ex.Read(ReadArgs{Path: "x.txt"})
 	if _, err := ex.Edit(EditArgs{Path: "x.txt", StartLine: 2, EndLine: 3, NewText: "BETA\nGAMMA"}); err != nil {
 		t.Fatal(err)
 	}
@@ -41,6 +42,7 @@ func TestEditLineRangeSingleLineDefaultsEnd(t *testing.T) {
 	root := t.TempDir()
 	ex := &Executor{Root: root}
 	writeEditFile(t, root, "x.txt", "alpha\nbeta\ngamma\n")
+	ex.Read(ReadArgs{Path: "x.txt"})
 	// EndLine 0 means StartLine: one line.
 	if _, err := ex.Edit(EditArgs{Path: "x.txt", StartLine: 2, NewText: "BETA"}); err != nil {
 		t.Fatal(err)
@@ -54,6 +56,7 @@ func TestEditLineRangeIgnoresOldText(t *testing.T) {
 	root := t.TempDir()
 	ex := &Executor{Root: root}
 	writeEditFile(t, root, "x.txt", "alpha\nbeta\n")
+	ex.Read(ReadArgs{Path: "x.txt"})
 	// OldText does not occur at all; the line form ignores it.
 	if _, err := ex.Edit(EditArgs{Path: "x.txt", OldText: "zzz", StartLine: 1, EndLine: 1, NewText: "ALPHA"}); err != nil {
 		t.Fatal(err)
@@ -67,6 +70,7 @@ func TestEditLineRangeNoTrailingNewline(t *testing.T) {
 	root := t.TempDir()
 	ex := &Executor{Root: root}
 	writeEditFile(t, root, "x.txt", "alpha\nbeta")
+	ex.Read(ReadArgs{Path: "x.txt"})
 	if _, err := ex.Edit(EditArgs{Path: "x.txt", StartLine: 2, NewText: "BETA"}); err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +83,7 @@ func TestEditLineRangeOutOfBounds(t *testing.T) {
 	root := t.TempDir()
 	ex := &Executor{Root: root}
 	writeEditFile(t, root, "x.txt", "alpha\nbeta\n")
+	ex.Read(ReadArgs{Path: "x.txt"})
 	_, err := ex.Edit(EditArgs{Path: "x.txt", StartLine: 1, EndLine: 5, NewText: "x"})
 	if err == nil || !strings.Contains(err.Error(), "beyond the last line (2)") {
 		t.Fatalf("err = %v, want beyond-the-last-line naming 2 lines", err)
@@ -116,6 +121,7 @@ func TestEditNoMatchDiagnosticClosestRegion(t *testing.T) {
 	root := t.TempDir()
 	ex := &Executor{Root: root}
 	writeEditFile(t, root, "x.txt", "alpha\nbeta\ngamma\ndelta\n")
+	ex.Read(ReadArgs{Path: "x.txt"})
 	// First line "alfa" occurs nowhere; beta/gamma match contiguously.
 	_, err := ex.Edit(EditArgs{Path: "x.txt", OldText: "alfa\nbeta\ngamma", NewText: "y"})
 	if err == nil {
@@ -133,6 +139,7 @@ func TestEditNoMatchDiagnosticNoLineMatches(t *testing.T) {
 	root := t.TempDir()
 	ex := &Executor{Root: root}
 	writeEditFile(t, root, "x.txt", "alpha\nbeta\n")
+	ex.Read(ReadArgs{Path: "x.txt"})
 	_, err := ex.Edit(EditArgs{Path: "x.txt", OldText: "zzz\nyyy", NewText: "y"})
 	if err == nil {
 		t.Fatal("want an error")
@@ -162,6 +169,7 @@ func TestEditOldTextPathUnchanged(t *testing.T) {
 	root := t.TempDir()
 	ex := &Executor{Root: root}
 	writeEditFile(t, root, "x.txt", "alpha\nbeta\n")
+	ex.Read(ReadArgs{Path: "x.txt"})
 	if _, err := ex.Edit(EditArgs{Path: "x.txt", OldText: "beta", NewText: "BETA"}); err != nil {
 		t.Fatal(err)
 	}
@@ -174,6 +182,7 @@ func TestDispatchLineEditCarriesDiffDetail(t *testing.T) {
 	root := t.TempDir()
 	ex := &Executor{Root: root}
 	writeEditFile(t, root, "x.txt", "alpha\nbeta\ngamma\n")
+	ex.Read(ReadArgs{Path: "x.txt"})
 	res, err := ex.Dispatch(context.Background(), "edit", `{"path":"x.txt","startLine":2,"newText":"BETA"}`)
 	if err != nil {
 		t.Fatal(err)
@@ -183,5 +192,29 @@ func TestDispatchLineEditCarriesDiffDetail(t *testing.T) {
 	}
 	if res.Detail != "− beta\n+ BETA" {
 		t.Fatalf("detail = %q, want the removed-line diff", res.Detail)
+	}
+}
+
+func TestLineEditRejectsChangedFile(t *testing.T) {
+	root := t.TempDir()
+	e := &Executor{Root: root}
+	writeEditFile(t, root, "f", "a\nb\nc\n")
+	if _, err := e.Read(ReadArgs{Path: "f"}); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(root, "f"), []byte("new\na\nb\nc\n"), 0600)
+	if _, err := e.Edit(EditArgs{Path: "f", StartLine: 2, NewText: "B"}); err == nil {
+		t.Fatal("stale line edit accepted")
+	}
+	if got := readEditFile(t, root, "f"); got != "new\na\nb\nc\n" {
+		t.Fatal(got)
+	}
+}
+func TestLineEditRequiresRead(t *testing.T) {
+	root := t.TempDir()
+	e := &Executor{Root: root}
+	writeEditFile(t, root, "f", "a\nb\n")
+	if _, err := e.Edit(EditArgs{Path: "f", StartLine: 2, NewText: "B"}); err == nil {
+		t.Fatal("line edit without read accepted")
 	}
 }

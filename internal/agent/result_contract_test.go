@@ -13,6 +13,31 @@ import (
 	"testing"
 )
 
+func TestBashFailureHasTypedError(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls == 1 {
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"bash","arguments":"{\"command\":\"exit 7\"}"}}]}}]}`+"\n\n")
+		} else {
+			fmt.Fprint(w, textSSE("done"))
+			return
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	var end Event
+	cfg := &Config{Client: &llm.Client{BaseURL: srv.URL, Model: "mock", APIKey: "test"}, Exec: &tools.Executor{Root: t.TempDir()}, Tools: ToolDefs(), Mode: "auto", OnEvent: func(e Event) {
+		if e.Kind == EventToolEnd {
+			end = e
+		}
+	}}
+	cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "task"}})
+	if end.ToolErr == nil || end.ToolStatus != tools.ResultError || end.ToolExitCode == nil || *end.ToolExitCode != 7 {
+		t.Fatalf("bash exit 7 lost failure metadata: %+v", end)
+	}
+}
 func TestOutputLimitIsNotCompletedTurn(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

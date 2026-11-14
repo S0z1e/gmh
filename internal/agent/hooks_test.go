@@ -246,9 +246,7 @@ func TestToolResultHookRewritesObservation(t *testing.T) {
 	}
 }
 
-func TestToolResultHookSkipsBash(t *testing.T) {
-	// Hooks run on the Dispatch path only, so a bash observation is
-	// never rewritten: this pins the documented limitation.
+func TestToolResultHookRewritesBash(t *testing.T) {
 	root := t.TempDir()
 	hooks := &fakePluginRunner{result: map[string]string{"bash": "REPLACED"}}
 	cfg := &Config{
@@ -260,11 +258,8 @@ func TestToolResultHookSkipsBash(t *testing.T) {
 		MaxSteps: 5,
 	}
 	_, secondBody := runTwoTurns(t, cfg, toolCallSSE("call_1", "bash", `{"command":"echo hi"}`))
-	if strings.Contains(secondBody, "REPLACED") {
-		t.Fatal("bash observation was rewritten, but hooks only run on Dispatch")
-	}
-	if !strings.Contains(secondBody, "hi") {
-		t.Fatal("the model never saw the real bash output")
+	if !strings.Contains(secondBody, "REPLACED") {
+		t.Fatal("the model never saw the hook-rewritten bash observation")
 	}
 }
 

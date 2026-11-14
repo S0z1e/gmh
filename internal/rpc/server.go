@@ -780,7 +780,7 @@ func (s *Server) onEvent(ev agent.Event) {
 		s.writeEvent(Event{Type: "tool_start", Tool: ev.ToolName, Args: parseToolArgs(ev.ToolArgs)})
 	case agent.EventToolEnd:
 		out, trunc := capOutput(ev.ToolOutput, maxToolOutputChars)
-		e := Event{Type: "tool_end", Tool: ev.ToolName, Output: out, Truncated: trunc}
+		e := Event{Type: "tool_end", Tool: ev.ToolName, Output: out, Truncated: trunc, Status: string(ev.ToolStatus), ExitCode: ev.ToolExitCode, OutputFile: ev.ToolOutputFile}
 		if ev.ToolErr != nil {
 			e.Error = ev.ToolErr.Error()
 		}
@@ -797,7 +797,7 @@ func (s *Server) onEvent(ev agent.Event) {
 		s.writeEvent(Event{Type: "background_wait", Jobs: ev.Text})
 	case agent.EventToolBackgroundDone:
 		out, trunc := capOutput(ev.ToolOutput, maxToolOutputChars)
-		e := Event{Type: "tool_background_done", Job: ev.JobID, Output: out, Truncated: trunc}
+		e := Event{Type: "tool_background_done", Job: ev.JobID, Output: out, Truncated: trunc, Status: string(ev.ToolStatus), ExitCode: ev.ToolExitCode, OutputFile: ev.ToolOutputFile}
 		if ev.ToolErr != nil {
 			e.Error = ev.ToolErr.Error()
 		}
@@ -997,12 +997,7 @@ func (s *Server) doControl(req Request) {
 			s.respond(req, nil, fmt.Errorf("rename_session needs {\"name\": old, \"new\": new}"))
 			return
 		}
-		var err error
-		if req.Name == s.app.Store.ID {
-			err = s.app.Store.Rename(req.New)
-		} else {
-			err = session.RenameSession(req.Name, req.New)
-		}
+		err := s.app.RenameSession(req.Name, req.New)
 		if err != nil {
 			s.respond(req, nil, err)
 			return

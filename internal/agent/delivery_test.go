@@ -108,25 +108,31 @@ func TestExecBashBackgroundFlag(t *testing.T) {
 	}
 
 	// Foreground: result directly, no job.
-	obs, job := cfg.execBash(ctx, bashCall(`{"command":"echo hi"}`))
+	res, job, err := cfg.execBash(ctx, bashCall(`{"command":"echo hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if job != nil {
 		t.Fatalf("foreground call returned a job %+v", job)
 	}
-	if !strings.Contains(obs, "hi") {
-		t.Fatalf("foreground observation = %q, want it to contain hi", obs)
+	if !strings.Contains(res.Text, "hi") {
+		t.Fatalf("foreground observation = %q, want it to contain hi", res.Text)
 	}
 
 	// Explicit background: returns at once with a job.
 	start := time.Now()
-	obs, job = cfg.execBash(ctx, bashCall(`{"command":"sleep 5; echo BG","background":true}`))
+	res, job, err = cfg.execBash(ctx, bashCall(`{"command":"sleep 5; echo BG","background":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatalf("background call took %v, want it to return at once", time.Since(start))
 	}
 	if job == nil {
 		t.Fatal("background call returned no job")
 	}
-	if !strings.Contains(obs, job.ID) {
-		t.Fatalf("background observation = %q, want it to name job %s", obs, job.ID)
+	if !strings.Contains(res.Text, job.ID) {
+		t.Fatalf("background observation = %q, want it to name job %s", res.Text, job.ID)
 	}
 	// Nothing to collect while it runs.
 	if msgs, _ := cfg.collectFinishedJobs(nil, []pendingJob{{callID: "call_1", job: job}}); len(msgs) != 0 {

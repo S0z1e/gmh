@@ -931,6 +931,23 @@ func (p *Plugin) call(ctx context.Context, t *Tool, argsJSON string, timeout tim
 	if cr.err != nil {
 		return "", fmt.Errorf("plugin %s tool %s: %w", p.Name, t.Name, cr.err)
 	}
+	// Tool handlers may return an explicit result envelope. Ordinary strings,
+	// including text beginning with "Error:", are never interpreted as status.
+	if g, convErr := p.rt.ToGo(cr.res); convErr == nil {
+		if obj, ok := g.(map[string]any); ok {
+			if failed, ok := obj["isError"].(bool); ok {
+				text, ok := obj["text"].(string)
+				if !ok {
+					return "", fmt.Errorf("plugin result with isError requires text")
+				}
+				text = capObservation(text)
+				if failed {
+					return text, fmt.Errorf("plugin %s tool %s: %s", p.Name, t.Name, text)
+				}
+				return text, nil
+			}
+		}
+	}
 	return p.resultString(cr.res)
 }
 

@@ -1027,6 +1027,26 @@ harness.on("session_start", () => {});
 	}
 }
 
+func TestExplicitToolResultStatus(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "typed", "", "t.js", `
+harness.registerTool("typed", "Typed result.", {type:"object"}, a => ({text:"failed action",isError:a.fail}));
+harness.registerTool("literal", "Literal text.", {type:"object"}, () => "Error: a literal example");`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if text, err := reg.Call(context.Background(), "typed", `{"fail":true}`); err == nil || text != "failed action" {
+		t.Fatalf("failed = %q, %v", text, err)
+	}
+	if text, err := reg.Call(context.Background(), "typed", `{"fail":false}`); err != nil || text != "failed action" {
+		t.Fatalf("success = %q, %v", text, err)
+	}
+	if text, err := reg.Call(context.Background(), "literal", `{}`); err != nil || text != "Error: a literal example" {
+		t.Fatalf("literal = %q, %v", text, err)
+	}
+}
+
 func TestStoreRejectsSymlinkEscape(t *testing.T) {
 	root, outside := t.TempDir(), t.TempDir()
 	writePlugin(t, root, "store", "", "s.js", `

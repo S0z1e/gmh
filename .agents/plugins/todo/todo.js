@@ -38,7 +38,7 @@ harness.registerTool(
   },
   (args) => {
     const text = String(args.text || "").trim();
-    if (!text) return "Error: todo text is empty.";
+    if (!text) return {isError: true, text: "Todo text is empty."};
     const items = loadTodos();
     const id = nextId(items);
     items.push({ id, text, done: false });
@@ -84,7 +84,7 @@ harness.registerTool(
     const id = Number(args.id);
     const items = loadTodos();
     const item = items.find((t) => t.id === id);
-    if (!item) return "Error: no todo #" + args.id + ".";
+    if (!item) return {isError: true, text: "No todo #" + args.id + "."};
     if (item.done) return "Todo #" + id + " is already done: " + item.text;
     item.done = true;
     saveTodos(items);

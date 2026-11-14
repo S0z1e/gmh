@@ -19,7 +19,7 @@ import (
 
 // Line-edit recovery: the model first fails an oldText edit (stale
 // text), then fixes the same line with a startLine edit — in two
-// steps, without re-reading the file. This is the fix-loop economy
+// steps, after a read has established an unchanged file version.
 // the line form exists for: a failed edit costs one step, not a
 // read plus a blind retry.
 func TestRunLineEditAfterFailedOldText(t *testing.T) {
@@ -46,13 +46,15 @@ func TestRunLineEditAfterFailedOldText(t *testing.T) {
 		n := atomic.AddInt32(&calls, 1)
 		switch n {
 		case 1:
+			fmt.Fprint(w, toolCall("read_1", "read", map[string]any{"path": "fix.txt"}))
+		case 2:
 			// Stale oldText: the first line is real (line 2), the
 			// second is not, so the whole oldText matches 0 times
 			// but the diagnostic can still name line 2.
 			fmt.Fprint(w, toolCall("call_1", "edit", map[string]any{
 				"path": "fix.txt", "oldText": "line two\nline TWO", "newText": "line TWO",
 			}))
-		case 2:
+		case 3:
 			// Line-anchored retry, no oldText at all.
 			fmt.Fprint(w, toolCall("call_2", "edit", map[string]any{
 				"path": "fix.txt", "startLine": 2, "newText": "line TWO",
@@ -85,9 +87,7 @@ func TestRunLineEditAfterFailedOldText(t *testing.T) {
 	if got, _ := os.ReadFile(filepath.Join(root, "fix.txt")); string(got) != "line one\nline TWO\nline three\n" {
 		t.Fatalf("file = %q", got)
 	}
-	// Two edit calls, no read: the recovery cost one step, and the
-	// failure diagnostic — not a re-read — is what made the second
-	// call possible.
+	// A failed oldText match leaves the previous read version valid.
 	var edits, reads int
 	for _, e := range events {
 		if e.Kind == EventToolStart && e.ToolName == "edit" {
@@ -100,11 +100,11 @@ func TestRunLineEditAfterFailedOldText(t *testing.T) {
 	if edits != 2 {
 		t.Fatalf("edit calls = %d, want 2", edits)
 	}
-	if reads != 0 {
-		t.Fatalf("read calls = %d, want 0 (no re-read to recover)", reads)
+	if reads != 1 {
+		t.Fatalf("read calls = %d, want 1", reads)
 	}
-	if got := atomic.LoadInt32(&calls); got != 3 {
-		t.Fatalf("LLM calls = %d, want 3", got)
+	if got := atomic.LoadInt32(&calls); got != 4 {
+		t.Fatalf("LLM calls = %d, want 4", got)
 	}
 	// The first edit's failure must have named the matching line, so
 	// a model reading the observation knows line 2 is the target.

@@ -1,6 +1,9 @@
 package agent
 
-import "minimalharness/internal/llm"
+import (
+	"minimalharness/internal/llm"
+	"minimalharness/internal/tools"
+)
 
 // Event stream seam (P1-3a). The loop emits events; the CLI is one
 // renderer of them. A future Bubble Tea TUI will be another renderer
@@ -103,8 +106,11 @@ type Event struct {
 	ToolArgs string
 	// ToolOutput is the observation for ToolEnd (including the "Error:"
 	// prefix when ToolErr is set).
-	ToolOutput string
-	ToolErr    error
+	ToolOutput     string
+	ToolErr        error
+	ToolStatus     tools.ResultStatus
+	ToolExitCode   *int
+	ToolOutputFile string
 	// ToolDetail is display-only content for ToolEnd (never sent to
 	// the model): write carries the written content, edit a -/+ diff
 	// of the replaced lines. Empty for other tools.

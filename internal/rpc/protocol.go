@@ -117,11 +117,14 @@ type Event struct {
 	SessionCostUSD *float64 `json:"session_cost_usd,omitempty"`
 	Fee            string   `json:"fee,omitempty"`
 	// tool_start / tool_end / background events.
-	Tool      string `json:"tool,omitempty"`
-	Args      any    `json:"args,omitempty"`
-	Output    string `json:"output,omitempty"`
-	Truncated bool   `json:"truncated,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Tool       string `json:"tool,omitempty"`
+	Status     string `json:"status,omitempty"`
+	ExitCode   *int   `json:"exit_code,omitempty"`
+	OutputFile string `json:"output_file,omitempty"`
+	Args       any    `json:"args,omitempty"`
+	Output     string `json:"output,omitempty"`
+	Truncated  bool   `json:"truncated,omitempty"`
+	Error      string `json:"error,omitempty"`
 	// tool_end only: display detail (write content / edit diff) and,
 	// for grep/glob, the match count (0 omitted; the output text
 	// says "no matches" then). The GUI renders these; the model

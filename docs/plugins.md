@@ -100,7 +100,7 @@ model gets the observation `Denied by plugin <name>: <reason>` and a
 tool-end event with an error, and the denial is audited like a
 refused approval. A hook that throws or times out **denies the
 call** (fail closed). `tool_result` hooks run after the tool
-dispatches (bash never reaches them — it has its own path) and
+dispatches (including bash and ask_user) and
 before the result enters history; a hook that throws, times out, or
 returns a non-string keeps the original result and warns on stderr
 (fail open). Hooks never bypass approval: anything they let through
@@ -108,9 +108,9 @@ still prompts in suggest mode.
 
 ## Lifecycle hooks
 
-Five more hooks, all registered with `harness.on` at load time
+Six lifecycle hooks, all registered with `harness.on` at load time
 only, at most one per event per plugin. Unlike `tool_call`, all
-five **fail open**: a hook that throws, times out, or returns an
+six **fail open**: a hook that throws, times out, or returns an
 unusable value is skipped with a stderr warning and the turn,
 compact, or session switch carries on without it.
 
@@ -239,3 +239,20 @@ Cost: moejs is the one non-stdlib dependency outside the TUI, and it
 adds ~8 MB to the stripped binary (core harness ~8 MB → ~16 MB).
 The shipped pilot is `.agents/plugins/todo/` — `todo_add` /
 `todo_list` / `todo_done`, state in its `data/todos.json`.
+
+Tool handlers can return `{text: "...", isError: true}` to report a failure,
+or throw an error. `{text: "...", isError: false}` reports success. A plain
+string is successful output even when it begins with `Error:`; status never
+comes from an output prefix. Result hooks may rewrite text but cannot turn a
+failed execution into success.
+
+`harness.getSession()` returns the current session id (empty in a standalone
+registry). The built-in plan plugin stores `plan-<session>.json` separately
+for each session. Existing project-wide `plan.json` files are retained but
+are not imported automatically, so a fresh session cannot inherit an old
+plan. The todo plugin retains its project-wide list.
+
+`session_rename` receives `{session, previous}` after the transcript is renamed.
+A plugin storing state by session id can move it here; return values are ignored,
+and errors warn without undoing the transcript rename. The built-in plan plugin
+moves the plan and retires its old filename.

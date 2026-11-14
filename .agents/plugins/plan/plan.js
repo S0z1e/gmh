@@ -83,9 +83,9 @@ harness.registerTool(
   },
   (args) => {
     const plan = loadPlan();
-    if (!plan) return "Error: no plan yet. Use plan_create first.";
+    if (!plan) return {isError: true, text: "No plan yet. Use plan_create first."};
     const i = Number(args.index) - 1;
-    if (!plan.steps[i]) return "Error: no step #" + args.index + ".";
+    if (!plan.steps[i]) return {isError: true, text: "No step #" + args.index + "."};
     plan.steps[i].text = String(args.text);
     savePlan(plan);
     return formatPlan(plan);
@@ -104,9 +104,9 @@ harness.registerTool(
   },
   (args) => {
     const plan = loadPlan();
-    if (!plan) return "Error: no plan yet. Use plan_create first.";
+    if (!plan) return {isError: true, text: "No plan yet. Use plan_create first."};
     const i = Number(args.index) - 1;
-    if (!plan.steps[i]) return "Error: no step #" + args.index + ".";
+    if (!plan.steps[i]) return {isError: true, text: "No step #" + args.index + "."};
     if (plan.steps[i].done)
       return "Step #" + args.index + " is already done: " + plan.steps[i].text;
     plan.steps[i].done = true;

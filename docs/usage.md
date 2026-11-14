@@ -35,8 +35,9 @@
   a failed match names the closest lines, so the call can be fixed
   instead of re-reading the file) or `startLine`/`endLine` (1-based,
   inclusive; `endLine` defaults to `startLine`) to replace those
-  lines with `newText`. After a `read`, prefer the line form: it
-  cannot go stale the way `oldText` can. `write` takes
+  lines with `newText`. Line edits require a `read` in the current session and an unchanged
+  file since that read. After an edit or external change, read the
+  target lines again; stale edits fail before writing. `write` takes
   `overwrite:true` to replace an existing file wholesale (default:
   it fails if the file exists — use `edit` then); prefer `edit` for
   a small change. Run builds and tests bare,
@@ -74,8 +75,8 @@
 - Compaction: `/compact` summarises the conversation into a 6-section
   brief and replaces history with it; the original transcript is
   saved to `<session>-pre-compact-<time>.jsonl`. It also triggers
-  automatically when the last call's context reaches 70% of the
-  window (`-context-limit`, default: the model's `contextWindow`,
+  inside the tool loop, before the next model call, when measured
+  usage plus new content reaches 70% of the window (`-context-limit`, default: the model's `contextWindow`,
   else 128000).
 - Step budget: steps are unlimited by default (like Claude Code,
   Codex, Gemini, Qwen, OpenCode and Pi): a turn runs until the model

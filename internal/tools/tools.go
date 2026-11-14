@@ -303,6 +303,8 @@ func splitFileLines(s string) ([]string, int) {
 }
 
 func (e *Executor) Edit(a EditArgs) (string, error) {
+	e.editMu.Lock()
+	defer e.editMu.Unlock()
 	p, err := e.resolve(a.Path)
 	if err != nil {
 		return "", err
@@ -313,7 +315,18 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 	}
 	s := string(data)
 	if a.StartLine > 0 {
-		return e.editLines(p, s, a)
+		expected, ok := e.snapshots[p]
+		if !ok {
+			return "", fmt.Errorf("line edit requires a fresh read of %s", a.Path)
+		}
+		if sha256.Sum256(data) != expected {
+			return "", fmt.Errorf("file changed since last read: %s; read the target lines again before editing", a.Path)
+		}
+		out, err := e.editLines(p, s, a)
+		if err == nil {
+			delete(e.snapshots, p)
+		}
+		return out, err
 	}
 	if a.StartLine < 0 {
 		return "", fmt.Errorf("startLine must be >= 1, got %d in %s", a.StartLine, a.Path)
@@ -321,6 +334,7 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 	if n := strings.Count(s, a.OldText); n != 1 {
 		return "", editMatchError(a.Path, s, a.OldText, n)
 	}
+	defer delete(e.snapshots, p)
 	if err := e.writeExisting(p, []byte(strings.Replace(s, a.OldText, a.NewText, 1))); err != nil {
 		return "", err
 	}
