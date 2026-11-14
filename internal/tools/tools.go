@@ -171,14 +171,7 @@ func (e *Executor) Read(a ReadArgs) (string, error) {
 		}
 		var digest [32]byte
 		copy(digest[:], h.Sum(nil))
-		if e.snapshots == nil {
-			e.snapshots = map[string][32]byte{}
-		}
-		key, _ := filepath.Abs(a.Path)
-		if !filepath.IsAbs(a.Path) {
-			key = filepath.Join(e.Root, filepath.Clean(a.Path))
-		}
-		e.snapshots[key] = digest
+		e.rememberSnapshot(a.Path, digest)
 	}
 	start := max(a.Offset, 0)
 	reader := bufio.NewReader(f)
@@ -236,7 +229,6 @@ type WriteArgs struct {
 func (e *Executor) Write(a WriteArgs) (string, error) {
 	e.editMu.Lock()
 	defer e.editMu.Unlock()
-	defer e.invalidateSnapshot(a.Path)
 	r, rel, err := fileguard.Root(e.Root, a.Path)
 	if err != nil {
 		return "", err
@@ -260,6 +252,9 @@ func (e *Executor) Write(a WriteArgs) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Open may already have truncated the file. A partial write cannot retain
+	// the previous version, and a successful write records exactly our bytes.
+	e.invalidateSnapshot(a.Path)
 	_, err = f.WriteString(a.Content)
 	closeErr := f.Close()
 	if err != nil {
@@ -268,6 +263,7 @@ func (e *Executor) Write(a WriteArgs) (string, error) {
 	if closeErr != nil {
 		return "", closeErr
 	}
+	e.rememberSnapshot(a.Path, sha256.Sum256([]byte(a.Content)))
 	if statErr == nil {
 		return "overwrote " + a.Path, nil
 	}
@@ -280,8 +276,8 @@ type EditArgs struct {
 	NewText string `json:"newText"`
 	// StartLine/EndLine are the line-range form (1-based, inclusive):
 	// when StartLine > 0 the edit replaces exactly those lines with
-	// NewText after validating the last read version. EndLine 0 means StartLine (one
-	// line). A line edit requires an unchanged file since its last read.
+	// NewText after validating the last known version. EndLine 0 means StartLine
+	// (one line). A read or full write establishes that version; edits can update it.
 	StartLine int `json:"startLine,omitempty"`
 	EndLine   int `json:"endLine,omitempty"`
 }
@@ -317,16 +313,12 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 	if a.StartLine > 0 {
 		expected, ok := e.snapshots[p]
 		if !ok {
-			return "", fmt.Errorf("line edit requires a fresh read of %s", a.Path)
+			return "", fmt.Errorf("line edit requires a known version of %s; read the target lines before editing", a.Path)
 		}
 		if sha256.Sum256(data) != expected {
-			return "", fmt.Errorf("file changed since last read: %s; read the target lines again before editing", a.Path)
+			return "", fmt.Errorf("file changed since last read or write: %s; read the target lines again before editing", a.Path)
 		}
-		out, err := e.editLines(p, s, a)
-		if err == nil {
-			delete(e.snapshots, p)
-		}
-		return out, err
+		return e.editLines(p, s, a)
 	}
 	if a.StartLine < 0 {
 		return "", fmt.Errorf("startLine must be >= 1, got %d in %s", a.StartLine, a.Path)
@@ -334,8 +326,9 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 	if n := strings.Count(s, a.OldText); n != 1 {
 		return "", editMatchError(a.Path, s, a.OldText, n)
 	}
-	defer delete(e.snapshots, p)
-	if err := e.writeExisting(p, []byte(strings.Replace(s, a.OldText, a.NewText, 1))); err != nil {
+	expected, known := e.snapshots[p]
+	known = known && sha256.Sum256(data) == expected
+	if err := e.writeExisting(p, []byte(strings.Replace(s, a.OldText, a.NewText, 1)), known); err != nil {
 		return "", err
 	}
 	return "edited " + a.Path, nil
@@ -363,7 +356,7 @@ func (e *Executor) editLines(p, s string, a EditArgs) (string, error) {
 	newParts = append(newParts, parts[:a.StartLine-1]...)
 	newParts = append(newParts, strings.Split(a.NewText, "\n")...)
 	newParts = append(newParts, parts[end:]...)
-	if err := e.writeExisting(p, []byte(strings.Join(newParts, "\n"))); err != nil {
+	if err := e.writeExisting(p, []byte(strings.Join(newParts, "\n")), true); err != nil {
 		return "", err
 	}
 	return "edited " + a.Path, nil
@@ -850,18 +843,40 @@ func (e *Executor) LoadSkill(a LoadSkillArgs) (string, error) {
 	return match.Load()
 }
 
-func (e *Executor) writeExisting(path string, data []byte) error {
+// keepSnapshot requires the caller to have validated the original bytes against
+// a known version. Matching oldText alone says nothing about surrounding lines.
+func (e *Executor) writeExisting(path string, data []byte, keepSnapshot bool) error {
 	r, rel, err := fileguard.Root(e.Root, path)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
-	return r.WriteFile(rel, data, 0644)
+	if err := r.WriteFile(rel, data, 0644); err != nil {
+		e.invalidateSnapshot(path)
+		return err
+	}
+	if keepSnapshot {
+		e.rememberSnapshot(path, sha256.Sum256(data))
+	} else {
+		e.invalidateSnapshot(path)
+	}
+	return nil
 }
 
-func (e *Executor) invalidateSnapshot(path string) {
+func (e *Executor) snapshotPath(path string) string {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(e.Root, filepath.Clean(path))
 	}
-	delete(e.snapshots, path)
+	return filepath.Clean(path)
+}
+
+func (e *Executor) rememberSnapshot(path string, digest [32]byte) {
+	if e.snapshots == nil {
+		e.snapshots = map[string][32]byte{}
+	}
+	e.snapshots[e.snapshotPath(path)] = digest
+}
+
+func (e *Executor) invalidateSnapshot(path string) {
+	delete(e.snapshots, e.snapshotPath(path))
 }

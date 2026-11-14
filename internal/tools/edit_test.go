@@ -218,3 +218,130 @@ func TestLineEditRequiresRead(t *testing.T) {
 		t.Fatal("line edit without read accepted")
 	}
 }
+
+func TestLineEditAfterOwnWrite(t *testing.T) {
+	root := t.TempDir()
+	e := &Executor{Root: root}
+	writeEditFile(t, root, "f", "old\n")
+	if _, err := e.Write(WriteArgs{Path: "f", Content: "alpha\nbeta\n", Overwrite: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Edit(EditArgs{Path: "f", StartLine: 2, OldText: "beta", NewText: "BETA"}); err != nil {
+		t.Fatalf("line edit rejected the content just written by this executor: %v", err)
+	}
+	if got := readEditFile(t, root, "f"); got != "alpha\nBETA\n" {
+		t.Fatalf("file = %q", got)
+	}
+}
+
+func TestLineEditAfterOwnWriteStillRejectsExternalChanges(t *testing.T) {
+	root := t.TempDir()
+	e := &Executor{Root: root}
+	if _, err := e.Write(WriteArgs{Path: "f", Content: "alpha\nbeta\n"}); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(root, "f"), []byte("inserted\nalpha\nbeta\n"), 0600)
+	if _, err := e.Edit(EditArgs{Path: "f", StartLine: 2, OldText: "beta", NewText: "BETA"}); err == nil || !strings.Contains(err.Error(), "file changed") {
+		t.Fatalf("external change was accepted after own write: %v", err)
+	}
+	if got := readEditFile(t, root, "f"); got != "inserted\nalpha\nbeta\n" {
+		t.Fatalf("external content changed: %q", got)
+	}
+}
+
+func TestLineEditAfterOwnEdit(t *testing.T) {
+	for _, lineForm := range []bool{false, true} {
+		t.Run(map[bool]string{false: "text", true: "line"}[lineForm], func(t *testing.T) {
+			root := t.TempDir()
+			e := &Executor{Root: root}
+			writeEditFile(t, root, "f", "alpha\nbeta\n")
+			if _, err := e.Read(ReadArgs{Path: "f"}); err != nil {
+				t.Fatal(err)
+			}
+			first := EditArgs{Path: "f", OldText: "alpha", NewText: "ALPHA"}
+			if lineForm {
+				first.StartLine = 1
+			}
+			if _, err := e.Edit(first); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := e.Edit(EditArgs{Path: "f", StartLine: 2, NewText: "BETA"}); err != nil {
+				t.Fatalf("own edit invalidated known content: %v", err)
+			}
+			if got := readEditFile(t, root, "f"); got != "ALPHA\nBETA\n" {
+				t.Fatalf("file = %q", got)
+			}
+		})
+	}
+}
+
+func TestFailedWritePreservesReadVersion(t *testing.T) {
+	root := t.TempDir()
+	e := &Executor{Root: root}
+	writeEditFile(t, root, "f", "alpha\nbeta\n")
+	if _, err := e.Read(ReadArgs{Path: "f"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Write(WriteArgs{Path: "f", Content: "rejected"}); err == nil {
+		t.Fatal("write unexpectedly overwrote existing file")
+	}
+	if _, err := e.Edit(EditArgs{Path: "f", StartLine: 2, NewText: "BETA"}); err != nil {
+		t.Fatalf("failed write invalidated unchanged content: %v", err)
+	}
+}
+
+func TestTextEditAfterExternalChangeDoesNotTrustLineNumbers(t *testing.T) {
+	for _, baseline := range []string{"read", "write"} {
+		t.Run(baseline, func(t *testing.T) {
+			root := t.TempDir()
+			e := &Executor{Root: root}
+			original := "alpha\nbeta\ngamma\n"
+			if baseline == "write" {
+				if _, err := e.Write(WriteArgs{Path: "f", Content: original}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				writeEditFile(t, root, "f", original)
+				if _, err := e.Read(ReadArgs{Path: "f"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeEditFile(t, root, "f", "inserted\n"+original)
+			if _, err := e.Edit(EditArgs{Path: "f", OldText: "gamma", NewText: "GAMMA"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := e.Edit(EditArgs{Path: "f", StartLine: 2, OldText: "beta", NewText: "BETA"}); err == nil {
+				t.Fatal("text edit made stale line numbers trusted")
+			}
+			if got := readEditFile(t, root, "f"); got != "inserted\nalpha\nbeta\nGAMMA\n" {
+				t.Fatalf("stale line edit changed the file: %q", got)
+			}
+			if _, err := e.Read(ReadArgs{Path: "f"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := e.Edit(EditArgs{Path: "f", StartLine: 3, NewText: "BETA"}); err != nil {
+				t.Fatalf("fresh read did not restore line editing: %v", err)
+			}
+			if got := readEditFile(t, root, "f"); got != "inserted\nalpha\nBETA\nGAMMA\n" {
+				t.Fatalf("file after fresh read/edit = %q", got)
+			}
+		})
+	}
+}
+
+func TestTextEditsWithoutKnownVersionDoNotEnableLineEdit(t *testing.T) {
+	root := t.TempDir()
+	e := &Executor{Root: root}
+	writeEditFile(t, root, "f", "alpha\nbeta\ngamma\n")
+	for _, text := range []string{"alpha", "beta"} {
+		if _, err := e.Edit(EditArgs{Path: "f", OldText: text, NewText: strings.ToUpper(text)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.Edit(EditArgs{Path: "f", StartLine: 3, NewText: "GAMMA"}); err == nil {
+		t.Fatal("text edits established a version of unread surrounding content")
+	}
+	if got := readEditFile(t, root, "f"); got != "ALPHA\nBETA\ngamma\n" {
+		t.Fatalf("unread line edit changed the file: %q", got)
+	}
+}

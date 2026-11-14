@@ -35,9 +35,12 @@
   a failed match names the closest lines, so the call can be fixed
   instead of re-reading the file) or `startLine`/`endLine` (1-based,
   inclusive; `endLine` defaults to `startLine`) to replace those
-  lines with `newText`. Line edits require a `read` in the current session and an unchanged
-  file since that read. After an edit or external change, read the
-  target lines again; stale edits fail before writing. `write` takes
+  lines with `newText`. A `read` or successful full `write` establishes a known
+  version for line edits in the current session. Successful edits update it
+  without an extra read only if the original file still matched that version.
+  An `oldText` edit can match unread or externally changed content, but does
+  not establish a known version in that case: read the target lines before
+  a line edit. Stale line edits fail before writing. `write` takes
   `overwrite:true` to replace an existing file wholesale (default:
   it fails if the file exists — use `edit` then); prefer `edit` for
   a small change. Run builds and tests bare,
