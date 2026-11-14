@@ -19,13 +19,16 @@ import (
 )
 
 type Config struct {
-	Client   *llm.Client
-	Exec     *tools.Executor
-	Tools    []llm.ToolDef
-	System   string
-	Mode     string // "suggest" (ask) or "auto" (no ask)
-	MaxSteps int
-	Session  *session.Store
+	Client         *llm.Client
+	Exec           *tools.Executor
+	Tools          []llm.ToolDef
+	System         string
+	Mode           string // "suggest" (ask) or "auto" (no ask)
+	ContextLimit   int
+	CompactHistory func(context.Context, []llm.Message) (string, llm.Usage, error)
+	OnCompact      func(history []llm.Message, usage llm.Usage, archive string)
+	MaxSteps       int
+	Session        *session.Store
 	// OnEvent receives every loop event; the caller renders them.
 	// (There is no OnText: streamed text arrives as TextDelta events.)
 	OnEvent func(Event)
@@ -676,8 +679,24 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		// history passes the prune threshold, which bounds prompt
 		// growth on long runs; the prune's block boundaries are
 		// frozen, so the sent view stays append-only between prunes.
-		apiMsgs := truncateToolResults(msgs, toolResultMaxChars)
-		apiMsgs = pruneOldToolResults(apiMsgs, pruneThresholdChars, pruneBlockChars, pruneKeepNewestBlocks)
+		if c.ContextLimit > 0 && c.needsCompact(msgs) {
+			compacted, usage, err := c.compactInLoop(ctx, msgs)
+			total.Add(usage)
+			c.emit(Event{Kind: EventStepUsage, Usage: usage})
+			if err != nil {
+				c.LastTerminalReason = TerminalError
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: TerminalError})
+				return lastText, total, err
+			}
+			msgs = compacted
+			if c.needsCompact(msgs) {
+				err := fmt.Errorf("context still exceeds the budget after compaction; reduce the task, system prompt or tool definitions, or select a larger context window")
+				c.LastTerminalReason = TerminalError
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: TerminalError})
+				return lastText, total, err
+			}
+		}
+		apiMsgs := c.promptView(msgs)
 		attempts, err := c.streamStep(ctx, apiMsgs, c.Tools, func(s string) {
 			c.emit(Event{Kind: EventTextDelta, Text: s})
 		}, func(m llm.Message, u llm.Usage) {
@@ -717,6 +736,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			return lastText, total, wrapped
 		}
 		c.LastPromptTokens = usage.PromptTokens
+		c.lastPromptEstimate = estimatePromptTokens(apiMsgs, c.Tools)
 		total.Add(usage)
 		c.emit(Event{Kind: EventStepUsage, Usage: usage})
 		lastText = assistant.Content
@@ -1071,8 +1091,7 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	defer cancel()
 	graceMsgs := append(append([]llm.Message{}, msgs...),
 		llm.Message{Role: "user", Content: instruction})
-	apiMsgs := truncateToolResults(graceMsgs, toolResultMaxChars)
-	apiMsgs = pruneOldToolResults(apiMsgs, pruneThresholdChars, pruneBlockChars, pruneKeepNewestBlocks)
+	apiMsgs := c.promptView(graceMsgs)
 	var final llm.Message
 	var usage llm.Usage
 	var thinking strings.Builder

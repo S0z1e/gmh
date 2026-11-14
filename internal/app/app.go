@@ -410,6 +410,7 @@ func Setup(p Params) (*App, error) {
 		contextLimit = config.DefaultContextWindow
 	}
 	a.ContextLimit = contextLimit
+	a.Cfg.ContextLimit = contextLimit
 
 	a.TUITheme = os.Getenv("HARNESS_TUI_THEME")
 	if a.TUITheme == "" {
@@ -658,6 +659,7 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 	a.Model = mdl
 	a.Provider = provName
 	a.ContextLimit = contextLimit
+	a.Cfg.ContextLimit = contextLimit
 	return provName, mdl.ID, apiMode, nil
 }
 
@@ -1317,6 +1319,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		turnHistory = append(turnHistory, history...)
 		history = turnHistory
 	}
+	r.configureCompaction()
 	_, usage, err := r.App.Cfg.Run(ctx, history)
 	r.LastErr = err
 	if err != nil {
@@ -1340,11 +1343,6 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		turnLine += fmt.Sprintf(" | est. cost: ~$%.4f", turnCost)
 	}
 	r.Print("\n%s\n[usage] session: %s | %s", turnLine, r.SessionUsage, r.costLine(r.SessionCost))
-	// Auto-compact when the last call's context hit 70% of the window.
-	if agent.ShouldCompact(r.App.Cfg.LastPromptTokens, r.App.ContextLimit) {
-		r.Print("[compact] context at %d tokens (limit %d), compacting…", r.App.Cfg.LastPromptTokens, r.App.ContextLimit)
-		r.doCompact(ctx)
-	}
 }
 
 // Rollback drops the last n turns from the session — Codex's
@@ -1386,38 +1384,34 @@ func (r *Runner) doCompact(ctx context.Context) {
 		r.Print("[compact] nothing to compact.")
 		return
 	}
-	// session_before_compact hooks add instructions to the summary
-	// prompt (append-only); a failing hook is skipped, never fails
-	// the compact. Manual /compact and auto-compact share this one
-	// insertion point.
+	r.configureCompaction()
+	_, usage, err := r.App.Cfg.Compact(ctx, r.App.History)
+	r.SessionUsage.Add(usage)
+	r.SessionCost += r.App.Rates.Cost(usage, time.Now())
+	if err != nil {
+		r.Print("[compact] failed: %v (history unchanged)", err)
+		return
+	}
+	r.App.Cfg.LastPromptTokens = 0
+}
+
+// configureCompaction keeps persistence in the agent and rendering in the app.
+func (r *Runner) configureCompaction() {
+	r.App.Cfg.CompactHistory = r.compactHistory
+	r.App.Cfg.OnCompact = func(history []llm.Message, usage llm.Usage, archive string) {
+		r.App.History = history
+		if r.OnCompact != nil {
+			r.OnCompact(len(history), usage.CompletionTokens)
+		}
+		r.Print("[compact] history replaced by summary; original transcript saved to %s", archive)
+	}
+}
+
+// compactHistory supplies plugin instructions; the agent commits the checkpoint.
+func (r *Runner) compactHistory(ctx context.Context, history []llm.Message) (string, llm.Usage, error) {
 	var extras []string
 	if r.App.Plugins != nil {
-		extras = r.App.Plugins.RunSessionBeforeCompactHooks(ctx, r.App.sessionID(), len(r.App.History))
+		extras = r.App.Plugins.RunSessionBeforeCompactHooks(ctx, r.App.sessionID(), len(history))
 	}
-	summary, cUsage, err := agent.Compact(ctx, r.App.Cfg.Client, r.App.History, extras)
-	if err != nil {
-		r.Print("[compact] failed: %v (history unchanged)", err)
-		return
-	}
-	archiveName := fmt.Sprintf("%s-pre-compact-%s", r.App.Store.ID, time.Now().Format("150405"))
-	archivePath, err := r.App.Store.ArchiveCopy(archiveName)
-	if err != nil {
-		r.Print("[compact] failed to save transcript: %v (history unchanged)", err)
-		return
-	}
-	if err := r.App.Store.MarkCompact(summary); err != nil {
-		r.Print("[compact] failed: %v (history unchanged)", err)
-		return
-	}
-	if msgs, err := session.Load(r.App.Store.ID); err == nil {
-		r.App.History = msgs
-	}
-	r.SessionUsage.Add(cUsage)
-	r.SessionCost += r.App.Rates.Cost(cUsage, time.Now())
-	// The summary's token count is the completion of the compact
-	// call, which generated the summary text.
-	if r.OnCompact != nil {
-		r.OnCompact(len(r.App.History), cUsage.CompletionTokens)
-	}
-	r.Print("[compact] %d tokens used for the summary; history replaced by summary (%d chars). Original transcript saved to %s", cUsage.TotalTokens, len(summary), archivePath)
+	return agent.Compact(ctx, r.App.Cfg.Client, history, extras)
 }

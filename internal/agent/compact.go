@@ -2,8 +2,11 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"minimalharness/internal/session"
 	"strings"
+	"time"
 
 	"minimalharness/internal/llm"
 )
@@ -15,9 +18,8 @@ import (
 // so --resume starts from the summary.
 
 const (
-	// DefaultContextLimit is the context window of deepseek-v4.1-flash
-	// (1,048,576 tokens). Override with -context-limit for other models.
-	DefaultContextLimit = 1048576
+	// DefaultContextLimit matches the conservative config fallback.
+	DefaultContextLimit = 128000
 	// CompactThreshold is the fraction of the window that triggers compaction.
 	CompactThreshold = 0.7
 )
@@ -93,5 +95,102 @@ func Compact(ctx context.Context, client *llm.Client, history []llm.Message, ext
 	if err != nil {
 		return "", usage, err
 	}
+	if msg.FinishReason == "length" || msg.FinishReason == "max_tokens" || msg.FinishReason == "incomplete" {
+		return "", usage, fmt.Errorf("summary was truncated by the model output limit")
+	}
 	return msg.Content, usage, nil
+}
+
+// estimatePromptTokens is a conservative local guard, not provider usage.
+// Schema and framing overhead count too; image cost varies by provider.
+func estimatePromptTokens(msgs []llm.Message, defs []llm.ToolDef) int {
+	schemas, _ := json.Marshal(defs)
+	bytes, images := len(schemas), 0
+	for _, m := range msgs {
+		bytes += len(m.Content) + len(m.Role) + len(m.ToolCallID) + 24
+		images += len(m.Images)
+		for _, tc := range m.ToolCalls {
+			bytes += len(tc.Function.Arguments) + len(tc.Function.Name) + len(tc.ID) + 24
+		}
+	}
+	return (bytes+2)/3 + images*2048
+}
+
+func (c *Config) promptView(msgs []llm.Message) []llm.Message {
+	view := truncateToolResults(session.RepairToolBatches(msgs), toolResultMaxChars)
+	return pruneOldToolResults(view, pruneThresholdChars, pruneBlockChars, pruneKeepNewestBlocks)
+}
+
+// needsCompact combines measured usage with growth since the last request.
+func (c *Config) needsCompact(msgs []llm.Message) bool {
+	budget := int(float64(c.ContextLimit) * CompactThreshold)
+	if c.Client != nil && c.Client.MaxTokens > 0 {
+		budget = min(budget, c.ContextLimit-c.Client.MaxTokens)
+	}
+	estimated := estimatePromptTokens(c.promptView(msgs), c.Tools)
+	projected := c.LastPromptTokens
+	if c.lastPromptEstimate > 0 {
+		projected += max(0, estimated-c.lastPromptEstimate)
+	}
+	return max(estimated, projected) >= budget
+}
+
+func (c *Config) compactInLoop(ctx context.Context, msgs []llm.Message) ([]llm.Message, llm.Usage, error) {
+	return c.compactMessages(ctx, msgs, true)
+}
+
+// Compact manually replaces history by a summary, using the same checkpoint as
+// automatic compaction. The automatic path additionally retains the active task.
+func (c *Config) Compact(ctx context.Context, history []llm.Message) ([]llm.Message, llm.Usage, error) {
+	return c.compactMessages(ctx, history, false)
+}
+
+func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTask bool) ([]llm.Message, llm.Usage, error) {
+	var system, history []llm.Message
+	for _, m := range msgs {
+		if m.Role == "system" {
+			system = append(system, m)
+		} else {
+			history = append(history, m)
+		}
+	}
+	var summary string
+	var usage llm.Usage
+	var err error
+	if c.CompactHistory != nil {
+		summary, usage, err = c.CompactHistory(ctx, history)
+	} else {
+		summary, usage, err = Compact(ctx, c.Client, history, nil)
+	}
+	if err != nil {
+		return nil, usage, fmt.Errorf("compact before next model call: %w", err)
+	}
+	if strings.TrimSpace(summary) == "" {
+		return nil, usage, fmt.Errorf("compaction returned an empty summary")
+	}
+	replacement := []llm.Message{{Role: "user", Kind: "summary", Content: "Previous conversation summary:\n" + summary}}
+	if keepTask {
+		for i := len(history) - 1; i >= 0; i-- {
+			if session.IsTurnStart(history[i]) {
+				replacement = append(replacement, history[i])
+				break
+			}
+		}
+	}
+	archive := ""
+	if c.Session != nil {
+		archive, err = c.Session.ArchiveCopy(fmt.Sprintf("%s-pre-compact-%d", c.Session.ID, time.Now().UnixNano()))
+		if err == nil {
+			err = c.Session.MarkCompactMessages(replacement)
+		}
+		if err != nil {
+			return nil, usage, err
+		}
+	}
+	c.LastPromptTokens = 0
+	c.lastPromptEstimate = 0
+	if c.OnCompact != nil {
+		c.OnCompact(replacement, usage, archive)
+	}
+	return append(system, replacement...), usage, nil
 }

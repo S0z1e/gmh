@@ -1104,9 +1104,8 @@ func TestCompactedEventManual(t *testing.T) {
 }
 
 func TestCompactedEventAuto(t *testing.T) {
-	// A tiny context window (14 tokens): the fake's 10-token prompt
-	// is past 70% of it, so the turn auto-compacts. The config is
-	// rewritten in place (the fake server URL is already in it).
+	// The previous request reached 80% of the window. The next
+	// request must compact first and retain the active user task.
 	tinyWindow := func(root string) {
 		path := filepath.Join(root, ".harness.json")
 		raw, err := os.ReadFile(path)
@@ -1119,7 +1118,8 @@ func TestCompactedEventAuto(t *testing.T) {
 		}
 		mock := cfg["providers"].(map[string]any)["mock"].(map[string]any)
 		models := mock["models"].([]any)
-		models[0].(map[string]any)["contextWindow"] = 14
+		models[0].(map[string]any)["contextWindow"] = 10000
+		models[0].(map[string]any)["maxTokens"] = 1000
 		mock["models"] = models
 		out, err := json.Marshal(cfg)
 		if err != nil {
@@ -1132,14 +1132,15 @@ func TestCompactedEventAuto(t *testing.T) {
 	a, runner, _ := setupTestApp(t, "auto", []fakeStep{
 		{kind: "text", text: "hello world"},
 	}, tinyWindow)
+	a.Cfg.LastPromptTokens = 8000
 	d := startDriver(t, a, runner)
 	d.waitFor("ready", 5*time.Second)
 	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "Say hello"})
 	d.waitFor("response", 5*time.Second)
 	// doCompact runs inside the turn, before agent_settled.
 	ev := d.waitFor("compacted", 5*time.Second)
-	if ev["messages"] != float64(1) || ev["summary_tokens"] != float64(5) {
-		t.Fatalf("compacted = %v, want messages 1 summary_tokens 5", ev)
+	if ev["messages"] != float64(2) || ev["summary_tokens"] != float64(5) {
+		t.Fatalf("compacted = %v, want messages 2 summary_tokens 5", ev)
 	}
 	d.waitFor("agent_settled", 5*time.Second)
 	d.quit(t)

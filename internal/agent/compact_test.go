@@ -14,10 +14,10 @@ func TestShouldCompact(t *testing.T) {
 	}{
 		{7000, 10000, true},      // exactly 70%
 		{6999, 10000, false},     // just below 70%
-		{100, 0, false},          // 0 limit falls back to default 1,048,576
-		{800000, 1048576, true},  // 76% of the default window
-		{734002, 1048576, false}, // just below 70% of the default window
-		{734003, 1048576, true},  // 70% of the default window (int truncation)
+		{100, 0, false},          // 0 limit falls back to default 128,000
+		{800000, 1048576, true},  // explicitly configured 1M window
+		{734002, 1048576, false}, // just below 70% of the configured window
+		{734003, 1048576, true},  // 70% of the configured window (int truncation)
 	}
 	for _, c := range cases {
 		if got := ShouldCompact(c.lastPrompt, c.limit); got != c.want {
