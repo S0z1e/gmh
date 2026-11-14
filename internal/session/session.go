@@ -1,5 +1,5 @@
 // Package session appends one JSON line per message to a session file
-// and reloads it for --resume. No compaction in v1; the loop caps steps.
+// and reloads it for --resume, repairing interrupted tool batches.
 package session
 
 import (
@@ -23,7 +23,8 @@ type Store struct {
 	// mu guards Append and Audit: a background job's completion audit
 	// can land on its own goroutine while the loop appends or audits
 	// on the main one.
-	mu sync.Mutex
+	mu     sync.Mutex
+	closed bool
 }
 
 // AuditPath is the sidecar file holding approval/bash audit records
@@ -38,6 +39,19 @@ func (s *Store) AuditPath() string {
 func (s *Store) Audit(v any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		f, err := os.OpenFile(s.AuditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = f.Write(append(b, '\n'))
+		return err
+	}
 	if s.auditFile == nil {
 		f, err := os.OpenFile(s.AuditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
@@ -63,6 +77,11 @@ func Dir() string {
 
 func New(id string) (*Store, error) {
 	auto := id == ""
+	if !auto {
+		if err := ValidateSessionID(id); err != nil {
+			return nil, err
+		}
+	}
 	if auto {
 		id = time.Now().Format("20060102-150405")
 	}
@@ -77,8 +96,12 @@ func New(id string) (*Store, error) {
 		// until the path is free. An explicit id is never suffixed:
 		// --resume needs the exact file.
 		for i := 1; ; i++ {
-			if _, err := os.Stat(path); os.IsNotExist(err) {
-				break
+			f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_WRONLY, 0600)
+			if err == nil {
+				return &Store{ID: id, Path: path, file: f}, nil
+			}
+			if !os.IsExist(err) {
+				return nil, err
 			}
 			id = fmt.Sprintf("%s-%d", time.Now().Format("20060102-150405"), i)
 			path = filepath.Join(dir, id+".jsonl")
@@ -94,6 +117,9 @@ func New(id string) (*Store, error) {
 func (s *Store) Append(m llm.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed || s.file == nil {
+		return os.ErrClosed
+	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -116,13 +142,27 @@ func (s *Store) Clear() error {
 	return s.Append(llm.Message{Role: clearMarkerRole})
 }
 
-// MarkCompact records a compaction point: a marker followed by the summary
-// as a user message, which becomes the new context on Load.
+// MarkCompact commits a summary checkpoint, which becomes the context on Load.
 func (s *Store) MarkCompact(summary string) error {
-	if err := s.Append(llm.Message{Role: compactMarkerRole}); err != nil {
+	return s.MarkCompactMessages([]llm.Message{{Role: "user", Kind: "summary", Content: "Previous conversation summary:\n" + summary}})
+}
+
+// MarkCompactMessages commits the summary and active task in a single record.
+func (s *Store) MarkCompactMessages(msgs []llm.Message) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.file == nil {
+		return os.ErrClosed
+	}
+	b, err := json.Marshal(struct {
+		Role     string        `json:"role"`
+		Messages []llm.Message `json:"messages"`
+	}{compactMarkerRole, msgs})
+	if err != nil {
 		return err
 	}
-	return s.Append(llm.Message{Role: "user", Content: "Previous conversation summary:\n" + summary})
+	_, err = s.file.Write(append(b, '\n'))
+	return err
 }
 
 // ArchiveCopy copies the current session file to a new file in the same
@@ -145,10 +185,12 @@ func (s *Store) ArchiveCopy(name string) (string, error) {
 // itself appended. Turn-internal user messages are the auto-loaded
 // skill bodies ("Skill <name>:\n..."), background-job deliveries
 // ("Background job ...") and the compact summary ("Previous
-// conversation summary:\n..."). A real task that starts with one
-// of those prefixes is misread as internal — an accepted edge, and
-// the reason it is documented here rather than silently assumed.
+// conversation summary:\n..."). Kind distinguishes new task messages
+// explicitly; prefix checks exist only for older transcripts.
 func IsTurnStart(m llm.Message) bool {
+	if m.Kind != "" {
+		return m.Kind == "task"
+	}
 	if m.Role != "user" || len(m.Images) > 0 || strings.TrimSpace(m.Content) == "" {
 		return false
 	}
@@ -198,8 +240,8 @@ func Rollback(msgs []llm.Message, n int) ([]llm.Message, int) {
 func (s *Store) Rewrite(msgs []llm.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.file.Close(); err != nil {
-		return err
+	if s.closed || s.file == nil {
+		return os.ErrClosed
 	}
 	var b strings.Builder
 	for _, m := range msgs {
@@ -210,10 +252,30 @@ func (s *Store) Rewrite(msgs []llm.Message) error {
 		b.Write(line)
 		b.WriteByte('\n')
 	}
-	if err := os.WriteFile(s.Path, []byte(b.String()), 0o644); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(s.Path), ".session-rewrite-*")
+	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(s.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(b.String()); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := s.file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), s.Path); err != nil {
+		s.file, _ = os.OpenFile(s.Path, os.O_APPEND|os.O_WRONLY, 0600)
+		return err
+	}
+	f, err := os.OpenFile(s.Path, os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
@@ -222,16 +284,25 @@ func (s *Store) Rewrite(msgs []llm.Message) error {
 }
 
 func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
 	if s.auditFile != nil {
 		s.auditFile.Close()
+		s.auditFile = nil
 	}
 	return s.file.Close()
 }
 
-// Load replays a JSONL session. A trailing dangling assistant tool call
-// (tool call with no matching tool result) is dropped so resume does not
-// break on an incomplete turn.
+// Load replays the active checkpoint and repairs incomplete tool batches
+// without replaying actions whose outcome was not recorded.
 func Load(id string) ([]llm.Message, error) {
+	if err := ValidateSessionID(id); err != nil {
+		return nil, err
+	}
 	path := filepath.Join(Dir(), id+".jsonl")
 	f, err := os.Open(path)
 	if err != nil {
@@ -254,6 +325,20 @@ func Load(id string) ([]llm.Message, error) {
 			// /clear or /compact point: forget everything before it
 			// (file keeps it).
 			msgs = nil
+			if m.Role == compactMarkerRole {
+				var checkpoint struct {
+					Messages []llm.Message `json:"messages"`
+				}
+				if err := json.Unmarshal(line, &checkpoint); err == nil && checkpoint.Messages != nil {
+					msgs = checkpoint.Messages
+					continue
+				}
+			}
+			if m.Role == compactMarkerRole && m.Content != "" {
+				m.Role = "user"
+				m.Kind = "summary"
+				msgs = append(msgs, m)
+			}
 			continue
 		}
 		msgs = append(msgs, m)
@@ -261,13 +346,54 @@ func Load(id string) ([]llm.Message, error) {
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
-	// Drop a dangling final assistant message that has tool calls but no
-	// following tool result.
-	if len(msgs) > 0 {
-		last := msgs[len(msgs)-1]
-		if last.Role == "assistant" && len(last.ToolCalls) > 0 {
-			msgs = msgs[:len(msgs)-1]
+	return RepairToolBatches(msgs), nil
+}
+
+// RepairToolBatches preserves completed work and supplies explicit unknown-
+// outcome observations for calls interrupted before their results were saved.
+// A recovered call is never replayed: it might already have caused a side effect.
+func RepairToolBatches(msgs []llm.Message) []llm.Message {
+	var out []llm.Message
+	for i := 0; i < len(msgs); {
+		m := msgs[i]
+		i++
+		if m.Role == "tool" {
+			continue
+		} // orphaned results cannot be sent to a provider
+		if m.Role == "assistant" && (m.FinishReason == "length" || m.FinishReason == "max_tokens" || m.FinishReason == "incomplete") {
+			// These arguments were never dispatched. A partially generated
+			// name or JSON object must not poison the next provider request.
+			m.ToolCalls = nil
+			if m.Content == "" {
+				m.Content = "[The model output was truncated before its tool calls were complete. No tools from this response were executed.]"
+			}
 		}
+		out = append(out, m)
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			continue
+		}
+		results := map[string]llm.Message{}
+		var deferred []llm.Message
+		for i < len(msgs) {
+			next := msgs[i]
+			if next.Role == "assistant" || (next.Role == "user" && IsTurnStart(next)) {
+				break
+			}
+			i++
+			if next.Role == "tool" {
+				results[next.ToolCallID] = next
+			} else {
+				deferred = append(deferred, next)
+			}
+		}
+		for _, call := range m.ToolCalls {
+			result, ok := results[call.ID]
+			if !ok {
+				result = llm.Message{Role: "tool", ToolCallID: call.ID, ToolError: true, Kind: "interrupted", Content: "Error: execution was interrupted before this result was recorded. The outcome is unknown; inspect the current state before retrying any action."}
+			}
+			out = append(out, result)
+		}
+		out = append(out, deferred...)
 	}
-	return msgs, nil
+	return out
 }

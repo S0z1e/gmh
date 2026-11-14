@@ -136,7 +136,7 @@ func TestArchiveCopyKeepsOriginal(t *testing.T) {
 	}
 }
 
-func TestClearThenDanglingToolCallDropped(t *testing.T) {
+func TestClearThenDanglingToolCallRepaired(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store, err := New("test-clear-dangling")
 	if err != nil {
@@ -151,8 +151,8 @@ func TestClearThenDanglingToolCallDropped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(msgs) != 1 || msgs[0].Content != "after" {
-		t.Fatalf("Load = %+v, want only 'after'", msgs)
+	if len(msgs) != 3 || msgs[0].Content != "after" || msgs[2].ToolCallID != "1" || !msgs[2].ToolError {
+		t.Fatalf("Load = %+v, want post-clear history with an interrupted result", msgs)
 	}
 }
 

@@ -56,8 +56,12 @@ a container):
 - There is no OS sandbox by default; the denylist and jail are harm
   reduction, not isolation. `--sandbox` adds one for bash only.
 
-Cancellation stops a foreground bash process tree. Explicit abort also cancels
-background jobs; normal turn cleanup leaves them running.
+Cancellation stops a foreground bash process tree. An explicit abort also
+cancels background jobs belonging to the active session; normal turn cleanup
+leaves them running. Switching sessions isolates job results, approval guards,
+read snapshots and queued images. Background completions keep their owner's
+audit destination after a switch. Job ownership survives switches within the
+process; process restart does not reattach operating-system processes.
 
 Search subprocesses are not an OS sandbox: a concurrent path replacement
 after validation remains a race. Use the sandbox or a disposable workspace

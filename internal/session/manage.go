@@ -1,16 +1,12 @@
 package session
 
 import (
-	"bufio"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
-
-	"minimalharness/internal/llm"
 )
 
 // Info is one row of the session list: the id, how many messages a
@@ -70,34 +66,18 @@ func readInfo(path, id string) (Info, error) {
 		return Info{}, err
 	}
 	info := Info{ID: id, Modified: st.ModTime()}
-	f, err := os.Open(path)
+	msgs, err := Load(id)
 	if err != nil {
 		return Info{}, err
 	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var m llm.Message
-		if err := json.Unmarshal(line, &m); err != nil {
-			continue
-		}
-		if m.Role == clearMarkerRole || m.Role == compactMarkerRole {
-			info.Messages = 0
-			info.Preview = ""
-			continue
-		}
-		info.Messages++
-		if info.Preview == "" && m.Role == "user" && strings.TrimSpace(m.Content) != "" {
-			one := strings.ReplaceAll(strings.TrimSpace(m.Content), "\n", " ")
-			info.Preview = truncateRunes(one, 60)
+	info.Messages = len(msgs)
+	for _, m := range msgs {
+		if m.Role == "user" && strings.TrimSpace(m.Content) != "" {
+			info.Preview = truncateRunes(strings.ReplaceAll(strings.TrimSpace(m.Content), "\n", " "), 60)
+			break
 		}
 	}
-	return info, sc.Err()
+	return info, nil
 }
 
 func truncateRunes(s string, n int) string {
@@ -136,6 +116,9 @@ func ValidateSessionID(id string) error {
 // and its pre-compact archives to a new id. The sidecar and archives
 // are optional: a missing one is not an error.
 func renameSessionFiles(oldID, newID string) error {
+	if err := ValidateSessionID(oldID); err != nil {
+		return err
+	}
 	if err := ValidateSessionID(newID); err != nil {
 		return err
 	}

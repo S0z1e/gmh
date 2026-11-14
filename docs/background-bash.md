@@ -22,4 +22,5 @@ abandoned (their child processes keep running, orphaned).
 
 Foreground commands follow turn cancellation until handed to the session as
 background jobs. Explicit abort cancels the current session's jobs; finishing
-a turn normally does not.
+a turn normally does not. Each session has a separate registry, so starting
+or resuming another session cannot inject the previous session's results.

@@ -155,6 +155,8 @@ type Plugin struct {
 	hasSessionStartHook         bool
 	sessionSwitchHook           moejs.Value
 	hasSessionSwitchHook        bool
+	sessionRenameHook           moejs.Value
+	hasSessionRenameHook        bool
 	// stopHook is the turn-end gate: a non-empty return blocks the
 	// turn from ending (see RunStopHooks).
 	stopHook    moejs.Value
@@ -175,6 +177,8 @@ type Registry struct {
 	// refuses setMode, so standalone uses never panic.
 	ModeSetter func(string) error
 	ModeGetter func() string
+	// SessionGetter identifies the current session for session-owned plugin state.
+	SessionGetter func() string
 	// dir is the plugins directory Load read (<root>/.agents/plugins).
 	dir string
 	// infos is the discovery outcome: one entry per plugin directory
@@ -630,6 +634,18 @@ func (r *Registry) RunSessionSwitchHooks(ctx context.Context, session, previous 
 		}
 		if _, err := p.callHook(ctx, p.sessionSwitchHook, hookSessionSwitchInput(session, previous), r.timeout()); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: plugin %s session_switch hook failed: %v\n", p.Name, err)
+		}
+	}
+}
+
+// RunSessionRenameHooks lets session-owned plugin state follow a renamed chat.
+func (r *Registry) RunSessionRenameHooks(ctx context.Context, name, previous string) {
+	for _, p := range r.plugins {
+		if !p.hasSessionRenameHook {
+			continue
+		}
+		if _, err := p.callHook(ctx, p.sessionRenameHook, hookSessionSwitchInput(name, previous), r.timeout()); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: plugin %s session_rename hook failed: %v\n", p.Name, err)
 		}
 	}
 }

@@ -3,7 +3,7 @@
 // plugin can register slash commands and switch the agent's tool
 // mode.
 //
-// State is one JSON file, plan.json, in the plugin's own data dir
+// State is one JSON file per session, plan-<session>.json, in the plugin's own data dir
 // (harness.readFile / harness.writeFile are jailed there: the plugin
 // cannot read or write anywhere else, and cannot run bash).
 //
@@ -15,9 +15,13 @@
 // offered tools; it does not force the model to follow the plan
 // once it is back in default mode.
 
+function planPath() {
+  return "plan-" + (harness.getSession() || "default") + ".json";
+}
+
 function loadPlan() {
   try {
-    const raw = harness.readFile("plan.json");
+    const raw = harness.readFile(planPath());
     const plan = JSON.parse(raw);
     if (!plan || !Array.isArray(plan.steps)) return null;
     return plan;
@@ -28,7 +32,7 @@ function loadPlan() {
 }
 
 function savePlan(plan) {
-  harness.writeFile("plan.json", JSON.stringify(plan, null, 2));
+  harness.writeFile(planPath(), JSON.stringify(plan, null, 2));
 }
 
 function formatPlan(plan) {
@@ -157,4 +161,13 @@ harness.on("session_before_compact", (event) => {
     "\", open steps: " +
     (open.length ? open.map((s) => s.text).join("; ") : "none")
   );
+});
+
+// Rename state and retire the old name so reusing that id cannot inherit it.
+harness.on("session_rename", (event) => {
+  let raw;
+  try { raw = harness.readFile("plan-" + event.previous + ".json"); }
+  catch (e) { return; }
+  harness.writeFile("plan-" + event.session + ".json", raw);
+  harness.writeFile("plan-" + event.previous + ".json", "null");
 });

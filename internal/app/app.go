@@ -261,6 +261,7 @@ func Setup(p Params) (*App, error) {
 	// has built the agent config below.
 	pluginReg.ModeSetter = func(name string) error { return a.SetToolMode(agent.ToolMode(name)) }
 	pluginReg.ModeGetter = func() string { return string(a.ToolMode()) }
+	pluginReg.SessionGetter = a.sessionID
 
 	executor := &tools.Executor{Root: absRoot, ImageInput: slices.Contains(mdl.Input, "image"), Plugins: pluginReg}
 	// Bash output files live in this session's directory (never in
@@ -268,6 +269,7 @@ func Setup(p Params) (*App, error) {
 	// new session / resume re-points the executor (see newSession
 	// and LoadSession, which reset it alongside the audit hook).
 	executor.OutputDir = sessionOutputDir(store.ID)
+	executor.SwitchSession(store.ID)
 	if p.BashTimeoutSeconds > 0 {
 		executor.BashTimeout = time.Duration(p.BashTimeoutSeconds) * time.Second
 	} else if v := os.Getenv("OPENAI_BASH_TIMEOUT_SECONDS"); v != "" {
@@ -460,7 +462,11 @@ func (a *App) hydrateImages(msgs []llm.Message) {
 			if img.Data != "" || img.Path == "" {
 				continue
 			}
-			if loaded, err := a.Cfg.Exec.LoadImage(img.Path); err == nil {
+			loader := a.Cfg.Exec.LoadImage
+			if img.Workspace || msgs[i].Kind == "image" {
+				loader = a.Cfg.Exec.ReadImage
+			}
+			if loaded, err := loader(img.Path); err == nil {
 				*img = loaded
 			}
 		}
@@ -768,9 +774,11 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 	}
 	a.Store = store
 	a.History = nil
+	a.PendingImages = nil
 	a.resetToolMode()
 	if a.Cfg != nil {
 		a.Cfg.Session = store
+		a.Cfg.ResetSessionState()
 		if a.Cfg.Client != nil {
 			// The cache key follows the current session: a new
 			// session must not reuse the previous session's key.
@@ -780,6 +788,7 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 			// Bash output files follow the current session too.
 			a.Cfg.Exec.OutputDir = sessionOutputDir(store.ID)
+			a.Cfg.Exec.SwitchSession(store.ID)
 		}
 	}
 	if old != nil {
@@ -813,10 +822,12 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	}
 	a.Store = store
 	a.History = history
+	a.PendingImages = nil
 	a.ResumedMessage = fmt.Sprintf("Resumed session %s (%d messages).", id, len(history))
 	a.resetToolMode()
 	if a.Cfg != nil {
 		a.Cfg.Session = store
+		a.Cfg.ResetSessionState()
 		if a.Cfg.Client != nil {
 			// The cache key follows the current session.
 			a.Cfg.Client.PromptCacheKey = store.ID
@@ -825,6 +836,7 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 			// Bash output files follow the resumed session too.
 			a.Cfg.Exec.OutputDir = sessionOutputDir(store.ID)
+			a.Cfg.Exec.SwitchSession(store.ID)
 		}
 	}
 	if old != nil {
@@ -832,6 +844,33 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	}
 	a.fireSessionEvents(oldID, store.ID)
 	return history, nil
+}
+
+// RenameSession keeps the executor and plugin state under the transcript's id.
+func (a *App) RenameSession(oldID, newID string) error {
+	var err error
+	current := a.Store != nil && a.Store.ID == oldID
+	if current {
+		err = a.Store.Rename(newID)
+	} else {
+		err = session.RenameSession(oldID, newID)
+	}
+	if err != nil {
+		return err
+	}
+	if a.Cfg != nil && a.Cfg.Exec != nil {
+		a.Cfg.Exec.RenameSession(oldID, newID)
+		if current {
+			a.Cfg.Exec.OutputDir = sessionOutputDir(newID)
+		}
+	}
+	if current && a.Cfg != nil && a.Cfg.Client != nil {
+		a.Cfg.Client.PromptCacheKey = newID
+	}
+	if a.Plugins != nil {
+		a.Plugins.RunSessionRenameHooks(context.Background(), newID, oldID)
+	}
+	return nil
 }
 
 // Print is the line printer (plain: fmt.Printf; TUI: sent as a message
@@ -983,12 +1022,7 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 			return false
 		}
 		old, newID := args[0], args[1]
-		var err error
-		if old == r.App.Store.ID {
-			err = r.App.Store.Rename(newID)
-		} else {
-			err = session.RenameSession(old, newID)
-		}
+		err := r.App.RenameSession(old, newID)
 		if err != nil {
 			r.Print("[error] %v", err)
 			return false
@@ -1213,7 +1247,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 				body, err := sk.Load()
 				if err == nil {
 					r.Print("Loaded skill %s (%d bytes).", name, len(body))
-					r.App.History = append(r.App.History, llm.Message{Role: "user", Content: "Skill " + name + ":\n" + body})
+					r.App.History = append(r.App.History, llm.Message{Role: "user", Kind: "skill", Content: "Skill " + name + ":\n" + body})
 					_ = r.App.Store.Append(r.App.History[len(r.App.History)-1])
 				}
 				return
@@ -1230,11 +1264,15 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 			continue
 		}
 		r.Print("Auto-loaded skill %s (mentioned in your task).", sk.Name)
-		skillMsg := llm.Message{Role: "user", Content: "Skill " + sk.Name + ":\n" + body}
+		skillMsg := llm.Message{Role: "user", Kind: "skill", Content: "Skill " + sk.Name + ":\n" + body}
 		r.App.History = append(r.App.History, skillMsg)
-		_ = r.App.Store.Append(skillMsg)
+		if err := r.App.Store.Append(skillMsg); err != nil {
+			r.LastErr = fmt.Errorf("save session: %w", err)
+			r.Print("[error] %v", r.LastErr)
+			return
+		}
 	}
-	userMsg := llm.Message{Role: "user", Content: task}
+	userMsg := llm.Message{Role: "user", Content: task, Kind: "task"}
 	// Images attached for this turn (-image, /image, RPC) ride on
 	// the task message itself, then clear: they live in history
 	// from here and are resent on later calls like any message.
@@ -1243,7 +1281,11 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		r.App.PendingImages = nil
 	}
 	r.App.History = append(r.App.History, userMsg)
-	_ = r.App.Store.Append(userMsg)
+	if err := r.App.Store.Append(userMsg); err != nil {
+		r.LastErr = fmt.Errorf("save session: %w", err)
+		r.Print("[error] %v", r.LastErr)
+		return
+	}
 	r.Turns++
 	// The context hook rewrites this turn's starting history
 	// (in-memory only — the session file keeps the true history).

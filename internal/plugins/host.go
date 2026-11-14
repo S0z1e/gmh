@@ -21,10 +21,18 @@ func (p *Plugin) installHostAPI() error {
 		"on":              moejs.NativeFunc(p.nativeOn),
 		"setMode":         moejs.NativeFunc(p.nativeSetMode),
 		"getMode":         moejs.NativeFunc(p.nativeGetMode),
+		"getSession":      moejs.NativeFunc(p.nativeGetSession),
 		"log":             moejs.NativeFunc(p.nativeLog),
 		"readFile":        moejs.NativeFunc(p.nativeReadFile),
 		"writeFile":       moejs.NativeFunc(p.nativeWriteFile),
 	})
+}
+
+func (p *Plugin) nativeGetSession(_ *moejs.Realm, _ moejs.Value, _ []moejs.Value) (moejs.Value, error) {
+	if p.registry != nil && p.registry.SessionGetter != nil {
+		return moejs.String(p.registry.SessionGetter()), nil
+	}
+	return moejs.String(""), nil
 }
 
 // builtinCommands are the harness's own slash command names (without
@@ -143,6 +151,12 @@ func (p *Plugin) nativeOn(r *moejs.Realm, _ moejs.Value, args []moejs.Value) (mo
 		}
 		p.sessionSwitchHook = handler
 		p.hasSessionSwitchHook = true
+	case "session_rename":
+		if p.hasSessionRenameHook {
+			return moejs.Undefined(), fmt.Errorf("plugin %s already has a session_rename handler", p.Name)
+		}
+		p.sessionRenameHook = handler
+		p.hasSessionRenameHook = true
 	case "stop":
 		if p.hasStopHook {
 			return moejs.Undefined(), fmt.Errorf("plugin %s already has a stop handler", p.Name)
@@ -150,7 +164,7 @@ func (p *Plugin) nativeOn(r *moejs.Realm, _ moejs.Value, args []moejs.Value) (mo
 		p.stopHook = handler
 		p.hasStopHook = true
 	default:
-		return moejs.Undefined(), fmt.Errorf("unknown hook event %q (want tool_call, tool_result, before_agent_start, context, session_before_compact, session_start, session_switch or stop)", event)
+		return moejs.Undefined(), fmt.Errorf("unknown hook event %q (want tool_call, tool_result, before_agent_start, context, session_before_compact, session_start, session_switch, session_rename or stop)", event)
 	}
 	return moejs.Undefined(), nil
 }

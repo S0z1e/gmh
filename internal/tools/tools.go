@@ -84,8 +84,10 @@ type Executor struct {
 	// with its file access jailed to its own data dir.
 	Plugins PluginRunner
 
-	jobsMu sync.Mutex
-	jobs   *JobRegistry
+	jobsMu      sync.Mutex
+	jobs        *JobRegistry
+	sessionJobs map[string]*JobRegistry
+	sessionID   string
 
 	outMu  sync.Mutex
 	outSeq int

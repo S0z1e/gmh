@@ -210,7 +210,7 @@ func toAnthropicMessages(messages []Message) (string, []anthropicMessage) {
 				content = "(no output)"
 			}
 			appendBlock("user", anthropicContentBlock{
-				Type: "tool_result", ToolUseID: m.ToolCallID, Content: content,
+				Type: "tool_result", ToolUseID: m.ToolCallID, Content: content, IsError: m.ToolError,
 			})
 		}
 	}
@@ -358,6 +358,7 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 				// to forward, so it is ignored entirely.
 			}
 		case "message_delta":
+			msg.FinishReason = ev.Delta.StopReason
 			usage.CompletionTokens = ev.Usage.OutputTokens
 		case "message_stop":
 			sawStop = true

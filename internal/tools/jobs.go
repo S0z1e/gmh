@@ -505,3 +505,37 @@ func (e *Executor) registry() *JobRegistry {
 	}
 	return e.jobs
 }
+
+// SwitchSession retains each session's jobs without exposing them to another.
+// Session switches happen between turns; job goroutines capture their owner.
+func (e *Executor) SwitchSession(id string) {
+	e.editMu.Lock()
+	e.snapshots = nil
+	e.editMu.Unlock()
+	e.jobsMu.Lock()
+	defer e.jobsMu.Unlock()
+	if e.sessionJobs == nil {
+		e.sessionJobs = map[string]*JobRegistry{}
+	}
+	if e.jobs != nil {
+		e.sessionJobs[e.sessionID] = e.jobs
+	}
+	e.sessionID = id
+	e.jobs = e.sessionJobs[id]
+	if e.jobs == nil {
+		e.jobs = &JobRegistry{}
+		e.sessionJobs[id] = e.jobs
+	}
+}
+
+func (e *Executor) RenameSession(oldID, newID string) {
+	e.jobsMu.Lock()
+	defer e.jobsMu.Unlock()
+	if registry := e.sessionJobs[oldID]; registry != nil {
+		e.sessionJobs[newID] = registry
+		delete(e.sessionJobs, oldID)
+	}
+	if e.sessionID == oldID {
+		e.sessionID = newID
+	}
+}

@@ -287,3 +287,31 @@ func TestBashCwd(t *testing.T) {
 		t.Fatalf("background bad cwd error = %v, want an 'invalid cwd' error", err)
 	}
 }
+
+func TestCapturedCancelOnlyStopsOwnerSession(t *testing.T) {
+	e := &Executor{Root: t.TempDir()}
+	e.SwitchSession("first")
+	first, err := e.BashBackground(context.Background(), BashArgs{Command: "sleep 10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Cancel()
+	cancelFirst := e.SessionCanceller()
+	e.SwitchSession("second")
+	second, err := e.BashBackground(context.Background(), BashArgs{Command: "sleep 10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Cancel()
+	cancelFirst()
+	select {
+	case <-first.Done():
+	case <-time.After(time.Second):
+		t.Fatal("owner job survived cancel")
+	}
+	select {
+	case <-second.Done():
+		t.Fatal("old cancel stopped the new session job")
+	default:
+	}
+}

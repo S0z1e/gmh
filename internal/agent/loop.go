@@ -65,14 +65,16 @@ type Config struct {
 	// LastPromptTokens is the prompt-token count of the most recent LLM
 	// call in the last Run: the current context size, since history is
 	// resent in full each time. Used for the compaction trigger.
-	LastPromptTokens int
+	LastPromptTokens   int
+	lastPromptEstimate int
 	// LastTerminalReason is why the most recent Run ended, in the
 	// structured form the RPC server reports as agent_settled.reason.
 	LastTerminalReason TerminalReason
 
 	// doomLoop is the per-Config guard: its streak and session
 	// allowlist outlive one turn, like Qwen's agent-context guard.
-	doomLoop *DoomLoopGuard
+	doomLoop   *DoomLoopGuard
+	persistErr error
 }
 
 // DoomLoop returns the Config's guard, creating it on first use.
@@ -322,10 +324,12 @@ func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) (
 		res, _ := p.job.Result()
 		obs, toolErr := jobResultMessage(p.job, res)
 		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID})
-		p.job.MarkDelivered()
-		msgs = append(msgs, llm.Message{Role: "user", Content: obs})
+		msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: obs})
 		if c.Session != nil {
-			_ = c.Session.Append(msgs[len(msgs)-1])
+			c.persist(msgs[len(msgs)-1])
+		}
+		if c.persistErr == nil {
+			p.job.MarkDelivered()
 		}
 	}
 	return msgs, rest
@@ -399,10 +403,12 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 		res, _ := job.Result()
 		obs, toolErr := jobResultMessage(job, res)
 		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID})
-		job.MarkDelivered()
-		msgs = append(msgs, llm.Message{Role: "user", Content: obs})
+		msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: obs})
 		if c.Session != nil {
-			_ = c.Session.Append(msgs[len(msgs)-1])
+			c.persist(msgs[len(msgs)-1])
+		}
+		if c.persistErr == nil {
+			job.MarkDelivered()
 		}
 	}
 	if len(freshJobs) == 0 {
@@ -429,10 +435,12 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 			res, _ := job.Result()
 			obs, toolErr := jobResultMessage(job, res)
 			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID})
-			job.MarkDelivered()
-			msgs = append(msgs, llm.Message{Role: "user", Content: obs})
+			msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: obs})
 			if c.Session != nil {
-				_ = c.Session.Append(msgs[len(msgs)-1])
+				c.persist(msgs[len(msgs)-1])
+			}
+			if c.persistErr == nil {
+				job.MarkDelivered()
 			}
 			remaining--
 		case <-timer.C:
@@ -458,9 +466,9 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 						fmt.Fprintf(&b, "\n- %s (job %s): still running.", job.Command, job.ID)
 					}
 				}
-				msgs = append(msgs, llm.Message{Role: "user", Content: b.String()})
+				msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: b.String()})
 				if c.Session != nil {
-					_ = c.Session.Append(msgs[len(msgs)-1])
+					c.persist(msgs[len(msgs)-1])
 				}
 			}
 			return msgs, nil
@@ -591,7 +599,15 @@ func (c *Config) streamStep(ctx context.Context, apiMsgs []llm.Message, tools []
 
 // Run executes one user turn. It appends messages to the session store
 // and returns the assistant's final text, total tokens used, and error.
-func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Usage, error) {
+func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, runUsage llm.Usage, runErr error) {
+	c.persistErr = nil
+	defer func() {
+		if c.persistErr != nil {
+			runErr = c.persistErr
+			c.LastTerminalReason = TerminalError
+			c.emit(Event{Kind: EventError, Err: runErr, Text: text, TerminalReason: TerminalError})
+		}
+	}()
 	if c.Exec != nil {
 		stop := context.AfterFunc(ctx, c.Exec.SessionCanceller())
 		defer stop()
@@ -642,6 +658,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		// in completion order — the model sees results as soon
 		// as they are ready, not only when the turn would end.
 		msgs, pending = c.collectFinishedJobs(msgs, pending)
+		if c.persistErr != nil {
+			return lastText, total, c.persistErr
+		}
 		var assistant llm.Message
 		var usage llm.Usage
 		// thinking accumulates this step's thinking text. It is
@@ -703,7 +722,16 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		lastText = assistant.Content
 		msgs = append(msgs, assistant)
 		if c.Session != nil {
-			_ = c.Session.Append(assistant)
+			c.persist(assistant)
+		}
+		if c.persistErr != nil {
+			return lastText, total, c.persistErr
+		}
+		if assistant.FinishReason == "length" || assistant.FinishReason == "max_tokens" || assistant.FinishReason == "incomplete" {
+			err := fmt.Errorf("model output stopped at its token limit (%s); response is incomplete", assistant.FinishReason)
+			c.LastTerminalReason = TerminalOutputLimit
+			c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: TerminalOutputLimit})
+			return lastText, total, err
 		}
 		if len(assistant.ToolCalls) == 0 {
 			if len(pending) == 0 {
@@ -721,10 +749,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 					if reason := c.Exec.Plugins.RunStopHooks(ctx, sessionID, lastText); reason != "" {
 						stopBlocks++
 						c.emit(Event{Kind: EventStopBlocked, Text: reason})
-						blockMsg := llm.Message{Role: "user", Content: "A stop hook blocked the turn from ending: " + reason + " Address it before finishing, then answer again."}
+						blockMsg := llm.Message{Role: "user", Kind: "hook", Content: "A stop hook blocked the turn from ending: " + reason + " Address it before finishing, then answer again."}
 						msgs = append(msgs, blockMsg)
 						if c.Session != nil {
-							_ = c.Session.Append(blockMsg)
+							c.persist(blockMsg)
 						}
 						continue
 					}
@@ -752,6 +780,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 		stepHadExecution := false
 		stepAllFailed := true
 		for _, tc := range assistant.ToolCalls {
+			if c.persistErr != nil {
+				return lastText, total, c.persistErr
+			}
 			if err := ctx.Err(); err != nil {
 				c.LastTerminalReason = TerminalAbort
 				c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: TerminalAbort})
@@ -776,7 +807,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: fmt.Errorf("denied by plugin %s", deny)})
 					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 					if c.Session != nil {
-						_ = c.Session.Append(msgs[len(msgs)-1])
+						c.persist(msgs[len(msgs)-1])
 					}
 					continue
 				}
@@ -800,7 +831,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: fmt.Errorf("tool %s not offered in this turn", tc.Function.Name)})
 				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 				if c.Session != nil {
-					_ = c.Session.Append(msgs[len(msgs)-1])
+					c.persist(msgs[len(msgs)-1])
 				}
 				continue
 			}
@@ -818,7 +849,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs})
 				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 				if c.Session != nil {
-					_ = c.Session.Append(msgs[len(msgs)-1])
+					c.persist(msgs[len(msgs)-1])
 				}
 				if len(pending) > 0 {
 					_, _ = c.drainPending(ctx, msgs, pending)
@@ -851,7 +882,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: ErrRepeatedToolFailureDenied})
 				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 				if c.Session != nil {
-					_ = c.Session.Append(msgs[len(msgs)-1])
+					c.persist(msgs[len(msgs)-1])
 				}
 				stepHadExecution = true
 				recordLastError(&lastErrors, obs)
@@ -887,7 +918,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs})
 					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 					if c.Session != nil {
-						_ = c.Session.Append(msgs[len(msgs)-1])
+						c.persist(msgs[len(msgs)-1])
 					}
 					continue
 				}
@@ -948,7 +979,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count})
 			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID})
 			if c.Session != nil {
-				_ = c.Session.Append(msgs[len(msgs)-1])
+				c.persist(msgs[len(msgs)-1])
 			}
 			// A read image comes back with its bytes: attach them as
 			// a user message right after the tool result, so the next
@@ -956,10 +987,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Us
 			// images in any of the three APIs, and the image must be
 			// in the history before the next call, not after it.
 			if err == nil && len(res.Images) > 0 {
-				imgMsg := llm.Message{Role: "user", Content: llm.ImageText(res.Images), Images: res.Images}
+				imgMsg := llm.Message{Role: "user", Kind: "image", Content: llm.ImageText(res.Images), Images: res.Images}
 				msgs = append(msgs, imgMsg)
 				if c.Session != nil {
-					_ = c.Session.Append(imgMsg)
+					c.persist(imgMsg)
 				}
 			}
 		}
@@ -1059,8 +1090,14 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	}, func() {
 		thinking.Reset()
 	})
-	if err != nil || final.Content == "" {
+	if err != nil || final.Content == "" || len(final.ToolCalls) > 0 || final.FinishReason == "length" || final.FinishReason == "max_tokens" || final.FinishReason == "incomplete" {
 		return "", llm.Usage{}, false
+	}
+	if c.Session != nil {
+		c.persist(final)
+		if c.persistErr != nil {
+			return "", usage, false
+		}
 	}
 	c.emit(Event{Kind: EventStepUsage, Usage: usage})
 	return final.Content, usage, true
@@ -1097,4 +1134,22 @@ func truncate(s string, n int) string {
 		return s[:n] + "…"
 	}
 	return s
+}
+
+// ResetSessionState clears guards and token accounting owned by one session.
+func (c *Config) ResetSessionState() {
+	c.doomLoop = nil
+	c.LastPromptTokens = 0
+	c.lastPromptEstimate = 0
+	c.LastTerminalReason = ""
+}
+
+// persist latches a storage failure. The loop stops before its next action;
+// continuing without a durable tool-call record would make recovery unsafe.
+func (c *Config) persist(m llm.Message) {
+	if c.Session != nil && c.persistErr == nil {
+		if err := c.Session.Append(m); err != nil {
+			c.persistErr = fmt.Errorf("save session: %w", err)
+		}
+	}
 }

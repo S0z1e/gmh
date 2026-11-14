@@ -249,6 +249,13 @@ func (e *Executor) outputDirBase(p string) (string, bool) {
 	if !filepath.IsAbs(clean) {
 		return "", false
 	}
+	// Retained jobs grant access to their own file, not the old directory:
+	// another session can reuse that directory after a rename.
+	for _, job := range e.Jobs() {
+		if job.OutputFile != "" && filepath.Clean(job.OutputFile) == clean {
+			return filepath.Dir(job.OutputFile), true
+		}
+	}
 	if e.OutputDir != "" {
 		rel, err := filepath.Rel(e.OutputDir, clean)
 		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {

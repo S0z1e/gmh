@@ -71,7 +71,8 @@ type TerminalReason string
 
 const (
 	// TerminalEndTurn: the model finished with no more tool calls.
-	TerminalEndTurn TerminalReason = "end_turn"
+	TerminalEndTurn     TerminalReason = "end_turn"
+	TerminalOutputLimit TerminalReason = "output_limit"
 	// TerminalMaxTurns: the step cap was hit.
 	TerminalMaxTurns TerminalReason = "max_turns"
 	// TerminalAbort: the turn was aborted (context cancelled).

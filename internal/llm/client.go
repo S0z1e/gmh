@@ -27,10 +27,13 @@ import (
 )
 
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Kind         string     `json:"kind,omitempty"`
+	ToolError    bool       `json:"tool_error,omitempty"`
+	FinishReason string     `json:"finish_reason,omitempty"`
+	Role         string     `json:"role"`
+	Content      string     `json:"content,omitempty"`
+	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID   string     `json:"tool_call_id,omitempty"`
 	// Images are attached images (user messages only). The session
 	// file stores their path and media type, never the bytes; the
 	// bytes are re-read from disk on --resume.
@@ -649,6 +652,9 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 			usage.normalize()
 		}
 		for _, ch := range chunk.Choices {
+			if ch.FinishReason != "" {
+				msg.FinishReason = ch.FinishReason
+			}
 			if ch.Delta.Content != "" {
 				msg.Content += ch.Delta.Content
 				if onText != nil {
@@ -953,7 +959,13 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 					}
 				}
 			}
+		case "response.incomplete":
+			sawCompleted = true
+			msg.FinishReason = "incomplete"
+			u := ev.Response.Usage
+			usage = Usage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens}
 		case "response.completed":
+			msg.FinishReason = "stop"
 			sawCompleted = true
 			for _, out := range ev.Response.Output {
 				switch out.Type {

@@ -792,7 +792,7 @@ func TestPlanPluginRoundTrip(t *testing.T) {
 		t.Fatalf("/execute = %q, %v, mode %q", out, err, mode)
 	}
 	// The state file on disk agrees with the tools.
-	stateRaw, err := os.ReadFile(filepath.Join(root, ".agents", "plugins", "plan", "data", "plan.json"))
+	stateRaw, err := os.ReadFile(filepath.Join(root, ".agents", "plugins", "plan", "data", "plan-default.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
