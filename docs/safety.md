@@ -1,7 +1,7 @@
 # Safety (suggest mode) — what it can and cannot promise
 
 Approval is a policy boundary, **not a sandbox**. In `-mode suggest`,
-write/edit/bash ask first (stdin in plain mode, a y/n dialog in the
+write/edit/bash, webfetch and plugin tools ask first (stdin in plain mode, a y/n dialog in the
 TUI); read, grep, glob and `load_skill` never ask. `-p` print mode
 and `--deny-instead-of-prompt` (also `OPENAI_DENY_INSTEAD_OF_PROMPT=1`)
 refuse every approval without asking — they only ever deny, never

@@ -5,6 +5,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -881,9 +882,10 @@ func (a *App) RenameSession(oldID, newID string) error {
 // rates are configured (App.Rates); the estimate is always labelled
 // with its source, and the provider's real price stays unverified.
 type Runner struct {
-	App          *App
-	SessionUsage llm.Usage
-	SessionCost  float64 // USD estimate, accumulated per turn
+	historyLoadErr error
+	App            *App
+	SessionUsage   llm.Usage
+	SessionCost    float64 // USD estimate, accumulated per turn
 	// Turns counts completed agent turns (slash commands excluded),
 	// for the TUI meta line.
 	Turns int
@@ -1238,6 +1240,17 @@ func (r *Runner) printJobs() {
 }
 
 func (r *Runner) runOnce(ctx context.Context, task string) {
+	if r.historyLoadErr != nil {
+		msgs, err := session.Load(r.App.Store.ID)
+		if err != nil {
+			r.LastErr = fmt.Errorf("cannot continue with stale history: %w", err)
+			r.Print("[error] %v", r.LastErr)
+			return
+		}
+		r.App.hydrateImages(msgs)
+		r.App.History = msgs
+		r.historyLoadErr = nil
+	}
 	// A run that never reaches the loop (e.g. /skill: with an unknown
 	// name) must not leave a stale error behind for the next reader.
 	r.LastErr = nil
@@ -1319,7 +1332,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	r.App.History = append(r.App.History, turnContext)
 	history = append(append([]llm.Message(nil), history...), turnContext)
 	r.configureCompaction()
-	_, usage, err := r.App.Cfg.Run(ctx, history)
+	text, usage, err := r.App.Cfg.Run(ctx, history)
 	r.LastErr = err
 	if err != nil {
 		r.Print("\n[error] %v", err)
@@ -1330,6 +1343,15 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	if msgs, err := session.Load(r.App.Store.ID); err == nil {
 		r.App.hydrateImages(msgs)
 		r.App.History = msgs
+	} else {
+		loadErr := fmt.Errorf("reload session: %w", err)
+		r.historyLoadErr = loadErr
+		r.LastErr = errors.Join(r.LastErr, loadErr)
+		r.App.Cfg.LastTerminalReason = agent.TerminalError
+		if r.App.Cfg.OnEvent != nil {
+			r.App.Cfg.OnEvent(agent.Event{Kind: agent.EventError, Err: r.LastErr, Text: text, TerminalReason: agent.TerminalError})
+		}
+		r.Print("[error] %v", loadErr)
 	}
 	r.SessionUsage.Add(usage)
 	turnCost := r.App.Rates.Cost(usage, time.Now())

@@ -17,8 +17,8 @@
   sessions stay in the shared format and replay across modes;
   consecutive same-role messages merge into one (Anthropic requires
   strict user/assistant alternation), an empty tool result replays as
-  `(no output)`, and thinking blocks are skipped on replay (they were
-  never persisted — thinking is display-only). `max_tokens` defaults to 16384,
+  `(no output)`, and Anthropic thinking blocks (including opaque signatures) are
+  persisted and replayed in their original order. `max_tokens` defaults to 16384,
   or `ANTHROPIC_MAX_TOKENS`.
 - Stream integrity: a chat stream that ends without `[DONE]`, a
   Responses stream without `response.completed`, or an Anthropic
@@ -29,7 +29,7 @@
   streams request `stream_options: {"include_usage": true}` — without
   it a spec-compliant provider sends no usage object at all and the
   turn reports 0 tokens.
-- Modes: `-mode suggest` (default, ask before write/edit/bash),
+- Modes: `-mode suggest` (default, ask before write/edit/bash, webfetch and plugin tools),
   `-mode auto` (no prompts, use only on a disposable copy).
 - Editing: `edit` takes either `oldText` (must match exactly once —
   a failed match names the closest lines, so the call can be fixed
@@ -204,8 +204,8 @@ after the turn has run 300 ms with no text, so short turns never
 flash a spinner. When the model streams thinking, the first thinking
 delta replaces that row with the accumulating thinking text, dim and
 italic, above the live answer; it stays in the scrollback after the
-turn, ahead of the reply. Thinking is display-only: it is never part
-of the answer, the session file, or the usage totals. Usage lines stay in the timeline with thousands
+turn, ahead of the reply. Thinking is separate from the answer. Anthropic replay blocks are saved in
+the session; token totals remain provider-reported. Usage lines stay in the timeline with thousands
 separators. The approval dialog is a full-width panel:
 `△ Approval required`, the tool summary, `[y] Allow once` on a solid
 blue background, `[n] Deny`, `esc = deny` (single key, Esc = deny).

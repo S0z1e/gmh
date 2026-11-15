@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"unicode/utf8"
 
 	"minimalharness/internal/llm"
 )
@@ -28,6 +29,14 @@ func TestShouldCompact(t *testing.T) {
 		if got := ShouldCompact(c.lastPrompt, c.limit); got != c.want {
 			t.Errorf("ShouldCompact(%d, %d) = %v, want %v", c.lastPrompt, c.limit, got, c.want)
 		}
+	}
+}
+
+func TestSummaryCapsToolArgumentsWithoutSplittingUTF8(t *testing.T) {
+	args := strings.Repeat("中", 10000) + "END-SENTINEL"
+	prompt := BuildCompactPrompt([]llm.Message{{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: "write", Arguments: args}}}}}, nil)
+	if strings.Contains(prompt, "END-SENTINEL") || len(prompt) > 2500 || !utf8.ValidString(prompt) {
+		t.Fatal("summary tool arguments were not safely bounded")
 	}
 }
 

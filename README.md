@@ -7,7 +7,7 @@ bash, grep, glob, `load_skill`, `webfetch`.
 
 It stays small on purpose: a lightweight system prompt, no
 sub-agents, no built-in permission popups. It also has suggest mode
-(approval before write/edit/bash), background bash jobs, JavaScript
+(approval before write/edit/bash, webfetch and plugin tools), background bash jobs, JavaScript
 plugins, plan mode via a plugin, and an RPC mode (JSONL over stdio)
 for driving it from a GUI — see [rpc](docs/rpc.md).
 
@@ -80,7 +80,7 @@ Without rates, no estimate is shown.
 ## Safety
 
 Approval is a policy boundary, **not a sandbox**. In `-mode suggest`
-(the default), write/edit/bash ask first; read, grep, glob and
+(the default), write/edit/bash, webfetch and plugin tools ask first; read, grep, glob and
 `load_skill` never ask. `-mode auto` never prompts — use it only on a
 disposable copy. `-p` print mode refuses every approval without
 asking.

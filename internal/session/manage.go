@@ -2,6 +2,7 @@ package session
 
 import (
 	"fmt"
+	"minimalharness/internal/privatefile"
 	"os"
 	"path/filepath"
 	"sort"
@@ -203,14 +204,14 @@ func (s *Store) Rename(newID string) error {
 	s.file.Close()
 	if err := renameSessionFiles(oldID, newID); err != nil {
 		// Put the store back on its old file so it stays usable.
-		f, err2 := os.OpenFile(s.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		f, err2 := privatefile.Open(s.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
 		if err2 == nil {
 			s.file = f
 		}
 		return err
 	}
 	newPath := filepath.Join(Dir(), newID+".jsonl")
-	f, err := os.OpenFile(newPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := privatefile.Open(newPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
 	if err != nil {
 		return err
 	}

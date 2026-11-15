@@ -14,20 +14,52 @@ import (
 // README's safety section for what suggest-mode can and cannot promise.
 func DeniedCommand(cmd string) string {
 	lower := strings.ToLower(cmd)
+	// Nested shell syntax may execute writes inside a read-only command.
+	// Keep the old conservative denial across the whole command, including
+	// separators inside substitutions. ${HOME} itself is just a pathname.
+	nested := strings.ContainsAny(cmd, "()`") || strings.Contains(strings.ReplaceAll(lower, "${home}", ""), "${")
+	if nested && strings.Contains(cmd, ">") && credentialPath(cmd) {
+		return "nested shell command may write into a credential directory"
+	}
 
-	// Credential directories: never let the agent WRITE into them.
-	// (The research lists ~/.ssh, ~/.aws, ~/.config/gcloud, ~/.kube,
-	// ~/.docker. $HOME forms are the same directories spelled out.)
-	// Reading them (cat, ls, grep) is allowed — only a write indicator
-	// (a redirect, or a copy/move/write command) triggers the denial,
-	// so grepping for the path itself still works.
-	for _, dir := range []string{
-		"~/.ssh", "~/.aws", "~/.config/gcloud", "~/.kube", "~/.docker",
-		"$home/.ssh", "$home/.aws", "$home/.config/gcloud", "$home/.kube", "$home/.docker",
-		"${home}/.ssh", "${home}/.aws", "${home}/.config/gcloud", "${home}/.kube", "${home}/.docker",
-	} {
-		if strings.Contains(lower, dir) && hasWriteIndicator(lower) {
-			return "command writes into a credential directory (" + dir + "); use a repo-scoped, short-lived token instead"
+	// Read-only commands are checked only at output destinations, so reading
+	// credentials and redirecting stderr elsewhere is allowed. For write
+	// commands retain the conservative check of every credential reference:
+	// options and auxiliary outputs need not be interpreted as shell syntax.
+	for _, seg := range splitSegments(cmd) {
+		fields := shellWords(seg)
+		for i, field := range fields {
+			if field == ">" && i+1 < len(fields) && credentialPath(fields[i+1]) {
+				return "command redirects output into a credential directory"
+			}
+		}
+		fields = unwrapCommand(withoutRedirects(fields))
+		if len(fields) < 2 {
+			continue
+		}
+		if credentialPath(seg) && strings.Contains(seg, ">") {
+			// Do not interpret nested shell commands or arbitrary interpreters
+			// as simple reads just because their outer redirect looks harmless.
+			simpleRead := false
+			switch fields[0] {
+			case "ls", "cat", "head", "tail", "grep", "wc", "echo", "printf":
+				simpleRead = !strings.Contains(seg, "$(") && !strings.Contains(seg, "`")
+			}
+			if !simpleRead {
+				return "command may redirect output into a credential directory"
+			}
+		}
+		switch fields[0] {
+		case "cp", "mv", "install", "ln", "rsync", "scp":
+			if credentialPath(seg) {
+				return "command writes into a credential directory"
+			}
+		case "tee", "touch", "mkdir", "chmod", "chown":
+			for _, f := range fields[1:] {
+				if credentialPath(f) {
+					return "command writes into a credential directory"
+				}
+			}
 		}
 	}
 
@@ -36,10 +68,22 @@ func DeniedCommand(cmd string) string {
 		return "command touches the Docker socket (/var/run/docker.sock)"
 	}
 
-	// Split on shell separators so one bad segment cannot hide behind a
-	// harmless first command.
-	for _, seg := range splitSegments(lower) {
-		fields := strings.Fields(seg)
+	// Keep the original conservative split for write commands and catastrophic
+	// operations, including separators inside quoted interpreter strings.
+	// The quote-aware split above is only for locating redirect targets.
+	for _, seg := range strings.FieldsFunc(lower, func(r rune) bool {
+		return r == ';' || r == '&' || r == '|' || r == '\n'
+	}) {
+		// Preserve HEAD's credential-reference check even when an inner write
+		// is hidden inside a quoted shell command or command substitution.
+		raw := unwrapCommand(strings.Fields(seg))
+		if credentialPath(lower) && len(raw) > 0 {
+			switch raw[0] {
+			case "cp", "mv", "tee", "install", "ln", "touch", "mkdir", "chmod", "chown", "rsync", "scp":
+				return "command writes into a credential directory"
+			}
+		}
+		fields := unwrapCommand(shellWords(seg))
 		if len(fields) == 0 {
 			continue
 		}
@@ -70,28 +114,143 @@ func DeniedCommand(cmd string) string {
 // splitSegments splits a command on ; & | and newlines. It is a rough
 // lexical split, not a shell parser — good enough for a denylist.
 func splitSegments(cmd string) []string {
-	return strings.FieldsFunc(cmd, func(r rune) bool {
-		return r == ';' || r == '&' || r == '|' || r == '\n'
-	})
-}
-
-// hasWriteIndicator reports whether the command writes somewhere: a
-// redirect, or a copy/move/write command.
-func hasWriteIndicator(lower string) bool {
-	if strings.Contains(lower, ">") {
-		return true
-	}
-	for _, seg := range splitSegments(lower) {
-		fields := strings.Fields(seg)
-		if len(fields) == 0 {
+	var segments []string
+	var quote byte
+	start := 0
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		if c == '\\' && quote != '\'' && i+1 < len(cmd) {
+			i++
 			continue
 		}
-		switch fields[0] {
-		case "cp", "mv", "tee", "install", "ln", "touch", "mkdir", "chmod", "chown", "rsync", "scp":
-			return true
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			quote = c
+			continue
+		}
+		if c == '>' {
+			for i+1 < len(cmd) && strings.ContainsRune(">|&", rune(cmd[i+1])) {
+				i++
+			}
+			continue
+		}
+		if c == '&' && i+1 < len(cmd) && cmd[i+1] == '>' {
+			continue
+		}
+		if c == ';' || c == '&' || c == '|' || c == '\n' {
+			segments = append(segments, cmd[start:i])
+			start = i + 1
+		}
+	}
+	return append(segments, cmd[start:])
+}
+
+func credentialPath(path string) bool {
+	path = strings.ToLower(path)
+	for _, base := range []string{"~", "$home", "${home}"} {
+		for _, dir := range []string{"/.ssh", "/.aws", "/.config/gcloud", "/.kube", "/.docker"} {
+			prefix := base + dir
+			if strings.Contains(path, prefix) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+func withoutRedirects(fields []string) []string {
+	var out []string
+	for i := 0; i < len(fields); i++ {
+		if fields[i] == ">" {
+			if len(out) > 0 {
+				numeric := true
+				for _, c := range out[len(out)-1] {
+					if c < '0' || c > '9' {
+						numeric = false
+					}
+				}
+				if numeric {
+					out = out[:len(out)-1]
+				}
+			}
+			for i+1 < len(fields) && fields[i+1] == ">" {
+				i++
+			}
+			if i+1 < len(fields) {
+				i++
+			}
+			continue
+		}
+		out = append(out, fields[i])
+	}
+	return out
+}
+
+// shellWords is a lexical pass, not an evaluator or shell sandbox.
+func shellWords(s string) []string {
+	// Classify combined/clobber redirects like ordinary output redirects.
+	// The original command is never rewritten for execution.
+	s = strings.NewReplacer(">|", ">", ">&", ">", "&>", ">").Replace(s)
+	var words []string
+	var word strings.Builder
+	var quote rune
+	flush := func() {
+		if word.Len() > 0 {
+			words = append(words, word.String())
+			word.Reset()
+		}
+	}
+	for _, r := range s {
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				word.WriteRune(r)
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"':
+			quote = r
+		case ' ', '\t':
+			flush()
+		case '>':
+			flush()
+			words = append(words, ">")
+		default:
+			word.WriteRune(r)
+		}
+	}
+	flush()
+	return words
+}
+
+func unwrapCommand(fields []string) []string {
+	for len(fields) > 0 {
+		name := fields[0]
+		if i := strings.LastIndex(name, "/"); i >= 0 {
+			name = name[i+1:]
+		}
+		fields[0] = name
+		switch name {
+		case "sudo", "command", "exec", "env", "nohup", "doas":
+			fields = fields[1:]
+			for len(fields) > 0 && (strings.HasPrefix(fields[0], "-") || strings.Contains(fields[0], "=")) {
+				if (fields[0] == "-u" || fields[0] == "-g") && len(fields) > 1 {
+					fields = fields[1:]
+				}
+				fields = fields[1:]
+			}
+		default:
+			return fields
+		}
+	}
+	return fields
 }
 
 // deniesRm reports whether an rm invocation is a recursive-force delete
@@ -119,8 +278,8 @@ func deniesRm(fields []string) bool {
 			continue
 		}
 		if recursive && force {
-			switch f {
-			case "/", "/*", "~", "$home", "${home}":
+			switch strings.TrimRight(f, "/") {
+			case "", "/*", "~", "$home", "${home}":
 				return true
 			}
 		}

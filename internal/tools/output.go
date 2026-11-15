@@ -13,6 +13,8 @@ package tools
 import (
 	"fmt"
 	"io"
+	"minimalharness/internal/privatefile"
+	"minimalharness/internal/textutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -116,7 +118,7 @@ func capLine(line string) string {
 	if len(line) <= bashOutputMaxLineChars {
 		return line
 	}
-	return line[:bashOutputMaxLineChars] + "… [line truncated]"
+	return textutil.Prefix(line, bashOutputMaxLineChars) + "… [line truncated]"
 }
 
 // Close flushes a trailing partial line as a line (when non-empty).
@@ -230,7 +232,7 @@ func (e *Executor) nextOutputFile() string {
 	}
 	e.outSeq++
 	path := filepath.Join(e.OutputDir, fmt.Sprintf("bash-%d-%d.log", os.Getpid(), e.outSeq))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	f, err := privatefile.Open(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY)
 	if err != nil {
 		return ""
 	}

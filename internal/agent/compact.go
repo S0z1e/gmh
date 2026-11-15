@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"minimalharness/internal/session"
+	"minimalharness/internal/textutil"
 	"strings"
 	"time"
 
@@ -66,7 +67,7 @@ func BuildCompactPrompt(history []llm.Message, extras []string) string {
 				fmt.Fprintf(&b, "[assistant] %s\n", m.Content)
 			}
 			for _, tc := range m.ToolCalls {
-				fmt.Fprintf(&b, "[assistant tool call] %s %s\n", tc.Function.Name, tc.Function.Arguments)
+				fmt.Fprintf(&b, "[assistant tool call] %s %s\n", tc.Function.Name, truncateForSummary(tc.Function.Arguments))
 			}
 		case "tool":
 			fmt.Fprintf(&b, "[tool result] %s\n", truncateForSummary(m.Content))
@@ -79,7 +80,7 @@ func BuildCompactPrompt(history []llm.Message, extras []string) string {
 // the full results are already in the saved transcript.
 func truncateForSummary(s string) string {
 	if len(s) > 500 {
-		return s[:500] + "… [truncated in summary prompt]"
+		return textutil.Prefix(s, 500) + "… [truncated in summary prompt]"
 	}
 	return s
 }
@@ -124,7 +125,9 @@ func estimatePromptTokens(msgs []llm.Message, defs []llm.ToolDef) int {
 		bytes += len(m.Content) + len(m.Role) + len(m.ToolCallID) + 24
 		if len(m.AnthropicContent) > 0 {
 			// Text and tool input are already counted through shared fields.
-			for _,block:= range m.AnthropicContent { bytes += len(block.Thinking)+len(block.Signature)+len(block.Data)+24 }
+			for _, block := range m.AnthropicContent {
+				bytes += len(block.Thinking) + len(block.Signature) + len(block.Data) + 24
+			}
 		}
 		images += len(m.Images)
 		for _, tc := range m.ToolCalls {

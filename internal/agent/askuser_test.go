@@ -64,11 +64,15 @@ func TestRunAskUserTool(t *testing.T) {
 	var asked []Question
 	var events []Event
 	cfg := &Config{
-		Client:   &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
-		Exec:     &tools.Executor{Root: t.TempDir()},
-		Tools:    ToolDefs(),
-		System:   "test system",
-		Mode:     "auto",
+		Client: &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
+		Exec:   &tools.Executor{Root: t.TempDir()},
+		Tools:  ToolDefs(),
+		System: "test system",
+		Mode:   "suggest",
+		Ask: func(ApprovalRequest) (bool, error) {
+			t.Fatal("ask_user should not require tool approval")
+			return false, nil
+		},
 		MaxSteps: 5,
 		OnEvent:  func(e Event) { events = append(events, e) },
 		AskQuestion: func(req QuestionRequest) (QuestionAnswers, error) {

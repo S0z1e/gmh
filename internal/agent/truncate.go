@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"minimalharness/internal/textutil"
 
 	"minimalharness/internal/llm"
 )
@@ -34,5 +35,5 @@ func capText(s string, max int) string {
 	head := max * 3 / 4
 	tail := max - head
 	return fmt.Sprintf("%s\n... [truncated: %d chars shown of %d] ...\n%s",
-		s[:head], max, len(s), s[len(s)-tail:])
+		textutil.Prefix(s, head), max, len(s), textutil.Suffix(s, tail))
 }

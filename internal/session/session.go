@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"minimalharness/internal/privatefile"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,7 +45,7 @@ func (s *Store) Audit(v any) error {
 		if err != nil {
 			return err
 		}
-		f, err := os.OpenFile(s.AuditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		f, err := privatefile.Open(s.AuditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY)
 		if err != nil {
 			return err
 		}
@@ -53,7 +54,7 @@ func (s *Store) Audit(v any) error {
 		return err
 	}
 	if s.auditFile == nil {
-		f, err := os.OpenFile(s.AuditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		f, err := privatefile.Open(s.AuditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY)
 		if err != nil {
 			return err
 		}
@@ -96,7 +97,7 @@ func New(id string) (*Store, error) {
 		// until the path is free. An explicit id is never suffixed:
 		// --resume needs the exact file.
 		for i := 1; ; i++ {
-			f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_WRONLY, 0600)
+			f, err := privatefile.Open(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_WRONLY)
 			if err == nil {
 				return &Store{ID: id, Path: path, file: f}, nil
 			}
@@ -107,7 +108,7 @@ func New(id string) (*Store, error) {
 			path = filepath.Join(dir, id+".jsonl")
 		}
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := privatefile.Open(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +199,7 @@ func (s *Store) ArchiveCopy(name string) (string, error) {
 		return "", err
 	}
 	dst := filepath.Join(Dir(), name+".jsonl")
-	if err := os.WriteFile(dst, data, 0o644); err != nil {
+	if err := privatefile.Write(dst, data); err != nil {
 		return "", err
 	}
 	return dst, nil
@@ -296,10 +297,10 @@ func (s *Store) Rewrite(msgs []llm.Message) error {
 		return err
 	}
 	if err := os.Rename(tmp.Name(), s.Path); err != nil {
-		s.file, _ = os.OpenFile(s.Path, os.O_APPEND|os.O_WRONLY, 0600)
+		s.file, _ = privatefile.Open(s.Path, os.O_APPEND|os.O_WRONLY)
 		return err
 	}
-	f, err := os.OpenFile(s.Path, os.O_APPEND|os.O_WRONLY, 0600)
+	f, err := privatefile.Open(s.Path, os.O_APPEND|os.O_WRONLY)
 	if err != nil {
 		return err
 	}

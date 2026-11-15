@@ -22,3 +22,22 @@ func TestApprovalReceivesCompleteInvocation(t *testing.T) {
 		t.Fatalf("approval did not receive full invocation: %+v", got)
 	}
 }
+
+func TestSuggestApprovesNetworkAndPluginTools(t *testing.T) {
+	for _, tool := range []string{"webfetch", "external_plugin"} {
+		asked := false
+		defs := append(ToolDefs(), llm.Tool("external_plugin", "external tool", `{"type":"object"}`))
+		cfg := &Config{Client: &llm.Client{APIKey: "fake", Model: "test"}, Exec: &tools.Executor{Root: t.TempDir()}, Tools: defs, Mode: "suggest", MaxSteps: 3, Ask: func(req ApprovalRequest) (bool, error) {
+			asked = true
+			if req.ToolName != tool {
+				t.Error("wrong approval")
+			}
+			return false, nil
+		}}
+		chunk, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"tool_calls": []llm.ToolCall{{ID: "a", Type: "function", Function: llm.FunctionCall{Name: tool, Arguments: `{"url":"https://example.com"}`}}}}}}})
+		runTwoTurns(t, cfg, "data: "+string(chunk)+"\n\ndata: [DONE]\n\n")
+		if !asked {
+			t.Fatalf("suggest mode bypassed approval for %s", tool)
+		}
+	}
+}

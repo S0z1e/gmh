@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"minimalharness/internal/textutil"
 	"os"
 	"sort"
 	"strings"
@@ -198,7 +199,12 @@ func (c *Config) needsApproval(name string) bool {
 	if c.Mode == "auto" {
 		return false
 	}
-	return name == "write" || name == "edit" || name == "bash"
+	// Network and plugin tools can send data or cause side effects.
+	switch name {
+	case "read", "grep", "glob", "load_skill", "ask_user":
+		return false
+	}
+	return true
 }
 
 // toolOffered reports whether name is in the turn's offered tool
@@ -618,10 +624,6 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			c.emit(Event{Kind: EventError, Err: runErr, Text: text, TerminalReason: TerminalError})
 		}
 	}()
-	if c.Exec != nil {
-		stop := context.AfterFunc(ctx, c.Exec.SessionCanceller())
-		defer stop()
-	}
 	steps := c.MaxSteps
 	// MaxSteps <= 0 means unlimited (the mainstream default): the turn
 	// runs until the model stops calling tools, an error ends it, or
@@ -1200,7 +1202,7 @@ func recordLastError(errs *[]string, obs string) {
 
 func truncate(s string, n int) string {
 	if len(s) > n {
-		return s[:n] + "…"
+		return textutil.Prefix(s, n) + "…"
 	}
 	return s
 }

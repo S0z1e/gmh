@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"minimalharness/internal/privatefile"
 	"os"
 	"os/exec"
 	"sync"
@@ -304,7 +305,7 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 			defer os.Remove(filePath)
 		}
 	}
-	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	f, err := privatefile.Open(filePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY)
 	if err != nil {
 		return "", -1, fmt.Errorf("open bash output: %w", err)
 	}
@@ -478,7 +479,8 @@ func (j *Job) Cancel() {
 	}
 }
 
-// CancelJobs is used for an explicit abort, independently of normal turn cleanup.
+// CancelJobs explicitly stops the current session's jobs. Turn cancellation
+// deliberately does not call it: detached work belongs to the session.
 func (e *Executor) CancelJobs() {
 	e.SessionCanceller()()
 }

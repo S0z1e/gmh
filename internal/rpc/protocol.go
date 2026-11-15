@@ -9,6 +9,7 @@ package rpc
 import (
 	"encoding/json"
 	"fmt"
+	"minimalharness/internal/textutil"
 	"strings"
 
 	"minimalharness/internal/agent"
@@ -226,5 +227,5 @@ func capOutput(s string, maxChars int) (string, bool) {
 	head := maxChars / 2
 	tail := maxChars - head
 	marker := fmt.Sprintf("\n[truncated: %d chars shown of %d]", maxChars, len(s))
-	return s[:head] + marker + s[len(s)-tail:], true
+	return textutil.Prefix(s, head) + marker + textutil.Suffix(s, tail), true
 }

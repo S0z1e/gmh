@@ -5,12 +5,14 @@ package tools
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"minimalharness/internal/textutil"
 	"net"
 	"net/http"
 	"os"
@@ -20,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"minimalharness/internal/fileguard"
 	"minimalharness/internal/llm"
@@ -117,7 +120,7 @@ func (e *Executor) resolve(p string) (string, error) {
 
 func truncate(s string, n int) string {
 	if len(s) > n {
-		return s[:n] + "\n... [truncated]"
+		return textutil.Prefix(s, n) + "\n... [truncated]"
 	}
 	return s
 }
@@ -197,6 +200,18 @@ func (e *Executor) Read(a ReadArgs) (string, error) {
 			break
 		}
 		if line >= start {
+			// A byte cap may end in the middle of a valid final character.
+			for i := 0; clipped && i < utf8.UTFMax-1 && !utf8.Valid(data) && len(data) > 0; i++ {
+				data = data[:len(data)-1]
+			}
+			if bytes.IndexByte(data, 0) >= 0 || !utf8.Valid(data) {
+				return "", fmt.Errorf("read: binary or non-UTF-8 file; use a binary inspection command instead")
+			}
+			for _, b := range data {
+				if b < 0x20 && b != '\n' && b != '\r' && b != '\t' {
+					return "", fmt.Errorf("read: binary control bytes in file; use a binary inspection command instead")
+				}
+			}
 			fmt.Fprintf(&out, "%d\t%s\n", line+1, strings.TrimSuffix(string(data), "\n"))
 			if clipped {
 				out.WriteString("... [line truncated at read byte limit]\n")

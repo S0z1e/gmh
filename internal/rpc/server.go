@@ -49,12 +49,15 @@ var (
 // is refreshed by the agent goroutine after every work item, so the
 // reader goroutine can answer without touching runner state.
 type serverState struct {
-	streaming    bool
-	turns        int
-	sessionUsage llm.Usage
-	sessionCost  float64
-	messages     int
-	sessionID    string
+	streaming                   bool
+	turns                       int
+	sessionUsage                llm.Usage
+	sessionCost                 float64
+	messages                    int
+	sessionID                   string
+	model, api, mode, root, fee string
+	contextWindow, maxTokens    int
+	ratesConfigured             bool
 	// toolMode is the loop's tool mode ("default" or "plan").
 	toolMode string
 }
@@ -174,9 +177,7 @@ func (s *Server) run() error {
 	s.runner.OnCompact = func(messages, summaryTokens int) {
 		s.writeEvent(Event{Type: "compacted", Messages: messages, SummaryTokens: summaryTokens})
 	}
-	s.state.sessionID = s.app.Store.ID
-	s.state.messages = len(s.app.History)
-	s.state.toolMode = string(s.app.ToolMode())
+	s.refreshState()
 	fmt.Fprintf(os.Stderr, "harness rpc ready: session %s (stdin/stdout JSONL)\n", s.app.Store.ID)
 	s.writeEvent(Event{
 		Type: "ready", Protocol: protocolVersion,
@@ -412,7 +413,6 @@ func (s *Server) handleAbort(req Request) {
 	if cancel != nil {
 		s.turnAborted = true
 		cancel()
-		s.app.Cfg.Exec.CancelJobs()
 	}
 	s.turnMu.Unlock()
 	s.failApprovals(errAborted)
@@ -449,21 +449,21 @@ func (s *Server) failApprovals(err error) {
 }
 
 func (s *Server) handleQuery(req Request) {
+	s.mu.Lock()
+	st := s.state
+	s.mu.Unlock()
 	switch req.Type {
 	case "get_state":
-		s.mu.Lock()
-		st := s.state
-		s.mu.Unlock()
 		s.respond(req, map[string]any{
-			"session": st.sessionID, "model": s.app.Cfg.Client.Model, "api": s.app.Cfg.Client.API,
-			"mode": s.app.Cfg.Mode, "tool_mode": st.toolMode, "root": s.app.Root, "streaming": st.streaming,
+			"session": st.sessionID, "model": st.model, "api": st.api,
+			"mode": st.mode, "tool_mode": st.toolMode, "root": st.root, "streaming": st.streaming,
 			"queued": len(s.work), "messages": st.messages, "turns": st.turns,
 			"total_tokens": st.sessionUsage.TotalTokens,
 			// The effective window and output cap for the current
 			// model (Setup/SwitchModel resolved flag/env/model/
 			// config/default), so the GUI can meter context against
 			// the limit the compact trigger uses.
-			"context_window": s.app.ContextLimit, "max_tokens": s.app.Cfg.Client.MaxTokens,
+			"context_window": st.contextWindow, "max_tokens": st.maxTokens,
 		}, nil)
 	case "usage":
 		s.mu.Lock()
@@ -473,7 +473,7 @@ func (s *Server) handleQuery(req Request) {
 			"session": usageJSON(st.sessionUsage),
 			"fee":     s.feeLabel(), "turns": st.turns,
 		}
-		if s.app.Rates.Configured {
+		if st.ratesConfigured {
 			c := st.sessionCost
 			data["cost_usd"] = &c
 		}
@@ -491,7 +491,7 @@ func (s *Server) handleQuery(req Request) {
 			rows = append(rows, map[string]any{
 				"id": info.ID, "messages": info.Messages,
 				"modified": info.Modified.Format(time.RFC3339), "preview": info.Preview,
-				"current": info.ID == s.app.Store.ID,
+				"current": info.ID == st.sessionID,
 			})
 		}
 		s.respond(req, map[string]any{"sessions": rows}, nil)
@@ -504,7 +504,7 @@ func (s *Server) handleQuery(req Request) {
 	case "history":
 		id := req.Session
 		if id == "" {
-			id = s.app.Store.ID
+			id = st.sessionID
 		}
 		if err := session.ValidateSessionID(id); err != nil {
 			s.respond(req, nil, err)
@@ -853,6 +853,11 @@ func (s *Server) refreshState() {
 	s.state.sessionUsage = s.runner.SessionUsage
 	s.state.sessionCost = s.runner.SessionCost
 	s.state.toolMode = string(s.runner.App.ToolMode())
+	s.state.model, s.state.api = s.app.Cfg.Client.Model, s.app.Cfg.Client.API
+	s.state.mode, s.state.root = s.app.Cfg.Mode, s.app.Root
+	s.state.contextWindow, s.state.maxTokens = s.app.ContextLimit, s.app.Cfg.Client.MaxTokens
+	s.state.ratesConfigured = s.app.Rates.Configured
+	s.state.fee = s.app.Cfg.Client.ProviderName() + " price unverified"
 	s.mu.Unlock()
 }
 
@@ -1126,7 +1131,9 @@ func (s *Server) isDone() bool {
 }
 
 func (s *Server) feeLabel() string {
-	return s.app.Cfg.Client.ProviderName() + " price unverified"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.fee
 }
 
 func usageJSON(u llm.Usage) *UsageJSON {
