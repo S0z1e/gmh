@@ -122,7 +122,7 @@ func Setup(p Params) (*App, error) {
 
 	// Config: flag > env > project file > global file > built-in
 	// default. A bad config file fails fast, before any session
-	// is created. The API key is never read from a file.
+	// is created.
 	var cfg *config.File
 	if p.ConfigPath != "" {
 		var err error
@@ -153,8 +153,8 @@ func Setup(p Params) (*App, error) {
 		return nil, fmt.Errorf("no providers configured: add a provider to %s (global) or %s (project)", global, config.ProjectPath(absRoot))
 	}
 
-	// API key: the provider's apiKey "$NAME" reference wins, else
-	// OPENAI_API_KEY. A literal key never lives in the file.
+	// API key: the provider's literal key or environment reference wins,
+	// else OPENAI_API_KEY.
 	apiKey := ""
 	if prov.APIKey != "" {
 		k, err := config.ResolveAPIKey(prov.APIKey)
@@ -166,7 +166,7 @@ func Setup(p Params) (*App, error) {
 		apiKey = os.Getenv("OPENAI_API_KEY")
 	}
 	if apiKey == "" {
-		return nil, fmt.Errorf("missing API key: set OPENAI_API_KEY, or set apiKey: \"$NAME\" for provider %q in the config file", provName)
+		return nil, fmt.Errorf("missing API key: set OPENAI_API_KEY, or set apiKey to a key or \"$NAME\" for provider %q in the config file", provName)
 	}
 
 	// Model: flag > env > defaultModel (when the selected provider
@@ -582,8 +582,8 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 	if mdl.ID == "" {
 		return "", "", "", fmt.Errorf("provider %q: no model configured (set \"model\" or add a \"models\" entry)", provName)
 	}
-	// API key: the provider's apiKey "$NAME" reference wins, else
-	// OPENAI_API_KEY. A literal key never lives in the file.
+	// API key: the provider's literal key or environment reference wins,
+	// else OPENAI_API_KEY.
 	apiKey := ""
 	if prov.APIKey != "" {
 		k, err := config.ResolveAPIKey(prov.APIKey)
@@ -595,7 +595,7 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 		apiKey = os.Getenv("OPENAI_API_KEY")
 	}
 	if apiKey == "" {
-		return "", "", "", fmt.Errorf("missing API key: set OPENAI_API_KEY, or set apiKey: \"$NAME\" for provider %q in the config file", provName)
+		return "", "", "", fmt.Errorf("missing API key: set OPENAI_API_KEY, or set apiKey to a key or \"$NAME\" for provider %q in the config file", provName)
 	}
 	apiMode := a.Cfg.Client.API
 	if mdl.API != "" {

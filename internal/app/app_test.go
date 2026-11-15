@@ -92,6 +92,54 @@ func TestSetupResolvesConfigFile(t *testing.T) {
 	}
 }
 
+func TestSetupAndSwitchResolveAPIKeyForms(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "fallback-key")
+	t.Setenv("GMH_TEST_PROVIDER_KEY", "env-key")
+	auth := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth <- r.Header.Get("Authorization")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	for _, value := range []string{"literal-key", "$GMH_TEST_PROVIDER_KEY", "${GMH_TEST_PROVIDER_KEY}"} {
+		t.Run(value, func(t *testing.T) {
+			root := t.TempDir()
+			raw, err := json.Marshal(map[string]any{"providers": map[string]any{
+				"test":  map[string]any{"baseUrl": srv.URL, "apiKey": value, "model": "test"},
+				"other": map[string]any{"baseUrl": srv.URL, "apiKey": "switch-key", "model": "other"},
+			}, "defaultProvider": "test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, ".harness.json"), raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			a, err := Setup(Params{Root: root, MaxSteps: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer a.Store.Close()
+			if _, _, err := a.Cfg.Client.Chat(context.Background(), []llm.Message{{Role: "user", Content: "OK"}}, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			want := "Bearer env-key"
+			if value == "literal-key" {
+				want = "Bearer literal-key"
+			}
+			if <-auth != want {
+				t.Fatal("provider credential did not reach the authorization header")
+			}
+			if _, _, _, err := a.SwitchModel("other", "other"); err != nil {
+				t.Fatal(err)
+			}
+			if a.Cfg.Client.APIKey != "switch-key" {
+				t.Fatal("model switch did not resolve the literal credential")
+			}
+		})
+	}
+}
+
 // The models array: per-model api/contextWindow/maxTokens,
 // apiKey "$NAME" resolution, headers, and the defaults when a
 // model omits a value.

@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,22 +72,22 @@ func TestLoadRejectsUnknownField(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsAPIKey(t *testing.T) {
-	// A literal key is refused wherever it appears.
+func TestLoadAPIKeyForms(t *testing.T) {
+	// apiKey belongs inside a provider, regardless of its value.
 	p := write(t, t.TempDir(), "c.json", `{"apiKey": "sk-secret"}`)
 	if _, err := Load(p); err == nil {
-		t.Fatal("apiKey in the config file should be rejected")
+		t.Fatal("top-level apiKey should be rejected")
 	}
 	p2 := write(t, t.TempDir(), "c2.json", `{"providers": {"x": {"baseUrl": "https://example.com", "apiKey": "sk-secret"}}}`)
-	if _, err := Load(p2); err == nil {
-		t.Fatal("apiKey inside a provider should be rejected")
+	if f, err := LoadExplicit(p2); err != nil || f.Providers["x"].APIKey != "sk-secret" {
+		t.Fatalf("literal apiKey inside a provider should be accepted: %v", err)
 	}
 	// "!command" is not supported either.
 	p3 := write(t, t.TempDir(), "c3.json", `{"providers": {"x": {"baseUrl": "https://example.com", "apiKey": "!pass show x"}}}`)
 	if _, err := Load(p3); err == nil {
 		t.Fatal("apiKey as !command should be rejected")
 	}
-	// A "$NAME" reference inside a provider is the allowed form.
+	// Environment references remain supported alongside literals.
 	p4 := write(t, t.TempDir(), "c4.json", `{"providers": {"x": {"baseUrl": "https://example.com", "apiKey": "$MY_API_KEY"}}}`)
 	f, err := Load(p4)
 	if err != nil {
@@ -140,14 +141,32 @@ func TestResolveAPIKey(t *testing.T) {
 	if _, err := ResolveAPIKey("$MY_MISSING_KEY"); err == nil {
 		t.Fatal("unset env var should fail")
 	}
-	if _, err := ResolveAPIKey("sk-literal"); err == nil {
-		t.Fatal("literal key should fail")
+	if got, err := ResolveAPIKey("sk-literal"); err != nil || got != "sk-literal" {
+		t.Fatalf("literal key should pass through unchanged: %v", err)
 	}
 	if _, err := ResolveAPIKey("!cmd"); err == nil {
 		t.Fatal("!command should fail")
 	}
 	if got, err := ResolveAPIKey(""); err != nil || got != "" {
 		t.Fatalf("empty ref = %q, %v", got, err)
+	}
+}
+
+func TestAPIKeyErrorsDoNotEchoValues(t *testing.T) {
+	for i, value := range []string{"$", "${BROKEN", "$BAD-NAME", "!secret-command", "sk-secret\ninvalid", "   "} {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			if _, err := ResolveAPIKey(value); err == nil || len(value) > 1 && strings.Contains(err.Error(), value) {
+				t.Fatal("ResolveAPIKey should reject invalid values without echoing them")
+			}
+			raw, err := json.Marshal(map[string]any{"providers": map[string]any{"x": map[string]any{"baseUrl": "https://example.com", "apiKey": value}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := write(t, t.TempDir(), "config.json", string(raw))
+			if _, err := LoadExplicit(path); err == nil || len(value) > 1 && strings.Contains(err.Error(), value) {
+				t.Fatal("LoadExplicit should reject invalid values without echoing them")
+			}
+		})
 	}
 }
 

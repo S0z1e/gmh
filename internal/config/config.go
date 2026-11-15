@@ -45,8 +45,8 @@
 // provider without the providers map. Precedence everywhere is:
 // flag > environment variable > project file > global file > default
 // (contextWindow 128000, maxTokens 16384, timeoutSeconds 600,
-// idleTimeoutSeconds 60). The API key is never a literal in a file:
-// provider apiKey is a "$NAME" environment reference.
+// idleTimeoutSeconds 60). Provider apiKey accepts a literal key or a
+// "$NAME" / "${NAME}" environment reference.
 package config
 
 import (
@@ -163,8 +163,8 @@ type Provider struct {
 	BaseURL string `json:"baseUrl"`
 	API     string `json:"api"`
 	Model   string `json:"model"`
-	// APIKey is a "$NAME" / "${NAME}" environment reference only.
-	// A literal key is refused at load time; "!command" is not supported.
+	// APIKey is a literal key or a "$NAME" / "${NAME}" environment reference.
+	// "!command" is not supported.
 	APIKey  string            `json:"apiKey"`
 	Headers map[string]string `json:"headers"`
 	Models  []Model           `json:"models"`
@@ -702,9 +702,8 @@ func validateCost(provider, model string, c *ModelCost) error {
 	return nil
 }
 
-// validateAPIKeyForm checks a provider apiKey value: only a "$NAME"
-// or "${NAME}" environment reference is allowed. A literal key must
-// never be written in a config file; "!command" is not supported.
+// validateAPIKeyForm accepts a literal key or an environment reference.
+// Never include the value in errors: it may be a credential.
 func validateAPIKeyForm(ref string) error {
 	if ref == "" {
 		return nil
@@ -712,23 +711,31 @@ func validateAPIKeyForm(ref string) error {
 	if _, ok := envRefName(ref); ok {
 		return nil
 	}
-	return fmt.Errorf("apiKey %q: use \"$NAME\" to read the key from an environment variable (a literal key must never be written in the config file; \"!command\" is not supported)", ref)
+	trimmed := strings.TrimSpace(ref)
+	if trimmed == "" || strings.HasPrefix(trimmed, "$") || strings.HasPrefix(trimmed, "!") {
+		return fmt.Errorf("apiKey must be a literal key or a valid \"$NAME\" / \"${NAME}\" environment reference; \"!command\" is not supported")
+	}
+	for _, r := range ref {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("apiKey must not contain control characters")
+		}
+	}
+	return nil
 }
 
-// ResolveAPIKey resolves a provider apiKey reference to the key
-// itself, reading the named environment variable. An unset variable
-// is an error: fail fast instead of calling the API with an empty key.
+// ResolveAPIKey returns a literal key unchanged or reads its environment
+// reference. An unset variable is an error rather than an empty key.
 func ResolveAPIKey(ref string) (string, error) {
-	if ref == "" {
-		return "", nil
+	if err := validateAPIKeyForm(ref); err != nil {
+		return "", err
 	}
 	name, ok := envRefName(ref)
 	if !ok {
-		return "", fmt.Errorf("apiKey %q: use \"$NAME\" to read the key from an environment variable", ref)
+		return ref, nil
 	}
 	v := os.Getenv(name)
 	if v == "" {
-		return "", fmt.Errorf("apiKey %q: environment variable %s is not set", ref, name)
+		return "", fmt.Errorf("apiKey: environment variable %s is not set", name)
 	}
 	return v, nil
 }
@@ -779,9 +786,8 @@ func validEnvName(name string) bool {
 	return true
 }
 
-// checkAPIKeyForms refuses a non-reference apiKey value anywhere in
-// the raw document. A "$NAME" reference is fine; a literal key or
-// "!command" is not. Misplaced apiKey fields (top level, inside a
+// checkAPIKeyForms checks apiKey values before strict decoding, without
+// echoing credentials in errors. Misplaced fields (top level, inside a
 // model) are rejected later as unknown fields by the strict decoder.
 func checkAPIKeyForms(data []byte) error {
 	var v any
@@ -798,7 +804,7 @@ func walkKeys(v any) error {
 			if strings.EqualFold(k, "apiKey") || strings.EqualFold(k, "api_key") {
 				s, isStr := child.(string)
 				if !isStr || validateAPIKeyForm(s) != nil {
-					return fmt.Errorf("apiKey must be a \"$NAME\" environment reference and cannot be a literal key in the config file")
+					return fmt.Errorf("apiKey must be a literal key or a valid \"$NAME\" / \"${NAME}\" environment reference; \"!command\" and control characters are not supported")
 				}
 			}
 			if err := walkKeys(child); err != nil {

@@ -1,7 +1,7 @@
 # Run
 
-- The API key is read only from the environment. Never commit it,
-  never put it in a file.
+- Set a provider's `apiKey` to a literal key or a `$NAME` / `${NAME}`
+  environment reference; with no `apiKey`, `OPENAI_API_KEY` is used.
 - `OPENAI_BASE_URL` may be given with or without a trailing `/v1`;
   the client normalises it.
 - Three API shapes: `-api chat` (`POST /v1/chat/completions`,

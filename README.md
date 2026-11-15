@@ -17,8 +17,8 @@ full documentation.
 
 ## Getting started
 
-You need Go and an API key in the environment — the key is read only
-from env vars, never from a file.
+You need Go and an API key. Set the key in an environment variable or
+in your provider's `apiKey` config field.
 
 ```bash
 go build -o harness ./cmd/harness
@@ -26,7 +26,7 @@ go build -o harness ./cmd/harness
 
 Copy the example config into place (see
 [configuration](docs/configuration.md) for the full format). It names
-your providers and models; the keys stay in env vars:
+your providers and models; this example reads the key from an env var:
 
 ```bash
 cp config.example.json ~/.minimal-harness/config.json

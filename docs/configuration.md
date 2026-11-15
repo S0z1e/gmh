@@ -52,8 +52,8 @@ compact trigger), `maxTokens` 16384, `reasoning` false,
 `anthropic-messages` = `anthropic`; `google-generative-ai` is
 rejected — the harness has no client for it.
 
-`apiKey` is a `"$NAME"` / `"${NAME}"` environment reference only: a
-literal key in the file is refused, and `!command` is not supported.
+`apiKey` accepts a literal key or a `"$NAME"` / `"${NAME}"` environment
+reference. An unset referenced variable is an error; `!command` is not supported.
 When a provider sets no `apiKey`, `OPENAI_API_KEY` is used.
 `headers` (provider and per-model, model wins) accept the same
 `$NAME` references; auth headers are never taken from them.
