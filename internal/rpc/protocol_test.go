@@ -32,26 +32,12 @@ func TestDecodeRequestErrors(t *testing.T) {
 	}
 }
 
-func TestParseApprovalPrompt(t *testing.T) {
-	tool, args := parseApprovalPrompt(`Run write {"path":"u.txt","content":"hi"}?`)
-	if tool != "write" {
-		t.Fatalf("tool = %q, want write", tool)
-	}
-	m, ok := args.(map[string]any)
-	if !ok || m["path"] != "u.txt" {
-		t.Fatalf("args = %#v, want path u.txt", args)
-	}
-	// A prompt without the expected shape falls back to the raw text.
-	tool, args = parseApprovalPrompt("Run bash?")
-	if tool != "" {
-		t.Fatalf("tool = %q, want empty", tool)
-	}
-	if args != "Run bash?" {
-		t.Fatalf("args = %#v, want the raw prompt", args)
-	}
-}
-
 func TestParseToolArgs(t *testing.T) {
+	for _, input := range []string{`{"path":"x"} garbage`, `{} {}`} {
+		if got := parseToolArgs(input); got != input {
+			t.Fatal("trailing data was lost")
+		}
+	}
 	v := parseToolArgs(`{"path":"t.txt"}`)
 	m, ok := v.(map[string]any)
 	if !ok || m["path"] != "t.txt" {

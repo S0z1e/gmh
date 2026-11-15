@@ -130,7 +130,7 @@ func TestHookDenySkipsApprovalAndReachesModel(t *testing.T) {
 		Tools:  ToolDefs(),
 		System: "test system",
 		Mode:   "suggest",
-		Ask: func(string) (bool, error) {
+		Ask: func(ApprovalRequest) (bool, error) {
 			asked = true
 			return true, nil
 		},
@@ -204,8 +204,8 @@ func TestHookRewriteReachesApprovalPrompt(t *testing.T) {
 		Tools:  ToolDefs(),
 		System: "test system",
 		Mode:   "suggest",
-		Ask: func(p string) (bool, error) {
-			prompt = p
+		Ask: func(req ApprovalRequest) (bool, error) {
+			prompt = req.Prompt()
 			return true, nil
 		},
 		MaxSteps: 5,

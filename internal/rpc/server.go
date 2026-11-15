@@ -633,15 +633,14 @@ func (s *Server) jobsList() []map[string]any {
 // is aborted, or the server shuts down. The loop emits EventApproval
 // before calling ask; onEvent deliberately ignores that event, or the
 // request would go out twice.
-func (s *Server) ask(prompt string) (bool, error) {
+func (s *Server) ask(req agent.ApprovalRequest) (bool, error) {
 	s.approvalsMu.Lock()
 	s.apprSeq++
 	id := fmt.Sprintf("appr-%d", s.apprSeq)
 	ch := make(chan approvalAnswer, 1)
 	s.approvals[id] = ch
 	s.approvalsMu.Unlock()
-	tool, args := parseApprovalPrompt(prompt)
-	s.writeEvent(Event{Type: "approval_request", ID: id, Tool: tool, Args: args, Prompt: prompt})
+	s.writeEvent(Event{Type: "approval_request", ID: id, Tool: req.ToolName, Args: parseToolArgs(req.Arguments), Prompt: req.Prompt()})
 	select {
 	case ans := <-ch:
 		return ans.approved, ans.err

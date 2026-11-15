@@ -34,7 +34,7 @@ type Config struct {
 	OnEvent func(Event)
 	// TraceRequests emits content-free request diagnostics and audits each attempt.
 	TraceRequests bool
-	Ask           func(prompt string) (bool, error) // nil = use stdin prompt
+	Ask           func(ApprovalRequest) (bool, error) // nil = use stdin prompt
 	// ConfirmContinuation is the doom-loop guard's seam: it asks the
 	// user whether a tool call repeated Threshold times may continue,
 	// with "once" / "session" / "deny" (and optionally updated
@@ -117,14 +117,14 @@ func ToolDefs() []llm.ToolDef {
 	}
 }
 
-func (c *Config) ask(prompt string) (bool, error) {
+func (c *Config) ask(req ApprovalRequest) (bool, error) {
 	if c.DenyInsteadOfPrompt {
 		return false, nil
 	}
 	if c.Ask != nil {
-		return c.Ask(prompt)
+		return c.Ask(req)
 	}
-	fmt.Printf("%s [y/N] ", prompt)
+	fmt.Printf("%s [y/N] ", req.Prompt())
 	reader := bufio.NewReader(os.Stdin)
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -920,9 +920,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				continue
 			}
 			if c.needsApproval(tc.Function.Name) {
-				prompt := fmt.Sprintf("Run %s %s?", tc.Function.Name, truncate(tc.Function.Arguments, 200))
-				c.emit(Event{Kind: EventApproval, Text: prompt})
-				ok, err := c.ask(prompt)
+				req := ApprovalRequest{ToolName: tc.Function.Name, Arguments: tc.Function.Arguments}
+				c.emit(Event{Kind: EventApproval, Text: req.Prompt(), ToolName: req.ToolName, ToolArgs: req.Arguments})
+				ok, err := c.ask(req)
 				// Audit every decision (approved, denied, or errored)
 				// to the session sidecar, for later review.
 				if c.Session != nil {

@@ -6,6 +6,8 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"minimalharness/internal/agent"
 )
 
 // The approval answer must come from the same scanner the REPL
@@ -20,7 +22,7 @@ func TestAskFromScannerSharesREPLInput(t *testing.T) {
 		t.Fatalf("first task line = %q", scanner.Text())
 	}
 	ask := askFromScanner(scanner)
-	ok, err := ask("Run write ...?")
+	ok, err := ask(agent.ApprovalRequest{ToolName: "write", Arguments: `{}`})
 	if err != nil {
 		t.Fatalf("ask returned error: %v", err)
 	}
@@ -48,7 +50,7 @@ func TestAskFromScannerAnswers(t *testing.T) {
 		{"maybe\n", false},
 	} {
 		scanner := bufio.NewScanner(strings.NewReader(tc.in))
-		ok, err := askFromScanner(scanner)("Run write ...?")
+		ok, err := askFromScanner(scanner)(agent.ApprovalRequest{ToolName: "write", Arguments: `{}`})
 		if err != nil {
 			t.Errorf("ask(%q) error: %v", tc.in, err)
 			continue
@@ -63,13 +65,13 @@ func TestAskFromScannerEOFAndError(t *testing.T) {
 	// Clean EOF (a pipe that ends mid-approval) is an error, like
 	// the loop's default ask returning the ReadString error.
 	scanner := bufio.NewScanner(strings.NewReader(""))
-	if _, err := askFromScanner(scanner)("Run write ...?"); !errors.Is(err, io.EOF) {
+	if _, err := askFromScanner(scanner)(agent.ApprovalRequest{ToolName: "write", Arguments: `{}`}); !errors.Is(err, io.EOF) {
 		t.Fatalf("ask on EOF = %v, want io.EOF", err)
 	}
 	// A read error surfaces instead of being swallowed.
 	boom := errors.New("boom")
 	scanner = bufio.NewScanner(errReader{err: boom})
-	if _, err := askFromScanner(scanner)("Run write ...?"); !errors.Is(err, boom) {
+	if _, err := askFromScanner(scanner)(agent.ApprovalRequest{ToolName: "write", Arguments: `{}`}); !errors.Is(err, boom) {
 		t.Fatalf("ask on read error = %v, want boom", err)
 	}
 }

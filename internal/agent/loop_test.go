@@ -531,7 +531,7 @@ func TestRunEmitsEventsForDeniedToolCall(t *testing.T) {
 		System:   "test system",
 		Mode:     "suggest",
 		MaxSteps: 2,
-		Ask:      func(prompt string) (bool, error) { return false, nil },
+		Ask:      func(req ApprovalRequest) (bool, error) { return false, nil },
 		OnEvent:  func(e Event) { events = append(events, e) },
 	}
 	_, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "write x.txt"}})

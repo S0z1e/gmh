@@ -103,7 +103,9 @@ type Model struct {
 	spinnerFrame int
 	spinning     bool // a spinner tick loop is running
 	// approval is non-nil while the agent waits for a y/n answer.
-	approval *ApprovalRequest
+	approval       *ApprovalRequest
+	approvalScroll int
+	height         int
 	// pendingReply is a finished turn's text, waiting to be committed
 	// to the scrollback together with the runner's next print (usually
 	// the usage lines). It exists because two separate tea.Println
@@ -240,6 +242,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
+		m.height = msg.Height
+		if m.approval != nil {
+			lines, page := m.approvalDetails()
+			m.approvalScroll = min(m.approvalScroll, max(0, len(lines)-page))
+		}
 		return m, nil
 	case tea.KeyPressMsg:
 		return m.handleKey(msg.Key())
@@ -275,6 +282,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Println(stylePrint(msg.Text))
 	case ApprovalMsg:
 		m.approval = msg.Request
+		m.approvalScroll = 0
 		return m, nil
 	case MetaUpdateMsg:
 		m.sessionTokens = msg.Tokens
@@ -302,6 +310,13 @@ func (m Model) handleKey(k tea.Key) (tea.Model, tea.Cmd) {
 	// only y/n (or Esc for no) are accepted, no Enter needed.
 	if m.approval != nil {
 		switch {
+		case k.Code == tea.KeyDown || k.Code == tea.KeyPgDown:
+			lines, pageSize := m.approvalDetails()
+			m.approvalScroll = min(m.approvalScroll+1, max(0, len(lines)-pageSize))
+		case k.Code == tea.KeyUp || k.Code == tea.KeyPgUp:
+			if m.approvalScroll > 0 {
+				m.approvalScroll--
+			}
 		case k.Code == 'y' || k.Code == 'Y':
 			m.approval.Reply <- true
 			m.approval = nil
@@ -1034,8 +1049,8 @@ func userPanel(line string, width int) string {
 // panel: a full-width block with a peach left border (not a box), a
 // warning "△ Approval required" header, the tool line, the raw detail,
 // and the option row. It stays inline-first (no alt-screen overlay).
-func (m Model) approvalBox() string {
-	width := 60
+func (m Model) approvalGeometry() (width, textWidth int) {
+	width = 60
 	if m.width > 8 && m.width-4 < width {
 		width = m.width - 4
 	}
@@ -1047,14 +1062,46 @@ func (m Model) approvalBox() string {
 	// (2+2) narrower. Wrap and right-align against that text width,
 	// or the option row wraps (a row exactly text-wide already
 	// pushes its last word onto the next line).
-	textWidth := width - 5
+	textWidth = width - 5
 	if textWidth < 10 {
 		textWidth = 10
 	}
-	tool, summary, detail := parseApprovalPrompt(m.approval.Prompt)
+	return width, textWidth
+}
+
+func (m Model) approvalDetails() ([]string, int) {
+	_, textWidth := m.approvalGeometry()
+	detail := m.approval.Arguments
+	if m.approval.ToolName == "" {
+		detail = m.approval.Prompt
+	}
+	detailLines := strings.Split(ansi.Hardwrap(detail, textWidth, true), "\n")
+	pageSize := 12
+	if m.height > 0 {
+		pageSize = max(1, m.height-12)
+	}
+	return detailLines, pageSize
+}
+
+func (m Model) approvalBox() string {
+	width, textWidth := m.approvalGeometry()
+	tool, detail := m.approval.ToolName, m.approval.Arguments
+	summary := toolSummary(tool, detail)
+	if tool == "" {
+		summary, detail = m.approval.Prompt, m.approval.Prompt
+	}
+	// The summary is only a label; the complete invocation remains scrollable.
+	summary = ansi.Truncate(strings.SplitN(summary, "\n", 2)[0], textWidth-2, "…")
 	header := styleWarning.Render("△") + " " + styleTitle.Render("Approval required")
 	toolLine := "  " + styleMuted.Render(toolIcon(tool)) + " " + styleBase.Render(summary)
-	detailLines := wrapText(detail, textWidth)
+	detailLines, pageSize := m.approvalDetails()
+	start := min(m.approvalScroll, max(0, len(detailLines)-pageSize))
+	end := min(len(detailLines), start+pageSize)
+	position := ""
+	if len(detailLines) > pageSize {
+		position = fmt.Sprintf("\n  Lines %d–%d/%d · ↑/↓ scroll", start+1, end, len(detailLines))
+	}
+	detailLines = detailLines[start:end]
 	// Option row: the selected option has a solid blue background
 	// (the colour the opencode screenshots show for the focused
 	// button); the hint sits at the right edge.
@@ -1075,32 +1122,13 @@ func (m Model) approvalBox() string {
 	for _, l := range detailLines {
 		b.WriteString("\n" + styleMuted.Render(l))
 	}
-	b.WriteString("\n" + optionRow)
+	b.WriteString(position + "\n" + optionRow)
 	st := raisedBackground(lipgloss.NewStyle().
 		Border(lipgloss.Border{Left: "┃"}, false, false, false, true).
 		BorderForeground(colorPeach).
 		Padding(1, 2).
 		Width(width))
 	return st.Render(b.String())
-}
-
-// parseApprovalPrompt splits an approval prompt "Run <tool> <json>?"
-// into the tool name, a one-line summary and the detail (the raw
-// JSON). It falls back to the raw prompt when the shape is
-// unexpected, so the dialog never hides what it is asking about.
-func parseApprovalPrompt(prompt string) (tool, summary, detail string) {
-	rest := strings.TrimSuffix(strings.TrimPrefix(prompt, "Run "), "?")
-	i := strings.Index(rest, " ")
-	if i < 0 {
-		return "", prompt, prompt
-	}
-	tool = rest[:i]
-	detail = rest[i+1:]
-	summary = toolSummary(tool, detail)
-	if summary == tool {
-		summary = prompt
-	}
-	return tool, summary, detail
 }
 
 // wrapText word-wraps s at width runes.

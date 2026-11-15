@@ -12,8 +12,10 @@ import (
 // blocks on Reply; the model answers it from a y/n keypress. The agent
 // never touches Bubble Tea directly — it only calls Approver.Ask.
 type ApprovalRequest struct {
-	Prompt string
-	Reply  chan bool // buffered: the answer never blocks the UI
+	ToolName  string
+	Arguments string
+	Prompt    string
+	Reply     chan bool // buffered: the answer never blocks the UI
 }
 
 // ApprovalMsg carries a new approval request into the model.
@@ -33,8 +35,12 @@ func NewApprover(p *tea.Program) *Approver {
 // Ask sends the request to the model and blocks until the user answers
 // y or n. If the program is gone (quit while waiting), Reply stays
 // unread and the process exits anyway — Ask never returns an error.
-func (a *Approver) Ask(prompt string) (bool, error) {
-	req := &ApprovalRequest{Prompt: prompt, Reply: make(chan bool, 1)}
+func (a *Approver) Ask(input agent.ApprovalRequest) (bool, error) {
+	req := &ApprovalRequest{ToolName: input.ToolName, Arguments: input.Arguments, Prompt: input.Prompt(), Reply: make(chan bool, 1)}
+	return a.ask(req)
+}
+
+func (a *Approver) ask(req *ApprovalRequest) (bool, error) {
 	a.program.Send(ApprovalMsg{Request: req})
 	return <-req.Reply, nil
 }
@@ -45,7 +51,7 @@ func (a *Approver) Ask(prompt string) (bool, error) {
 // the RPC GUI offer all three decisions.
 func (a *Approver) ConfirmContinuation(req agent.ContinuationRequest) (agent.ContinuationDecision, error) {
 	prompt := fmt.Sprintf("Repeated tool call: %s %s was requested %d times with identical input. Continue once?", req.ToolName, req.InputPreview, req.RepeatCount)
-	ok, err := a.Ask(prompt)
+	ok, err := a.ask(&ApprovalRequest{Prompt: prompt, Reply: make(chan bool, 1)})
 	if err != nil {
 		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
 	}

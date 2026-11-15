@@ -203,26 +203,16 @@ func decodeRequest(line string) (Request, error) {
 // It returns the parsed object; when the args do not parse, the raw
 // string, so the GUI still sees what was asked.
 func parseToolArgs(argsJSON string) any {
+	if !json.Valid([]byte(argsJSON)) {
+		return argsJSON
+	}
 	var v any
-	if err := json.Unmarshal([]byte(argsJSON), &v); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(argsJSON))
+	decoder.UseNumber()
+	if err := decoder.Decode(&v); err != nil {
 		return argsJSON
 	}
 	return v
-}
-
-// parseApprovalPrompt splits an approval prompt "Run <tool> <json>?"
-// into the tool name and its args. It falls back to the raw prompt
-// when the shape is unexpected, so the dialog never hides what it is
-// asking about. (Same shape as the TUI's parser; the rpc package
-// stays stdlib-only, so it carries its own copy.)
-func parseApprovalPrompt(prompt string) (tool string, args any) {
-	rest := strings.TrimSuffix(strings.TrimPrefix(prompt, "Run "), "?")
-	i := strings.Index(rest, " ")
-	if i < 0 {
-		return "", prompt
-	}
-	tool, argsJSON := rest[:i], rest[i+1:]
-	return tool, parseToolArgs(argsJSON)
 }
 
 // capOutput caps s at maxChars with a head+tail cut, like the loop's

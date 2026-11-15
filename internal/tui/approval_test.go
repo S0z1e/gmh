@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"minimalharness/internal/agent"
 )
 
 // The full channel path: Approver.Ask sends the request into a running
@@ -24,7 +25,7 @@ func TestApproverAskAnsweredByKey(t *testing.T) {
 		approver := NewApprover(prog)
 		result := make(chan bool, 1)
 		go func() {
-			ok, err := approver.Ask("Run write?")
+			ok, err := approver.Ask(agent.ApprovalRequest{ToolName: "write", Arguments: `{}`})
 			if err != nil {
 				t.Errorf("Ask error: %v", err)
 			}

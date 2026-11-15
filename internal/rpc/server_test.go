@@ -416,8 +416,9 @@ func TestApprovalApproveAndDeny(t *testing.T) {
 		{"deny", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			content := strings.Repeat("中", 300) + "TAIL?"
 			a, runner, root := setupTestApp(t, "suggest", []fakeStep{
-				{kind: "tool", tool: "write", args: map[string]any{"path": "u.txt", "content": "hello"}},
+				{kind: "tool", tool: "write", args: map[string]any{"path": "u.txt", "content": content}},
 				{kind: "text", text: "OK, noted."},
 			})
 			d := startDriver(t, a, runner)
@@ -427,6 +428,9 @@ func TestApprovalApproveAndDeny(t *testing.T) {
 			appr := d.waitFor("approval_request", 5*time.Second)
 			if appr["tool"] != "write" {
 				t.Fatalf("approval tool = %v, want write", appr["tool"])
+			}
+			if args, ok := appr["args"].(map[string]any); !ok || args["content"] != content {
+				t.Fatal("approval_request lost full content")
 			}
 			id, _ := appr["id"].(string)
 			if id == "" {

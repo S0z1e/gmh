@@ -339,7 +339,7 @@ func TestModelBackspaceAndCursor(t *testing.T) {
 }
 
 func TestModelApprovalDialogReplacesInput(t *testing.T) {
-	req := &ApprovalRequest{Prompt: `Run write {"path":"x.txt"}?`, Reply: make(chan bool, 1)}
+	req := &ApprovalRequest{ToolName: "write", Arguments: `{"path":"x.txt"}`, Reply: make(chan bool, 1)}
 	m := NewModel("")
 	m = apply(t, m, ApprovalMsg{Request: req})
 	view := m.View().Content
@@ -603,14 +603,25 @@ type errTestType string
 
 func (e errTestType) Error() string { return string(e) }
 
-func TestParseApprovalPrompt(t *testing.T) {
-	tool, summary, detail := parseApprovalPrompt(`Run write {"path":"dialog.txt","content":"hi"}?`)
-	if tool != "write" || summary != "Write dialog.txt" || detail != `{"path":"dialog.txt","content":"hi"}` {
-		t.Fatalf("parsed = (%q, %q, %q)", tool, summary, detail)
+func TestApprovalScrollShowsCompleteArguments(t *testing.T) {
+	m := NewModel("")
+	m.width, m.height = 60, 24
+	m.approval = &ApprovalRequest{ToolName: "write", Arguments: `{"content":"` + strings.Repeat("中", 300) + `TAIL?"}`, Reply: make(chan bool, 1)}
+	if strings.Contains(m.approvalBox(), "TAIL?") {
+		t.Fatal("expected detail pagination")
 	}
-	tool, summary, detail = parseApprovalPrompt("Run bash?")
-	if tool != "" || summary != "Run bash?" {
-		t.Fatalf("unparseable prompt = (%q, %q, %q)", tool, summary, detail)
+	for i := 0; i < 100; i++ {
+		next, _ := m.handleKey(tea.Key{Code: tea.KeyDown})
+		m = next.(Model)
+	}
+	if !strings.Contains(m.approvalBox(), "TAIL?") {
+		t.Fatal("last argument bytes are inaccessible")
+	}
+	last := m.approvalScroll
+	next, _ := m.handleKey(tea.Key{Code: tea.KeyUp})
+	m = next.(Model)
+	if m.approvalScroll != last-1 {
+		t.Fatal("scrolling back from the end is stuck")
 	}
 }
 

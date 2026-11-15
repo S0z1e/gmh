@@ -192,9 +192,9 @@ func main() {
 // terminal only delivers a line once it is typed — and type-ahead
 // ("y" typed before the prompt appears) now works too, instead of
 // being swallowed by the scanner's read-ahead.
-func askFromScanner(scanner *bufio.Scanner) func(string) (bool, error) {
-	return func(prompt string) (bool, error) {
-		fmt.Printf("%s [y/N] ", prompt)
+func askFromScanner(scanner *bufio.Scanner) func(agent.ApprovalRequest) (bool, error) {
+	return func(req agent.ApprovalRequest) (bool, error) {
+		fmt.Printf("%s [y/N] ", req.Prompt())
 		if !scanner.Scan() {
 			if err := scanner.Err(); err != nil {
 				return false, err

@@ -142,7 +142,7 @@ Events (stdout):
 - `tool_backgrounded` / `background_wait` / `tool_background_done` —
   the background bash events, the same shapes as the CLI's scrollback
   notices.
-- `approval_request` `{"id":"appr-1","tool":"write","args":{...},"prompt":"Run write ...?"}` — emitted by the approval bridge (not
+- `approval_request` `{"id":"appr-1","tool":"write","args":{...},"prompt":"Run write ...?"}` — `args` contains the complete invocation, without a preview cap; render it in a scrollable or expandable view. Emitted by the approval bridge (not
   by the loop's `approval` event, which the server ignores to avoid
   sending it twice). The agent blocks until the GUI answers; in
   `-mode auto` or with `--deny-instead-of-prompt` no request is ever
