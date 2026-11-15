@@ -142,15 +142,18 @@ type anthropicEvent struct {
 		Signature string `json:"signature"`
 	} `json:"content_block"`
 	Message struct {
-		Usage anthropicUsage `json:"usage"`
+		Usage *anthropicUsage `json:"usage"`
 	} `json:"message"`
-	Usage anthropicUsage `json:"usage"`
+	Usage *anthropicUsage `json:"usage"`
 }
 
 type anthropicUsage struct {
-	InputTokens          int `json:"input_tokens"`
-	OutputTokens         int `json:"output_tokens"`
-	CacheReadInputTokens int `json:"cache_read_input_tokens"`
+	hasInput, hasOutput, hasCreation bool
+	CacheCreationInputTokens         int  `json:"cache_creation_input_tokens"`
+	CacheUsageReported               bool `json:"-"`
+	InputTokens                      int  `json:"input_tokens"`
+	OutputTokens                     int  `json:"output_tokens"`
+	CacheReadInputTokens             int  `json:"cache_read_input_tokens"`
 }
 
 // toAnthropicMessages converts the shared Message history into an
@@ -270,6 +273,35 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 	var msg Message
 	msg.Role = "assistant"
 	var usage Usage
+	var inputUsage anthropicUsage
+	recordUsage := func(delta *anthropicUsage) {
+		if delta == nil {
+			return
+		}
+		if delta.hasInput {
+			inputUsage.InputTokens = delta.InputTokens
+		}
+		if delta.hasCreation {
+			inputUsage.CacheCreationInputTokens = delta.CacheCreationInputTokens
+		}
+		if delta.CacheUsageReported {
+			inputUsage.CacheReadInputTokens = delta.CacheReadInputTokens
+			inputUsage.CacheUsageReported = true
+		}
+		if delta.hasOutput {
+			inputUsage.OutputTokens = delta.OutputTokens
+		}
+		usage.PromptTokens = inputUsage.InputTokens + inputUsage.CacheReadInputTokens + inputUsage.CacheCreationInputTokens
+		usage.CachedTokens = inputUsage.CacheReadInputTokens
+		usage.CompletionTokens = inputUsage.OutputTokens
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+		usage.CacheUsageReported = inputUsage.CacheUsageReported
+		if usage.CacheUsageReported {
+			usage.CacheUsageSource = "cache_read_input_tokens"
+		}
+		usage.normalize()
+		traceUsage(ctx, usage)
+	}
 	// thinkingSignature accumulates the thinking block's signature
 	// (content_block_start + signature_delta). It is opaque replay
 	// data, never text: it is kept here only so a future step that
@@ -310,8 +342,7 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 		}
 		switch ev.Type {
 		case "message_start":
-			usage.PromptTokens = ev.Message.Usage.InputTokens
-			usage.CachedTokens = ev.Message.Usage.CacheReadInputTokens
+			recordUsage(ev.Message.Usage)
 		case "content_block_start":
 			a, ok := accs[ev.Index]
 			if !ok {
@@ -359,7 +390,7 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			}
 		case "message_delta":
 			msg.FinishReason = ev.Delta.StopReason
-			usage.CompletionTokens = ev.Usage.OutputTokens
+			recordUsage(ev.Usage)
 		case "message_stop":
 			sawStop = true
 		}

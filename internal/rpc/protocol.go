@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"minimalharness/internal/agent"
+	"minimalharness/internal/llm"
 )
 
 // Request is one line from the GUI. ID is echoed in the response when
@@ -81,10 +82,13 @@ type Response struct {
 
 // UsageJSON is one usage object: prompt/cached/completion/total tokens.
 type UsageJSON struct {
-	Prompt     int `json:"prompt"`
-	Cached     int `json:"cached"`
-	Completion int `json:"completion"`
-	Total      int `json:"total"`
+	CacheUsageReported        bool   `json:"cache_usage_reported"`
+	CacheUsageSource          string `json:"cache_usage_source,omitempty"`
+	CacheReportedPromptTokens int    `json:"cache_reported_prompt_tokens"`
+	Prompt                    int    `json:"prompt"`
+	Cached                    int    `json:"cached"`
+	Completion                int    `json:"completion"`
+	Total                     int    `json:"total"`
 	// Reasoning is the thinking part of the completion tokens: a
 	// subset of Completion, never an extra charge. Omitted when the
 	// provider did not report it.
@@ -97,7 +101,10 @@ type UsageJSON struct {
 // tool_backgrounded, background_wait, tool_background_done,
 // approval_request, agent_settled, compacted, error.
 type Event struct {
-	Type string `json:"type"`
+	Request   *llm.RequestTrace `json:"request,omitempty"`
+	Operation string            `json:"operation,omitempty"`
+	Attempt   int               `json:"attempt,omitempty"`
+	Type      string            `json:"type"`
 	// ready: protocol version and session identity.
 	Protocol int    `json:"protocol,omitempty"`
 	Session  string `json:"session,omitempty"`

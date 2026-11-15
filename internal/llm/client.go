@@ -82,9 +82,12 @@ type Usage struct {
 	// CachedTokens is filled from whichever field the provider returns:
 	// top-level cached_tokens, prompt_cache_hit_tokens, or
 	// prompt_tokens_details.cached_tokens. See Usage.normalize.
-	CachedTokens         int `json:"cached_tokens"`
-	PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
-	PromptTokensDetails  struct {
+	CachedTokens              int    `json:"cached_tokens"`
+	CacheUsageReported        bool   `json:"cache_usage_reported"`
+	CacheUsageSource          string `json:"cache_usage_source,omitempty"`
+	CacheReportedPromptTokens int    `json:"cache_reported_prompt_tokens"`
+	PromptCacheHitTokens      int    `json:"prompt_cache_hit_tokens"`
+	PromptTokensDetails       struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
 	CompletionTokensDetails struct {
@@ -137,7 +140,7 @@ type streamChunk struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage Usage `json:"usage"`
+	Usage *Usage `json:"usage"`
 }
 
 // --- Responses API wire shapes ---
@@ -170,9 +173,10 @@ type reasoningParams struct {
 }
 
 type responsesUsage struct {
-	InputTokens        int `json:"input_tokens"`
-	OutputTokens       int `json:"output_tokens"`
-	TotalTokens        int `json:"total_tokens"`
+	CacheUsageReported bool `json:"-"`
+	InputTokens        int  `json:"input_tokens"`
+	OutputTokens       int  `json:"output_tokens"`
+	TotalTokens        int  `json:"total_tokens"`
 	InputTokensDetails struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"input_tokens_details"`
@@ -210,15 +214,17 @@ type responsesEvent struct {
 				Text string `json:"text"`
 			} `json:"content"`
 		} `json:"output"`
-		Usage responsesUsage `json:"usage"`
+		Usage *responsesUsage `json:"usage"`
 	} `json:"response"`
 }
 
 type Client struct {
-	BaseURL string // may be with or without /v1
-	APIKey  string
-	Model   string
-	API     string // "chat" (default), "responses" or "anthropic"
+	traceMu       sync.Mutex
+	previousTrace *RequestTrace
+	BaseURL       string // may be with or without /v1
+	APIKey        string
+	Model         string
+	API           string // "chat" (default), "responses" or "anthropic"
 	// MaxTokens is the per-response output budget, sent by all three
 	// modes (chat: max_tokens, responses: max_output_tokens,
 	// anthropic: max_tokens). 0 = defaultAnthropicMaxTokens.
@@ -454,6 +460,7 @@ func (c *Client) doPost(ctx context.Context, body []byte) (*http.Response, conte
 // cancelling first would close the body mid-stream). On any error
 // the cancel is already called and nil is returned.
 func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[string]string, withBearer bool) (*http.Response, context.CancelFunc, error) {
+	c.traceRequest(ctx, body)
 	// The request runs on a derived context so the first-byte idle
 	// deadline can abort it: if the server sends no response
 	// headers within the idle timeout, the stream is stalled before
@@ -506,6 +513,7 @@ func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[str
 		cancel()
 		return nil, nil, fmt.Errorf("%w: no response headers for %s from model %q", ErrIdleTimeout, c.idleTimeout(), c.Model)
 	}
+	traceResponseHeaders(ctx, resp)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
@@ -541,7 +549,16 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolDef, 
 // Responses, thinking_delta in Anthropic). Thinking is display-only:
 // it is never part of the returned message's Content, and signatures
 // / encrypted_content are never passed through it.
-func (c *Client) Stream(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage), onThinking func(string)) error {
+func (c *Client) Stream(ctx context.Context, messages []Message, tools []ToolDef, onText func(string), onDone func(Message, Usage), onThinking func(string)) (err error) {
+	ctx, finish := startRequestTrace(ctx)
+	defer func() { finish(err) }()
+	done := onDone
+	onDone = func(m Message, u Usage) {
+		u.normalize()
+		if done != nil {
+			done(m, u)
+		}
+	}
 	if c.APIKey == "" {
 		return fmt.Errorf("missing API key: set OPENAI_API_KEY")
 	}
@@ -647,9 +664,13 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
 		}
-		if chunk.Usage.TotalTokens != 0 {
-			usage = chunk.Usage
+		if chunk.Usage != nil {
+			usage = *chunk.Usage
+			if usage.TotalTokens == 0 {
+				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			}
 			usage.normalize()
+			traceUsage(ctx, usage)
 		}
 		for _, ch := range chunk.Choices {
 			if ch.FinishReason != "" {
@@ -857,6 +878,10 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
 			continue
 		}
+		if u := ev.Response.Usage; u != nil {
+			usage = u.sharedUsage()
+			traceUsage(ctx, usage)
+		}
 		switch ev.Type {
 		case "response.output_text.delta":
 			if ev.Delta != "" {
@@ -962,8 +987,6 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 		case "response.incomplete":
 			sawCompleted = true
 			msg.FinishReason = "incomplete"
-			u := ev.Response.Usage
-			usage = Usage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens}
 		case "response.completed":
 			msg.FinishReason = "stop"
 			sawCompleted = true
@@ -1008,10 +1031,6 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 						}
 					}
 				}
-			}
-			u := ev.Response.Usage
-			if u.TotalTokens != 0 {
-				usage = Usage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens, CachedTokens: u.InputTokensDetails.CachedTokens, ReasoningTokens: u.OutputTokensDetails.ReasoningTokens}
 			}
 		}
 	}

@@ -27,6 +27,7 @@ const (
 	// is non-empty; a call with no thinking emits nothing.
 	EventThinkingEnd EventKind = "thinking_end"
 	EventStepUsage   EventKind = "step_usage"
+	EventLLMRequest  EventKind = "llm_request"
 	EventToolStart   EventKind = "tool_start"
 	EventToolEnd     EventKind = "tool_end"
 	// EventApproval fires when the loop pauses for a tool approval.
@@ -122,7 +123,10 @@ type Event struct {
 	// JobID names the background job for the background events.
 	JobID string
 	// Usage is the per-call usage for StepUsage, the turn total for Done.
-	Usage llm.Usage
+	Usage     llm.Usage
+	Request   *llm.RequestTrace
+	Operation string
+	Attempt   int
 	// Err is the failure for EventError.
 	Err error
 	// TerminalReason says why the turn ended, for Done and Error.

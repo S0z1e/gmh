@@ -32,7 +32,9 @@ type Config struct {
 	// OnEvent receives every loop event; the caller renders them.
 	// (There is no OnText: streamed text arrives as TextDelta events.)
 	OnEvent func(Event)
-	Ask     func(prompt string) (bool, error) // nil = use stdin prompt
+	// TraceRequests emits content-free request diagnostics and audits each attempt.
+	TraceRequests bool
+	Ask           func(prompt string) (bool, error) // nil = use stdin prompt
 	// ConfirmContinuation is the doom-loop guard's seam: it asks the
 	// user whether a tool call repeated Threshold times may continue,
 	// with "once" / "session" / "deny" (and optionally updated
@@ -541,6 +543,20 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 	attempts := c.maxLLMAttempts()
 	var err error
 	for attempt := 1; attempt <= attempts; attempt++ {
+		requestCtx := ctx
+		if c.TraceRequests {
+			requestCtx = llm.WithRequestObserver(ctx, func(trace llm.RequestTrace) {
+				c.emit(Event{Kind: EventLLMRequest, Request: &trace, Operation: operation, Attempt: attempt})
+				if c.Session != nil {
+					_ = c.Session.Audit(struct {
+						Kind      string           `json:"kind"`
+						Operation string           `json:"operation"`
+						Attempt   int              `json:"attempt"`
+						Request   llm.RequestTrace `json:"request"`
+					}{"llm_request", operation, attempt, trace})
+				}
+			})
+		}
 		outputSeen := false
 		doneSeen := false
 		wrappedText := func(s string) {
@@ -562,7 +578,7 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 				onThinking(s)
 			}
 		}
-		err = c.Client.Stream(ctx, apiMsgs, tools, wrappedText, wrappedDone, wrappedThinking)
+		err = c.Client.Stream(requestCtx, apiMsgs, tools, wrappedText, wrappedDone, wrappedThinking)
 		if err == nil {
 			return attempt, nil
 		}

@@ -823,7 +823,7 @@ func stylePrintLine(l string) string {
 	}
 }
 
-var usageRe = regexp.MustCompile(`^(turn|session): prompt=(\d+) \(cached=(\d+)\) completion=(\d+) total=(\d+)`)
+var usageRe = regexp.MustCompile(`^(turn|session): prompt=(\d+) \(cached=(unknown|\d+(?:\+unknown)?)\) completion=(\d+) total=(\d+)`)
 
 // formatUsage restyles one runner usage line:
 // "[usage] turn: prompt=3922 (cached=1920) completion=215 total=4137
@@ -847,6 +847,12 @@ func formatUsage(line string) string {
 		return rest
 	}
 	nums := func(s string) string {
+		if prefix, ok := strings.CutSuffix(s, "+unknown"); ok {
+			n, err := strconv.Atoi(prefix)
+			if err == nil {
+				return formatInt(n) + "+unknown"
+			}
+		}
 		n, err := strconv.Atoi(s)
 		if err != nil {
 			return s

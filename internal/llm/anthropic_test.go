@@ -144,8 +144,8 @@ func TestAnthropicStreamTextAndThinking(t *testing.T) {
 	if len(got.ToolCalls) != 0 {
 		t.Fatalf("want no tool calls, got %+v", got.ToolCalls)
 	}
-	if gotUsage.PromptTokens != 15 || gotUsage.CachedTokens != 5 || gotUsage.CompletionTokens != 20 || gotUsage.TotalTokens != 35 {
-		t.Fatalf("usage = %+v, want prompt 15 cached 5 completion 20 total 35", gotUsage)
+	if gotUsage.PromptTokens != 20 || gotUsage.CachedTokens != 5 || gotUsage.CompletionTokens != 20 || gotUsage.TotalTokens != 40 {
+		t.Fatalf("usage = %+v, want prompt 20 cached 5 completion 20 total 40", gotUsage)
 	}
 	if gotAuth != "Bearer test-key" {
 		t.Fatalf("Authorization = %q", gotAuth)

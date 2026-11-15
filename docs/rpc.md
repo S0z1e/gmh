@@ -105,9 +105,31 @@ Events (stdout):
   call with no thinking emits neither event. Thinking is display-only:
   it never enters `agent_settled.text`, the session file, or
   `history`.
-- `step_usage` `{"usage":{"prompt":N,"cached":N,"completion":N,"total":N,"reasoning":N}}` — per LLM call. `reasoning` is the thinking
+- `llm_request` `{"operation":"LLM call","attempt":1,"request":{...}}` —
+  emitted after every HTTP attempt, including retries and failed streams, and
+  persisted in the session audit sidecar. `request` includes an opaque `id`,
+  `previous_id`, model/API, SHA-256 hashes of the endpoint, session cache key,
+  actual request, system, tools, settings and individual wire messages;
+  `relation` (`baseline`, `identical`, `append`, `rewrite`), `shared_messages`,
+  zero-based `first_changed_message` when an old message changes or is removed,
+  and separate scope/system/tools/settings change flags. Relation compares
+  messages only: unchanged messages do not guarantee an unchanged tool prefix.
+  `started_at`, `request_bytes`, `status_code`, `headers_ms`, `duration_ms`,
+  `outcome` and optional `upstream_request_id` correlate latency and errors.
+  `headers_ms` measures response headers, not time to the first model token.
+  `usage` is present when received, including usage on an interrupted chat
+  stream. No prompt content, image bytes, API keys, arbitrary headers or error
+  bodies are included. Comparisons are to the previous observed request on the
+  client, not server token-prefix measurements. A scope change starts a baseline.
+- `step_usage` `{"usage":{"prompt":N,"cached":N,"completion":N,"total":N,"reasoning":N,"cache_usage_reported":true,"cache_reported_prompt_tokens":N}}` — per LLM call. `reasoning` is the thinking
   part of the completion tokens — a subset of `completion`, never an
   extra charge — and is omitted when the provider did not report it.
+  `cache_usage_reported` distinguishes an explicit zero from an absent/null cache
+  counter; false means unknown, even when `cached` is zero. The optional
+  `cache_usage_source` names the provider field. Turn/session totals set reported
+  true only when all counted usage reports cache counters, and use `partial` for
+  mixed coverage. `cache_reported_prompt_tokens` sums only input with known cache
+  counters, so unknown usage is not silently used as a miss-rate denominator.
 - `tool_start` `{"tool":"read","args":{...}}` — args as parsed JSON
   (the raw string when unparseable).
 - `tool_end` `{"tool":"...","output":"...","truncated":bool,"error":null|"...","detail":"...","count":N}` — output capped at 32 KiB head+tail, like the loop's

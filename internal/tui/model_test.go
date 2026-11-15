@@ -91,6 +91,16 @@ func TestModelHeaderPrintsOnceNotInView(t *testing.T) {
 // thousands separators) and errors become "✗ <text>"; the literal
 // numbers must survive the styling.
 func TestStylePrintRestylesUsageAndErrors(t *testing.T) {
+	for _, cached := range []string{"unknown", "1200+unknown"} {
+		got := stripANSI(stylePrint("[usage] turn: prompt=3922 (cached=" + cached + ") completion=215 total=4137"))
+		wantCached := cached
+		if cached == "1200+unknown" {
+			wantCached = "1,200+unknown"
+		}
+		if got != "   turn · prompt 3,922 (cached "+wantCached+") · completion 215 · total 4,137" {
+			t.Fatalf("usage restyled wrong: %q", got)
+		}
+	}
 	if got := stripANSI(stylePrint("[usage] turn: prompt=3922 (cached=1920) completion=215 total=4137")); got != "   turn · prompt 3,922 (cached 1,920) · completion 215 · total 4,137" {
 		t.Fatalf("usage restyled wrong: %q", got)
 	}

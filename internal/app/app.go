@@ -388,6 +388,7 @@ func Setup(p Params) (*App, error) {
 		Exec:                executor,
 		Tools:               a.allTools,
 		System:              system,
+		TraceRequests:       true,
 		Mode:                mode,
 		MaxSteps:            p.MaxSteps,
 		Session:             store,

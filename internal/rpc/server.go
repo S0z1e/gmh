@@ -776,6 +776,8 @@ func (s *Server) onEvent(ev agent.Event) {
 	case agent.EventStepUsage:
 		s.turnUsage.Add(ev.Usage)
 		s.writeEvent(Event{Type: "step_usage", Usage: usageJSON(ev.Usage)})
+	case agent.EventLLMRequest:
+		s.writeEvent(Event{Type: "llm_request", Request: ev.Request, Operation: ev.Operation, Attempt: ev.Attempt})
 	case agent.EventToolStart:
 		s.writeEvent(Event{Type: "tool_start", Tool: ev.ToolName, Args: parseToolArgs(ev.ToolArgs)})
 	case agent.EventToolEnd:
@@ -1129,7 +1131,7 @@ func (s *Server) feeLabel() string {
 }
 
 func usageJSON(u llm.Usage) *UsageJSON {
-	return &UsageJSON{Prompt: u.PromptTokens, Cached: u.CachedTokens, Completion: u.CompletionTokens, Total: u.TotalTokens, Reasoning: u.ReasoningTokens}
+	return &UsageJSON{Prompt: u.PromptTokens, Cached: u.CachedTokens, Completion: u.CompletionTokens, Total: u.TotalTokens, Reasoning: u.ReasoningTokens, CacheUsageReported: u.CacheUsageReported, CacheUsageSource: u.CacheUsageSource, CacheReportedPromptTokens: u.CacheReportedPromptTokens}
 }
 
 func truncateRunes(s string, n int) string {
