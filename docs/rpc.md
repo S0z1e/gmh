@@ -181,12 +181,12 @@ arrived, a later error ends the turn instead. A turn that still fails reports
   text and the grace call (if any) failed too. The GUI waits for this event, never for the
   `prompt` response. `tool_mode` is the loop's tool mode at the end
   of the turn, so the GUI knows which tools the next turn offers.
-- `compacted` `{"messages":N,"summary_tokens":N}` — a compaction
+- `compacted` `{"messages":N,"summary_tokens":N}` — a context checkpoint
   succeeded (manual `/compact` or automatic inside the tool loop): the
-  history was replaced by a summary, `messages` is the new message
-  count, `summary_tokens` is the summary's token count (the
-  completion tokens of the compact call, which generated it). The
-  CLI and TUI keep their `[compact]` print and see nothing new; the
+  history was replaced by a summary or a pruned context. `messages` is the new
+  message count; `summary_tokens` is the compact call's completion-token count,
+  or zero when older tool outputs were pruned without a model call. The
+  CLI and TUI print `[compact]`; the
   GUI should re-fetch `history` after this event, since the
   transcript it holds is now stale.
 - `error` `{"error":"..."}` — protocol-level errors only (a malformed

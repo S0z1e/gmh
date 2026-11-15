@@ -1404,7 +1404,7 @@ func (r *Runner) configureCompaction() {
 		if r.OnCompact != nil {
 			r.OnCompact(len(history), usage.CompletionTokens)
 		}
-		r.Print("[compact] history replaced by summary; original transcript saved to %s", archive)
+		r.Print("[compact] context checkpoint saved; original transcript saved to %s", archive)
 	}
 }
 

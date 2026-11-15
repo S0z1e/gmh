@@ -678,14 +678,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		// the session, and thinking_end fires only when it is
 		// non-empty.
 		var thinking strings.Builder
-		// Send the truncated view to the LLM; the full history stays
-		// in msgs and in the session file. The cap is uniform (see
-		// truncate.go): a result's sent form never changes after
-		// its first send, so the cached prefix stays valid. Old tool
-		// results are then pruned to a fixed placeholder once the
-		// history passes the prune threshold, which bounds prompt
-		// growth on long runs; the prune's block boundaries are
-		// frozen, so the sent view stays append-only between prunes.
+		// Rendering uses a fixed per-result cap. Old content changes only
+		// at a persisted checkpoint when the context budget is reached.
 		if c.ContextLimit > 0 && c.needsCompact(msgs) {
 			compacted, usage, err := c.compactInLoop(ctx, msgs)
 			total.Add(usage)
@@ -1041,7 +1035,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			if failedFixes >= MaxFailedFixAttempts {
 				if len(pending) > 0 {
-					_, _ = c.drainPending(ctx, msgs, pending)
+					msgs, _ = c.drainPending(ctx, msgs, pending)
 				}
 				blocked := fmt.Errorf("task blocked: %d consecutive steps ended with only failed tool calls; the last error was not fixed by retrying", MaxFailedFixAttempts)
 				// Blocked-grace summary, mirroring the step-cap
@@ -1052,12 +1046,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				// turn settled blocked with an empty text). One
 				// tool-less final call asks for a short summary
 				// of what was verified, what failed and what is
-				// left; it is persisted, and a failed grace
-				// call changes nothing.
+				// left. Only a complete answer is persisted.
 				if ctx.Err() == nil {
-					if graceText, graceUsage, ok := c.graceCall(ctx, msgs, blockedGracePrompt(blocked, lastErrors)); ok {
+					graceText, graceUsage, ok := c.graceCall(ctx, msgs, blockedGracePrompt(blocked, lastErrors))
+					total.Add(graceUsage)
+					if ok {
 						lastText = graceText
-						total.Add(graceUsage)
 					}
 				}
 				c.LastTerminalReason = TerminalBlocked
@@ -1072,7 +1066,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	// bound applies here too, and the job's result is delivered at
 	// the next turn via the Run-start re-attach.
 	if len(pending) > 0 {
-		_, _ = c.drainPending(ctx, msgs, pending)
+		msgs, _ = c.drainPending(ctx, msgs, pending)
 	}
 	// Step-cap grace period, after Gemini CLI: a hard cut throws
 	// away the turn, so the model gets one final, tool-less call —
@@ -1081,11 +1075,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	// turn; the temporary instruction stays local. The turn still
 	// ends with the cap error and TerminalMaxTurns; only the final
 	// text (and its usage) is the grace answer instead of the last
-	// tool-call step's text. A failed grace call changes nothing.
+	// tool-call step's text. A failed final attempt adds no assistant
+	// message; a context checkpoint may already have been committed.
 	if ctx.Err() == nil {
-		if graceText, graceUsage, ok := c.graceCall(ctx, msgs, "You have reached the step limit. Give your best final answer now, summarising what was done and what remains unfinished. Do not call any more tools."); ok {
+		graceText, graceUsage, ok := c.graceCall(ctx, msgs, "You have reached the step limit. Give your best final answer now, summarising what was done and what remains unfinished. Do not call any more tools.")
+		total.Add(graceUsage)
+		if ok {
 			lastText = graceText
-			total.Add(graceUsage)
 		}
 	}
 	capped := fmt.Errorf("step cap reached (%d); the task was not finished", steps)
@@ -1105,6 +1101,19 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	defer cancel()
 	graceMsgs := append(append([]llm.Message{}, msgs...),
 		llm.Message{Role: "user", Content: instruction})
+	var total llm.Usage
+	if c.ContextLimit > 0 && c.needsCompact(graceMsgs) {
+		compacted, u, err := c.compactInLoop(graceCtx, msgs)
+		total.Add(u)
+		c.emit(Event{Kind: EventStepUsage, Usage: u})
+		if err != nil {
+			return "", total, false
+		}
+		graceMsgs = append(compacted, llm.Message{Role: "user", Content: instruction})
+		if c.needsCompact(graceMsgs) {
+			return "", total, false
+		}
+	}
 	apiMsgs := c.promptView(graceMsgs)
 	var final llm.Message
 	var usage llm.Usage
@@ -1123,17 +1132,22 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	}, func() {
 		thinking.Reset()
 	})
+	total.Add(usage)
+	if usage.PromptTokens > 0 {
+		c.LastPromptTokens = usage.PromptTokens
+		c.lastPromptEstimate = estimatePromptTokens(apiMsgs, nil)
+	}
+	c.emit(Event{Kind: EventStepUsage, Usage: usage})
 	if err != nil || final.Content == "" || len(final.ToolCalls) > 0 || final.FinishReason == "length" || final.FinishReason == "max_tokens" || final.FinishReason == "incomplete" {
-		return "", llm.Usage{}, false
+		return "", total, false
 	}
 	if c.Session != nil {
 		c.persist(final)
 		if c.persistErr != nil {
-			return "", usage, false
+			return "", total, false
 		}
 	}
-	c.emit(Event{Kind: EventStepUsage, Usage: usage})
-	return final.Content, usage, true
+	return final.Content, total, true
 }
 
 // stoppedReport gives callers a usable failure report even if the last tool-call

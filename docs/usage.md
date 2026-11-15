@@ -85,6 +85,14 @@
   Retries are labelled `Compaction` in `step_retry` events. Failed or truncated
   summaries never replace history. If retries are exhausted, the turn stops
   with an explicit failure report rather than an empty answer.
+- Context checkpoints: normal requests use one fixed 32 KiB cap per tool
+  result and never prune by age. At the compaction boundary, the harness first
+  tries replacing older tool outputs with a fixed placeholder, keeping the
+  latest tool batch. It commits that view only if it brings estimated/projected
+  input below 60% of the trigger budget; otherwise it generates a summary.
+  Both paths archive the full transcript and persist the replacement atomically,
+  so resume retains the checkpoint. This trades larger input between checkpoints
+  for fewer prefix rewrites; it does not guarantee lower token cost or cache hits.
 - Step budget: steps are unlimited by default (like Claude Code,
   Codex, Gemini, Qwen, OpenCode and Pi): a turn runs until the model
   stops calling tools, an error ends it, or the task is blocked
@@ -98,8 +106,9 @@
   one tool-less call (60s) whose prompt names the blocked reason
   and the last errors, so the settled text is a short summary of
   what was verified, what failed and what is left — a blocked turn
-  used to settle with an empty text and no report at all. A failed
-  grace call changes nothing in either case.
+  used to settle with an empty text and no report at all. Grace requests use
+  the same context checkpoint guard. A failed final attempt adds no assistant
+  message, but any completed checkpoint and reported usage are retained.
 - Repeat-failure circuit breaker (after Qoder's denial circuit
   breaker, adapted): the doom-loop guard only sees consecutive
   repeats, so a call that keeps failing with other work in between

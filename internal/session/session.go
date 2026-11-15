@@ -136,6 +136,8 @@ const clearMarkerRole = "__clear__"
 // message written after it (plus later messages).
 const compactMarkerRole = "__compact__"
 
+const maxRecordBytes = 4 * 1024 * 1024
+
 // Clear records a clear point in the session file. The caller also drops
 // its in-memory history; Load after this returns only later messages.
 func (s *Store) Clear() error {
@@ -147,22 +149,41 @@ func (s *Store) MarkCompact(summary string) error {
 	return s.MarkCompactMessages([]llm.Message{{Role: "user", Kind: "summary", Content: "Previous conversation summary:\n" + summary}})
 }
 
-// MarkCompactMessages commits the summary and active task in a single record.
+// MarkCompactMessages commits replacement context (a summary or pruned history)
+// in a single record.
 func (s *Store) MarkCompactMessages(msgs []llm.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.file == nil {
 		return os.ErrClosed
 	}
-	b, err := json.Marshal(struct {
-		Role     string        `json:"role"`
-		Messages []llm.Message `json:"messages"`
-	}{compactMarkerRole, msgs})
+	b, err := marshalCheckpoint(msgs)
 	if err != nil {
 		return err
 	}
 	_, err = s.file.Write(append(b, '\n'))
 	return err
+}
+
+// CheckpointFits reports whether a replacement can be loaded as one session
+// record. Large raw histories should be summarized instead of pruned.
+func CheckpointFits(msgs []llm.Message) bool {
+	_, err := marshalCheckpoint(msgs)
+	return err == nil
+}
+
+func marshalCheckpoint(msgs []llm.Message) ([]byte, error) {
+	b, err := json.Marshal(struct {
+		Role     string        `json:"role"`
+		Messages []llm.Message `json:"messages"`
+	}{compactMarkerRole, msgs})
+	if err != nil {
+		return nil, err
+	}
+	if len(b)+1 >= maxRecordBytes {
+		return nil, fmt.Errorf("session checkpoint exceeds the %d-byte record limit", maxRecordBytes)
+	}
+	return b, nil
 }
 
 // ArchiveCopy copies the current session file to a new file in the same
@@ -311,7 +332,7 @@ func Load(id string) ([]llm.Message, error) {
 	defer f.Close()
 	var msgs []llm.Message
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	sc.Buffer(make([]byte, 64*1024), maxRecordBytes)
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {

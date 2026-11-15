@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -130,26 +131,97 @@ func estimatePromptTokens(msgs []llm.Message, defs []llm.ToolDef) int {
 }
 
 func (c *Config) promptView(msgs []llm.Message) []llm.Message {
-	view := truncateToolResults(session.RepairToolBatches(msgs), toolResultMaxChars)
-	return pruneOldToolResults(view, pruneThresholdChars, pruneBlockChars, pruneKeepNewestBlocks)
+	return truncateToolResults(session.RepairToolBatches(msgs), toolResultMaxChars)
 }
 
-// needsCompact combines measured usage with growth since the last request.
-func (c *Config) needsCompact(msgs []llm.Message) bool {
+func (c *Config) contextBudget() int {
 	budget := int(float64(c.ContextLimit) * CompactThreshold)
 	if c.Client != nil && c.Client.MaxTokens > 0 {
 		budget = min(budget, c.ContextLimit-c.Client.MaxTokens)
 	}
-	estimated := estimatePromptTokens(c.promptView(msgs), c.Tools)
+	return budget
+}
+
+// contextTokens combines measured usage with estimated changes since the last
+// request. It also accounts for removed content when evaluating a checkpoint.
+func (c *Config) contextTokens(view []llm.Message) int {
+	estimated := estimatePromptTokens(view, c.Tools)
 	projected := c.LastPromptTokens
 	if c.lastPromptEstimate > 0 {
-		projected += max(0, estimated-c.lastPromptEstimate)
+		projected += estimated - c.lastPromptEstimate
 	}
-	return max(estimated, projected) >= budget
+	return max(estimated, projected)
+}
+
+func (c *Config) needsCompact(msgs []llm.Message) bool {
+	return c.contextTokens(c.promptView(msgs)) >= c.contextBudget()
 }
 
 func (c *Config) compactInLoop(ctx context.Context, msgs []llm.Message) ([]llm.Message, llm.Usage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, llm.Usage{}, err
+	}
+	if pruned, ok := c.pruneCheckpoint(msgs); ok {
+		return c.commitCheckpoint(pruned, llm.Usage{})
+	}
 	return c.compactMessages(ctx, msgs, true)
+}
+
+// pruneCheckpoint is attempted only at the context-budget boundary, never
+// while rendering a normal request. Keep the latest tool batch intact and
+// reclaim enough space for a substantial append-only interval (60% of the
+// trigger budget). If old tool outputs cannot do that, generate a summary.
+func (c *Config) pruneCheckpoint(msgs []llm.Message) ([]llm.Message, bool) {
+	base := session.RepairToolBatches(msgs)
+	if c.Session != nil {
+		// A context hook may supply a transient rewrite. Persisting that
+		// entire view would turn its temporary edits into session history.
+		// Such turns use summary compaction instead of a raw-view checkpoint.
+		var history []llm.Message
+		for _, m := range base {
+			if m.Role != "system" {
+				history = append(history, m)
+			}
+		}
+		saved, err := session.Load(c.Session.ID)
+		if err != nil {
+			return nil, false
+		}
+		// Compare persisted fields: hydrated image bytes deliberately stay
+		// in memory and must not make an otherwise identical history differ.
+		currentJSON, currentErr := json.Marshal(history)
+		savedJSON, savedErr := json.Marshal(saved)
+		if currentErr != nil || savedErr != nil || !bytes.Equal(currentJSON, savedJSON) {
+			return nil, false
+		}
+	}
+	view := truncateToolResults(base, toolResultMaxChars)
+	newestBatch := -1
+	for i := len(view) - 1; i >= 0; i-- {
+		if view[i].Role == "assistant" && len(view[i].ToolCalls) > 0 {
+			newestBatch = i
+			break
+		}
+	}
+	if newestBatch < 0 {
+		return nil, false
+	}
+	out := append([]llm.Message(nil), base...)
+	target := c.contextBudget() * 3 / 5
+	for i := 0; i < newestBatch; i++ {
+		if view[i].Role != "tool" || len(view[i].Content) <= len(prunedToolResultPlaceholder) {
+			continue
+		}
+		view[i].Content = prunedToolResultPlaceholder
+		out[i].Content = prunedToolResultPlaceholder
+		if c.contextTokens(view) <= target {
+			if c.Session != nil && !session.CheckpointFits(out) {
+				return nil, false
+			}
+			return out, true
+		}
+	}
+	return nil, false
 }
 
 // Compact manually replaces history by a summary, using the same checkpoint as
@@ -190,7 +262,22 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 			}
 		}
 	}
+	return c.commitCheckpoint(append(system, replacement...), usage)
+}
+
+// commitCheckpoint persists both pruning and summaries through the same atomic
+// session marker. Resume therefore keeps exactly the view sent after a rewrite.
+func (c *Config) commitCheckpoint(msgs []llm.Message, usage llm.Usage) ([]llm.Message, llm.Usage, error) {
+	var system, replacement []llm.Message
+	for _, m := range msgs {
+		if m.Role == "system" {
+			system = append(system, m)
+		} else {
+			replacement = append(replacement, m)
+		}
+	}
 	archive := ""
+	var err error
 	if c.Session != nil {
 		archive, err = c.Session.ArchiveCopy(fmt.Sprintf("%s-pre-compact-%d", c.Session.ID, time.Now().UnixNano()))
 		if err == nil {
