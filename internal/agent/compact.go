@@ -122,6 +122,10 @@ func estimatePromptTokens(msgs []llm.Message, defs []llm.ToolDef) int {
 	bytes, images := len(schemas), 0
 	for _, m := range msgs {
 		bytes += len(m.Content) + len(m.Role) + len(m.ToolCallID) + 24
+		if len(m.AnthropicContent) > 0 {
+			// Text and tool input are already counted through shared fields.
+			for _,block:= range m.AnthropicContent { bytes += len(block.Thinking)+len(block.Signature)+len(block.Data)+24 }
+		}
 		images += len(m.Images)
 		for _, tc := range m.ToolCalls {
 			bytes += len(tc.Function.Arguments) + len(tc.Function.Name) + len(tc.ID) + 24

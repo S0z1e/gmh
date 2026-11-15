@@ -63,6 +63,14 @@ request body of the two OpenAI modes only; Anthropic
 ignores it. Structural keys (`model`, `messages`, `tools`, `stream`,
 `max_tokens`, …) are never overridden by it.
 
+For Anthropic, the optional per-model `thinking` selects `adaptive` or
+`enabled` when `effort` is set. By default known Claude 4.6+ IDs use adaptive
+thinking plus `output_config.effort`; older Claude and unknown gateway IDs
+retain manual budgets. Set `thinking` explicitly for model aliases.
+Manual thinking requires `maxTokens` greater than 1024. Anthropic response
+blocks (including opaque signatures) are persisted for replay through tool
+loops; signatures and redacted data are never rendered as text.
+
 `effort` (`low`, `medium` or `high`; empty means the provider
 default) is how hard a reasoning model thinks, sent per API shape:
 chat sends `reasoning_effort`, responses sends

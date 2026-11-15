@@ -132,6 +132,7 @@ type Model struct {
 	// (at least 1024 tokens, always below maxTokens). A model that
 	// does not reason ignores it; a non-reasoning model should
 	// leave it unset.
+	Thinking      string `json:"thinking"` // anthropic: "", "adaptive", or "enabled"
 	Effort        string `json:"effort"`
 	ContextWindow *int   `json:"contextWindow"`
 	MaxTokens     *int   `json:"maxTokens"`
@@ -499,6 +500,7 @@ func (p Provider) ResolveModel(id string) (Model, bool) {
 			m.BaseURL = e.BaseURL
 		}
 		m.Reasoning = e.Reasoning
+		m.Thinking = e.Thinking
 		if eff, err := normalizeEffort(e.Effort); err == nil {
 			m.Effort = eff
 		} else {
@@ -639,6 +641,9 @@ func validateModel(provider string, m Model) error {
 	}
 	if m.ContextWindow != nil && *m.ContextWindow <= 0 {
 		return fmt.Errorf("provider %q model %q: contextWindow must be > 0", provider, m.ID)
+	}
+	if m.Thinking != "" && m.Thinking != "adaptive" && m.Thinking != "enabled" {
+		return fmt.Errorf("provider %q model %q: thinking must be adaptive or enabled", provider, m.ID)
 	}
 	if _, err := normalizeEffort(m.Effort); err != nil {
 		return fmt.Errorf("provider %q model %q: %w", provider, m.ID, err)

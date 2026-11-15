@@ -30,6 +30,7 @@ type Message struct {
 	Kind         string     `json:"kind,omitempty"`
 	ToolError    bool       `json:"tool_error,omitempty"`
 	FinishReason string     `json:"finish_reason,omitempty"`
+	Refusal      string     `json:"refusal,omitempty"`
 	Role         string     `json:"role"`
 	Content      string     `json:"content,omitempty"`
 	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
@@ -38,6 +39,8 @@ type Message struct {
 	// file stores their path and media type, never the bytes; the
 	// bytes are re-read from disk on --resume.
 	Images []Image `json:"images,omitempty"`
+	// AnthropicContent preserves provider blocks and signatures for exact replay.
+	AnthropicContent []AnthropicContentBlock `json:"anthropic_content,omitempty"`
 }
 
 type ToolCall struct {
@@ -125,6 +128,7 @@ type streamChunk struct {
 	Choices []struct {
 		Delta struct {
 			Content string `json:"content"`
+			Refusal string `json:"refusal"`
 			// ReasoningContent is the model's thinking for this delta
 			// (DeepSeek / OpenConsole). It is not the answer and must
 			// never enter msg.Content; it goes to onThinking instead.
@@ -241,7 +245,8 @@ type Client struct {
 	// a thinking budget derived from MaxTokens (see
 	// effortThinkingBudget). A model that does not reason ignores
 	// it.
-	Effort string
+	Thinking string // empty selects a format from the model ID; enabled/adaptive override it
+	Effort   string
 	// Timeout is the total per-request cap (http.Client.Timeout):
 	// 0 = DefaultTotalTimeout. It is a backstop for a request that
 	// never finishes at all; a slow-but-alive stream is governed
@@ -660,6 +665,9 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 			sawDone = true
 			break
 		}
+		if err := streamProviderError("chat", data); err != nil {
+			return err
+		}
 		var chunk streamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
@@ -673,6 +681,7 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 			traceUsage(ctx, usage)
 		}
 		for _, ch := range chunk.Choices {
+			msg.Refusal += ch.Delta.Refusal
 			if ch.FinishReason != "" {
 				msg.FinishReason = ch.FinishReason
 			}
@@ -874,6 +883,9 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 		if data == "[DONE]" {
 			break
 		}
+		if err := streamProviderError("responses", data); err != nil {
+			return err
+		}
 		var ev responsesEvent
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
 			continue
@@ -883,6 +895,8 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 			traceUsage(ctx, usage)
 		}
 		switch ev.Type {
+		case "response.refusal.delta":
+			msg.Refusal += ev.Delta
 		case "response.output_text.delta":
 			if ev.Delta != "" {
 				msg.Content += ev.Delta

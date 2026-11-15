@@ -383,7 +383,7 @@ func Setup(p Params) (*App, error) {
 	a.allTools = append(agent.ToolDefs(), pluginTools...)
 	timeout, idle := clientTimeouts(mdl)
 	a.Cfg = &agent.Config{
-		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort, PromptCacheKey: a.sessionID(), Timeout: timeout, IdleTimeout: idle},
+		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort, Thinking: mdl.Thinking, PromptCacheKey: a.sessionID(), Timeout: timeout, IdleTimeout: idle},
 		Exec:                executor,
 		Tools:               a.allTools,
 		System:              system,
@@ -654,7 +654,7 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 		contextLimit = config.DefaultContextWindow
 	}
 	timeout, idle := clientTimeouts(mdl)
-	a.Cfg.Client = &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort, PromptCacheKey: a.sessionID(), Timeout: timeout, IdleTimeout: idle}
+	a.Cfg.Client = &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort, Thinking: mdl.Thinking, PromptCacheKey: a.sessionID(), Timeout: timeout, IdleTimeout: idle}
 	a.Cfg.Exec.ImageInput = slices.Contains(mdl.Input, "image")
 	a.Model = mdl
 	a.Provider = provName

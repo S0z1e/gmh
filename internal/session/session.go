@@ -388,6 +388,7 @@ func RepairToolBatches(msgs []llm.Message) []llm.Message {
 			// These arguments were never dispatched. A partially generated
 			// name or JSON object must not poison the next provider request.
 			m.ToolCalls = nil
+			m.AnthropicContent = nil
 			if m.Content == "" {
 				m.Content = "[The model output was truncated before its tool calls were complete. No tools from this response were executed.]"
 			}

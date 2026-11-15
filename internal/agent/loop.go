@@ -763,6 +763,19 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		}
 		if len(assistant.ToolCalls) == 0 {
 			if len(pending) == 0 {
+				if assistant.Refusal != "" || assistant.FinishReason == "refusal" || assistant.FinishReason == "content_filter" || strings.TrimSpace(lastText) == "" {
+					message := "model returned an empty answer without tool calls"
+					if assistant.Refusal != "" || assistant.FinishReason == "refusal" || assistant.FinishReason == "content_filter" {
+						message = "model refused the request"
+						if assistant.Refusal != "" {
+							message += ": " + assistant.Refusal
+						}
+					}
+					err := fmt.Errorf("%s", message)
+					c.LastTerminalReason = TerminalError
+					c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: TerminalError})
+					return lastText, total, err
+				}
 				// Turn-end gate (Claude's Stop hook): a plugin stop
 				// hook may veto the end — e.g. a check the final
 				// answer failed. The reason is fed back to the

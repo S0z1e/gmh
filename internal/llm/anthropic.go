@@ -18,7 +18,7 @@
 //     merge into one, because Anthropic requires strict
 //     user/assistant alternation.
 //   - reasoning: Agents-A1 emits thinking blocks before its answer.
-//     They are skipped, like reasoning_content in chat mode.
+//     They are displayed separately and preserved as blocks for replay.
 //
 // The event sequence was probed live against Discovery 2026-11-09:
 // message_start, content_block_start (thinking, then text or
@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -39,13 +40,42 @@ import (
 // Anthropic requires max_tokens; the default is 16384.
 const defaultAnthropicMaxTokens = 16384
 
+// Known Claude 4.6+ models use adaptive thinking. Unknown compatible gateway
+// model IDs retain the manual format; config can override aliases explicitly.
+func anthropicThinkingMode(model string) string {
+	parts := strings.Split(strings.TrimPrefix(strings.ToLower(model), "claude-"), "-")
+	if strings.HasPrefix(strings.ToLower(model), "claude-") && len(parts) > 1 {
+		if parts[0] == "mythos" || parts[0] == "fable" {
+			return "adaptive"
+		}
+		version := parts[1:]
+		if _, err := strconv.Atoi(parts[0]); err == nil {
+			version = parts
+		}
+		major, err := strconv.Atoi(version[0])
+		minor := 0
+		if len(version) > 1 {
+			minor, _ = strconv.Atoi(version[1])
+		}
+		if err == nil && (major >= 5 || (major == 4 && minor >= 6 && minor < 100)) {
+			return "adaptive"
+		}
+	}
+	return "enabled"
+}
+
 type anthropicTool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"input_schema"`
 }
 
-type anthropicContentBlock struct {
+// AnthropicContentBlock is a replayable Messages API block. Signatures and
+// redacted data are opaque; never render them as answer or thinking text.
+type AnthropicContentBlock struct {
+	Thinking  string          `json:"thinking,omitempty"`
+	Signature string          `json:"signature,omitempty"`
+	Data      string          `json:"data,omitempty"`
 	Type      string          `json:"type"`
 	Text      string          `json:"text,omitempty"`
 	ID        string          `json:"id,omitempty"`
@@ -58,6 +88,17 @@ type anthropicContentBlock struct {
 	Source *anthropicImageSource `json:"source,omitempty"`
 }
 
+func (b AnthropicContentBlock) MarshalJSON() ([]byte, error) {
+	type plain AnthropicContentBlock
+	if b.Type == "thinking" {
+		return json.Marshal(struct {
+			plain
+			Thinking string `json:"thinking"`
+		}{plain(b), b.Thinking})
+	}
+	return json.Marshal(plain(b))
+}
+
 type anthropicImageSource struct {
 	Type      string `json:"type"` // "base64"
 	MediaType string `json:"media_type"`
@@ -66,7 +107,7 @@ type anthropicImageSource struct {
 
 type anthropicMessage struct {
 	Role    string                  `json:"role"`
-	Content []anthropicContentBlock `json:"content"`
+	Content []AnthropicContentBlock `json:"content"`
 }
 
 type anthropicRequest struct {
@@ -78,13 +119,16 @@ type anthropicRequest struct {
 	Stream    bool               `json:"stream"`
 	// Thinking enables extended thinking with a token budget.
 	// Nil omits the field (the provider default).
-	Thinking *anthropicThinking `json:"thinking,omitempty"`
+	Thinking     *anthropicThinking `json:"thinking,omitempty"`
+	OutputConfig *struct {
+		Effort string `json:"effort"`
+	} `json:"output_config,omitempty"`
 }
 
 // anthropicThinking is the Messages API's thinking object.
 type anthropicThinking struct {
 	Type         string `json:"type"` // "enabled"
-	BudgetTokens int    `json:"budget_tokens"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
 // effortThinkingBudget maps a reasoning-effort level to an
@@ -133,15 +177,8 @@ type anthropicEvent struct {
 		PartialJSON string `json:"partial_json"`
 		StopReason  string `json:"stop_reason"`
 	} `json:"delta"`
-	ContentBlock struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
-		Name string `json:"name"`
-		// Signature is a thinking block's signature, sent with its
-		// content_block_start. Opaque replay data, never text.
-		Signature string `json:"signature"`
-	} `json:"content_block"`
-	Message struct {
+	ContentBlock AnthropicContentBlock `json:"content_block"`
+	Message      struct {
 		Usage *anthropicUsage `json:"usage"`
 	} `json:"message"`
 	Usage *anthropicUsage `json:"usage"`
@@ -167,12 +204,12 @@ type anthropicUsage struct {
 func toAnthropicMessages(messages []Message) (string, []anthropicMessage) {
 	var system []string
 	var msgs []anthropicMessage
-	appendBlock := func(role string, b anthropicContentBlock) {
+	appendBlock := func(role string, b AnthropicContentBlock) {
 		if len(msgs) > 0 && msgs[len(msgs)-1].Role == role {
 			msgs[len(msgs)-1].Content = append(msgs[len(msgs)-1].Content, b)
 			return
 		}
-		msgs = append(msgs, anthropicMessage{Role: role, Content: []anthropicContentBlock{b}})
+		msgs = append(msgs, anthropicMessage{Role: role, Content: []AnthropicContentBlock{b}})
 	}
 	for _, m := range messages {
 		switch m.Role {
@@ -184,7 +221,7 @@ func toAnthropicMessages(messages []Message) (string, []anthropicMessage) {
 			// Images first, then the text: the same order as the
 			// direct probe that verified Agents-A1 image input.
 			for _, img := range imageParts(m) {
-				appendBlock("user", anthropicContentBlock{
+				appendBlock("user", AnthropicContentBlock{
 					Type: "image",
 					Source: &anthropicImageSource{
 						Type: "base64", MediaType: img.MediaType, Data: img.Data,
@@ -192,18 +229,27 @@ func toAnthropicMessages(messages []Message) (string, []anthropicMessage) {
 				})
 			}
 			if m.Content != "" {
-				appendBlock("user", anthropicContentBlock{Type: "text", Text: m.Content})
+				appendBlock("user", AnthropicContentBlock{Type: "text", Text: m.Content})
 			}
 		case "assistant":
+			if len(m.AnthropicContent) > 0 {
+				for _, block := range anthropicReplayBlocks(m) {
+					if block.Type == "text" && block.Text == "" {
+						continue
+					}
+					appendBlock("assistant", block)
+				}
+				continue
+			}
 			if m.Content != "" {
-				appendBlock("assistant", anthropicContentBlock{Type: "text", Text: m.Content})
+				appendBlock("assistant", AnthropicContentBlock{Type: "text", Text: m.Content})
 			}
 			for _, tc := range m.ToolCalls {
 				input := json.RawMessage(tc.Function.Arguments)
 				if len(input) == 0 || !json.Valid(input) {
 					input = json.RawMessage("{}")
 				}
-				appendBlock("assistant", anthropicContentBlock{
+				appendBlock("assistant", AnthropicContentBlock{
 					Type: "tool_use", ID: tc.ID, Name: tc.Function.Name, Input: input,
 				})
 			}
@@ -212,12 +258,73 @@ func toAnthropicMessages(messages []Message) (string, []anthropicMessage) {
 			if content == "" {
 				content = "(no output)"
 			}
-			appendBlock("user", anthropicContentBlock{
+			appendBlock("user", AnthropicContentBlock{
 				Type: "tool_result", ToolUseID: m.ToolCallID, Content: content, IsError: m.ToolError,
 			})
 		}
 	}
 	return strings.Join(system, "\n"), msgs
+}
+
+// Context hooks may rewrite shared text/tool fields. Retain opaque thinking
+// while reflecting those explicit edits in the otherwise exact block replay.
+func anthropicReplayBlocks(m Message) []AnthropicContentBlock {
+	var text strings.Builder
+	for _, b := range m.AnthropicContent {
+		if b.Type == "text" {
+			text.WriteString(b.Text)
+		}
+	}
+	changedText := text.String() != m.Content
+	textWritten := false
+	calls := map[string]ToolCall{}
+	for _, tc := range m.ToolCalls {
+		calls[tc.ID] = tc
+	}
+	seen := map[string]bool{}
+	var blocks []AnthropicContentBlock
+	for _, b := range m.AnthropicContent {
+		switch b.Type {
+		case "text":
+			if changedText {
+				if textWritten {
+					continue
+				}
+				b.Text = m.Content
+				textWritten = true
+			}
+			if b.Text == "" {
+				continue
+			}
+		case "tool_use":
+			tc, ok := calls[b.ID]
+			if !ok {
+				continue
+			}
+			b.Name = tc.Function.Name
+			if string(b.Input) != tc.Function.Arguments {
+				b.Input = json.RawMessage(tc.Function.Arguments)
+			}
+			if !json.Valid(b.Input) {
+				b.Input = json.RawMessage("{}")
+			}
+			seen[b.ID] = true
+		}
+		blocks = append(blocks, b)
+	}
+	if changedText && !textWritten && m.Content != "" {
+		blocks = append(blocks, AnthropicContentBlock{Type: "text", Text: m.Content})
+	}
+	for _, tc := range m.ToolCalls {
+		if !seen[tc.ID] {
+			input := json.RawMessage(tc.Function.Arguments)
+			if !json.Valid(input) {
+				input = json.RawMessage("{}")
+			}
+			blocks = append(blocks, AnthropicContentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Function.Name, Input: input})
+		}
+	}
+	return blocks
 }
 
 // anthropicBearerAuth reports whether the Anthropic call should
@@ -252,7 +359,21 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 		Messages: anthMsgs, Tools: atools, Stream: true,
 	}
 	if c.Effort != "" {
-		anthReq.Thinking = &anthropicThinking{Type: "enabled", BudgetTokens: effortThinkingBudget(c.Effort, maxTokens)}
+		mode := c.Thinking
+		if mode == "" {
+			mode = anthropicThinkingMode(c.Model)
+		}
+		anthReq.Thinking = &anthropicThinking{Type: mode}
+		if mode == "adaptive" {
+			anthReq.OutputConfig = &struct {
+				Effort string `json:"effort"`
+			}{c.Effort}
+		} else {
+			if maxTokens <= 1024 {
+				return fmt.Errorf("Anthropic enabled thinking requires maxTokens greater than 1024")
+			}
+			anthReq.Thinking.BudgetTokens = effortThinkingBudget(c.Effort, maxTokens)
+		}
 	}
 	body, err := json.Marshal(anthReq)
 	if err != nil {
@@ -302,17 +423,12 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 		usage.normalize()
 		traceUsage(ctx, usage)
 	}
-	// thinkingSignature accumulates the thinking block's signature
-	// (content_block_start + signature_delta). It is opaque replay
-	// data, never text: it is kept here only so a future step that
-	// persists thinking can replay it verbatim, and it is never
-	// passed to onThinking.
-	var thinkingSignature strings.Builder
 	type acc struct {
-		id   string
-		name string
-		kind string
-		args strings.Builder
+		id    string
+		name  string
+		kind  string
+		args  strings.Builder
+		block AnthropicContentBlock
 	}
 	accs := map[int]*acc{}
 	order := []int{}
@@ -336,6 +452,9 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 		if data == "[DONE]" {
 			break
 		}
+		if err := streamProviderError("anthropic", data); err != nil {
+			return err
+		}
 		var ev anthropicEvent
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
 			continue
@@ -353,14 +472,22 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			a.kind = ev.ContentBlock.Type
 			a.id = ev.ContentBlock.ID
 			a.name = ev.ContentBlock.Name
-			// A thinking block's signature arrives with its start
-			// event; record it (opaque replay data, never text).
-			if ev.ContentBlock.Type == "thinking" && ev.ContentBlock.Signature != "" {
-				thinkingSignature.WriteString(ev.ContentBlock.Signature)
+			a.block = ev.ContentBlock
+			if a.kind == "text" && a.block.Text != "" {
+				msg.Content += a.block.Text
+				if onText != nil {
+					onText(a.block.Text)
+				}
+			}
+			if a.kind == "thinking" && a.block.Thinking != "" && onThinking != nil {
+				onThinking(a.block.Thinking)
 			}
 		case "content_block_delta":
 			switch ev.Delta.Type {
 			case "text_delta":
+				if a := accs[ev.Index]; a != nil {
+					a.block.Text += ev.Delta.Text
+				}
 				if ev.Delta.Text != "" {
 					msg.Content += ev.Delta.Text
 					if onText != nil {
@@ -368,6 +495,9 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 					}
 				}
 			case "thinking_delta":
+				if a := accs[ev.Index]; a != nil {
+					a.block.Thinking += ev.Delta.Thinking
+				}
 				// Thinking is display-only: forward it, never add
 				// it to the answer.
 				if ev.Delta.Thinking != "" && onThinking != nil {
@@ -376,7 +506,9 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			case "signature_delta":
 				// Opaque replay data, not text: accumulate it and
 				// never forward it to onThinking.
-				thinkingSignature.WriteString(ev.Delta.Signature)
+				if a := accs[ev.Index]; a != nil {
+					a.block.Signature += ev.Delta.Signature
+				}
 			case "input_json_delta":
 				a, ok := accs[ev.Index]
 				if !ok {
@@ -404,12 +536,31 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	for _, idx := range order {
 		a := accs[idx]
+		if a.kind == "tool_use" && (a.id == "" || a.name == "") {
+			return fmt.Errorf("Anthropic tool_use is missing its id or name")
+		}
+		if a.kind == "tool_use" && a.args.Len() > 0 {
+			a.block.Input = json.RawMessage(a.args.String())
+		}
+		if a.kind == "tool_use" && !json.Valid(a.block.Input) {
+			// Truncated tool input is never dispatched or replayed as a block.
+			if msg.FinishReason == "max_tokens" {
+				continue
+			}
+			return fmt.Errorf("Anthropic tool_use %q returned invalid JSON input", a.id)
+		}
+		if a.block.Type != "" {
+			msg.AnthropicContent = append(msg.AnthropicContent, a.block)
+		}
 		if a.kind != "tool_use" || a.name == "" || a.id == "" {
 			continue
 		}
 		args := a.args.String()
 		if args == "" {
-			args = "{}"
+			args = string(a.block.Input)
+			if args == "" {
+				args = "{}"
+			}
 		}
 		msg.ToolCalls = append(msg.ToolCalls, ToolCall{
 			ID: a.id, Type: "function",

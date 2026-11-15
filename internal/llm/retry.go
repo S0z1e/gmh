@@ -61,10 +61,14 @@ func IsRetryable(err error) bool {
 	if errors.Is(err, ErrIdleTimeout) {
 		return true
 	}
+	var stream *StreamError
+	if errors.As(err, &stream) {
+		return stream.retryable()
+	}
 	var api *APIError
 	if errors.As(err, &api) {
 		switch api.StatusCode {
-		case 403, 429, 500, 502, 503, 504:
+		case 403, 408, 429, 500, 502, 503, 504, 529:
 			return true
 		}
 		return false
