@@ -455,10 +455,10 @@ func (c *Client) doPost(ctx context.Context, body []byte) (*http.Response, conte
 // framing headers, which this function owns; the per-call headers
 // win over config headers.
 // It also returns the request context's cancel func: the caller
-// owns cancel and must defer it AFTER deferring the body close
-// (LIFO: the body closes first, then the context is cancelled —
-// cancelling first would close the body mid-stream). On any error
-// the cancel is already called and nil is returned.
+// owns cancel and must run it before closing the body, after consuming the
+// stream. The line pump can still be reading after a terminal SSE event;
+// cancelling first releases that read so Body.Close cannot wait on it.
+// On any error the cancel is already called and nil is returned.
 func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[string]string, withBearer bool) (*http.Response, context.CancelFunc, error) {
 	c.traceRequest(ctx, body)
 	// The request runs on a derived context so the first-byte idle
@@ -626,8 +626,8 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 	if err != nil {
 		return err
 	}
-	defer cancel()
 	defer resp.Body.Close()
+	defer cancel()
 
 	var msg Message
 	msg.Role = "assistant"
@@ -818,8 +818,8 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 	if err != nil {
 		return err
 	}
-	defer cancel()
 	defer resp.Body.Close()
+	defer cancel()
 
 	var msg Message
 	msg.Role = "assistant"

@@ -267,8 +267,8 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 	if err != nil {
 		return err
 	}
-	defer cancel()
 	defer resp.Body.Close()
+	defer cancel()
 
 	var msg Message
 	msg.Role = "assistant"
