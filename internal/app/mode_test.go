@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"minimalharness/internal/agent"
+	"minimalharness/internal/llm"
 )
 
 // installPlanPlugin copies the shipped plan pilot into the test root.
@@ -199,15 +201,36 @@ func TestRunnerModeSwitchInjectsReminder(t *testing.T) {
 	if !strings.Contains(bodies[0], agent.PlanModeReminder) {
 		t.Fatal("the plan reminder was not injected into the turn's messages")
 	}
-	// The reminder is one-turn only: the next turn has no reminder.
+	// The prior snapshot remains historical; the next one records current mode.
 	if quit := r.Handle(ctx, "again"); quit {
 		t.Fatal("task should not quit")
 	}
 	if len(bodies) != 2 {
 		t.Fatalf("got %d model requests, want 2", len(bodies))
 	}
-	if strings.Contains(bodies[1], agent.PlanModeReminder) {
-		t.Fatal("the plan reminder leaked into the following turn")
+	var req struct {
+		Messages []llm.Message `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(bodies[1]), &req); err != nil {
+		t.Fatal(err)
+	}
+	last := req.Messages[len(req.Messages)-1]
+	if !strings.Contains(last.Content, "Tool mode: plan") || strings.Contains(last.Content, agent.PlanModeReminder) {
+		t.Fatal("new snapshot should record plan mode without re-injecting the old transition")
+	}
+	if _, err := a.LoadSession(a.Store.ID); err != nil {
+		t.Fatal(err)
+	}
+	r.Handle(ctx, "after resume")
+	if r.LastErr != nil || len(bodies) != 3 {
+		t.Fatalf("resumed turn: %v, requests=%d", r.LastErr, len(bodies))
+	}
+	if err := json.Unmarshal([]byte(bodies[2]), &req); err != nil {
+		t.Fatal(err)
+	}
+	last = req.Messages[len(req.Messages)-1]
+	if !strings.Contains(last.Content, "Tool mode: default") || strings.Contains(last.Content, agent.PlanModeReminder) {
+		t.Fatal("resumed default mode must supersede historical plan snapshots")
 	}
 }
 
@@ -234,11 +257,11 @@ func TestRunnerUnknownCommandFallsThrough(t *testing.T) {
 	if quit := r.Handle(context.Background(), "/nosuchthing"); quit {
 		t.Fatal("unknown command should not quit")
 	}
-	if len(a.History) != 2 {
-		t.Fatalf("history = %d messages, want 2 (the line reached the model)", len(a.History))
+	if len(a.History) != 3 {
+		t.Fatalf("history = %d messages, want 3 (the line reached the model)", len(a.History))
 	}
-	if a.History[1].Content != "hi there" {
-		t.Fatalf("assistant message = %q, want the model's answer", a.History[1].Content)
+	if a.History[2].Content != "hi there" {
+		t.Fatalf("assistant message = %q, want the model's answer", a.History[2].Content)
 	}
 }
 

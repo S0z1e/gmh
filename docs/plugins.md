@@ -116,8 +116,14 @@ compact, or session switch carries on without it.
 
 `before_agent_start` — per-turn context injection. Runs once per
 turn, before the model call, in plugin load order; the
-contributions are concatenated into one system message, each
-prefixed `"[plugin <name>] "`. The todo pilot uses it to inject
+contributions are concatenated into a `user` message with session kind
+`turn_context`, appended after the current task and persisted. Each contribution
+is prefixed `"[plugin <name>] "`. A new snapshot is appended every turn, including
+when contributions are empty; earlier snapshots are historical state. This
+keeps the system prefix stable across turns and preserves context on resume.
+Snapshots describe task-start state; later tool results and compaction summaries
+can update it. An explicit `context` hook still may rewrite the starting history.
+The todo pilot uses it to inject
 the open todos, so the model knows what is pending without calling
 `todo_list` first.
 
@@ -130,7 +136,7 @@ harness.on("before_agent_start", (input) => {
 ```
 
 `context` — rewrite the turn's starting messages. Runs once per
-turn, after `before_agent_start` and before the model call, in
+turn, before the current `before_agent_start` snapshot and the model call, in
 load order (each hook sees the previous one's rewrite). The input
 is `{session, mode, messages}` — the turn's starting history with
 the system message excluded (the harness prepends its own system
@@ -217,7 +223,7 @@ stay, because a JS tool is jailed to its own data dir and needs no
 approval). A plugin reads the mode with `harness.getMode()` and
 switches it with `harness.setMode("plan" | "default")`; an unknown
 mode is an error. Modes switch only between turns, and a switch
-queues a one-line system reminder for the next turn so the model is
+queues a reminder in the next turn's persisted context snapshot so the model is
 told the tools changed. The mode is session-only: a new or resumed
 session starts in `default`, and it is never written to the config
 file. The TUI shows a `plan` chip next to the approval-mode chip

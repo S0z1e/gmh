@@ -71,7 +71,7 @@ const (
 	DefaultModeReminder = "Back in default mode: you may write, edit and run bash again."
 )
 
-// ReminderFor returns the one-turn system reminder for entering
+// ReminderFor returns the next turn's context reminder for entering
 // mode m ("" when m is the default mode and no switch happened —
 // callers set it only on an actual switch).
 func ReminderFor(m ToolMode) string {

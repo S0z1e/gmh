@@ -103,9 +103,8 @@ type App struct {
 	// allTools is the full tool list (built-ins + plugin tools) that
 	// SetToolMode filters per mode. Cfg.Tools is the filtered view.
 	allTools []llm.ToolDef
-	// pendingReminder is a one-turn system message set by a mode
-	// switch and consumed by the next runOnce (never persisted to
-	// the session): the model needs to be told the tools changed.
+	// pendingReminder is a reminder for the next turn snapshot set by a mode
+	// switch and persisted by the next runOnce with that snapshot.
 	pendingReminder string
 }
 
@@ -693,8 +692,8 @@ func (a *App) ToolMode() agent.ToolMode {
 }
 
 // SetToolMode switches the loop's tool set between turns: the next
-// turn's tools are rebuilt from the full list, and a one-turn system
-// reminder is queued so the model is told the tools changed.
+// turn's tools are rebuilt from the full list, and a reminder for its
+// persisted context snapshot is queued so the model is told the tools changed.
 // Switching to the current mode is a no-op (no reminder). An unknown
 // mode is an error. Only ever called between turns — the loop reads
 // Cfg.Tools fresh every step, so no locking is needed.
@@ -1290,36 +1289,35 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		return
 	}
 	r.Turns++
-	// The context hook rewrites this turn's starting history
-	// (in-memory only — the session file keeps the true history).
-	// It sees the original history, before the reminder and the
-	// before_agent_start contributions below are prepended.
+	// Context hooks retain their explicit, transient rewrite semantics.
+	// The harness snapshot is appended afterwards, so mode and plugin state
+	// no longer change the system prefix or disappear on the next turn.
 	history := r.App.History
 	if r.App.Plugins != nil {
 		history = r.App.Plugins.RunContextHooks(ctx, r.App.sessionID(), string(r.App.ToolMode()), history)
 	}
-	// A mode switch queues a one-turn system reminder, and
-	// before_agent_start hooks contribute per-turn context: both are
-	// prepended as system messages to this turn's history only, so
-	// the model is told the tools changed (and what is pending)
-	// without either persisting in the session. The reminder goes
-	// first (tool set), the hook contributions after (content).
-	var prefix []llm.Message
-	if r.App.pendingReminder != "" {
-		prefix = append(prefix, llm.Message{Role: "system", Content: r.App.pendingReminder})
-		r.App.pendingReminder = ""
-	}
+	contrib := ""
 	if r.App.Plugins != nil {
-		if contrib := r.App.Plugins.RunBeforeAgentStartHooks(ctx, r.App.sessionID(), string(r.App.ToolMode())); contrib != "" {
-			prefix = append(prefix, llm.Message{Role: "system", Content: contrib})
-		}
+		contrib = r.App.Plugins.RunBeforeAgentStartHooks(ctx, r.App.sessionID(), string(r.App.ToolMode()))
 	}
-	if len(prefix) > 0 {
-		turnHistory := make([]llm.Message, 0, len(prefix)+len(history))
-		turnHistory = append(turnHistory, prefix...)
-		turnHistory = append(turnHistory, history...)
-		history = turnHistory
+	// Hooks may switch the tool mode. Capture both the final mode and its
+	// queued reminder only after all before-agent-start hooks have finished.
+	parts := []string{fmt.Sprintf("[harness turn context]\nState at the start of this user task. Tool mode: %s. Earlier snapshots are historical. Later tool results and conversation summaries may update this state.", r.App.ToolMode())}
+	if r.App.pendingReminder != "" {
+		parts = append(parts, r.App.pendingReminder)
 	}
+	if contrib != "" {
+		parts = append(parts, contrib)
+	}
+	turnContext := llm.Message{Role: "user", Kind: "turn_context", Content: strings.Join(parts, "\n")}
+	if err := r.App.Store.Append(turnContext); err != nil {
+		r.LastErr = fmt.Errorf("save turn context: %w", err)
+		r.Print("[error] %v", r.LastErr)
+		return
+	}
+	r.App.pendingReminder = ""
+	r.App.History = append(r.App.History, turnContext)
+	history = append(append([]llm.Message(nil), history...), turnContext)
 	r.configureCompaction()
 	_, usage, err := r.App.Cfg.Run(ctx, history)
 	r.LastErr = err

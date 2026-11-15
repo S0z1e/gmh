@@ -266,8 +266,8 @@ func TestRunnerHandleTaskAndUsage(t *testing.T) {
 	if quit := r.Handle(context.Background(), "say hi"); quit {
 		t.Fatal("task should not quit")
 	}
-	if len(a.History) != 2 { // user + assistant
-		t.Fatalf("history = %d messages, want 2", len(a.History))
+	if len(a.History) != 3 { // task + context snapshot + assistant
+		t.Fatalf("history = %d messages, want 3", len(a.History))
 	}
 	if r.SessionUsage.TotalTokens != 15 {
 		t.Fatalf("session usage total = %d, want 15", r.SessionUsage.TotalTokens)
@@ -360,8 +360,8 @@ func TestRunnerKeywordTriggerLoadsSkill(t *testing.T) {
 	defer a2.Store.Close()
 	r2 := &Runner{App: a2, Print: func(format string, args ...any) {}}
 	r2.Handle(context.Background(), "just do something unrelated")
-	if len(a2.History) != 2 { // task + assistant only
-		t.Fatalf("history = %d messages, want 2 (no skill loaded)", len(a2.History))
+	if len(a2.History) != 3 { // task + context snapshot + assistant
+		t.Fatalf("history = %d messages, want 3 (no skill loaded)", len(a2.History))
 	}
 }
 
@@ -1087,8 +1087,7 @@ func writePhase4Plugin(t *testing.T, root, name, src string) {
 }
 
 // A turn runs the before_agent_start and context hooks: the model
-// sees the contribution and the rewrite, but neither is persisted —
-// the session file and the in-memory history keep the true history.
+// sees the persisted turn snapshot and a transient context rewrite.
 func TestRunnerTurnRunsPhase4Hooks(t *testing.T) {
 	var bodies [][]byte
 	srv := recordingServer(t, &bodies)
@@ -1124,13 +1123,14 @@ harness.on("context", (e) => {
 	if err := json.Unmarshal(bodies[0], &req); err != nil {
 		t.Fatalf("request body not JSON: %v", err)
 	}
-	// The first message is the harness system prompt; the hook
-	// contribution follows it as its own system message.
+	// The system prefix stays static; the hook contribution is appended
+	// after the current task and transient context rewrite.
 	if len(req.Messages) < 3 || req.Messages[0].Role != "system" {
 		t.Fatalf("request messages = %+v", req.Messages)
 	}
-	if req.Messages[1].Role != "system" || req.Messages[1].Content != "[plugin note] Remember: the vault is 7-3-9." {
-		t.Fatalf("contribution message = %+v, want the prefixed system message second", req.Messages[1])
+	snapshot := req.Messages[len(req.Messages)-1]
+	if snapshot.Role != "user" || !strings.Contains(snapshot.Content, "[plugin note] Remember: the vault is 7-3-9.") {
+		t.Fatalf("contribution message = %+v, want an appended turn snapshot", snapshot)
 	}
 	foundRewrite, foundTask := false, false
 	for _, m := range req.Messages {
@@ -1144,16 +1144,15 @@ harness.on("context", (e) => {
 	if !foundRewrite || !foundTask {
 		t.Fatalf("request messages = %+v, want the context rewrite and the task", req.Messages)
 	}
-	// Neither hook's text reached the session file or the
-	// in-memory history: the turn's history copy only.
-	if len(a.History) != 2 {
-		t.Fatalf("history = %d messages, want 2 (user + assistant)", len(a.History))
+	// The snapshot persists; the explicit context rewrite stays transient.
+	if len(a.History) != 3 || a.History[1].Kind != "turn_context" {
+		t.Fatalf("history = %d messages, want task + snapshot + assistant", len(a.History))
 	}
 	data, err := os.ReadFile(a.Store.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "7-3-9") || strings.Contains(string(data), "metric units") {
+	if !strings.Contains(string(data), "7-3-9") || strings.Contains(string(data), "metric units") {
 		t.Fatalf("session file contains hook text:\n%s", data)
 	}
 }

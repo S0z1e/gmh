@@ -510,8 +510,8 @@ func (r *Registry) RunToolResultHooks(ctx context.Context, tool, argsJSON, resul
 }
 
 // RunBeforeAgentStartHooks runs the registered before_agent_start
-// hooks in load order and returns the contributions as one system
-// message (each prefixed "[plugin <name>] ", empty contributions
+// hooks in load order and returns the contributions for the turn's persisted
+// context snapshot (each prefixed "[plugin <name>] ", empty contributions
 // dropped). A hook that throws, times out, or returns a non-string
 // is skipped with a stderr warning (fail open: the contribution is
 // additive context, never a gate).

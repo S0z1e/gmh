@@ -84,6 +84,10 @@ echoed in the response):
   unknown id is an error). The full history, no truncation — the GUI
   asked for it. After a `/clear` or a compact the file only holds
   what the model still sees, so history matches the live context.
+  `user` messages with `kind:"turn_context"` are harness mode/plugin snapshots,
+  appended after each task. They are turn-internal records, not additional user
+  tasks; rollback removes them with their task. Automatic compaction retains
+  the active task's snapshot alongside its summary.
 - `rename_session` `{"name":"old","new":"new"}` → `{"renamed":true,"from":"old","to":"new"}`. Same rename as `/rename` in the REPL.
 - `resume_session` `{"session":"..."}` → `{"session":"...","messages":N}`. Same switch as `/resume` in the REPL; `get_state` reports the new session at once.
 - `delete_session` `{"session":"..."}` → `{"deleted":true,"session":"..."}`. Removes another session's transcript, audit sidecar and pre-compact archives. The current session cannot be deleted (resume or start another one first); an unknown id is an error.

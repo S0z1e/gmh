@@ -1139,8 +1139,8 @@ func TestCompactedEventAuto(t *testing.T) {
 	d.waitFor("response", 5*time.Second)
 	// doCompact runs inside the turn, before agent_settled.
 	ev := d.waitFor("compacted", 5*time.Second)
-	if ev["messages"] != float64(2) || ev["summary_tokens"] != float64(5) {
-		t.Fatalf("compacted = %v, want messages 2 summary_tokens 5", ev)
+	if ev["messages"] != float64(3) || ev["summary_tokens"] != float64(5) {
+		t.Fatalf("compacted = %v, want messages 3 summary_tokens 5", ev)
 	}
 	d.waitFor("agent_settled", 5*time.Second)
 	d.quit(t)

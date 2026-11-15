@@ -93,6 +93,10 @@
   Both paths archive the full transcript and persist the replacement atomically,
   so resume retains the checkpoint. This trades larger input between checkpoints
   for fewer prefix rewrites; it does not guarantee lower token cost or cache hits.
+- Turn context: mode and `before_agent_start` plugin state are appended after
+  each task as a persisted snapshot. Historical snapshots remain unchanged;
+  the newest snapshot describes current state, including when no plugin adds
+  content. Explicit `context` hooks can still rewrite the request transiently.
 - Step budget: steps are unlimited by default (like Claude Code,
   Codex, Gemini, Qwen, OpenCode and Pi): a turn runs until the model
   stops calling tools, an error ends it, or the task is blocked

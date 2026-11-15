@@ -76,6 +76,26 @@ func TestContextBudgetIncludesNewResults(t *testing.T) {
 	}
 }
 
+func TestAutomaticCompactionRetainsCurrentTurnSnapshot(t *testing.T) {
+	task := llm.Message{Role: "user", Kind: "task", Content: "current task"}
+	snapshot := llm.Message{Role: "user", Kind: "turn_context", Content: "current plugin state"}
+	msgs := []llm.Message{{Role: "user", Kind: "task", Content: "old task"}, {Role: "user", Kind: "turn_context", Content: "old state"}, task, snapshot}
+	cfg := &Config{CompactHistory: func(context.Context, []llm.Message) (string, llm.Usage, error) { return "summary", llm.Usage{}, nil }}
+	out, _, err := cfg.compactInLoop(context.Background(), msgs)
+	if err != nil || len(out) != 3 || out[1].Content != task.Content || out[2].Kind != "turn_context" || out[2].Content != snapshot.Content {
+		t.Fatalf("compacted=%+v err=%v", out, err)
+	}
+}
+
+func TestAutomaticCompactionRetainsSnapshotWithoutTaskMarker(t *testing.T) {
+	msgs := []llm.Message{{Role: "user", Kind: "summary", Content: "context hook replaced task"}, {Role: "user", Kind: "turn_context", Content: "current state"}}
+	cfg := &Config{CompactHistory: func(context.Context, []llm.Message) (string, llm.Usage, error) { return "summary", llm.Usage{}, nil }}
+	out, _, err := cfg.compactInLoop(context.Background(), msgs)
+	if err != nil || len(out) != 2 || out[1].Kind != "turn_context" || out[1].Content != "current state" {
+		t.Fatalf("compacted=%+v err=%v", out, err)
+	}
+}
+
 func TestFailedCompactionPreservesHistory(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	s, err := session.New("failed-compact")

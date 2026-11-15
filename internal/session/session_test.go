@@ -108,6 +108,25 @@ func TestOversizedCheckpointLeavesSessionReadable(t *testing.T) {
 	}
 }
 
+func TestOversizedMessageLeavesSessionReadable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := New("oversized-message")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Append(llm.Message{Role: "user", Kind: "task", Content: "keep"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Append(llm.Message{Role: "user", Kind: "turn_context", Content: strings.Repeat("x", maxRecordBytes)}); err == nil {
+		t.Fatal("oversized message accepted")
+	}
+	saved, err := Load(store.ID)
+	if err != nil || len(saved) != 1 || saved[0].Content != "keep" {
+		t.Fatalf("original session changed: %v", err)
+	}
+}
+
 func TestMarkCompactKeepsOnlySummaryOnLoad(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store, err := New("test-compact")

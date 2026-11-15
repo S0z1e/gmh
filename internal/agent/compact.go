@@ -261,6 +261,15 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 				break
 			}
 		}
+		// Context hooks may replace the task message entirely. The app's
+		// current snapshot is appended after those hooks, so retain it
+		// independently of whether a task marker remains in the view.
+		for i := len(history) - 1; i >= 0; i-- {
+			if history[i].Kind == "turn_context" {
+				replacement = append(replacement, history[i])
+				break
+			}
+		}
 	}
 	return c.commitCheckpoint(append(system, replacement...), usage)
 }

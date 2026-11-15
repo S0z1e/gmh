@@ -124,6 +124,9 @@ func (s *Store) Append(m llm.Message) error {
 	if err != nil {
 		return err
 	}
+	if len(b)+1 >= maxRecordBytes {
+		return fmt.Errorf("session message exceeds the %d-byte record limit", maxRecordBytes)
+	}
 	_, err = s.file.Write(append(b, '\n'))
 	return err
 }
