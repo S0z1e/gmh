@@ -325,3 +325,79 @@ func TestBackupLifecyclePreservesOtherSessionsBackups(t *testing.T) {
 		})
 	}
 }
+
+func TestBackupLifecycleRecognizesCaseAliases(t *testing.T) {
+	for _, action := range []string{"rename", "delete"} {
+		t.Run(action, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			if err := os.MkdirAll(Dir(), 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(Dir(), "lower.jsonl")
+			if err := os.WriteFile(path, []byte(`{"role":"user","content":"private`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(filepath.Join(Dir(), "LOWER.jsonl")); os.IsNotExist(err) {
+				t.Skip("case-sensitive filesystem")
+			}
+			s, err := New("LOWER")
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.Close()
+			if action == "rename" {
+				err = RenameSession("lower", "new")
+			} else {
+				err = DeleteSession("lower")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries, err := os.ReadDir(Dir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(strings.ToLower(entry.Name()), "lower.jsonl-torn-") {
+					t.Fatalf("backup left behind: %s", entry.Name())
+				}
+			}
+		})
+	}
+}
+
+func TestBackupLifecyclePreservesCaseDistinctSession(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := os.MkdirAll(Dir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"lower", "LOWER"} {
+		path := filepath.Join(Dir(), id+".jsonl")
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if os.IsExist(err) {
+			t.Skip("case-insensitive filesystem")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = f.WriteString(`{"role":"user","content":"private`); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+		s, err := New(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Close()
+	}
+	other, err := recoveryBackups(filepath.Join(Dir(), "LOWER.jsonl"))
+	if err != nil || len(other) != 1 {
+		t.Fatalf("other=%v err=%v", other, err)
+	}
+	if err := DeleteSession("lower"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(other[0]); err != nil {
+		t.Fatalf("other backup removed: %v", err)
+	}
+}

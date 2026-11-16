@@ -104,14 +104,47 @@ func recoveryBackups(path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	prefix := filepath.Base(path) + "-torn-"
+	transcript, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	base := filepath.Base(path)
 	var backups []string
 	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) && strings.HasSuffix(entry.Name(), ".bak") && validBackupID(strings.TrimSuffix(strings.TrimPrefix(entry.Name(), prefix), ".bak")) {
-			backups = append(backups, filepath.Join(dir, entry.Name()))
+		name := entry.Name()
+		marker := strings.LastIndex(name, ".jsonl-torn-")
+		if entry.IsDir() || marker < 0 || !strings.HasSuffix(name, ".bak") {
+			continue
 		}
+		owner := name[:marker+len(".jsonl")]
+		nonce := name[marker+len(".jsonl-torn-") : len(name)-len(".bak")]
+		if !validBackupID(nonce) {
+			continue
+		}
+		if owner != base {
+			if !strings.EqualFold(owner, base) {
+				continue
+			}
+			alias, err := os.Stat(filepath.Join(dir, owner))
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if !os.SameFile(transcript, alias) {
+				continue
+			}
+		}
+		backups = append(backups, filepath.Join(dir, name))
 	}
 	return backups, nil
+}
+
+func recoveryBackupSuffix(path string) string {
+	// A generated nonce cannot contain '-', so the final marker is unambiguous
+	// even when the source ID contains markers or uses another casing.
+	return path[strings.LastIndex(path, "-torn-"):]
 }
 
 // rand.Text uses the RFC 4648 base32 alphabet. Restricting the nonce prevents

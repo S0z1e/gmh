@@ -144,12 +144,12 @@ func renameSessionFiles(oldID, newID string) error {
 	rollback := func(cause error) error {
 		for i := len(moved) - 1; i >= 0; i-- {
 			old := moved[i]
-			cause = errors.Join(cause, os.Rename(newPath+strings.TrimPrefix(old, oldPath), old))
+			cause = errors.Join(cause, os.Rename(newPath+recoveryBackupSuffix(old), old))
 		}
 		return cause
 	}
 	for _, old := range backups {
-		if err := os.Rename(old, newPath+strings.TrimPrefix(old, oldPath)); err != nil {
+		if err := os.Rename(old, newPath+recoveryBackupSuffix(old)); err != nil {
 			return rollback(err)
 		}
 		moved = append(moved, old)
