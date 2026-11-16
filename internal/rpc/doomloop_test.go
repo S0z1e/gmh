@@ -94,6 +94,43 @@ func TestContinuationCancellationRemovesRegisteredWaiter(t *testing.T) {
 	}
 }
 
+func TestAbortCleanupPrecedesNextTurnRegistration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &Server{out: io.Discard, turnCtx: ctx, turnCancel: cancel, continuations: map[string]chan agent.ContinuationDecision{}}
+	// Pause abort after cancellation, while the old turn can already exit.
+	s.approvalsMu.Lock()
+	aborted := make(chan struct{})
+	go func() { s.handleAbort(Request{}); close(aborted) }()
+	<-ctx.Done()
+	registered := make(chan struct{})
+	ch := make(chan agent.ContinuationDecision, 1)
+	go func() {
+		s.turnMu.Lock()
+		s.turnCtx = context.Background()
+		s.continuationsMu.Lock()
+		s.continuations["next-turn"] = ch
+		s.continuationsMu.Unlock()
+		s.turnMu.Unlock()
+		close(registered)
+	}()
+	select {
+	case <-registered:
+		s.approvalsMu.Unlock()
+		<-aborted
+		t.Fatal("next turn advanced before abort cleanup finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+	s.approvalsMu.Unlock()
+	<-aborted
+	<-registered
+	select {
+	case <-ch:
+		t.Fatal("abort denied next turn's continuation")
+	default:
+	}
+}
+
 // The doom-loop guard over RPC: a model that asks for the same read
 // five times gets a continuation_request (not an approval_request),
 // the GUI denies it, and the turn settles with the structured

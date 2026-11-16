@@ -416,10 +416,12 @@ func (s *Server) handleAbort(req Request) {
 		s.turnAborted = true
 		cancel()
 	}
-	s.turnMu.Unlock()
 	s.failApprovals(errAborted)
 	s.failContinuations(errAborted)
 	s.failQuestions(errAborted)
+	// Keep the next queued runTurn from registering new waiters until every
+	// waiter owned by the cancelled turn has been detached.
+	s.turnMu.Unlock()
 	s.respond(req, map[string]any{"aborted": cancel != nil}, nil)
 }
 
