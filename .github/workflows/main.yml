@@ -35,8 +35,8 @@ jobs:
       - name: Test
         run: go test ./...
 
-      - name: Test (race, TUI)
-        run: go test -race ./internal/tui/
+      - name: Test (race)
+        run: go test -race -p 2 ./...
 
       - name: Build and cross-compile
         run: |
