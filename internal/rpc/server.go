@@ -644,7 +644,7 @@ func (s *Server) ask(req agent.ApprovalRequest) (bool, error) {
 	ch := make(chan approvalAnswer, 1)
 	s.approvals[id] = ch
 	s.approvalsMu.Unlock()
-	s.writeEvent(Event{Type: "approval_request", ID: id, Tool: req.ToolName, ToolCallID: req.ToolCallID, InvocationID: req.InvocationID, Args: parseToolArgs(req.Arguments), Prompt: req.Prompt()})
+	s.writeEvent(Event{Type: "approval_request", ID: id, Tool: req.ToolName, ToolCallID: req.ToolCallID, InvocationID: req.InvocationID, TargetPath: req.TargetPath, Args: parseToolArgs(req.Arguments), Prompt: req.Prompt()})
 	select {
 	case ans := <-ch:
 		return ans.approved, ans.err

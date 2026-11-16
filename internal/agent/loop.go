@@ -988,7 +988,29 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			tc.Function.Arguments = argsJSON
 			msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
+			var mutation *tools.Mutation
+			if tc.Function.Name == "write" || tc.Function.Name == "edit" {
+				var target struct {
+					Path string `json:"path"`
+				}
+				_ = json.Unmarshal([]byte(argsJSON), &target)
+				var err error
+				mutation, err = c.Exec.PrepareMutation(target.Path)
+				if err != nil {
+					msgs = c.invalidArgs(msgs, *tc, err)
+					stepHadExecution = true
+					recordLastError(&lastErrors, err.Error())
+					continue
+				}
+				inv.TargetPath = mutation.TargetPath
+			}
+			closeMutation := func() {
+				if mutation != nil {
+					_ = mutation.Close()
+				}
+			}
 			if err := recordInvocation(argsJSON); err != nil {
+				closeMutation()
 				return lastText, total, err
 			}
 			startTool(argsJSON)
@@ -1017,10 +1039,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				}
 				stepHadExecution = true
 				recordLastError(&lastErrors, obs)
+				closeMutation()
 				continue
 			}
-			if c.needsApproval(tc.Function.Name, tc.Function.Arguments) {
-				req := ApprovalRequest{ToolName: tc.Function.Name, Arguments: tc.Function.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID}
+			if mutation != nil && mutation.Protected || c.needsApproval(tc.Function.Name, tc.Function.Arguments) {
+				req := ApprovalRequest{ToolName: tc.Function.Name, Arguments: tc.Function.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID, TargetPath: inv.TargetPath}
 				c.emit(Event{Kind: EventApproval, Text: req.Prompt(), ToolName: req.ToolName, ToolArgs: req.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID})
 				ok, err := c.ask(req)
 				// Audit every decision (approved, denied, or errored)
@@ -1042,6 +1065,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 						c.LastTerminalReason = TerminalAbort
 					}
 					c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: c.LastTerminalReason})
+					closeMutation()
 					return lastText, total, err
 				}
 				if !ok {
@@ -1053,10 +1077,14 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					if c.Session != nil {
 						c.persist(msgs[len(msgs)-1])
 					}
+					closeMutation()
 					continue
 				}
 			}
 			toolCtx := tools.WithInvocation(ctx, inv.ID, tc.ID)
+			if mutation != nil {
+				toolCtx = tools.WithMutation(toolCtx, mutation)
+			}
 			var obs string
 			var err error
 			var res tools.ToolResult
@@ -1072,6 +1100,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			default:
 				res, err = c.Exec.Dispatch(toolCtx, tc.Function.Name, argsJSON)
 			}
+			closeMutation()
 			if err != nil {
 				res.Status = tools.ResultError
 				obs = fmt.Sprintf("Error: %v\nOutput:\n%s", err, res.Text)

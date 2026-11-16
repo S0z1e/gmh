@@ -127,6 +127,7 @@ type Event struct {
 	// tool_start / tool_end / background events.
 	ToolCallID   string `json:"tool_call_id,omitempty"`
 	InvocationID string `json:"invocation_id,omitempty"`
+	TargetPath   string `json:"target_path,omitempty"`
 
 	Tool       string `json:"tool,omitempty"`
 	Status     string `json:"status,omitempty"`

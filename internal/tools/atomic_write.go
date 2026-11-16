@@ -2,51 +2,30 @@ package tools
 
 import (
 	"crypto/rand"
-	"fmt"
 	"os"
-	"path/filepath"
+
+	"minimalharness/internal/fileguard"
 )
 
-// atomicWriteFile follows file symlinks within r, then stages and renames
-// through one pinned parent directory. No operation reopens an ordinary path.
+// atomicWriteFile prepares and pins a target for callers without an approval lease.
 func atomicWriteFile(r *os.Root, name string, data []byte) error {
-	var mode os.FileMode
-	for links := 0; ; links++ {
-		st, err := r.Lstat(name)
-		if err != nil {
-			return err
-		}
-		if st.Mode()&os.ModeSymlink == 0 {
-			if !st.Mode().IsRegular() {
-				return fmt.Errorf("cannot replace non-regular file: %s", name)
-			}
-			mode = st.Mode().Perm()
-			break
-		}
-		if links >= 40 {
-			return fmt.Errorf("too many symlinks: %s", name)
-		}
-		target, err := r.Readlink(name)
-		if err != nil {
-			return err
-		}
-		if filepath.IsAbs(target) {
-			return fmt.Errorf("absolute symlink target is outside workspace root: %s", target)
-		}
-		// Keep .. components intact: a preceding directory may itself be
-		// a symlink, so lexical cleaning would change the target.
-		dir, _ := filepath.Split(name)
-		name = dir + target
-	}
-	dir, base := filepath.Split(name)
-	if dir == "" {
-		dir = "."
-	}
-	parent, err := r.OpenRoot(dir)
+	target, err := fileguard.ResolveTarget(r, name)
 	if err != nil {
 		return err
 	}
-	defer parent.Close()
+	defer target.Close()
+	if err := target.Check(); err != nil {
+		return err
+	}
+	return atomicWriteTarget(target, data)
+}
+
+func atomicWriteTarget(target *fileguard.Target, data []byte) error {
+	if target.Info == nil {
+		return os.ErrNotExist
+	}
+	parent, base := target.Parent, target.Name
+	mode := target.Info.Mode().Perm()
 	tmpName := ".gmh-write-" + rand.Text()
 	tmp, err := parent.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {

@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -244,34 +245,37 @@ type WriteArgs struct {
 	Overwrite bool `json:"overwrite,omitempty"`
 }
 
-func (e *Executor) Write(a WriteArgs) (string, error) {
+func (e *Executor) Write(a WriteArgs) (string, error) { return e.write(a, nil) }
+
+func (e *Executor) write(a WriteArgs, target *fileguard.Target) (string, error) {
 	e.editMu.Lock()
 	defer e.editMu.Unlock()
-	r, rel, err := fileguard.Root(e.Root, a.Path)
-	if err != nil {
+	if target == nil {
+		var err error
+		target, err = fileguard.Prepare(e.Root, a.Path)
+		if err != nil {
+			return "", err
+		}
+		defer target.Close()
+	}
+	if err := target.Check(); err != nil {
 		return "", err
 	}
-	defer r.Close()
-	_, statErr := r.Stat(rel)
-	if statErr == nil && !a.Overwrite {
+	if target.Info != nil && !a.Overwrite {
 		return "", fmt.Errorf("file exists, use edit instead: %s", a.Path)
 	}
-	if statErr != nil && !os.IsNotExist(statErr) {
-		return "", statErr
-	}
-	if err := r.MkdirAll(filepath.Dir(rel), 0755); err != nil {
-		return "", err
-	}
-	if a.Overwrite && statErr == nil {
+	if a.Overwrite && target.Info != nil {
 		e.invalidateSnapshot(a.Path)
-		if err := atomicWriteFile(r, rel, []byte(a.Content)); err != nil {
+		if err := atomicWriteTarget(target, []byte(a.Content)); err != nil {
 			return "", err
 		}
 		e.rememberSnapshot(a.Path, sha256.Sum256([]byte(a.Content)))
 		return "overwrote " + a.Path, nil
 	}
-	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
-	f, err := r.OpenFile(rel, flags, 0644)
+	if err := target.CreateParents(); err != nil {
+		return "", err
+	}
+	f, err := target.Parent.OpenFile(target.Name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		return "", err
 	}
@@ -318,14 +322,21 @@ func splitFileLines(s string) ([]string, int) {
 	return parts, n
 }
 
-func (e *Executor) Edit(a EditArgs) (string, error) {
+func (e *Executor) Edit(a EditArgs) (string, error) { return e.edit(a, nil) }
+
+func (e *Executor) edit(a EditArgs, target *fileguard.Target) (string, error) {
 	e.editMu.Lock()
 	defer e.editMu.Unlock()
-	p, err := e.resolve(a.Path)
-	if err != nil {
-		return "", err
+	if target == nil {
+		var err error
+		target, err = fileguard.Prepare(e.Root, a.Path)
+		if err != nil {
+			return "", err
+		}
+		defer target.Close()
 	}
-	data, err := fileguard.ReadFile(e.Root, p)
+	p := e.snapshotPath(a.Path)
+	data, err := target.ReadFile()
 	if err != nil {
 		return "", err
 	}
@@ -341,7 +352,7 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 		if sha256.Sum256(data) != expected {
 			return "", fmt.Errorf("file changed since last read or write: %s; read the target lines again before editing", a.Path)
 		}
-		return e.editLines(p, raw, s, a, normNew)
+		return e.editLines(target, p, raw, s, a, normNew)
 	}
 	if a.StartLine < 0 {
 		return "", fmt.Errorf("startLine must be >= 1, got %d in %s", a.StartLine, a.Path)
@@ -352,7 +363,7 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 	expected, known := e.snapshots[p]
 	known = known && sha256.Sum256(data) == expected && strings.Count(normOld, "\n") == strings.Count(normNew, "\n")
 	start := strings.Index(s, normOld)
-	if err := e.writeExisting(p, replaceNormalizedRange(raw, start, start+len(normOld), normNew), known); err != nil {
+	if err := e.writeExisting(target, p, replaceNormalizedRange(raw, start, start+len(normOld), normNew), known); err != nil {
 		return "", err
 	}
 	return "edited " + a.Path, nil
@@ -361,7 +372,7 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 // editLines replaces lines StartLine..EndLine (1-based, inclusive)
 // with normNew. The normalized range excludes the final line separator,
 // preserving the file's original separators outside the replacement.
-func (e *Executor) editLines(p, raw, s string, a EditArgs, normNew string) (string, error) {
+func (e *Executor) editLines(target *fileguard.Target, p, raw, s string, a EditArgs, normNew string) (string, error) {
 	parts, n := splitFileLines(s)
 	end := a.EndLine
 	if end == 0 {
@@ -384,7 +395,7 @@ func (e *Executor) editLines(p, raw, s string, a EditArgs, normNew string) (stri
 		endOffset += len(part)
 	}
 	keepSnapshot := strings.Count(normNew, "\n") == end-a.StartLine
-	if err := e.writeExisting(p, replaceNormalizedRange(raw, start, endOffset, normNew), keepSnapshot); err != nil {
+	if err := e.writeExisting(target, p, replaceNormalizedRange(raw, start, endOffset, normNew), keepSnapshot); err != nil {
 		return "", err
 	}
 	return "edited " + a.Path, nil
@@ -762,7 +773,11 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 			return ToolResult{}, fmt.Errorf("bad write args: %w", err)
 		}
-		out, err := e.Write(a)
+		target, err := e.mutationTarget(ctx, a.Path)
+		if err != nil {
+			return ToolResult{}, err
+		}
+		out, err := e.write(a, target)
 		if err != nil {
 			return ToolResult{Text: out}, err
 		}
@@ -772,25 +787,34 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 			return ToolResult{}, fmt.Errorf("bad edit args: %w", err)
 		}
+		target, err := e.mutationTarget(ctx, a.Path)
+		if err != nil {
+			return ToolResult{}, err
+		}
+		if target == nil {
+			target, err = fileguard.Prepare(e.Root, a.Path)
+			if err != nil {
+				return ToolResult{}, err
+			}
+			defer target.Close()
+		}
 		// For a line edit the diff needs the removed lines, which
 		// Edit overwrites: read them first (cheap, local, and the
 		// bounds are re-checked by Edit itself).
 		removed := a.OldText
 		if a.StartLine > 0 {
-			if p, rerr := e.resolve(a.Path); rerr == nil {
-				if data, rerr := fileguard.ReadFile(e.Root, p); rerr == nil {
-					lines, n := splitFileLines(string(data))
-					end := a.EndLine
-					if end == 0 {
-						end = a.StartLine
-					}
-					if a.StartLine >= 1 && end >= a.StartLine && end <= n {
-						removed = strings.Join(lines[a.StartLine-1:end], "\n")
-					}
+			if data, rerr := target.ReadFile(); rerr == nil {
+				lines, n := splitFileLines(string(data))
+				end := a.EndLine
+				if end == 0 {
+					end = a.StartLine
+				}
+				if a.StartLine >= 1 && end >= a.StartLine && end <= n {
+					removed = strings.Join(lines[a.StartLine-1:end], "\n")
 				}
 			}
 		}
-		out, err := e.Edit(a)
+		out, err := e.edit(a, target)
 		if err != nil {
 			return ToolResult{Text: out}, err
 		}
@@ -905,13 +929,11 @@ func (e *Executor) killJob(id string) (ToolResult, error) {
 // writeExisting atomically replaces an existing file while preserving its mode.
 // keepSnapshot requires the caller to have validated the original bytes against
 // a known version and preserved line numbers.
-func (e *Executor) writeExisting(path string, data []byte, keepSnapshot bool) error {
-	r, rel, err := fileguard.Root(e.Root, path)
-	if err != nil {
+func (e *Executor) writeExisting(target *fileguard.Target, path string, data []byte, keepSnapshot bool) error {
+	if err := target.Check(); err != nil {
 		return err
 	}
-	defer r.Close()
-	if err := atomicWriteFile(r, rel, data); err != nil {
+	if err := atomicWriteTarget(target, data); err != nil {
 		e.invalidateSnapshot(path)
 		return err
 	}
@@ -926,6 +948,18 @@ func (e *Executor) writeExisting(path string, data []byte, keepSnapshot bool) er
 // IsProtectedWorkspacePath reports whether path points to harness config,
 // plugins, or git internals that should always require explicit approval.
 func IsProtectedWorkspacePath(root, path string) bool {
+	if protectedSpelling(root, path) {
+		return true
+	}
+	target, err := fileguard.Prepare(root, path)
+	if err != nil {
+		return false
+	}
+	defer target.Close()
+	return protectedSpelling(root, target.Path) || target.Touches(".harness.json") || target.Touches(".git") || target.Touches(".agents/plugins")
+}
+
+func protectedSpelling(root, path string) bool {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return false
@@ -938,7 +972,15 @@ func IsProtectedWorkspacePath(root, path string) bool {
 	if err != nil {
 		return false
 	}
-	rel = filepath.ToSlash(filepath.Clean(rel))
+	rel = strings.ToLower(filepath.ToSlash(filepath.Clean(rel)))
+	if runtime.GOOS == "windows" {
+		parts := strings.Split(rel, "/")
+		for i, part := range parts {
+			part, _, _ = strings.Cut(part, ":") // Alternate data streams share the file.
+			parts[i] = strings.TrimRight(part, ". ")
+		}
+		rel = strings.Join(parts, "/")
+	}
 	return rel == ".harness.json" ||
 		rel == ".git" || strings.HasPrefix(rel, ".git/") ||
 		rel == ".agents/plugins" || strings.HasPrefix(rel, ".agents/plugins/")

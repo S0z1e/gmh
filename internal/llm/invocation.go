@@ -11,6 +11,7 @@ type ToolInvocation struct {
 	ToolName          string            `json:"tool_name"`
 	OriginalArguments string            `json:"original_arguments"`
 	Arguments         string            `json:"arguments"`
+	TargetPath        string            `json:"target_path,omitempty"`
 	Rewrites          []ArgumentRewrite `json:"rewrites,omitempty"`
 }
 
