@@ -196,6 +196,10 @@ func (c *Config) pruneCheckpoint(msgs []llm.Message) ([]llm.Message, bool) {
 		}
 		// Compare persisted fields: hydrated image bytes deliberately stay
 		// in memory and must not make an otherwise identical history differ.
+		history, err = session.ImageReferences(history)
+		if err != nil {
+			return nil, false
+		}
 		currentJSON, currentErr := json.Marshal(history)
 		savedJSON, savedErr := json.Marshal(saved)
 		if currentErr != nil || savedErr != nil || !bytes.Equal(currentJSON, savedJSON) {

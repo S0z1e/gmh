@@ -204,7 +204,11 @@ func (s *Store) MarkCompactMessages(msgs []llm.Message) error {
 // CheckpointFits reports whether a replacement can be loaded as one session
 // record. Large raw histories should be summarized instead of pruned.
 func CheckpointFits(msgs []llm.Message) bool {
-	_, err := marshalCheckpoint(msgs)
+	msgs, err := ImageReferences(msgs)
+	if err != nil {
+		return false
+	}
+	_, err = marshalCheckpoint(msgs)
 	return err == nil
 }
 

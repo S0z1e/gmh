@@ -60,24 +60,36 @@ func readImageBlob(root *os.Root, digest string) ([]byte, error) {
 	return data, nil
 }
 
-// Save the immutable bytes before a transcript can refer to them. Concurrent
-// writers may publish the same digest; both publish identical complete bytes.
-func persistImage(img llm.Image) (llm.Image, error) {
+func imageReference(img llm.Image) (llm.Image, []byte, error) {
 	if img.Data == "" {
-		return img, nil
+		return img, nil, nil
 	} // Preserve unavailable and legacy references.
 	if len(img.Data) > base64.StdEncoding.EncodedLen(maxImageBlobBytes) {
-		return img, fmt.Errorf("image exceeds size cap")
+		return img, nil, fmt.Errorf("image exceeds size cap")
 	}
 	data, err := base64.StdEncoding.DecodeString(img.Data)
 	if err != nil || len(data) > maxImageBlobBytes {
-		return img, fmt.Errorf("invalid or oversized image data")
+		return img, nil, fmt.Errorf("invalid or oversized image data")
 	}
 	sum := sha256.Sum256(data)
 	digest := hex.EncodeToString(sum[:])
 	if img.Digest != "" && img.Digest != digest {
-		return img, fmt.Errorf("image bytes do not match their digest")
+		return img, nil, fmt.Errorf("image bytes do not match their digest")
 	}
+	img.Digest = digest
+	img.Bytes = len(data)
+	img.Unavailable = ""
+	return img, data, nil
+}
+
+// Save bytes before a transcript can refer to them. Concurrent publishers of
+// one digest publish identical complete bytes.
+func persistImage(img llm.Image) (llm.Image, error) {
+	img, data, err := imageReference(img)
+	if err != nil || img.Data == "" {
+		return img, err
+	}
+	digest := img.Digest
 	dir := imageBlobDir()
 	base := filepath.Dir(Dir())
 	for _, parent := range []string{base, filepath.Dir(dir), dir} {
@@ -193,4 +205,21 @@ func HydrateImages(msgs []llm.Message) {
 			img.Unavailable = ""
 		}
 	}
+}
+
+// ImageReferences computes the metadata that persistence records, without IO or
+// changing caller-owned slices. Used to compare transient and persisted views.
+func ImageReferences(msgs []llm.Message) ([]llm.Message, error) {
+	out := slices.Clone(msgs)
+	for i := range out {
+		out[i].Images = slices.Clone(out[i].Images)
+		for j, img := range out[i].Images {
+			ref, _, err := imageReference(img)
+			if err != nil {
+				return nil, err
+			}
+			out[i].Images[j] = ref
+		}
+	}
+	return out, nil
 }
