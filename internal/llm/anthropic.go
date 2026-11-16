@@ -452,6 +452,20 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 		if err := streamProviderError("anthropic", data); err != nil {
 			return err
 		}
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if err := decodeStreamJSON("anthropic", data, &envelope); err != nil {
+			return err
+		}
+		if envelope.Type == "" {
+			return protocolError("anthropic", "missing event type")
+		}
+		switch envelope.Type {
+		case "message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop":
+		default:
+			continue
+		}
 		var ev anthropicEvent
 		if err := decodeStreamJSON("anthropic", data, &ev); err != nil {
 			return err

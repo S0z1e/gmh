@@ -33,6 +33,11 @@ func decodeStreamJSON(api, data string, dst any) error {
 }
 
 func sameJSON(a, b string) bool {
+	// Terminal incomplete replies can repeat an identical truncated fragment.
+	// Full JSON-object validity is checked only once the outcome is known.
+	if a == b {
+		return true
+	}
 	var x, y any
 	dx, dy := json.NewDecoder(strings.NewReader(a)), json.NewDecoder(strings.NewReader(b))
 	dx.UseNumber()
@@ -86,23 +91,27 @@ const maxSSEEventBytes = 4 << 20
 func splitSSELines() bufio.SplitFunc {
 	skipLF := false
 	return func(data []byte, atEOF bool) (int, []byte, error) {
+		offset := 0
 		if len(data) == 0 {
 			return 0, nil, nil
 		}
 		if skipLF {
 			skipLF = false
 			if data[0] == '\n' {
-				return 1, nil, nil
+				offset = 1
+				data = data[1:]
 			}
 		}
 		if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
 			skipLF = data[i] == '\r'
-			return i + 1, data[:i], nil
+			return offset + i + 1, data[:i], nil
 		}
 		if atEOF {
-			return len(data), data, nil
+			if len(data) > 0 {
+				return offset + len(data), data, nil
+			}
 		}
-		return 0, nil, nil
+		return offset, nil, nil
 	}
 }
 

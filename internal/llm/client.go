@@ -860,11 +860,12 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 	msg.Role = "assistant"
 	var usage Usage
 	type acc struct {
-		callID   string
-		name     string
-		args     strings.Builder
-		argsDone bool
-		done     bool
+		callID       string
+		name         string
+		args         strings.Builder
+		argsDone     bool
+		done         bool
+		argsConflict bool
 	}
 	accs := map[string]*acc{} // keyed by item_id
 	order := []string{}
@@ -909,6 +910,20 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 		}
 		if err := streamProviderError("responses", data); err != nil {
 			return err
+		}
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if err := decodeStreamJSON("responses", data, &envelope); err != nil {
+			return err
+		}
+		if envelope.Type == "" {
+			return protocolError("responses", "missing event type")
+		}
+		switch envelope.Type {
+		case "response.created", "response.in_progress", "response.refusal.delta", "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.output_item.added", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done", "response.incomplete", "response.completed":
+		default:
+			continue
 		}
 		var ev responsesEvent
 		if err := decodeStreamJSON("responses", data, &ev); err != nil {
@@ -971,7 +986,7 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 			}
 			if ev.Arguments != "" {
 				if a.args.Len() > 0 && !sameJSON(a.args.String(), ev.Arguments) {
-					return protocolError("responses", "arguments done conflicts with deltas")
+					a.argsConflict = true
 				}
 				// done carries the full arguments; prefer it over fragments.
 				a.args.Reset()
@@ -1017,7 +1032,7 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 					return protocolError("responses", "done item identity changed")
 				}
 				if ev.Item.Arguments != "" && a.args.Len() > 0 && !sameJSON(a.args.String(), ev.Item.Arguments) {
-					return protocolError("responses", "done item arguments changed")
+					a.argsConflict = true
 				}
 				if ev.Item.CallID != "" {
 					a.callID = ev.Item.CallID
@@ -1102,6 +1117,9 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 	streamIDs := map[string]bool{}
 	for _, id := range order {
 		a := accs[id]
+		if msg.FinishReason != "incomplete" && a.argsConflict {
+			return protocolError("responses", "terminal call arguments conflict with streamed fragments")
+		}
 		if streamIDs[a.callID] {
 			return protocolError("responses", "duplicate streamed call id %q", a.callID)
 		}

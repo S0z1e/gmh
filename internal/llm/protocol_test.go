@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 )
 
 func protocolEvent(v any) string {
@@ -123,6 +125,48 @@ func TestSSEFraming(t *testing.T) {
 				t.Fatalf("trailer: %v %v", ok, err)
 			}
 		})
+	}
+}
+
+func TestBufferedCRLFTerminalDoesNotWaitForEOF(t *testing.T) {
+	for _, api := range []string{"chat", "responses", "anthropic"} {
+		t.Run(api, func(t *testing.T) {
+			r, w := io.Pipe()
+			defer r.Close()
+			defer w.Close()
+			go func() { _, _ = io.WriteString(w, strings.ReplaceAll(protocolTerminal(api), "\n", "\r\n")) }()
+			s := newSSEScanner(r, 100*time.Millisecond, "test", api)
+			defer s.close()
+			_, ok, err := s.next()
+			if !ok || err != nil {
+				t.Fatalf("terminal stalled: %v %v", ok, err)
+			}
+		})
+	}
+}
+
+func TestUnknownEventsIgnoreExtensionPayloadSchema(t *testing.T) {
+	for _, api := range []string{"responses", "anthropic"} {
+		for _, delta := range []any{map[string]any{}, "string", 42} {
+			_, done, err := runProtocolStream(t, api, protocolEvent(map[string]any{"type": "future.extension", "delta": delta, "index": "extension"})+protocolTerminal(api))
+			if !done || err != nil {
+				t.Fatalf("%s: %v %v", api, done, err)
+			}
+		}
+	}
+}
+
+func TestResponsesIncompletePreservesRepeatedTruncatedArguments(t *testing.T) {
+	args := `{"path":`
+	item := map[string]any{"id": "item", "type": "function_call", "call_id": "a", "name": "read", "arguments": args}
+	body := protocolEvent(map[string]any{"type": "response.output_item.added", "item": map[string]any{"id": "item", "type": "function_call", "call_id": "a", "name": "read"}}) + protocolEvent(map[string]any{"type": "response.function_call_arguments.delta", "item_id": "item", "delta": args}) + protocolEvent(map[string]any{"type": "response.function_call_arguments.done", "item_id": "item", "arguments": args}) + protocolEvent(map[string]any{"type": "response.output_item.done", "item": item}) + protocolEvent(map[string]any{"type": "response.incomplete"})
+	m, done, err := runProtocolStream(t, "responses", body)
+	if !done || err != nil || m.FinishReason != "incomplete" || len(m.ToolCalls) != 0 {
+		t.Fatalf("%+v done=%v err=%v", m, done, err)
+	}
+	_, done, err = runProtocolStream(t, "responses", strings.ReplaceAll(body, `response.incomplete`, `response.completed`))
+	if done || err == nil {
+		t.Fatal("completed truncated args accepted")
 	}
 }
 
