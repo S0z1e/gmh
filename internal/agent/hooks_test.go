@@ -66,10 +66,12 @@ func (h *fakePluginRunner) RunStopHooks(_ context.Context, _, _ string) string {
 // toolCallSSE renders one tool-call turn as chat SSE, with the
 // arguments split across two fragments (as real streams do).
 func toolCallSSE(id, name, args string) string {
-	half := len(args) / 2
+	runes := []rune(args)
+	half := len(runes) / 2
+	quote := func(s string) string { b, _ := json.Marshal(s); return string(b) }
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":%q,\"function\":{\"name\":%q,\"arguments\":%q}}]}}]}\n\n", id, name, args[:half])
-	fmt.Fprintf(&sb, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":%q}}]}}]}\n\n", args[half:])
+	fmt.Fprintf(&sb, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":%s,\"function\":{\"name\":%s,\"arguments\":%s}}]}}]}\n\n", quote(id), quote(name), quote(string(runes[:half])))
+	fmt.Fprintf(&sb, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":%s}}]}}]}\n\n", quote(string(runes[half:])))
 	sb.WriteString("data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
 	sb.WriteString("data: [DONE]\n\n")
 	return sb.String()
