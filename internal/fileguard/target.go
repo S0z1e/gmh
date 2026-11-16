@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -134,7 +135,21 @@ func resolveTarget(r *os.Root, name string, allowDirectory bool) (target *Target
 		t.parents = append(t.parents, child)
 		names = append(names, part)
 	}
-	return nil, fmt.Errorf("target names a directory")
+	if !allowDirectory {
+		return nil, fmt.Errorf("target names a directory")
+	}
+	// A directory link may finish in '.', '..', or a trailing separator.
+	// These consume the path without reaching the normal leaf branch.
+	t.Parent = t.parents[len(t.parents)-1]
+	t.Name, t.Path = ".", filepath.Join(names...)
+	if t.Path == "" {
+		t.Path = "."
+	}
+	t.Info, err = t.Parent.Stat(".")
+	if err != nil {
+		return nil, err
+	}
+	return t, nil
 }
 
 // OpenRoot may follow a symlink inserted after Lstat. Compare the opened
@@ -247,7 +262,9 @@ func (t *Target) Touches(path string, directory bool) bool {
 	// Use the same resolver and symlink limit as the mutation itself.
 	resolved, err := resolveTarget(t.root, path, directory)
 	if err != nil {
-		return false
+		// An unresolvable protected root is an unknown policy boundary.
+		// Require approval instead of silently classifying it as safe.
+		return true
 	}
 	defer resolved.Close()
 	protected := resolved.Info
@@ -273,5 +290,5 @@ func (t *Target) Touches(path string, directory bool) bool {
 }
 
 func normalizedPath(path string) string {
-	return norm.NFC.String(strings.ToLower(filepath.ToSlash(path)))
+	return norm.NFC.String(cases.Fold().String(norm.NFC.String(filepath.ToSlash(path))))
 }

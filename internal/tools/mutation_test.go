@@ -63,6 +63,59 @@ func TestPinnedMutationCannotFollowLateAliasSwap(t *testing.T) {
 	}
 }
 
+func TestProtectedDirectoryAliasesEndingInDots(t *testing.T) {
+	for _, tc := range []struct{ protected, link, path string }{
+		{".git", ".", "file"}, {".git", "real/", "real/file"},
+		{".git", "real/.", "real/file"}, {".git", "real/sub/..", "real/file"},
+		{".agents/plugins", "../..", "file"},
+	} {
+		t.Run(tc.protected+tc.link, func(t *testing.T) {
+			root := t.TempDir()
+			for _, dir := range []string{"real/sub", ".agents"} {
+				if err := os.MkdirAll(filepath.Join(root, dir), 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(tc.link, filepath.Join(root, tc.protected)); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+			e := &Executor{Root: root}
+			m, err := e.PrepareMutation(tc.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			if !m.Protected || !IsProtectedWorkspacePath(root, tc.path) {
+				t.Fatal("directory alias classified as unprotected")
+			}
+		})
+	}
+}
+
+func TestUnresolvableProtectedRootsRequireApproval(t *testing.T) {
+	for _, link := range []string{".harness.json", "absolute"} {
+		t.Run(link, func(t *testing.T) {
+			root := t.TempDir()
+			target := link
+			if link == "absolute" {
+				target = filepath.Join(root, "actual")
+			}
+			if err := os.Symlink(target, filepath.Join(root, ".harness.json")); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+			e := &Executor{Root: root}
+			m, err := e.PrepareMutation("actual")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			if !m.Protected || !IsProtectedWorkspacePath(root, "actual") {
+				t.Fatal("unresolved protected root was treated as safe")
+			}
+		})
+	}
+}
+
 func TestPreparedMutationIsBoundToRequestedPath(t *testing.T) {
 	e := &Executor{Root: t.TempDir()}
 	m, err := e.PrepareMutation("public")

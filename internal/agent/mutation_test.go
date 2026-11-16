@@ -120,6 +120,9 @@ func TestDanglingProtectedAliasesRequireApproval(t *testing.T) {
 		{"reverse-git", "alias/config", "real-git/config", map[string]string{"alias": "real-git", ".git": "real-git"}},
 		{"normalized-config", "cafe\u0301", "cafe\u0301", map[string]string{".harness.json": "caf\u00e9"}},
 		{"normalized-plugins", "cafe\u0301/p.js", "cafe\u0301/p.js", map[string]string{".agents/plugins": "../caf\u00e9"}},
+		{"sigma", "\u03c2", "\u03c2", map[string]string{".harness.json": "\u03a3"}},
+		{"sharp-s", "ss", "ss", map[string]string{".harness.json": "\u00df"}},
+		{"long-s", "s", "s", map[string]string{".harness.json": "\u017f"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
