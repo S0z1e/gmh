@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -9,6 +10,27 @@ import (
 
 	"minimalharness/internal/llm"
 )
+
+type failedRecordReader struct {
+	data []byte
+	err  error
+}
+
+func (r *failedRecordReader) Read(p []byte) (int, error) {
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, r.err
+}
+
+func TestRecordReadFailureIsNotCrashDamage(t *testing.T) {
+	want := errors.New("injected read failure")
+	for _, data := range []string{`{"role":"user","content":"partial`, `{"role":"user","content":"complete"}`} {
+		_, _, torn, err := scanRecords(&failedRecordReader{data: []byte(data), err: want}, nil)
+		if !errors.Is(err, want) || torn {
+			t.Fatalf("torn=%v err=%v; want read failure", torn, err)
+		}
+	}
+}
 
 func TestResumeRepairsTornRecordAtEveryByte(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())

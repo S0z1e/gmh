@@ -16,7 +16,7 @@ import (
 // corrupt records are errors, including records before a clear/checkpoint.
 // end is the end of the valid prefix; newline reports a valid final record
 // that needs its delimiter restored before appending.
-func scanRecords(f *os.File, visit func([]byte, llm.Message)) (end int64, newline, torn bool, err error) {
+func scanRecords(f io.Reader, visit func([]byte, llm.Message)) (end int64, newline, torn bool, err error) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), maxRecordBytes)
 	var advance int
@@ -33,6 +33,9 @@ func scanRecords(f *os.File, visit func([]byte, llm.Message)) (end int64, newlin
 			var m llm.Message
 			if decodeErr := json.Unmarshal(line, &m); decodeErr != nil {
 				if !terminated {
+					if readErr := sc.Err(); readErr != nil {
+						return end, false, false, readErr
+					}
 					return end, false, true, nil
 				}
 				return end, false, false, fmt.Errorf("corrupt session record at byte %d: %w", end, decodeErr)
@@ -65,6 +68,15 @@ func recoverTail(f *os.File) error {
 			return err
 		}
 		if err := backup.Sync(); err != nil {
+			return err
+		}
+		dir, err := os.Open(filepath.Dir(f.Name()))
+		if err != nil {
+			return err
+		}
+		err = dir.Sync()
+		dir.Close()
+		if err != nil {
 			return err
 		}
 		if err := f.Truncate(end); err != nil {
