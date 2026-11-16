@@ -1,11 +1,95 @@
 package workspace
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 )
+
+func TestCaseAliasRevokesOriginalDecision(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	parent := t.TempDir()
+	root := filepath.Join(parent, "Workspace")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(parent, "workspace")
+	if _, err := os.Stat(alias); os.IsNotExist(err) {
+		t.Skip("case-sensitive filesystem")
+	}
+	id, err := Identify(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliased, err := Identify(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != aliased {
+		t.Fatalf("case alias has different identity: %+v vs %+v", id, aliased)
+	}
+	if err := Decide(id, "trust"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Decide(aliased, "untrust"); err != nil {
+		t.Fatal(err)
+	}
+	if trusted, err := Trusted(id); err != nil || trusted {
+		t.Fatalf("case alias failed to revoke: %v %v", trusted, err)
+	}
+}
+
+func TestOversizedTrustRecordFailsClosed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	id, err := Identify(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Decide(id, "trust"); err != nil {
+		t.Fatal(err)
+	}
+	dir, _ := trustDir()
+	path := filepath.Join(dir, trustName(id))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, bytes.Repeat([]byte(" "), (64<<10)-len(data))...)
+	data = append(data, []byte("INVALID")...)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if trusted, err := Trusted(id); trusted || err == nil {
+		t.Fatalf("oversized corrupt record accepted: %v %v", trusted, err)
+	}
+}
+
+func TestNormalizationDoesNotMergeDistinctDirectories(t *testing.T) {
+	parent := t.TempDir()
+	a := filepath.Join(parent, "Project")
+	b := filepath.Join(parent, "project")
+	if err := os.Mkdir(a, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(b, 0700); os.IsExist(err) {
+		t.Skip("case-insensitive filesystem")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	first, err := Identify(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Identify(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second || first.Path == second.Path {
+		t.Fatalf("distinct directories merged: %+v %+v", first, second)
+	}
+}
 
 func TestTrustIsExplicitPersistentAndRevocable(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())

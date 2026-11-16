@@ -26,11 +26,50 @@ func Identify(path string) (Identity, error) {
 	if err != nil {
 		return Identity{}, err
 	}
+	canonical, err = directorySpelling(canonical)
+	if err != nil {
+		return Identity{}, err
+	}
 	id, err := directoryID(canonical)
 	if err != nil {
 		return Identity{}, err
 	}
 	return Identity{Path: canonical, FileID: id}, nil
+}
+
+// EvalSymlinks on Unix preserves the caller's casing and Unicode spelling.
+// Resolve each directory entry's actual name so aliases share both the saved
+// decision and its revocation, without collapsing distinct case-sensitive paths.
+func directorySpelling(path string) (string, error) {
+	parent := filepath.Dir(path)
+	if parent == path {
+		return path, nil
+	}
+	parent, err := directorySpelling(parent)
+	if err != nil {
+		return "", err
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return "", err
+	}
+	name := filepath.Base(path)
+	for _, entry := range entries {
+		if entry.Name() == name {
+			return filepath.Join(parent, name), nil
+		}
+	}
+	wanted, err := os.Stat(filepath.Join(parent, name))
+	if err != nil {
+		return "", err
+	}
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err == nil && os.SameFile(wanted, info) {
+			return filepath.Join(parent, entry.Name()), nil
+		}
+	}
+	return "", fmt.Errorf("workspace directory changed while identifying %s", path)
 }
 
 func trustDir() (string, error) {
@@ -87,9 +126,13 @@ func Trusted(id Identity) (bool, error) {
 	if !info.Mode().IsRegular() {
 		return false, fmt.Errorf("workspace trust record is not a regular file")
 	}
-	data, err := io.ReadAll(io.LimitReader(f, 64<<10))
+	const maxTrustBytes = 64 << 10
+	data, err := io.ReadAll(io.LimitReader(f, maxTrustBytes+1))
 	if err != nil {
 		return false, err
+	}
+	if len(data) > maxTrustBytes {
+		return false, fmt.Errorf("workspace trust record exceeds %d bytes", maxTrustBytes)
 	}
 	var record trustRecord
 	if err := json.Unmarshal(data, &record); err != nil {
