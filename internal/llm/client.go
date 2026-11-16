@@ -776,6 +776,9 @@ func toResponsesInput(messages []Message) (string, []any) {
 					"type": "input_text", "text": m.Content,
 				})
 			}
+			if text := unavailableImageText(m); text != "" {
+				parts = append(parts, map[string]any{"type": "input_text", "text": text})
+			}
 			for _, img := range imageParts(m) {
 				parts = append(parts, map[string]any{
 					"type": "input_image", "image_url": img.DataURL(),

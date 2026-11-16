@@ -231,6 +231,9 @@ func toAnthropicMessages(messages []Message) (string, []anthropicMessage) {
 			if m.Content != "" {
 				appendBlock("user", AnthropicContentBlock{Type: "text", Text: m.Content})
 			}
+			if text := unavailableImageText(m); text != "" {
+				appendBlock("user", AnthropicContentBlock{Type: "text", Text: text})
+			}
 		case "assistant":
 			if len(m.AnthropicContent) > 0 {
 				for _, block := range anthropicReplayBlocks(m) {

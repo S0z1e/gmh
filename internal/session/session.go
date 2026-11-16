@@ -133,6 +133,10 @@ func (s *Store) Append(m llm.Message) error {
 	if s.closed || s.file == nil {
 		return os.ErrClosed
 	}
+	m, err := persistImages(m)
+	if err != nil {
+		return err
+	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -185,6 +189,10 @@ func (s *Store) MarkCompactMessages(msgs []llm.Message) error {
 	defer s.mu.Unlock()
 	if s.closed || s.file == nil {
 		return os.ErrClosed
+	}
+	msgs, err := persistMessageImages(msgs)
+	if err != nil {
+		return err
 	}
 	b, err := marshalCheckpoint(msgs)
 	if err != nil {
@@ -291,6 +299,10 @@ func (s *Store) Rewrite(msgs []llm.Message) error {
 	defer s.mu.Unlock()
 	if s.closed || s.file == nil {
 		return os.ErrClosed
+	}
+	msgs, err := persistMessageImages(msgs)
+	if err != nil {
+		return err
 	}
 	var b strings.Builder
 	for _, m := range msgs {

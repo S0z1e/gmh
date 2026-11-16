@@ -198,9 +198,9 @@ func TestClearThenDanglingToolCallRepaired(t *testing.T) {
 	}
 }
 
-// An image message round-trips through the file with its path and
-// media type, but the bytes never land in the file.
-func TestImageMessageStoresPathOnly(t *testing.T) {
+// An image message stores its immutable reference and metadata in the
+// transcript while its bytes live separately in the blob store.
+func TestImageMessageStoresImmutableReference(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store, err := New("test-image")
 	if err != nil {
@@ -230,7 +230,7 @@ func TestImageMessageStoresPathOnly(t *testing.T) {
 		t.Fatalf("loaded = %+v", msgs)
 	}
 	img := msgs[0].Images[0]
-	if img.Path != "pic.png" || img.MediaType != "image/png" || img.Data != "" || img.Width != 2 {
+	if img.Path != "pic.png" || img.MediaType != "image/png" || img.Data != "" || img.Width != 2 || !validImageDigest(img.Digest) || img.Bytes != 5 {
 		t.Fatalf("loaded image = %+v", img)
 	}
 }

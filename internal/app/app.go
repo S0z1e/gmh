@@ -452,28 +452,8 @@ func (a *App) AttachImage(path string) (llm.Image, error) {
 	return img, nil
 }
 
-// hydrateImages re-reads the bytes of every image in msgs whose
-// session file stored only the path (Data is never written to the
-// file). Images whose file is gone stay in history as text only:
-// the marker line says an image was there, and the payload builders
-// skip images with no bytes.
-func (a *App) hydrateImages(msgs []llm.Message) {
-	for i := range msgs {
-		for j := range msgs[i].Images {
-			img := &msgs[i].Images[j]
-			if img.Data != "" || img.Path == "" {
-				continue
-			}
-			loader := a.Cfg.Exec.LoadImage
-			if img.Workspace || msgs[i].Kind == "image" {
-				loader = a.Cfg.Exec.ReadImage
-			}
-			if loaded, err := loader(img.Path); err == nil {
-				*img = loaded
-			}
-		}
-	}
-}
+// hydrateImages uses the same immutable-blob loader for every history entry point.
+func (a *App) hydrateImages(msgs []llm.Message) { session.HydrateImages(msgs) }
 
 // SplitModelArg parses a /model argument: "provider/model" or a bare
 // model id (the provider is resolved by FindModel, current first).
@@ -824,6 +804,7 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 		oldID = old.ID
 	}
 	a.Store = store
+	a.hydrateImages(history)
 	a.History = history
 	a.PendingImages = nil
 	a.ResumedMessage = fmt.Sprintf("Resumed session %s (%d messages).", id, len(history))
