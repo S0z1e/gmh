@@ -53,12 +53,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"minimalharness/internal/workspace"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"minimalharness/internal/workspace"
 )
 
 // Defaults for optional model fields. A model that omits contextWindow/maxTokens gets these.
@@ -162,9 +164,10 @@ type Model struct {
 // overrides them where it sets a value. A provider needs a baseUrl
 // and an api at provider or model level.
 type Provider struct {
-	BaseURL string `json:"baseUrl"`
-	API     string `json:"api"`
-	Model   string `json:"model"`
+	credentials credentialBindings
+	BaseURL     string `json:"baseUrl"`
+	API         string `json:"api"`
+	Model       string `json:"model"`
 	// APIKey is a literal key or a "$NAME" / "${NAME}" environment reference.
 	// "!command" is not supported.
 	APIKey  string            `json:"apiKey"`
@@ -176,6 +179,7 @@ type Provider struct {
 // (inherit from the other file, the environment, or the default)
 // from an explicitly set value, including 0 and false.
 type File struct {
+	shorthandCredentials credentialBindings
 	// Schema is accepted and ignored: config files may carry
 	// "$schema": "https://example.com/schemas/models.schema.json"
 	// for editor validation.
@@ -259,6 +263,7 @@ func LoadExplicit(path string) (*File, error) {
 	if err := Validate(f); err != nil {
 		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
+	f.bindInitialCredentials()
 	return f, nil
 }
 
@@ -287,6 +292,7 @@ func LoadForTrust(root string, trusted bool) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
+	f.bindInitialCredentials()
 	if trusted {
 		project, err := Load(ProjectPath(root))
 		if err != nil {
@@ -305,6 +311,7 @@ func LoadForTrust(root string, trusted bool) (*File, error) {
 // A source models list replaces the provider's whole list:
 // a baseUrl/headers-only override keeps the destination's models.
 func Merge(dst, src *File) {
+	dst.bindInitialCredentials()
 	if src.Schema != "" {
 		dst.Schema = src.Schema
 	}
@@ -355,6 +362,9 @@ func Merge(dst, src *File) {
 			dst.Providers = map[string]Provider{}
 		}
 		dp := dst.Providers[name]
+		if dp.credentials == nil {
+			dp.credentials = credentialBindings{}
+		}
 		if sp.BaseURL != "" {
 			dp.BaseURL = sp.BaseURL
 		}
@@ -368,16 +378,19 @@ func Merge(dst, src *File) {
 			dp.APIKey = sp.APIKey
 		}
 		if len(sp.Headers) > 0 {
-			if dp.Headers == nil {
-				dp.Headers = map[string]string{}
+			mergedHeaders := map[string]string{}
+			for k, v := range dp.Headers {
+				mergedHeaders[http.CanonicalHeaderKey(k)] = v
 			}
 			for k, v := range sp.Headers {
-				dp.Headers[k] = v
+				mergedHeaders[http.CanonicalHeaderKey(k)] = v
 			}
+			dp.Headers = mergedHeaders
 		}
 		if len(sp.Models) > 0 {
 			dp.Models = sp.Models
 		}
+		dp.bindExplicit(sp)
 		dst.Providers[name] = dp
 	}
 }
@@ -417,7 +430,7 @@ func (f *File) Select(name string) (Provider, bool) {
 		}
 	}
 	if f.BaseURL != "" || f.API != "" || f.Model != "" {
-		return Provider{BaseURL: f.BaseURL, API: f.API, Model: f.Model}, true
+		return Provider{BaseURL: f.BaseURL, API: f.API, Model: f.Model, credentials: f.shorthandCredentials}, true
 	}
 	return Provider{}, true
 }

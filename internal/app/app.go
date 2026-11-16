@@ -165,22 +165,6 @@ func Setup(p Params) (*App, error) {
 		return nil, fmt.Errorf("no providers configured: add a provider to %s; project config requires a trusted workspace (--workspace-trust trust)", global)
 	}
 
-	// API key: the provider's literal key or environment reference wins,
-	// else OPENAI_API_KEY.
-	apiKey := ""
-	if prov.APIKey != "" {
-		k, err := config.ResolveAPIKey(prov.APIKey)
-		if err != nil {
-			return nil, err
-		}
-		apiKey = k
-	} else {
-		apiKey = os.Getenv("OPENAI_API_KEY")
-	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("missing API key: set OPENAI_API_KEY, or set apiKey to a key or \"$NAME\" for provider %q in the config file", provName)
-	}
-
 	// Model: flag > env > defaultModel (when the selected provider
 	// is the default one) > provider default > first models entry.
 	modelID := p.Model
@@ -221,6 +205,10 @@ func Setup(p Params) (*App, error) {
 	}
 	if baseURL == "" {
 		return nil, fmt.Errorf("provider %q: baseUrl is required", provName)
+	}
+	apiKey, headers, err := prov.ResolveCredentials(mdl, baseURL, os.Getenv("OPENAI_BASE_URL") != "")
+	if err != nil {
+		return nil, fmt.Errorf("provider %q: %w", provName, err)
 	}
 	mode := p.Mode
 	if mode == "" {
@@ -373,27 +361,6 @@ func Setup(p Params) (*App, error) {
 	}
 	if maxTokens <= 0 {
 		maxTokens = config.DefaultMaxTokens
-	}
-
-	// Headers: provider headers, model headers on top. A "$NAME"
-	// value reads the environment; literals pass through.
-	var headers map[string]string
-	merged := map[string]string{}
-	for k, v := range prov.Headers {
-		merged[k] = v
-	}
-	for k, v := range mdl.Headers {
-		merged[k] = v
-	}
-	if len(merged) > 0 {
-		headers = make(map[string]string, len(merged))
-		for k, v := range merged {
-			rv, err := config.ResolveValue(v)
-			if err != nil {
-				return nil, err
-			}
-			headers[k] = rv
-		}
 	}
 
 	a.Model = mdl
@@ -582,21 +549,6 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 	if mdl.ID == "" {
 		return "", "", "", fmt.Errorf("provider %q: no model configured (set \"model\" or add a \"models\" entry)", provName)
 	}
-	// API key: the provider's literal key or environment reference wins,
-	// else OPENAI_API_KEY.
-	apiKey := ""
-	if prov.APIKey != "" {
-		k, err := config.ResolveAPIKey(prov.APIKey)
-		if err != nil {
-			return "", "", "", err
-		}
-		apiKey = k
-	} else {
-		apiKey = os.Getenv("OPENAI_API_KEY")
-	}
-	if apiKey == "" {
-		return "", "", "", fmt.Errorf("missing API key: set OPENAI_API_KEY, or set apiKey to a key or \"$NAME\" for provider %q in the config file", provName)
-	}
 	apiMode := a.Cfg.Client.API
 	if mdl.API != "" {
 		m, err := config.NormalizeAPI(mdl.API)
@@ -612,6 +564,10 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 	if baseURL == "" {
 		return "", "", "", fmt.Errorf("provider %q: baseUrl is required", provName)
 	}
+	apiKey, headers, err := prov.ResolveCredentials(mdl, baseURL, os.Getenv("OPENAI_BASE_URL") != "")
+	if err != nil {
+		return "", "", "", fmt.Errorf("provider %q: %w", provName, err)
+	}
 	maxTokens := 0
 	if v := os.Getenv("ANTHROPIC_MAX_TOKENS"); v != "" {
 		fmt.Sscanf(v, "%d", &maxTokens)
@@ -622,24 +578,6 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 	}
 	if maxTokens <= 0 {
 		maxTokens = config.DefaultMaxTokens
-	}
-	var headers map[string]string
-	merged := map[string]string{}
-	for k, v := range prov.Headers {
-		merged[k] = v
-	}
-	for k, v := range mdl.Headers {
-		merged[k] = v
-	}
-	if len(merged) > 0 {
-		headers = make(map[string]string, len(merged))
-		for k, v := range merged {
-			rv, err := config.ResolveValue(v)
-			if err != nil {
-				return "", "", "", err
-			}
-			headers[k] = rv
-		}
 	}
 	contextLimit := 0
 	if v := os.Getenv("OPENAI_CONTEXT_LIMIT"); v != "" {

@@ -73,9 +73,21 @@ rejected — the harness has no client for it.
 
 `apiKey` accepts a literal key or a `"$NAME"` / `"${NAME}"` environment
 reference. An unset referenced variable is an error; `!command` is not supported.
-When a provider sets no `apiKey`, `OPENAI_API_KEY` is used.
+Global and explicitly selected config files may omit `apiKey` to use
+`OPENAI_API_KEY`. A provider introduced by project config must explicitly
+declare its credential, for example `"apiKey": "$OPENAI_API_KEY"`.
 `headers` (provider and per-model, model wins) accept the same
 `$NAME` references; auth headers are never taken from them.
+
+Credentials are bound to the endpoints declared by their configuration
+source. A project override of a provider or model `baseUrl` cannot silently
+inherit a global API key or header at the new destination. Declare `apiKey`
+and any inherited headers explicitly alongside the new endpoint, or configure
+a separate provider globally. A model-only override that keeps the endpoint
+continues to inherit credentials. Startup and `/model` use the same check.
+The direct `OPENAI_BASE_URL` environment override remains a user choice.
+Provider HTTP redirects are rejected, including redirects to another API
+path, so custom credential headers cannot be forwarded automatically.
 
 `samplingParams` (e.g. `temperature`, `top_p`) is merged into every
 request body of the two OpenAI modes only; Anthropic

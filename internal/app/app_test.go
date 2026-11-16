@@ -38,8 +38,8 @@ func TestSetupResolvesConfigFile(t *testing.T) {
 	cfg := `{
 		"defaultProvider": "discovery",
 		"providers": {
-			"openconsole": {"baseUrl": "https://www.openconsole.cn/v1", "api": "chat", "model": "deepseek-v4.1-flash"},
-			"discovery": {"baseUrl": "https://discovery-api.intern-ai.org.cn/v1", "api": "anthropic", "model": "Agents-A1"}
+			"openconsole": {"apiKey": "$OPENAI_API_KEY", "baseUrl": "https://www.openconsole.cn/v1", "api": "chat", "model": "deepseek-v4.1-flash"},
+			"discovery": {"apiKey": "$OPENAI_API_KEY", "baseUrl": "https://discovery-api.intern-ai.org.cn/v1", "api": "anthropic", "model": "Agents-A1"}
 		},
 		"mode": "auto",
 		"contextLimit": 12345,
@@ -163,7 +163,7 @@ func TestSetupResolvesModelsArray(t *testing.T) {
 					{"id": "deepseek-v4-flash-0731", "api": "openai-completions", "contextWindow": 256000, "maxTokens": 8192}
 				]
 			},
-			"openconsole": {"baseUrl": "https://www.openconsole.cn/v1", "api": "chat", "model": "deepseek-v4.1-flash"}
+			"openconsole": {"apiKey": "$OPENAI_API_KEY", "baseUrl": "https://www.openconsole.cn/v1", "api": "chat", "model": "deepseek-v4.1-flash"}
 		}
 	}`
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
@@ -209,7 +209,7 @@ func TestSetupResolvesModelsArray(t *testing.T) {
 	if a2.Cfg.Client.API != "chat" || a2.ContextLimit != 256000 || a2.Cfg.Client.MaxTokens != 8192 {
 		t.Fatalf("second model: api %q contextLimit %d maxTokens %d", a2.Cfg.Client.API, a2.ContextLimit, a2.Cfg.Client.MaxTokens)
 	}
-	// A provider without an apiKey ref falls back to OPENAI_API_KEY,
+	// A project provider explicitly references OPENAI_API_KEY,
 	// and a model that omits limits gets the defaults.
 	a3, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5, Provider: "openconsole"})
 	if err != nil {
@@ -238,7 +238,7 @@ func TestSetupResolvesModelsArray(t *testing.T) {
 // Setup requires one. OPENAI_BASE_URL still wins for the actual calls.
 func writeMockProvider(t *testing.T, root string) {
 	t.Helper()
-	cfg := `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "model": "mock"}}}`
+	cfg := `{"providers": {"mock": {"apiKey": "$OPENAI_API_KEY", "baseUrl": "http://127.0.0.1:1", "api": "chat", "model": "mock"}}}`
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -535,7 +535,7 @@ func TestImageAttachAndSend(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	t.Setenv("OPENAI_BASE_URL", srv.URL)
 	root := t.TempDir()
-	cfg := `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}]}}}`
+	cfg := `{"providers": {"mock": {"apiKey": "$OPENAI_API_KEY", "baseUrl": "http://127.0.0.1:1", "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}]}}}`
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -843,7 +843,7 @@ func TestPluginsCommand(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	root := t.TempDir()
-	cfg := `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "model": "mock"}}, "plugins": {"disabled": ["off"]}}`
+	cfg := `{"providers": {"mock": {"apiKey": "$OPENAI_API_KEY", "baseUrl": "http://127.0.0.1:1", "api": "chat", "model": "mock"}}, "plugins": {"disabled": ["off"]}}`
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1026,7 +1026,7 @@ func TestSetupSandbox(t *testing.T) {
 	a.Store.Close()
 
 	// (c) Config sandbox:true enables it without the flag.
-	cfg := `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "model": "mock"}}, "sandbox": true}`
+	cfg := `{"providers": {"mock": {"apiKey": "$OPENAI_API_KEY", "baseUrl": "http://127.0.0.1:1", "api": "chat", "model": "mock"}}, "sandbox": true}`
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1040,7 +1040,7 @@ func TestSetupSandbox(t *testing.T) {
 	a.Store.Close()
 
 	// (d) Env HARNESS_SANDBOX=1 enables it too.
-	cfg = `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "model": "mock"}}}`
+	cfg = `{"providers": {"mock": {"apiKey": "$OPENAI_API_KEY", "baseUrl": "http://127.0.0.1:1", "api": "chat", "model": "mock"}}}`
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}

@@ -24,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"minimalharness/internal/endpoint"
 )
 
 type Message struct {
@@ -316,16 +318,7 @@ func (c *Client) ProviderName() string {
 // endpoint normalises baseURL to .../v1/chat/completions,
 // .../v1/responses or .../v1/messages.
 func (c *Client) endpoint() string {
-	base := strings.TrimSuffix(strings.TrimSpace(c.BaseURL), "/")
-	if base == "" {
-		base = "https://api.openai.com/v1"
-	}
-	base = strings.TrimSuffix(base, "/chat/completions")
-	base = strings.TrimSuffix(base, "/responses")
-	base = strings.TrimSuffix(base, "/messages")
-	if !strings.HasSuffix(base, "/v1") {
-		base += "/v1"
-	}
+	base := endpoint.Base(c.BaseURL)
 	switch c.Mode() {
 	case "responses":
 		return base + "/responses"
@@ -336,10 +329,15 @@ func (c *Client) endpoint() string {
 }
 
 func (c *Client) httpClient() *http.Client {
+	client := &http.Client{Timeout: c.totalTimeout()}
 	if c.HTTP != nil {
-		return c.HTTP
+		copy := *c.HTTP
+		client = &copy
 	}
-	return &http.Client{Timeout: c.totalTimeout()}
+	// Redirects can move custom credential headers to another destination.
+	// Require the configured API endpoint to answer directly.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return client
 }
 
 // DefaultTotalTimeout is the per-request backstop when the model

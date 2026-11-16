@@ -226,9 +226,9 @@ func setupTestApp(t *testing.T, mode string, steps []fakeStep, writePlugins ...f
 		t.Fatal(err)
 	}
 	// The harness requires a configured provider: point a mock
-	// provider at the fake server. Env still wins for the key.
+	// provider at the fake server, explicitly referencing the test key.
 	// The mock model declares image input so attach_image works.
-	cfg := fmt.Sprintf(`{"providers": {"mock": {"baseUrl": %q, "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}, {"id": "mock2", "api": "openai-responses"}]}}}`, srv.URL+"/v1")
+	cfg := fmt.Sprintf(`{"providers": {"mock": {"apiKey": "$OPENAI_API_KEY", "baseUrl": %q, "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}, {"id": "mock2", "api": "openai-responses"}]}}}`, srv.URL+"/v1")
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -962,7 +962,7 @@ func TestListPlugins(t *testing.T) {
 		write("boom", "boom.js", `throw new Error("kaboom");`)
 		// Disable "off" in the project config (replaces the config
 		// setupTestApp wrote).
-		cfg := `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}]}}, "plugins": {"disabled": ["off"]}}`
+		cfg := `{"providers": {"mock": {"apiKey": "$OPENAI_API_KEY", "baseUrl": "http://127.0.0.1:1", "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}]}}, "plugins": {"disabled": ["off"]}}`
 		if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 			t.Fatal(err)
 		}
