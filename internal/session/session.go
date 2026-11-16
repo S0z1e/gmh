@@ -359,7 +359,15 @@ func Load(id string) ([]llm.Message, error) {
 	}
 	defer f.Close()
 	var msgs []llm.Message
+	var replayErr error
 	_, _, _, err = scanRecords(f, func(line []byte, m llm.Message) {
+		if replayErr != nil {
+			return
+		}
+		if m.Role == invocationMarkerRole {
+			replayErr = applyInvocation(msgs, m.ToolInvocations)
+			return
+		}
 		if m.Role == clearMarkerRole || m.Role == compactMarkerRole {
 			// /clear or /compact point: forget everything before it
 			// (file keeps it).
@@ -384,6 +392,9 @@ func Load(id string) ([]llm.Message, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	if replayErr != nil {
+		return nil, fmt.Errorf("load session invocation: %w", replayErr)
 	}
 	return RepairToolBatches(msgs), nil
 }
@@ -430,6 +441,14 @@ func RepairToolBatches(msgs []llm.Message) []llm.Message {
 			result, ok := results[call.ID]
 			if !ok {
 				result = llm.Message{Role: "tool", ToolCallID: call.ID, ToolError: true, Kind: "interrupted", Content: "Error: execution was interrupted before this result was recorded. The outcome is unknown; inspect the current state before retrying any action."}
+			}
+			if result.InvocationID == "" {
+				for _, inv := range m.ToolInvocations {
+					if inv.ToolCallID == call.ID {
+						result.InvocationID = inv.ID
+						break
+					}
+				}
 			}
 			out = append(out, result)
 		}

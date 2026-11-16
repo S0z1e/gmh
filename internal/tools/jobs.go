@@ -43,6 +43,10 @@ type JobResult struct {
 
 // Job is one background bash execution.
 type Job struct {
+	// Invocation identity is immutable from construction.
+	InvocationID string
+	ToolCallID   string
+
 	ID      string
 	Command string
 	// OutputFile is the per-call file holding the full stdout+stderr
@@ -420,12 +424,12 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		return nil, err
 	}
 	if reason := DeniedCommand(a.Command); reason != "" {
-		e.audit(AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
+		e.audit(ctx, AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
 		return nil, fmt.Errorf("denied by policy: %s", reason)
 	}
 	dir, err := e.bashDir(a)
 	if err != nil {
-		e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
+		e.audit(ctx, AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
 		return nil, err
 	}
 	timeout := e.bashTimeout(a)
@@ -434,7 +438,8 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	}
 	outPath := e.nextOutputFile()
 	runCtx, cancel := context.WithCancel(context.Background())
-	job := &Job{Command: a.Command, OutputFile: outPath, Started: time.Now(), done: make(chan struct{}), cancel: cancel}
+	identity := invocationFromContext(ctx)
+	job := &Job{InvocationID: identity.id, ToolCallID: identity.callID, Command: a.Command, OutputFile: outPath, Started: time.Now(), done: make(chan struct{}), cancel: cancel}
 	if foreground {
 		job.stopParent = context.AfterFunc(ctx, cancel)
 	}
@@ -450,7 +455,7 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		defer cancel()
 		out, code, err := e.runBashCmd(runCtx, a.Command, timeout, outPath, dir)
 		if audit != nil {
-			entry := AuditEntry{TS: time.Now(), Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
+			entry := AuditEntry{InvocationID: job.InvocationID, ToolCallID: job.ToolCallID, TS: time.Now(), Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
 			if err != nil {
 				entry.Error = err.Error()
 			}

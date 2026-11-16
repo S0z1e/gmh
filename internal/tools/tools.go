@@ -108,7 +108,9 @@ func (e *Executor) webfetchCache() *webfetchCache {
 	return e.fetchCache
 }
 
-func (e *Executor) audit(entry AuditEntry) {
+func (e *Executor) audit(ctx context.Context, entry AuditEntry) {
+	identity := invocationFromContext(ctx)
+	entry.InvocationID, entry.ToolCallID = identity.id, identity.callID
 	if e.Audit != nil {
 		entry.TS = time.Now()
 		e.Audit(entry)
@@ -612,7 +614,7 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 		return e.killJob(a.KillJobID)
 	}
 	if reason := DeniedCommand(a.Command); reason != "" {
-		e.audit(AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
+		e.audit(ctx, AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
 		return ToolResult{}, fmt.Errorf("denied by policy: %s", reason)
 	}
 	dir, err := e.bashDir(a)
@@ -625,7 +627,7 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 	if err != nil {
 		entry.Error = err.Error()
 	}
-	e.audit(entry)
+	e.audit(ctx, entry)
 	return ToolResult{Text: out, ExitCode: &code, OutputFile: path}, err
 }
 

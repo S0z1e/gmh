@@ -17,4 +17,7 @@ type AuditEntry struct {
 	Decision string    `json:"decision,omitempty"` // "approved" | "denied"
 	ExitCode int       `json:"exit_code"`
 	Error    string    `json:"error,omitempty"`
+
+	ToolCallID   string `json:"tool_call_id,omitempty"`
+	InvocationID string `json:"invocation_id,omitempty"`
 }

@@ -644,7 +644,7 @@ func (s *Server) ask(req agent.ApprovalRequest) (bool, error) {
 	ch := make(chan approvalAnswer, 1)
 	s.approvals[id] = ch
 	s.approvalsMu.Unlock()
-	s.writeEvent(Event{Type: "approval_request", ID: id, Tool: req.ToolName, Args: parseToolArgs(req.Arguments), Prompt: req.Prompt()})
+	s.writeEvent(Event{Type: "approval_request", ID: id, Tool: req.ToolName, ToolCallID: req.ToolCallID, InvocationID: req.InvocationID, Args: parseToolArgs(req.Arguments), Prompt: req.Prompt()})
 	select {
 	case ans := <-ch:
 		return ans.approved, ans.err
@@ -805,10 +805,10 @@ func (s *Server) onEvent(ev agent.Event) {
 	case agent.EventLLMRequest:
 		s.writeEvent(Event{Type: "llm_request", Request: ev.Request, Operation: ev.Operation, Attempt: ev.Attempt})
 	case agent.EventToolStart:
-		s.writeEvent(Event{Type: "tool_start", Tool: ev.ToolName, Args: parseToolArgs(ev.ToolArgs)})
+		s.writeEvent(Event{Type: "tool_start", Tool: ev.ToolName, ToolCallID: ev.ToolCallID, InvocationID: ev.InvocationID, Args: parseToolArgs(ev.ToolArgs)})
 	case agent.EventToolEnd:
 		out, trunc := capOutput(ev.ToolOutput, maxToolOutputChars)
-		e := Event{Type: "tool_end", Tool: ev.ToolName, Output: out, Truncated: trunc, Status: string(ev.ToolStatus), ExitCode: ev.ToolExitCode, OutputFile: ev.ToolOutputFile}
+		e := Event{Type: "tool_end", Tool: ev.ToolName, ToolCallID: ev.ToolCallID, InvocationID: ev.InvocationID, Output: out, Truncated: trunc, Status: string(ev.ToolStatus), ExitCode: ev.ToolExitCode, OutputFile: ev.ToolOutputFile}
 		if ev.ToolErr != nil {
 			e.Error = ev.ToolErr.Error()
 		}
@@ -820,12 +820,12 @@ func (s *Server) onEvent(ev agent.Event) {
 		}
 		s.writeEvent(e)
 	case agent.EventToolBackgrounded:
-		s.writeEvent(Event{Type: "tool_backgrounded", Tool: ev.ToolName, Args: parseToolArgs(ev.ToolArgs), Job: ev.JobID})
+		s.writeEvent(Event{Type: "tool_backgrounded", Tool: ev.ToolName, ToolCallID: ev.ToolCallID, InvocationID: ev.InvocationID, Args: parseToolArgs(ev.ToolArgs), Job: ev.JobID})
 	case agent.EventBackgroundWait:
 		s.writeEvent(Event{Type: "background_wait", Jobs: ev.Text})
 	case agent.EventToolBackgroundDone:
 		out, trunc := capOutput(ev.ToolOutput, maxToolOutputChars)
-		e := Event{Type: "tool_background_done", Job: ev.JobID, Output: out, Truncated: trunc, Status: string(ev.ToolStatus), ExitCode: ev.ToolExitCode, OutputFile: ev.ToolOutputFile}
+		e := Event{Type: "tool_background_done", Job: ev.JobID, ToolCallID: ev.ToolCallID, InvocationID: ev.InvocationID, Output: out, Truncated: trunc, Status: string(ev.ToolStatus), ExitCode: ev.ToolExitCode, OutputFile: ev.ToolOutputFile}
 		if ev.ToolErr != nil {
 			e.Error = ev.ToolErr.Error()
 		}

@@ -103,8 +103,10 @@ type Event struct {
 	// produced no text.
 	Text string
 	// ToolName / ToolArgs identify the call for ToolStart.
-	ToolName string
-	ToolArgs string
+	ToolName     string
+	ToolArgs     string
+	ToolCallID   string
+	InvocationID string
 	// ToolOutput is the observation for ToolEnd (including the "Error:"
 	// prefix when ToolErr is set).
 	ToolOutput     string

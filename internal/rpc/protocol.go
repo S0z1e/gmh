@@ -125,6 +125,9 @@ type Event struct {
 	SessionCostUSD *float64 `json:"session_cost_usd,omitempty"`
 	Fee            string   `json:"fee,omitempty"`
 	// tool_start / tool_end / background events.
+	ToolCallID   string `json:"tool_call_id,omitempty"`
+	InvocationID string `json:"invocation_id,omitempty"`
+
 	Tool       string `json:"tool,omitempty"`
 	Status     string `json:"status,omitempty"`
 	ExitCode   *int   `json:"exit_code,omitempty"`

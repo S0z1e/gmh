@@ -35,6 +35,11 @@ type Message struct {
 	Content      string     `json:"content,omitempty"`
 	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID   string     `json:"tool_call_id,omitempty"`
+
+	// Execution provenance is stored in sessions, never sent to providers.
+	ToolInvocations []ToolInvocation `json:"tool_invocations,omitempty"`
+	InvocationID    string           `json:"invocation_id,omitempty"`
+
 	// Images are attached images (user messages only). The session
 	// file stores their path and media type, never the bytes; the
 	// bytes are re-read from disk on --resume.

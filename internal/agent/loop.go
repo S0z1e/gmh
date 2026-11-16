@@ -6,6 +6,7 @@ package agent
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"minimalharness/internal/textutil"
@@ -116,10 +117,11 @@ func (c *Config) validateArgs(name, args string) error {
 	return fmt.Errorf("tool %s not offered in this turn", name)
 }
 
-func (c *Config) invalidArgs(msgs []llm.Message, tc llm.ToolCall, err error) []llm.Message {
+func (c *Config) invalidArgs(msgs []llm.Message, tc llm.ToolCall, invocationID string, err error) []llm.Message {
 	obs := fmt.Sprintf("Error: invalid %s arguments: %v", tc.Function.Name, err)
-	c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err})
-	m := llm.Message{Role: "tool", ToolCallID: tc.ID, ToolError: true, Content: obs}
+	c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments, ToolCallID: tc.ID, InvocationID: invocationID})
+	c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: invocationID, ToolOutput: obs, ToolErr: err})
+	m := llm.Message{Role: "tool", ToolCallID: tc.ID, InvocationID: invocationID, ToolError: true, Content: obs}
 	if c.Session != nil {
 		c.persist(m)
 	}
@@ -248,7 +250,7 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (tools.ToolResul
 		return tools.ToolResult{}, nil, fmt.Errorf("bad bash args: %w", err)
 	}
 	backgrounded := func(job *tools.Job) (tools.ToolResult, *tools.Job, error) {
-		c.emit(Event{Kind: EventToolBackgrounded, ToolName: "bash", ToolArgs: tc.Function.Arguments, JobID: job.ID})
+		c.emit(Event{Kind: EventToolBackgrounded, ToolName: "bash", ToolCallID: tc.ID, InvocationID: job.InvocationID, ToolArgs: tc.Function.Arguments, JobID: job.ID})
 		text := fmt.Sprintf("Command is still running in the background (job %s). Continue with other work; its output will be delivered automatically when it finishes. Do not re-run the command.", job.ID)
 		if job.OutputFile != "" {
 			text += fmt.Sprintf(" Read partial output with read %q.", job.OutputFile)
@@ -345,8 +347,8 @@ func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) (
 	for _, p := range done {
 		res, _ := p.job.Result()
 		obs, toolErr := jobResultMessage(p.job, res)
-		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID, ToolExitCode: &res.ExitCode, ToolOutputFile: p.job.OutputFile})
-		msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: obs})
+		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID, ToolCallID: p.job.ToolCallID, InvocationID: p.job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: p.job.OutputFile})
+		msgs = append(msgs, llm.Message{Role: "user", Kind: "job", InvocationID: p.job.InvocationID, Content: obs})
 		if c.Session != nil {
 			c.persist(msgs[len(msgs)-1])
 		}
@@ -424,8 +426,8 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 	for _, job := range doneJobs {
 		res, _ := job.Result()
 		obs, toolErr := jobResultMessage(job, res)
-		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
-		msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: obs})
+		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
+		msgs = append(msgs, llm.Message{Role: "user", Kind: "job", InvocationID: job.InvocationID, Content: obs})
 		if c.Session != nil {
 			c.persist(msgs[len(msgs)-1])
 		}
@@ -464,8 +466,8 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 		case job := <-done:
 			res, _ := job.Result()
 			obs, toolErr := jobResultMessage(job, res)
-			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
-			msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: obs})
+			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
+			msgs = append(msgs, llm.Message{Role: "user", Kind: "job", InvocationID: job.InvocationID, Content: obs})
 			if c.Session != nil {
 				c.persist(msgs[len(msgs)-1])
 			}
@@ -860,7 +862,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: TerminalAbort})
 				return lastText, total, err
 			}
-			c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments})
+			inv := llm.ToolInvocation{ID: rand.Text(), CallIndex: i, ToolCallID: tc.ID, ToolName: tc.Function.Name, OriginalArguments: tc.Function.Arguments}
+			startTool := func(args string) {
+				c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: args, ToolCallID: tc.ID, InvocationID: inv.ID})
+			}
 			// Plugin tool_call hooks run before approval: a denied
 			// call never prompts the user, and the approval flow
 			// still applies to anything the hooks let through — a
@@ -883,17 +888,18 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				recordLastError(&lastErrors, "tool not offered: "+tc.Function.Name)
 				obs := fmt.Sprintf("Tool %s is not available in this turn. Do not retry this tool call; explain and propose an alternative.", tc.Function.Name)
 				if c.Session != nil {
-					_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "tool not offered in this turn"})
+					_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "tool not offered in this turn"})
 				}
-				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: fmt.Errorf("tool %s not offered in this turn", tc.Function.Name)})
-				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: true})
+				startTool(argsJSON)
+				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: fmt.Errorf("tool %s not offered in this turn", tc.Function.Name)})
+				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
 				continue
 			}
 			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
-				msgs = c.invalidArgs(msgs, *tc, err)
+				msgs = c.invalidArgs(msgs, *tc, inv.ID, err)
 				stepHadExecution = true
 				recordLastError(&lastErrors, err.Error())
 				continue
@@ -905,21 +911,25 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					recordLastError(&lastErrors, "plugin denied tool call")
 					obs := "Denied by plugin " + deny + ". Do not retry this tool call; explain and propose an alternative."
 					if c.Session != nil {
-						_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: deny})
+						_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: deny})
 					}
-					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: fmt.Errorf("denied by plugin %s", deny)})
-					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: true})
+					startTool(argsJSON)
+					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: fmt.Errorf("denied by plugin %s", deny)})
+					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 					if c.Session != nil {
 						c.persist(msgs[len(msgs)-1])
 					}
 					continue
+				}
+				if newArgs != argsJSON {
+					inv.Rewrites = append(inv.Rewrites, llm.ArgumentRewrite{Source: "plugin_hook", Arguments: newArgs})
 				}
 				argsJSON = newArgs
 				tc.Function.Arguments = argsJSON
 				msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
 			}
 			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
-				msgs = c.invalidArgs(msgs, *tc, err)
+				msgs = c.invalidArgs(msgs, *tc, inv.ID, err)
 				stepHadExecution = true
 				recordLastError(&lastErrors, err.Error())
 				continue
@@ -933,10 +943,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if !allowed {
 				obs := RepeatedToolCallMessage(tc.Function.Name, RepeatedToolCallThreshold)
 				if c.Session != nil {
-					_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool call denied"})
+					_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool call denied"})
 				}
-				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: ErrRepeatedToolCallDenied})
-				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: true})
+				startTool(argsJSON)
+				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: ErrRepeatedToolCallDenied})
+				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
@@ -948,15 +959,27 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				c.emit(Event{Kind: EventError, Err: denied, Text: lastText, TerminalReason: TerminalRepeatedToolCallDenied})
 				return lastText, total, denied
 			}
+			if useArgs != argsJSON {
+				inv.Rewrites = append(inv.Rewrites, llm.ArgumentRewrite{Source: "continuation", Arguments: useArgs})
+			}
 			argsJSON = useArgs
 			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
-				msgs = c.invalidArgs(msgs, *tc, err)
+				msgs = c.invalidArgs(msgs, *tc, inv.ID, err)
 				stepHadExecution = true
 				recordLastError(&lastErrors, err.Error())
 				continue
 			}
 			tc.Function.Arguments = argsJSON
 			msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
+			inv.Arguments = argsJSON
+			if c.Session != nil {
+				if err := c.Session.RecordInvocation(inv); err != nil {
+					c.persistErr = fmt.Errorf("save tool invocation: %w", err)
+					return lastText, total, c.persistErr
+				}
+			}
+			msgs[assistantIdx].ToolInvocations = append(msgs[assistantIdx].ToolInvocations, inv)
+			startTool(argsJSON)
 			callKey := CanonicalToolKey(tc.Function.Name, argsJSON)
 			// Repeat-failure circuit breaker: a call that already
 			// failed FailureDenyAfter times this turn is denied
@@ -973,10 +996,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if denied, failures := breaker.Check(callKey); denied {
 				obs := RepeatedFailureDeniedMessage(tc.Function.Name, failures)
 				if c.Session != nil {
-					_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool failure denied"})
+					_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool failure denied"})
 				}
-				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: ErrRepeatedToolFailureDenied})
-				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: true})
+				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: ErrRepeatedToolFailureDenied})
+				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
@@ -985,13 +1008,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				continue
 			}
 			if c.needsApproval(tc.Function.Name, tc.Function.Arguments) {
-				req := ApprovalRequest{ToolName: tc.Function.Name, Arguments: tc.Function.Arguments}
-				c.emit(Event{Kind: EventApproval, Text: req.Prompt(), ToolName: req.ToolName, ToolArgs: req.Arguments})
+				req := ApprovalRequest{ToolName: tc.Function.Name, Arguments: tc.Function.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID}
+				c.emit(Event{Kind: EventApproval, Text: req.Prompt(), ToolName: req.ToolName, ToolArgs: req.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID})
 				ok, err := c.ask(req)
 				// Audit every decision (approved, denied, or errored)
 				// to the session sidecar, for later review.
 				if c.Session != nil {
-					entry := tools.AuditEntry{TS: time.Now(), Kind: "approval", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), ExitCode: -1}
+					entry := tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "approval", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), ExitCode: -1}
 					if err != nil {
 						entry.Error = err.Error()
 					} else if ok {
@@ -1013,14 +1036,15 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					stepHadExecution = true
 					obs := "User denied this tool call. Do not retry it; explain and propose an alternative."
 					recordLastError(&lastErrors, obs)
-					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: fmt.Errorf("tool call denied by user")})
-					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: true})
+					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: fmt.Errorf("tool call denied by user")})
+					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 					if c.Session != nil {
 						c.persist(msgs[len(msgs)-1])
 					}
 					continue
 				}
 			}
+			toolCtx := tools.WithInvocation(ctx, inv.ID, tc.ID)
 			var obs string
 			var err error
 			var res tools.ToolResult
@@ -1029,12 +1053,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			case "ask_user":
 				res.Text, err = c.askUser(ctx, argsJSON)
 			case "bash":
-				res, job, err = c.execBash(ctx, *tc)
+				res, job, err = c.execBash(toolCtx, *tc)
 				if job != nil {
 					pending = append(pending, pendingJob{callID: tc.ID, job: job})
 				}
 			default:
-				res, err = c.Exec.Dispatch(ctx, tc.Function.Name, argsJSON)
+				res, err = c.Exec.Dispatch(toolCtx, tc.Function.Name, argsJSON)
 			}
 			if err != nil {
 				res.Status = tools.ResultError
@@ -1070,8 +1094,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					breaker.ObserveSuccess(callKey)
 				}
 			}
-			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
-			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: err != nil})
+			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
+			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil})
 			if c.Session != nil {
 				c.persist(msgs[len(msgs)-1])
 			}
