@@ -33,7 +33,7 @@ func protectedTarget(root string, target *fileguard.Target) bool {
 			return true
 		}
 	}
-	return protectedSpelling(root, target.Path) || target.Touches(".harness.json") || target.Touches(".git") || target.Touches(".agents/plugins")
+	return protectedSpelling(root, target.Path) || target.Touches(".harness.json", false) || target.Touches(".git", true) || target.Touches(".agents/plugins", true)
 }
 
 func (m *Mutation) Close() error { return m.target.Close() }

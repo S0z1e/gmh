@@ -113,6 +113,10 @@ func TestDanglingProtectedAliasesRequireApproval(t *testing.T) {
 		{"plugins", "plugins-alias/p.js", "real-plugins/p.js", map[string]string{"plugins-alias": ".agents/plugins", ".agents/plugins": "../real-plugins"}},
 		{"git", "git-alias/config", "real-git/config", map[string]string{"git-alias": ".git", ".git": "real-git"}},
 		{"agents-parent", "plugins-alias/p.js", "real-agents/plugins/p.js", map[string]string{"plugins-alias": ".agents/plugins", ".agents": "real-agents"}},
+		{"reverse-config", "alias", "real-config", map[string]string{"alias": "real-config", ".harness.json": "real-config"}},
+		{"reverse-plugins", "alias/p.js", "real-plugins/p.js", map[string]string{"alias": "real-plugins", ".agents/plugins": "../real-plugins"}},
+		{"direct-plugins", "real-plugins/p.js", "real-plugins/p.js", map[string]string{".agents/plugins": "../real-plugins"}},
+		{"reverse-git", "alias/config", "real-git/config", map[string]string{"alias": "real-git", ".git": "real-git"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()

@@ -237,9 +237,21 @@ func (t *Target) ReadFile() ([]byte, error) {
 
 // Touches recognizes filesystem aliases of a protected file or directory,
 // including case aliases and alternate names of a protected root itself.
-func (t *Target) Touches(path string) bool {
+func (t *Target) Touches(path string, directory bool) bool {
 	protected, err := t.root.Stat(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// A protected symlink can point at a not-yet-created leaf
+			// or subtree. Compare its resolved destination even when
+			// there is no inode to compare with SameFile yet.
+			missing, resolveErr := ResolveTarget(t.root, path)
+			if resolveErr == nil {
+				defer missing.Close()
+				want := strings.ToLower(filepath.ToSlash(missing.Path))
+				got := strings.ToLower(filepath.ToSlash(t.Path))
+				return got == want || directory && strings.HasPrefix(got, want+"/")
+			}
+		}
 		return false
 	}
 	if t.Info != nil && os.SameFile(t.Info, protected) {
