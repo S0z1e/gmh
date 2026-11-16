@@ -103,9 +103,11 @@ type Event struct {
 	// produced no text.
 	Text string
 	// ToolName / ToolArgs identify the call for ToolStart.
-	ToolName     string
-	ToolArgs     string
-	ToolCallID   string
+	ToolName   string
+	ToolArgs   string
+	ToolCallID string
+	// InvocationID identifies validated effective args. Early rejections
+	// carry only ToolCallID, since no invocation was committed.
 	InvocationID string
 	// ToolOutput is the observation for ToolEnd (including the "Error:"
 	// prefix when ToolErr is set).

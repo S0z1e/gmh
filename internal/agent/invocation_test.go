@@ -222,3 +222,101 @@ func TestCanceledBatchReplaysOnlyCommittedEffectiveInvocations(t *testing.T) {
 		t.Fatalf("wrong side effects: %v %v hooks=%d", entries, err, hooks.callCalls)
 	}
 }
+
+func TestContinuationDenialCommitsEffectiveInvocation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := session.New("denied-invocation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	root := t.TempDir()
+	original := `{"path":"requested","content":"data"}`
+	actual := `{"path":"actual","content":"data"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, toolCallSSE("call", "write", original))
+	}))
+	defer srv.Close()
+	var events []Event
+	cfg := &Config{Client: &llm.Client{BaseURL: srv.URL, APIKey: "test", Model: "test", API: "chat"}, Exec: &tools.Executor{Root: root, Plugins: &fakePluginRunner{rewrite: map[string]string{"write": actual}}}, Tools: ToolDefs(), Session: store, Mode: "auto", DoomLoopThreshold: 1,
+		ConfirmContinuation: func(ContinuationRequest) (ContinuationDecision, error) {
+			return ContinuationDecision{Outcome: ContinuationDeny}, nil
+		},
+		OnEvent: func(e Event) { events = append(events, e) },
+	}
+	_, _, err = cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "go"}})
+	if !errors.Is(err, ErrRepeatedToolCallDenied) {
+		t.Fatalf("Run error: %v", err)
+	}
+	loaded, err := session.Load(store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 2 || len(loaded[0].ToolInvocations) != 1 || loaded[0].ToolCalls[0].Function.Arguments != actual {
+		t.Fatalf("denial lost effective invocation: %+v", loaded)
+	}
+	id := loaded[0].ToolInvocations[0].ID
+	if id == "" || loaded[1].InvocationID != id {
+		t.Fatalf("denial has dangling identity: %+v", loaded)
+	}
+	for _, e := range events {
+		if e.Kind == EventToolStart || e.Kind == EventToolEnd {
+			if e.InvocationID != id {
+				t.Fatalf("event identity: %+v", e)
+			}
+		}
+	}
+	data, err := os.ReadFile(store.AuditPath())
+	if err != nil || !strings.Contains(string(data), id) {
+		t.Fatalf("audit identity: %q %v", data, err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("denied invocation executed: %v %v", entries, err)
+	}
+}
+
+func TestEarlyRejectionsDoNotPublishUncommittedInvocationIDs(t *testing.T) {
+	for _, reason := range []string{"unoffered", "invalid_original", "hook_denied", "invalid_hook", "invalid_continuation"} {
+		t.Run(reason, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			store, err := session.New("early-rejection")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			hooks := &fakePluginRunner{}
+			args := `{"path":"file","content":"data"}`
+			cfg := &Config{Client: &llm.Client{APIKey: "test", Model: "test", API: "chat"}, Exec: &tools.Executor{Root: t.TempDir(), Plugins: hooks}, Tools: ToolDefs(), Session: store, Mode: "auto", MaxSteps: 3}
+			switch reason {
+			case "unoffered":
+				cfg.Tools = ToolsForMode(ToolModePlan, ToolDefs())
+			case "invalid_original":
+				args = `{"path":"file"}`
+			case "hook_denied":
+				hooks.deny = "policy"
+			case "invalid_hook":
+				hooks.rewrite = map[string]string{"write": `{"path":"file"}`}
+			case "invalid_continuation":
+				cfg.DoomLoopThreshold = 1
+				cfg.ConfirmContinuation = func(ContinuationRequest) (ContinuationDecision, error) {
+					return ContinuationDecision{Outcome: ContinuationOnce, UpdatedArgs: `{"path":"file"}`}, nil
+				}
+			}
+			events, _ := runTwoTurns(t, cfg, toolCallSSE("call", "write", args))
+			for _, e := range events {
+				if e.InvocationID != "" {
+					t.Fatalf("uncommitted ID in event: %+v", e)
+				}
+			}
+			loaded, err := session.Load(store.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(loaded[0].ToolInvocations) != 0 || loaded[1].InvocationID != "" {
+				t.Fatalf("uncommitted ID in replay: %+v", loaded)
+			}
+		})
+	}
+}

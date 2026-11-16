@@ -117,11 +117,11 @@ func (c *Config) validateArgs(name, args string) error {
 	return fmt.Errorf("tool %s not offered in this turn", name)
 }
 
-func (c *Config) invalidArgs(msgs []llm.Message, tc llm.ToolCall, invocationID string, err error) []llm.Message {
+func (c *Config) invalidArgs(msgs []llm.Message, tc llm.ToolCall, err error) []llm.Message {
 	obs := fmt.Sprintf("Error: invalid %s arguments: %v", tc.Function.Name, err)
-	c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments, ToolCallID: tc.ID, InvocationID: invocationID})
-	c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: invocationID, ToolOutput: obs, ToolErr: err})
-	m := llm.Message{Role: "tool", ToolCallID: tc.ID, InvocationID: invocationID, ToolError: true, Content: obs}
+	c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments, ToolCallID: tc.ID})
+	c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, ToolOutput: obs, ToolErr: err})
+	m := llm.Message{Role: "tool", ToolCallID: tc.ID, ToolError: true, Content: obs}
 	if c.Session != nil {
 		c.persist(m)
 	}
@@ -863,6 +863,17 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				return lastText, total, err
 			}
 			inv := llm.ToolInvocation{ID: rand.Text(), CallIndex: i, ToolCallID: tc.ID, ToolName: tc.Function.Name, OriginalArguments: tc.Function.Arguments}
+			recordInvocation := func(args string) error {
+				inv.Arguments = args
+				if c.Session != nil {
+					if err := c.Session.RecordInvocation(inv); err != nil {
+						c.persistErr = fmt.Errorf("save tool invocation: %w", err)
+						return c.persistErr
+					}
+				}
+				msgs[assistantIdx].ToolInvocations = append(msgs[assistantIdx].ToolInvocations, inv)
+				return nil
+			}
 			startTool := func(args string) {
 				c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: args, ToolCallID: tc.ID, InvocationID: inv.ID})
 			}
@@ -884,6 +895,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// gets an error observation, like a hook denial, and
 			// the refusal is audited.
 			if !toolOffered(c.Tools, tc.Function.Name) {
+				// No validated invocation exists; only the request ID is durable.
+				inv.ID = ""
 				stepHadExecution = true
 				recordLastError(&lastErrors, "tool not offered: "+tc.Function.Name)
 				obs := fmt.Sprintf("Tool %s is not available in this turn. Do not retry this tool call; explain and propose an alternative.", tc.Function.Name)
@@ -899,7 +912,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				continue
 			}
 			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
-				msgs = c.invalidArgs(msgs, *tc, inv.ID, err)
+				msgs = c.invalidArgs(msgs, *tc, err)
 				stepHadExecution = true
 				recordLastError(&lastErrors, err.Error())
 				continue
@@ -907,6 +920,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if c.Exec != nil && c.Exec.Plugins != nil {
 				newArgs, deny := c.Exec.Plugins.RunToolCallHooks(ctx, tc.Function.Name, argsJSON)
 				if deny != "" {
+					inv.ID = ""
 					stepHadExecution = true
 					recordLastError(&lastErrors, "plugin denied tool call")
 					obs := "Denied by plugin " + deny + ". Do not retry this tool call; explain and propose an alternative."
@@ -929,7 +943,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
 			}
 			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
-				msgs = c.invalidArgs(msgs, *tc, inv.ID, err)
+				msgs = c.invalidArgs(msgs, *tc, err)
 				stepHadExecution = true
 				recordLastError(&lastErrors, err.Error())
 				continue
@@ -941,6 +955,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// call ends the turn with the structured reason.
 			useArgs, allowed := c.checkRepeatedCall(ctx, tc.Function.Name, argsJSON)
 			if !allowed {
+				if err := recordInvocation(argsJSON); err != nil {
+					return lastText, total, err
+				}
 				obs := RepeatedToolCallMessage(tc.Function.Name, RepeatedToolCallThreshold)
 				if c.Session != nil {
 					_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool call denied"})
@@ -964,21 +981,16 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			argsJSON = useArgs
 			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
-				msgs = c.invalidArgs(msgs, *tc, inv.ID, err)
+				msgs = c.invalidArgs(msgs, *tc, err)
 				stepHadExecution = true
 				recordLastError(&lastErrors, err.Error())
 				continue
 			}
 			tc.Function.Arguments = argsJSON
 			msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
-			inv.Arguments = argsJSON
-			if c.Session != nil {
-				if err := c.Session.RecordInvocation(inv); err != nil {
-					c.persistErr = fmt.Errorf("save tool invocation: %w", err)
-					return lastText, total, c.persistErr
-				}
+			if err := recordInvocation(argsJSON); err != nil {
+				return lastText, total, err
 			}
-			msgs[assistantIdx].ToolInvocations = append(msgs[assistantIdx].ToolInvocations, inv)
 			startTool(argsJSON)
 			callKey := CanonicalToolKey(tc.Function.Name, argsJSON)
 			// Repeat-failure circuit breaker: a call that already
