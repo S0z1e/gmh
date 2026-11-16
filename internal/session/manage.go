@@ -1,6 +1,7 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"minimalharness/internal/privatefile"
 	"os"
@@ -135,8 +136,26 @@ func renameSessionFiles(oldID, newID string) error {
 	if _, err := os.Stat(newPath); err == nil {
 		return fmt.Errorf("session %q already exists", newID)
 	}
-	if err := os.Rename(oldPath, newPath); err != nil {
+	backups, err := filepath.Glob(oldPath + "-torn-*")
+	if err != nil {
 		return err
+	}
+	var moved []string
+	rollback := func(cause error) error {
+		for i := len(moved) - 1; i >= 0; i-- {
+			old := moved[i]
+			cause = errors.Join(cause, os.Rename(newPath+strings.TrimPrefix(old, oldPath), old))
+		}
+		return cause
+	}
+	for _, old := range backups {
+		if err := os.Rename(old, newPath+strings.TrimPrefix(old, oldPath)); err != nil {
+			return rollback(err)
+		}
+		moved = append(moved, old)
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return rollback(err)
 	}
 	// Audit sidecar follows the transcript.
 	_ = os.Rename(filepath.Join(dir, oldID+"-audit.jsonl"), filepath.Join(dir, newID+"-audit.jsonl"))
@@ -171,6 +190,15 @@ func DeleteSession(id string) error {
 	path := filepath.Join(dir, id+".jsonl")
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return fmt.Errorf("unknown session %q", id)
+	}
+	backups, err := filepath.Glob(path + "-torn-*")
+	if err != nil {
+		return err
+	}
+	for _, backup := range backups {
+		if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	if err := os.Remove(path); err != nil {
 		return err

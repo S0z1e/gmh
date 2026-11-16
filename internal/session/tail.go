@@ -51,6 +51,11 @@ func scanRecords(f io.Reader, visit func([]byte, llm.Message)) (end int64, newli
 }
 
 func recoverTail(f *os.File) error {
+	unlock, err := lockTranscript(f)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	end, newline, torn, err := scanRecords(f, nil)
 	if err != nil {
 		return err

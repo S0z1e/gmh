@@ -3,9 +3,11 @@ package session
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 
 	"minimalharness/internal/llm"
@@ -118,5 +120,103 @@ func TestCorruptCompleteRecordIsNeverSilentlyDropped(t *testing.T) {
 	got, err := os.ReadFile(path)
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("corrupt session modified: %v", err)
+	}
+}
+
+func TestConcurrentRecoveryKeepsSuccessfulAppends(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := os.MkdirAll(Dir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 20; attempt++ {
+		id := fmt.Sprintf("race-%d", attempt)
+		path := filepath.Join(Dir(), id+".jsonl")
+		original := append([]byte("{\"role\":\"user\",\"content\":\"before\"}\n{\"role\":\"assistant\",\"content\":\""), bytes.Repeat([]byte("x"), 2*1024*1024)...)
+		if err := os.WriteFile(path, original, 0600); err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		for n := 0; n < 2; n++ {
+			wg.Go(func() {
+				<-start
+				s, err := New(id)
+				if err != nil {
+					errs <- err
+					return
+				}
+				defer s.Close()
+				errs <- s.Append(llm.Message{Role: "user", Content: fmt.Sprintf("after-%d", n)})
+			})
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		msgs, err := Load(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(msgs) != 3 {
+			t.Fatalf("attempt %d: two Append calls succeeded but got %d messages: %+v", attempt, len(msgs), msgs)
+		}
+	}
+}
+
+func TestDeleteRemovesTornBackup(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := os.MkdirAll(Dir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(Dir(), "deleted.jsonl")
+	if err := os.WriteFile(path, []byte("{\"role\":\"assistant\",\"content\":\"private"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New("deleted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if err := DeleteSession("deleted"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("deleted session left recovered private content in %v", entries)
+	}
+}
+
+func TestRenameMovesTornBackups(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := os.MkdirAll(Dir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(Dir(), "old.jsonl")
+	if err := os.WriteFile(path, []byte(`{"role":"user","content":"private`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New("old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Rename("new"); err != nil {
+		t.Fatal(err)
+	}
+	old, _ := filepath.Glob(path + "-torn-*")
+	backups, _ := filepath.Glob(s.Path + "-torn-*")
+	if len(old) != 0 || len(backups) != 1 {
+		t.Fatalf("old=%v new=%v", old, backups)
+	}
+	if err := s.Append(llm.Message{Role: "user", Content: "after"}); err != nil {
+		t.Fatal(err)
 	}
 }

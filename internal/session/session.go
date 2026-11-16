@@ -146,6 +146,11 @@ func (s *Store) Append(m llm.Message) error {
 // writeRecord runs under mu. A successful append is synced before the caller
 // may dispatch a side effect depending on that record.
 func (s *Store) writeRecord(b []byte) error {
+	unlock, err := lockTranscript(s.file)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if _, err := s.file.Write(append(b, '\n')); err != nil {
 		return err
 	}
