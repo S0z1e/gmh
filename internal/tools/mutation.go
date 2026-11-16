@@ -24,7 +24,16 @@ func (e *Executor) PrepareMutation(path string) (*Mutation, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Mutation{Path: path, TargetPath: target.Path, Protected: protectedSpelling(e.Root, path) || protectedSpelling(e.Root, target.Path) || target.Touches(".harness.json") || target.Touches(".git") || target.Touches(".agents/plugins"), executor: e, target: target}, nil
+	return &Mutation{Path: path, TargetPath: target.Path, Protected: protectedTarget(e.Root, target), executor: e, target: target}, nil
+}
+
+func protectedTarget(root string, target *fileguard.Target) bool {
+	for _, alias := range target.Aliases {
+		if protectedSpelling(root, alias) {
+			return true
+		}
+	}
+	return protectedSpelling(root, target.Path) || target.Touches(".harness.json") || target.Touches(".git") || target.Touches(".agents/plugins")
 }
 
 func (m *Mutation) Close() error { return m.target.Close() }

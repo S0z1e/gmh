@@ -14,10 +14,13 @@ import (
 // Path is relative to the workspace root; Info is nil for a new leaf.
 // Close releases all directory handles retained through an approval wait.
 type Target struct {
-	Path      string
-	Name      string
-	Parent    *os.Root
-	Info      os.FileInfo
+	Path   string
+	Name   string
+	Parent *os.Root
+	Info   os.FileInfo
+	// Aliases retains intermediate spellings while expanding symlinks,
+	// including protected names whose referents do not exist yet.
+	Aliases   []string
 	root      *os.Root
 	requested string
 	parents   []*os.Root
@@ -44,7 +47,7 @@ func ResolveTarget(r *os.Root, name string) (target *Target, err error) {
 	if filepath.IsAbs(name) || filepath.VolumeName(name) != "" {
 		return nil, fmt.Errorf("target must be relative to workspace")
 	}
-	t := &Target{root: r, requested: name, parents: []*os.Root{r}}
+	t := &Target{root: r, requested: name, parents: []*os.Root{r}, Aliases: []string{name}}
 	defer func() {
 		if err != nil {
 			t.Close()
@@ -104,6 +107,7 @@ func ResolveTarget(r *os.Root, name string) (target *Target, err error) {
 				return nil, fmt.Errorf("absolute symlink target is outside workspace: %s", link)
 			}
 			parts = append(strings.Split(filepath.ToSlash(link), "/"), parts...)
+			t.Aliases = append(t.Aliases, filepath.Join(append(slices.Clone(names), parts...)...))
 			continue
 		}
 		if len(parts) == 0 {

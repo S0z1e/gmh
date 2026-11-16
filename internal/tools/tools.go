@@ -956,7 +956,7 @@ func IsProtectedWorkspacePath(root, path string) bool {
 		return false
 	}
 	defer target.Close()
-	return protectedSpelling(root, target.Path) || target.Touches(".harness.json") || target.Touches(".git") || target.Touches(".agents/plugins")
+	return protectedTarget(root, target)
 }
 
 func protectedSpelling(root, path string) bool {

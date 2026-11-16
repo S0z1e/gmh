@@ -1072,7 +1072,7 @@ func (m Model) approvalGeometry() (width, textWidth int) {
 func (m Model) approvalDetails() ([]string, int) {
 	_, textWidth := m.approvalGeometry()
 	detail := m.approval.Arguments
-	if m.approval.ToolName == "" {
+	if m.approval.Prompt != "" {
 		detail = m.approval.Prompt
 	}
 	detailLines := strings.Split(ansi.Hardwrap(detail, textWidth, true), "\n")

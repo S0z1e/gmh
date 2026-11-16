@@ -103,3 +103,49 @@ func TestMutationRetargetedDuringApprovalIsRefused(t *testing.T) {
 		}
 	}
 }
+
+func TestDanglingProtectedAliasesRequireApproval(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, target string
+		links              map[string]string
+	}{
+		{"config", "settings", "real-config", map[string]string{"settings": ".harness.json", ".harness.json": "real-config"}},
+		{"plugins", "plugins-alias/p.js", "real-plugins/p.js", map[string]string{"plugins-alias": ".agents/plugins", ".agents/plugins": "../real-plugins"}},
+		{"git", "git-alias/config", "real-git/config", map[string]string{"git-alias": ".git", ".git": "real-git"}},
+		{"agents-parent", "plugins-alias/p.js", "real-agents/plugins/p.js", map[string]string{"plugins-alias": ".agents/plugins", ".agents": "real-agents"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			for alias, target := range tc.links {
+				if filepath.Dir(alias) != "." {
+					if err := os.MkdirAll(filepath.Join(root, filepath.Dir(alias)), 0755); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.Symlink(target, filepath.Join(root, alias)); err != nil {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+			}
+			if !tools.IsProtectedWorkspacePath(root, tc.path) {
+				t.Error("protected alias was not classified")
+			}
+			asks := 0
+			cfg := &Config{Client: &llm.Client{APIKey: "test", Model: "test", API: "chat"}, Exec: &tools.Executor{Root: root}, Tools: ToolDefs(), Mode: "auto", MaxSteps: 3,
+				Ask: func(req ApprovalRequest) (bool, error) {
+					asks++
+					if req.TargetPath != filepath.FromSlash(tc.target) {
+						t.Errorf("target = %q", req.TargetPath)
+					}
+					return false, nil
+				},
+			}
+			_, body := runTwoTurns(t, cfg, toolCallSSE("call", "write", `{"path":"`+tc.path+`","content":"CHANGED"}`))
+			if asks != 1 || !strings.Contains(body, "User denied") {
+				t.Fatalf("approval bypassed: asks=%d body=%s", asks, body)
+			}
+			if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(tc.target))); !os.IsNotExist(err) {
+				t.Fatalf("denied target created: %v", err)
+			}
+		})
+	}
+}
