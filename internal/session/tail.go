@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"minimalharness/internal/llm"
 )
@@ -61,7 +62,7 @@ func recoverTail(f *os.File) error {
 		return err
 	}
 	if torn {
-		backup, err := os.CreateTemp(filepath.Dir(f.Name()), filepath.Base(f.Name())+"-torn-*")
+		backup, err := os.CreateTemp(filepath.Dir(f.Name()), filepath.Base(f.Name())+"-torn-*.bak")
 		if err != nil {
 			return err
 		}
@@ -91,4 +92,22 @@ func recoverTail(f *os.File) error {
 		return f.Sync()
 	}
 	return nil
+}
+
+// Match basenames literally: HOME may contain glob metacharacters. The .bak
+// suffix distinguishes recovery files from independently named .jsonl sessions.
+func recoveryBackups(path string) ([]string, error) {
+	dir := filepath.Dir(path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	prefix := filepath.Base(path) + "-torn-"
+	var backups []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) && strings.HasSuffix(entry.Name(), ".bak") {
+			backups = append(backups, filepath.Join(dir, entry.Name()))
+		}
+	}
+	return backups, nil
 }

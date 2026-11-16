@@ -96,7 +96,7 @@ func New(id string) (*Store, error) {
 		// until the path is free. An explicit id is never suffixed:
 		// --resume needs the exact file.
 		for i := 1; ; i++ {
-			f, err := privatefile.Open(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_WRONLY)
+			f, err := privatefile.Open(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_RDWR)
 			if err == nil {
 				return &Store{ID: id, Path: path, file: f}, nil
 			}
@@ -120,7 +120,7 @@ func New(id string) (*Store, error) {
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
-	f, err = privatefile.Open(path, os.O_APPEND|os.O_WRONLY)
+	f, err = privatefile.Open(path, os.O_APPEND|os.O_RDWR)
 	if err != nil {
 		return nil, err
 	}
@@ -321,10 +321,10 @@ func (s *Store) Rewrite(msgs []llm.Message) error {
 		return err
 	}
 	if err := os.Rename(tmp.Name(), s.Path); err != nil {
-		s.file, _ = privatefile.Open(s.Path, os.O_APPEND|os.O_WRONLY)
+		s.file, _ = privatefile.Open(s.Path, os.O_APPEND|os.O_RDWR)
 		return err
 	}
-	f, err := privatefile.Open(s.Path, os.O_APPEND|os.O_WRONLY)
+	f, err := privatefile.Open(s.Path, os.O_APPEND|os.O_RDWR)
 	if err != nil {
 		return err
 	}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -218,5 +219,66 @@ func TestRenameMovesTornBackups(t *testing.T) {
 	}
 	if err := s.Append(llm.Message{Role: "user", Content: "after"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBackupLifecycleWithLiteralGlobCharacters(t *testing.T) {
+	for _, action := range []string{"rename", "delete"} {
+		t.Run(action, func(t *testing.T) {
+			t.Setenv("HOME", filepath.Join(t.TempDir(), "home[1]["))
+			if err := os.MkdirAll(Dir(), 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(Dir(), "old.jsonl")
+			if err := os.WriteFile(path, []byte(`{"role":"user","content":"private`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			s, err := New("old")
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.Close()
+			if action == "rename" {
+				err = RenameSession("old", "new")
+			} else {
+				err = DeleteSession("old")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries, err := os.ReadDir(Dir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, en := range entries {
+				if strings.HasPrefix(en.Name(), "old.jsonl-torn-") {
+					t.Fatalf("%s returned success but left private backup %s", action, en.Name())
+				}
+			}
+		})
+	}
+}
+
+func TestBackupCleanupPreservesSimilarlyNamedSession(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s, err := New("old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	other, err := New("old.jsonl-torn-keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Append(llm.Message{Role: "user", Content: "keep"}); err != nil {
+		t.Fatal(err)
+	}
+	other.Close()
+	if err := DeleteSession("old"); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := Load(other.ID)
+	if err != nil || len(msgs) != 1 || msgs[0].Content != "keep" {
+		t.Fatalf("other session changed: %+v %v", msgs, err)
 	}
 }

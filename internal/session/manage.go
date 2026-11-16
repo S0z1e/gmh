@@ -136,7 +136,7 @@ func renameSessionFiles(oldID, newID string) error {
 	if _, err := os.Stat(newPath); err == nil {
 		return fmt.Errorf("session %q already exists", newID)
 	}
-	backups, err := filepath.Glob(oldPath + "-torn-*")
+	backups, err := recoveryBackups(oldPath)
 	if err != nil {
 		return err
 	}
@@ -191,7 +191,7 @@ func DeleteSession(id string) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return fmt.Errorf("unknown session %q", id)
 	}
-	backups, err := filepath.Glob(path + "-torn-*")
+	backups, err := recoveryBackups(path)
 	if err != nil {
 		return err
 	}
@@ -232,14 +232,14 @@ func (s *Store) Rename(newID string) error {
 	s.file.Close()
 	if err := renameSessionFiles(oldID, newID); err != nil {
 		// Put the store back on its old file so it stays usable.
-		f, err2 := privatefile.Open(s.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
+		f, err2 := privatefile.Open(s.Path, os.O_CREATE|os.O_APPEND|os.O_RDWR)
 		if err2 == nil {
 			s.file = f
 		}
 		return err
 	}
 	newPath := filepath.Join(Dir(), newID+".jsonl")
-	f, err := privatefile.Open(newPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
+	f, err := privatefile.Open(newPath, os.O_CREATE|os.O_APPEND|os.O_RDWR)
 	if err != nil {
 		return err
 	}
