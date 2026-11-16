@@ -371,7 +371,7 @@ func TestLoadForProjectOverridesGlobal(t *testing.T) {
 	// A project file may name a provider only the global file defines.
 	root := t.TempDir()
 	write(t, root, ".harness.json", `{"defaultProvider": "openconsole"}`)
-	f, err := LoadFor(root)
+	f, err := LoadForTrust(root, true)
 	if err != nil {
 		t.Fatal(err)
 	}

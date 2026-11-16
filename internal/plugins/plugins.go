@@ -236,6 +236,18 @@ func (r *Registry) Has(name string) bool {
 	return ok
 }
 
+// Untrusted discovers names for display without reading or executing plugins.
+func Untrusted(root string) *Registry {
+	r := &Registry{byTool: map[string]*Tool{}, byCommand: map[string]*Command{}, dir: filepath.Join(root, ".agents", "plugins")}
+	entries, _ := os.ReadDir(r.dir)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			r.infos = append(r.infos, Info{Name: entry.Name(), State: "disabled", Reason: "workspace is untrusted"})
+		}
+	}
+	return r
+}
+
 // Load discovers and loads plugins from <root>/.agents/plugins/.
 // HARNESS_PLUGINS=0 (or false) disables loading. A missing plugins
 // directory loads nothing. Each failure is reported, one error per

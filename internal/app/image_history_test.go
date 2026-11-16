@@ -16,7 +16,7 @@ func TestImageHistoryDoesNotReloadItsOrigin(t *testing.T) {
 			root := t.TempDir()
 			writeMockProvider(t, root)
 			writeTestPNG(t, root, "pic.png")
-			a, err := Setup(Params{Root: root, Mode: "auto"})
+			a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto"})
 			if err != nil {
 				t.Fatal(err)
 			}

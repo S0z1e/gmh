@@ -17,7 +17,7 @@ func TestReloadFailureIsReportedAndPreventsStaleContinuation(t *testing.T) {
 	srv := recordingServer(t, &bodies)
 	defer srv.Close()
 	t.Setenv("OPENAI_BASE_URL", srv.URL)
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 2})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 2})
 	if err != nil {
 		t.Fatal(err)
 	}

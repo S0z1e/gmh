@@ -48,7 +48,7 @@ func TestSetupResolvesConfigFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestSetupResolvesConfigFile(t *testing.T) {
 		t.Fatalf("tuiTheme = %q", a.TUITheme)
 	}
 	// -provider picks another entry; env still wins over the file.
-	a2, err := Setup(Params{Root: root, MaxSteps: 5, Provider: "openconsole"})
+	a2, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5, Provider: "openconsole"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestSetupResolvesConfigFile(t *testing.T) {
 		t.Fatalf("provider openconsole = api %q model %q", a2.Cfg.Client.API, a2.Cfg.Client.Model)
 	}
 	t.Setenv("OPENAI_MODEL", "env-model")
-	a3, err := Setup(Params{Root: root, MaxSteps: 5})
+	a3, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestSetupResolvesConfigFile(t *testing.T) {
 		t.Fatalf("env should win over config, model = %q", a3.Cfg.Client.Model)
 	}
 	// Unknown provider is a setup error.
-	if _, err := Setup(Params{Root: root, MaxSteps: 5, Provider: "ghost"}); err == nil {
+	if _, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5, Provider: "ghost"}); err == nil {
 		t.Fatal("unknown provider should fail setup")
 	}
 }
@@ -115,7 +115,7 @@ func TestSetupAndSwitchResolveAPIKeyForms(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(root, ".harness.json"), raw, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			a, err := Setup(Params{Root: root, MaxSteps: 1})
+			a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 1})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -170,7 +170,7 @@ func TestSetupResolvesModelsArray(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Default: the defaultModel entry, with the spelling normalised.
-	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func TestSetupResolvesModelsArray(t *testing.T) {
 		t.Fatalf("resolved model = %+v", a.Model)
 	}
 	// Second model on the same provider overrides the api.
-	a2, err := Setup(Params{Root: root, MaxSteps: 5, Model: "deepseek-v4-flash-0731"})
+	a2, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5, Model: "deepseek-v4-flash-0731"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestSetupResolvesModelsArray(t *testing.T) {
 	}
 	// A provider without an apiKey ref falls back to OPENAI_API_KEY,
 	// and a model that omits limits gets the defaults.
-	a3, err := Setup(Params{Root: root, MaxSteps: 5, Provider: "openconsole"})
+	a3, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5, Provider: "openconsole"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,13 +223,13 @@ func TestSetupResolvesModelsArray(t *testing.T) {
 		t.Fatalf("defaults: contextLimit %d maxTokens %d", a3.ContextLimit, a3.Cfg.Client.MaxTokens)
 	}
 	// Unknown model id on a provider with a list is a setup error.
-	if _, err := Setup(Params{Root: root, MaxSteps: 5, Model: "ghost"}); err == nil {
+	if _, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5, Model: "ghost"}); err == nil {
 		t.Fatal("unknown model should fail setup")
 	}
 	// No config at all is a setup error now: providers must be
 	// configured by the user, there is no built-in default.
 	empty := t.TempDir()
-	if _, err := Setup(Params{Root: empty, MaxSteps: 5}); err == nil || !strings.Contains(err.Error(), "no providers configured") {
+	if _, err := Setup(Params{WorkspaceTrust: "trust", Root: empty, MaxSteps: 5}); err == nil || !strings.Contains(err.Error(), "no providers configured") {
 		t.Fatalf("no-config setup err = %v, want no-providers-configured", err)
 	}
 }
@@ -252,7 +252,7 @@ func TestRunnerHandleTaskAndUsage(t *testing.T) {
 	t.Setenv("OPENAI_BASE_URL", srv.URL)
 	root := t.TempDir()
 	writeMockProvider(t, root)
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestRunnerHandleClear(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,7 +330,7 @@ func TestRunnerKeywordTriggerLoadsSkill(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: greeter\ndescription: Greets people.\n---\n# Greeter\nSay hello warmly.\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +353,7 @@ func TestRunnerKeywordTriggerLoadsSkill(t *testing.T) {
 		t.Fatalf("no auto-load notice printed: %v", printed)
 	}
 	// A task that does not name the skill loads nothing.
-	a2, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5, SessionID: "other-session"})
+	a2, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5, SessionID: "other-session"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,7 +378,7 @@ func TestRunnerCostEstimate(t *testing.T) {
 	t.Setenv("OPENAI_PRICE_SOURCE", "test rates")
 	root := t.TempDir()
 	writeMockProvider(t, root)
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +420,7 @@ func TestRunnerNoCostWithoutRates(t *testing.T) {
 	t.Setenv("OPENAI_BASE_URL", srv.URL)
 	root := t.TempDir()
 	writeMockProvider(t, root)
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +448,7 @@ func TestRunnerJobsCommand(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	root := t.TempDir()
 	writeMockProvider(t, root)
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +491,7 @@ func TestRunnerHandleQuit(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	root := t.TempDir()
 	writeMockProvider(t, root)
-	a, err := Setup(Params{Root: root, Mode: "auto"})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,7 +541,7 @@ func TestImageAttachAndSend(t *testing.T) {
 	}
 	writeTestPNG(t, root, "pic.png")
 
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5, Images: []string{"pic.png"}})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5, Images: []string{"pic.png"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,7 +585,7 @@ func TestImageAttachAndSend(t *testing.T) {
 		t.Fatalf("/image with no arg = %v", printed)
 	}
 	// A bad -image path fails Setup.
-	if _, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5, Images: []string{"gone.png"}}); err == nil {
+	if _, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5, Images: []string{"gone.png"}}); err == nil {
 		t.Fatal("missing -image file should fail setup")
 	}
 }
@@ -602,7 +602,7 @@ func TestImageRefusedWithoutInput(t *testing.T) {
 	writeMockProvider(t, root)
 	writeTestPNG(t, root, "pic.png")
 
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,7 +618,7 @@ func TestImageRefusedWithoutInput(t *testing.T) {
 	if !strings.Contains(strings.Join(printed, "\n"), "image input is not enabled") {
 		t.Fatalf("/image refusal = %v", printed)
 	}
-	if _, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5, Images: []string{"pic.png"}}); err == nil || !strings.Contains(err.Error(), "image input is not enabled") {
+	if _, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5, Images: []string{"pic.png"}}); err == nil || !strings.Contains(err.Error(), "image input is not enabled") {
 		t.Fatalf("-image setup err = %v, want the image-input hint", err)
 	}
 }
@@ -658,7 +658,7 @@ func TestSwitchModel(t *testing.T) {
 	t.Setenv("KEY_B", "key-b")
 	root := t.TempDir()
 	writeSwitchConfig(t, root)
-	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -737,7 +737,7 @@ func TestModelCommand(t *testing.T) {
 	t.Setenv("KEY_B", "key-b")
 	root := t.TempDir()
 	writeSwitchConfig(t, root)
-	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -785,7 +785,7 @@ func TestSetupLoadsProjectContext(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("Project codename: ZEBRA-7.\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -813,7 +813,7 @@ func TestSetupLoadsPlugins(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(plugDir, "echo.js"), []byte(`harness.registerTool("echo", "Echo back the message.", {type: "object", properties: {msg: {type: "string"}}, required: ["msg"]}, (args) => "echo:" + args.msg);`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -863,7 +863,7 @@ func TestPluginsCommand(t *testing.T) {
 	writePlugin("echo", "echo.js", `harness.registerTool("echo", "Echo back the message.", {type: "object", properties: {msg: {type: "string"}}, required: ["msg"]}, (args) => "echo:" + args.msg);`)
 	writePlugin("off", "off.js", `harness.registerTool("offtool", "Off.", {type: "object", properties: {}}, () => "off");`)
 	writePlugin("boom", "boom.js", `throw new Error("kaboom");`)
-	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -895,7 +895,7 @@ func TestPluginsCommand(t *testing.T) {
 	// A root with no plugins says so plainly.
 	root2 := t.TempDir()
 	writeMockProvider(t, root2)
-	a2, err := Setup(Params{Root: root2, MaxSteps: 5})
+	a2, err := Setup(Params{WorkspaceTrust: "trust", Root: root2, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -916,7 +916,7 @@ func TestSessionsCommand(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	root := t.TempDir()
 	writeMockProvider(t, root)
-	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1005,7 +1005,7 @@ func TestSetupSandbox(t *testing.T) {
 	// (a) No bwrap on PATH: Setup fails fast.
 	emptyDir := t.TempDir()
 	t.Setenv("PATH", emptyDir)
-	if _, err := Setup(Params{Root: root, MaxSteps: 5, Sandbox: true}); err == nil || !strings.Contains(err.Error(), "bwrap") {
+	if _, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5, Sandbox: true}); err == nil || !strings.Contains(err.Error(), "bwrap") {
 		t.Fatalf("sandbox without bwrap err = %v", err)
 	}
 
@@ -1016,7 +1016,7 @@ func TestSetupSandbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir)
-	a, err := Setup(Params{Root: root, MaxSteps: 5, Sandbox: true})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5, Sandbox: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1030,7 +1030,7 @@ func TestSetupSandbox(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a, err = Setup(Params{Root: root, MaxSteps: 5})
+	a, err = Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1045,7 +1045,7 @@ func TestSetupSandbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("HARNESS_SANDBOX", "1")
-	a, err = Setup(Params{Root: root, MaxSteps: 5})
+	a, err = Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1105,7 +1105,7 @@ harness.on("context", (e) => {
   return msgs;
 });
 `)
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1169,7 +1169,7 @@ func TestSessionEventsFireOnNewAndLoad(t *testing.T) {
 harness.on("session_start", (e) => { harness.writeFile("start-" + e.session + ".txt", "started"); });
 harness.on("session_switch", (e) => { harness.writeFile("switch-" + e.previous + "-to-" + e.session + ".txt", "switched"); });
 `)
-	a, err := Setup(Params{Root: root, MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1238,7 +1238,7 @@ func TestDoCompactRunsSessionBeforeCompactHooks(t *testing.T) {
 	writeMockProvider(t, root)
 	writePhase4Plugin(t, root, "keeper", `harness.on("session_before_compact", () => "Keep the plan: ship it.");`)
 	writePhase4Plugin(t, root, "boom", `harness.on("session_before_compact", () => { throw new Error("kaboom"); });`)
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}

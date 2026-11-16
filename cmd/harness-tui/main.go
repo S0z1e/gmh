@@ -20,21 +20,22 @@ import (
 
 func main() {
 	var (
-		root      = flag.String("root", ".", "workspace root")
-		mode      = flag.String("mode", "", "suggest (ask in a y/n dialog) or auto (default config or suggest)")
-		model     = flag.String("model", "", "model id (default OPENAI_MODEL or config defaultModel)")
-		api       = flag.String("api", "", "chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages (default OPENAI_API_MODE or config)")
-		provider  = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
-		config    = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
-		maxSteps  = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
-		resume    = flag.String("resume", "", "resume session id")
-		sessionID = flag.String("session", "", "session id (default: timestamp)")
-		ctxLimit  = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
-		deny      = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1)")
-		sandbox   = flag.Bool("sandbox", false, "run bash calls under bwrap (bubblewrap): the workspace is the only writable directory (also env HARNESS_SANDBOX=1 or config sandbox)")
-		bashTO    = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
-		bgThresh  = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
-		images    stringList
+		root           = flag.String("root", ".", "workspace root")
+		workspaceTrust = flag.String("workspace-trust", "", "save workspace trust: trust or untrust (default: saved decision)")
+		mode           = flag.String("mode", "", "suggest (ask in a y/n dialog) or auto (default config or suggest)")
+		model          = flag.String("model", "", "model id (default OPENAI_MODEL or config defaultModel)")
+		api            = flag.String("api", "", "chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages (default OPENAI_API_MODE or config)")
+		provider       = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
+		config         = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
+		maxSteps       = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
+		resume         = flag.String("resume", "", "resume session id")
+		sessionID      = flag.String("session", "", "session id (default: timestamp)")
+		ctxLimit       = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
+		deny           = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1)")
+		sandbox        = flag.Bool("sandbox", false, "run bash calls under bwrap (bubblewrap): the workspace is the only writable directory (also env HARNESS_SANDBOX=1 or config sandbox)")
+		bashTO         = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
+		bgThresh       = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
+		images         stringList
 	)
 	flag.Var(&images, "image", "attach an image file to the first turn (repeatable; png, jpg, gif, webp; the model must declare image input)")
 	flag.Parse()
@@ -47,6 +48,7 @@ func main() {
 
 	a, err := app.Setup(app.Params{
 		Root:                       *root,
+		WorkspaceTrust:             *workspaceTrust,
 		Mode:                       *mode,
 		Model:                      *model,
 		API:                        *api,
@@ -74,6 +76,9 @@ func main() {
 	// live region after every turn. The help line lives in the input
 	// placeholder now, not in the header.
 	info := fmt.Sprintf("▪ harness · %s · %s\nroot %s · session %s · mode %s", a.Cfg.Client.API, a.Cfg.Client.Model, a.Root, a.Store.ID, a.Cfg.Mode)
+	if !a.WorkspaceTrusted {
+		info += "\nWorkspace untrusted: project config and plugins disabled (--workspace-trust trust)."
+	}
 	if a.ResumedMessage != "" {
 		info += "\n" + a.ResumedMessage
 	}

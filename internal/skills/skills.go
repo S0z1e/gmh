@@ -55,6 +55,10 @@ func parseFrontmatter(path string) (Skill, error) {
 // Discover scans root/.agents/skills/*/SKILL.md and, if present,
 // ~/.config/minimal-harness/skills/*/SKILL.md. Project skills win on name clash.
 func Discover(root string) []Skill {
+	return DiscoverForTrust(root, true)
+}
+
+func DiscoverForTrust(root string, trusted bool) []Skill {
 	var out []Skill
 	seen := map[string]bool{}
 	add := func(dir string) {
@@ -78,7 +82,9 @@ func Discover(root string) []Skill {
 			out = append(out, sk)
 		}
 	}
-	add(filepath.Join(root, ".agents", "skills"))
+	if trusted {
+		add(filepath.Join(root, ".agents", "skills"))
+	}
 	if home, err := os.UserHomeDir(); err == nil {
 		add(filepath.Join(home, ".config", "minimal-harness", "skills"))
 	}

@@ -47,7 +47,7 @@ func setupWithPlan(t *testing.T) (*App, *Runner, *[]string) {
 	root := t.TempDir()
 	writeMockProvider(t, root)
 	installPlanPlugin(t, root)
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestRunnerModeSwitchInjectsReminder(t *testing.T) {
 	}))
 	defer srv.Close()
 	t.Setenv("OPENAI_BASE_URL", srv.URL)
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestRunnerUnknownCommandFallsThrough(t *testing.T) {
 	root := t.TempDir()
 	writeMockProvider(t, root)
 	installPlanPlugin(t, root)
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 5})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5})
 	if err != nil {
 		t.Fatal(err)
 	}

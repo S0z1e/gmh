@@ -238,7 +238,7 @@ func setupTestApp(t *testing.T, mode string, steps []fakeStep, writePlugins ...f
 		w(root)
 	}
 	t.Setenv("OPENAI_API_KEY", "test")
-	a, err := app.Setup(app.Params{
+	a, err := app.Setup(app.Params{WorkspaceTrust: "trust",
 		Root: root, Mode: mode, MaxSteps: 10,
 		BackgroundThresholdSeconds: 0, DisableBackground: true,
 	})

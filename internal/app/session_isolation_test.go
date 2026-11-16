@@ -15,7 +15,7 @@ func TestSessionJobsStayWithOwner(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test")
 	root := t.TempDir()
 	writeMockProvider(t, root)
-	a, err := Setup(Params{Root: root, Mode: "auto"})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -22,17 +22,21 @@ import (
 	"minimalharness/internal/session"
 	"minimalharness/internal/skills"
 	"minimalharness/internal/tools"
+	"minimalharness/internal/workspace"
 )
 
 type Params struct {
-	Root         string
-	Mode         string // suggest (ask) or auto
-	Model        string
-	API          string // chat, responses or anthropic
-	MaxSteps     int
-	ContextLimit int
-	Resume       string
-	SessionID    string
+	// WorkspaceTrust records a direct user decision: trust, untrust, or empty
+	// to use the saved decision. It never comes from a project config.
+	WorkspaceTrust string
+	Root           string
+	Mode           string // suggest (ask) or auto
+	Model          string
+	API            string // chat, responses or anthropic
+	MaxSteps       int
+	ContextLimit   int
+	Resume         string
+	SessionID      string
 	// Provider selects a provider entry from the config file
 	// (defaultProvider when empty).
 	Provider string
@@ -65,12 +69,13 @@ type Params struct {
 }
 
 type App struct {
-	Cfg          *agent.Config
-	Store        *session.Store
-	History      []llm.Message
-	Skills       []skills.Skill
-	ContextLimit int
-	Root         string
+	WorkspaceTrusted bool
+	Cfg              *agent.Config
+	Store            *session.Store
+	History          []llm.Message
+	Skills           []skills.Skill
+	ContextLimit     int
+	Root             string
 	// Model is the resolved model entry: id, api, baseUrl,
 	// contextWindow, maxTokens, samplingParams, headers, input, cost.
 	Model config.Model
@@ -112,12 +117,19 @@ type App struct {
 // Setup builds the client, session and agent config. The caller sets
 // Cfg.OnEvent (the event renderer) before running anything.
 func Setup(p Params) (*App, error) {
-	absRoot, err := filepath.Abs(p.Root)
+	identity, err := workspace.Identify(p.Root)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Stat(absRoot); err != nil {
-		return nil, fmt.Errorf("root not found: %s", absRoot)
+	absRoot := identity.Path
+	if p.WorkspaceTrust != "" {
+		if err := workspace.Decide(identity, p.WorkspaceTrust); err != nil {
+			return nil, err
+		}
+	}
+	trusted, err := workspace.Trusted(identity)
+	if err != nil {
+		return nil, err
 	}
 
 	// Config: flag > env > project file > global file > built-in
@@ -132,7 +144,7 @@ func Setup(p Params) (*App, error) {
 		}
 	} else {
 		var err error
-		cfg, err = config.LoadFor(absRoot)
+		cfg, err = config.LoadForTrust(absRoot, trusted)
 		if err != nil {
 			return nil, err
 		}
@@ -150,7 +162,7 @@ func Setup(p Params) (*App, error) {
 	// built-in default provider any more.
 	if !cfg.HasProviders() {
 		global, _ := config.GlobalPath()
-		return nil, fmt.Errorf("no providers configured: add a provider to %s (global) or %s (project)", global, config.ProjectPath(absRoot))
+		return nil, fmt.Errorf("no providers configured: add a provider to %s; project config requires a trusted workspace (--workspace-trust trust)", global)
 	}
 
 	// API key: the provider's literal key or environment reference wins,
@@ -227,7 +239,7 @@ func Setup(p Params) (*App, error) {
 		return nil, err
 	}
 
-	a := &App{Store: store, Root: absRoot}
+	a := &App{Store: store, Root: absRoot, WorkspaceTrusted: trusted}
 	if p.Resume != "" {
 		history, err := session.Load(p.Resume)
 		if err != nil {
@@ -238,9 +250,13 @@ func Setup(p Params) (*App, error) {
 		a.ResumedMessage = fmt.Sprintf("Resumed session %s (%d messages).", p.Resume, len(history))
 	}
 
-	skillList := skills.Discover(absRoot)
+	skillList := skills.DiscoverForTrust(absRoot, trusted)
 	a.Skills = skillList
-	system := agent.SystemPrompt + agent.ProjectContext(absRoot) + skills.Listing(skillList)
+	system := agent.SystemPrompt
+	if trusted {
+		system += agent.ProjectContext(absRoot)
+	}
+	system += skills.Listing(skillList)
 
 	// Plugins: a bad plugin is skipped with a warning on stderr; it
 	// never fails Setup. Disabled with HARNESS_PLUGINS=0, or one by
@@ -249,7 +265,11 @@ func Setup(p Params) (*App, error) {
 	if cfg.Plugins != nil {
 		disabled = cfg.Plugins.Disabled
 	}
-	pluginReg, pluginErrs := plugins.Load(absRoot, disabled)
+	pluginReg := plugins.Untrusted(absRoot)
+	var pluginErrs []error
+	if trusted {
+		pluginReg, pluginErrs = plugins.Load(absRoot, disabled)
+	}
 	for _, err := range pluginErrs {
 		fmt.Fprintf(os.Stderr, "warning: plugin: %v\n", err)
 	}
@@ -263,7 +283,7 @@ func Setup(p Params) (*App, error) {
 	pluginReg.ModeGetter = func() string { return string(a.ToolMode()) }
 	pluginReg.SessionGetter = a.sessionID
 
-	executor := &tools.Executor{Root: absRoot, ImageInput: slices.Contains(mdl.Input, "image"), Plugins: pluginReg}
+	executor := &tools.Executor{Root: absRoot, UntrustedWorkspace: !trusted, ImageInput: slices.Contains(mdl.Input, "image"), Plugins: pluginReg}
 	// Bash output files live in this session's directory (never in
 	// the project tree): the loop's read tool can pull them, and a
 	// new session / resume re-points the executor (see newSession

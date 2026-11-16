@@ -21,24 +21,25 @@ import (
 
 func main() {
 	var (
-		printMode = flag.String("p", "", "print mode: run one task and exit")
-		root      = flag.String("root", ".", "workspace root")
-		mode      = flag.String("mode", "", "suggest (ask) or auto (default config or suggest)")
-		model     = flag.String("model", "", "model id (default OPENAI_MODEL or config defaultModel)")
-		api       = flag.String("api", "", "chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages (default OPENAI_API_MODE or config)")
-		provider  = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
-		config    = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
-		maxSteps  = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
-		resume    = flag.String("resume", "", "resume session id")
-		sessionID = flag.String("session", "", "session id (default: timestamp)")
-		ctxLimit  = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
-		ui        = flag.String("ui", "auto", "ui: auto, plain or tui (ignored by -p, which is always plain)")
-		deny      = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1; -p always denies)")
-		sandbox   = flag.Bool("sandbox", false, "run bash calls under bwrap (bubblewrap): the workspace is the only writable directory (also env HARNESS_SANDBOX=1 or config sandbox)")
-		bashTO    = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
-		bgThresh  = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
-		rpcMode   = flag.Bool("rpc", false, "RPC mode: JSONL over stdin/stdout for a GUI (see README); stdout carries protocol data only")
-		images    stringList
+		printMode      = flag.String("p", "", "print mode: run one task and exit")
+		root           = flag.String("root", ".", "workspace root")
+		workspaceTrust = flag.String("workspace-trust", "", "save workspace trust: trust or untrust (default: saved decision)")
+		mode           = flag.String("mode", "", "suggest (ask) or auto (default config or suggest)")
+		model          = flag.String("model", "", "model id (default OPENAI_MODEL or config defaultModel)")
+		api            = flag.String("api", "", "chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages (default OPENAI_API_MODE or config)")
+		provider       = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
+		config         = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
+		maxSteps       = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
+		resume         = flag.String("resume", "", "resume session id")
+		sessionID      = flag.String("session", "", "session id (default: timestamp)")
+		ctxLimit       = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
+		ui             = flag.String("ui", "auto", "ui: auto, plain or tui (ignored by -p, which is always plain)")
+		deny           = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1; -p always denies)")
+		sandbox        = flag.Bool("sandbox", false, "run bash calls under bwrap (bubblewrap): the workspace is the only writable directory (also env HARNESS_SANDBOX=1 or config sandbox)")
+		bashTO         = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
+		bgThresh       = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
+		rpcMode        = flag.Bool("rpc", false, "RPC mode: JSONL over stdin/stdout for a GUI (see README); stdout carries protocol data only")
+		images         stringList
 	)
 	flag.Var(&images, "image", "attach an image file to the first turn (repeatable; png, jpg, gif, webp; the model must declare image input)")
 	flag.Parse()
@@ -57,7 +58,7 @@ func main() {
 			fatal(err)
 		}
 		if uiMode == "tui" {
-			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *sandbox, images); err != nil {
+			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *sandbox, images, *workspaceTrust); err != nil {
 				fmt.Fprintf(os.Stderr, "harness: TUI unavailable (%v); continuing in plain mode.\n", err)
 			}
 			// execTUI replaces this process on success; reaching here
@@ -69,6 +70,7 @@ func main() {
 
 	a, err := app.Setup(app.Params{
 		Root:                       *root,
+		WorkspaceTrust:             *workspaceTrust,
 		Mode:                       *mode,
 		Model:                      *model,
 		API:                        *api,
@@ -107,6 +109,9 @@ func main() {
 		return
 	}
 
+	if !a.WorkspaceTrusted {
+		fmt.Fprintln(os.Stderr, "Workspace untrusted: project config and plugins disabled. Use --workspace-trust trust to enable them.")
+	}
 	if a.ResumedMessage != "" {
 		fmt.Println(a.ResumedMessage)
 	}
@@ -284,7 +289,7 @@ func askQuestionFromScanner(scanner *bufio.Scanner) func(agent.QuestionRequest) 
 // execTUI replaces this process with the sibling harness-tui binary,
 // passing the same flags through. It returns only if the sibling cannot
 // be started (then the caller falls back to plain mode).
-func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images []string) error {
+func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images []string, workspaceTrust string) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -296,6 +301,7 @@ func execTUI(root, mode, model, api, provider, config string, maxSteps int, resu
 	args := []string{
 		sibling,
 		"-root", root,
+		"-workspace-trust", workspaceTrust,
 		"-mode", mode,
 		"-model", model,
 		"-api", api,

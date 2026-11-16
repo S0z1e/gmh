@@ -50,6 +50,7 @@ var (
 // is refreshed by the agent goroutine after every work item, so the
 // reader goroutine can answer without touching runner state.
 type serverState struct {
+	workspaceTrusted            bool
 	streaming                   bool
 	turns                       int
 	sessionUsage                llm.Usage
@@ -461,7 +462,8 @@ func (s *Server) handleQuery(req Request) {
 		s.respond(req, map[string]any{
 			"session": st.sessionID, "model": st.model, "api": st.api,
 			"mode": st.mode, "tool_mode": st.toolMode, "root": st.root, "streaming": st.streaming,
-			"queued": len(s.work), "messages": st.messages, "turns": st.turns,
+			"workspace_trusted": st.workspaceTrusted,
+			"queued":            len(s.work), "messages": st.messages, "turns": st.turns,
 			"total_tokens": st.sessionUsage.TotalTokens,
 			// The effective window and output cap for the current
 			// model (Setup/SwitchModel resolved flag/env/model/
@@ -882,6 +884,7 @@ func (s *Server) refreshState() {
 	s.state.toolMode = string(s.runner.App.ToolMode())
 	s.state.model, s.state.api = s.app.Cfg.Client.Model, s.app.Cfg.Client.API
 	s.state.mode, s.state.root = s.app.Cfg.Mode, s.app.Root
+	s.state.workspaceTrusted = s.app.WorkspaceTrusted
 	s.state.contextWindow, s.state.maxTokens = s.app.ContextLimit, s.app.Cfg.Client.MaxTokens
 	s.state.ratesConfigured = s.app.Rates.Configured
 	s.state.fee = s.app.Cfg.Client.ProviderName() + " price unverified"

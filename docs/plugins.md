@@ -2,7 +2,12 @@
 
 Plugins extend the agent with new tools written in JavaScript (or
 TypeScript, types stripped). One directory per plugin under
-`.agents/plugins/<name>/`, with a `plugin.json` and one entry file:
+`.agents/plugins/<name>/`, with a `plugin.json` and one entry file.
+Project plugins load only after `--workspace-trust trust`; the saved decision
+is reused on later runs. An untrusted workspace lists them as disabled and
+does not execute their top-level code or hooks.
+
+Example manifest:
 
 ```json
 {"name": "todo", "description": "A personal todo list.", "version": "1.0.0", "entry": "todo.js"}

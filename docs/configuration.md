@@ -2,10 +2,25 @@
 
 Model setup lives in a JSON file instead of a dozen exports, following
 the `models.json` shape.
-Two files, merged field by field (project wins where it sets a value):
+Two files, merged field by field after the workspace is explicitly trusted
+(project wins where it sets a value):
 
 - global: `~/.minimal-harness/config.json`
 - project: `<root>/.harness.json`
+
+Workspaces start untrusted. Run `harness --workspace-trust trust` (or the
+same flag with `harness-tui`) to save trust for this canonical directory.
+Future runs reuse the decision. `--workspace-trust untrust` revokes it.
+Decisions live under `~/.minimal-harness/trust/`, bind the directory identity,
+and do not apply to child directories or a replacement directory.
+
+Untrusted workspaces use global configuration; project config, plugins,
+project instructions, project skills and startup Git commands are disabled.
+Explicit CLI flags and `--config <path>` remain direct user choices; an
+explicit config does not enable project plugins. Trust takes effect on the
+next process start. It allows project configuration and executable plugins;
+it does not create an OS sandbox. RPC `get_state.workspace_trusted` reports
+the active decision.
 
 ```json
 {

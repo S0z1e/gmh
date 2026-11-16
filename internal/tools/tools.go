@@ -45,9 +45,11 @@ const (
 )
 
 type Executor struct {
-	Root      string
-	editMu    sync.Mutex
-	snapshots map[string][32]byte
+	// UntrustedWorkspace disables discovery of project skill instructions.
+	UntrustedWorkspace bool
+	Root               string
+	editMu             sync.Mutex
+	snapshots          map[string][32]byte
 	// BashTimeout overrides the default 120s bash timeout (0 = default).
 	// The per-call timeout argument still caps at 600s.
 	BashTimeout time.Duration
@@ -879,7 +881,7 @@ func (e *Executor) LoadSkill(a LoadSkillArgs) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("load_skill needs a skill name")
 	}
-	found := skills.Discover(e.Root)
+	found := skills.DiscoverForTrust(e.Root, !e.UntrustedWorkspace)
 	var match *skills.Skill
 	for i, sk := range found {
 		if sk.Name == name {

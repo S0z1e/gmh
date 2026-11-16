@@ -53,6 +53,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"minimalharness/internal/workspace"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -264,6 +265,20 @@ func LoadExplicit(path string) (*File, error) {
 // LoadFor loads the global file, then the project file for root on
 // top of it, field by field (nested-merge behaviour).
 func LoadFor(root string) (*File, error) {
+	id, err := workspace.Identify(root)
+	if err != nil {
+		return nil, err
+	}
+	trusted, err := workspace.Trusted(id)
+	if err != nil {
+		return nil, err
+	}
+	return LoadForTrust(root, trusted)
+}
+
+// LoadForTrust merges project settings only after an explicit trust decision.
+// Untrusted project files are not parsed, including malformed or hostile files.
+func LoadForTrust(root string, trusted bool) (*File, error) {
 	global, err := GlobalPath()
 	if err != nil {
 		return nil, err
@@ -272,11 +287,13 @@ func LoadFor(root string) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	project, err := Load(ProjectPath(root))
-	if err != nil {
-		return nil, err
+	if trusted {
+		project, err := Load(ProjectPath(root))
+		if err != nil {
+			return nil, err
+		}
+		Merge(f, project)
 	}
-	Merge(f, project)
 	if err := Validate(f); err != nil {
 		return nil, err
 	}
