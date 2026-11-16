@@ -27,6 +27,7 @@ import (
 	"minimalharness/internal/fileguard"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/skills"
+	"minimalharness/internal/toolargs"
 )
 
 const (
@@ -722,6 +723,14 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 			result.Status = ResultSuccess
 		}
 	}()
+	for _, def := range Defs() {
+		if def.Function.Name == name {
+			if err := toolargs.Validate(def.Function.Parameters, argsJSON); err != nil {
+				return ToolResult{}, fmt.Errorf("bad %s args: %w", name, err)
+			}
+			break
+		}
+	}
 	switch name {
 	case "read":
 		var a ReadArgs

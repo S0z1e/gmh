@@ -48,6 +48,7 @@ import (
 	"github.com/MoeForge/moejs"
 
 	"minimalharness/internal/llm"
+	"minimalharness/internal/toolargs"
 )
 
 const (
@@ -427,6 +428,9 @@ func (r *Registry) Call(ctx context.Context, name, argsJSON string) (string, err
 	t, ok := r.byTool[name]
 	if !ok {
 		return "", fmt.Errorf("unknown plugin tool: %s", name)
+	}
+	if err := toolargs.Validate(t.Parameters, argsJSON); err != nil {
+		return "", fmt.Errorf("bad %s args: %w", name, err)
 	}
 	return t.plugin.call(ctx, t, argsJSON, r.timeout())
 }

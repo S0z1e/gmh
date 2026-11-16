@@ -16,6 +16,7 @@ import (
 
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
+	"minimalharness/internal/toolargs"
 	"minimalharness/internal/tools"
 )
 
@@ -104,18 +105,25 @@ func (c *Config) emit(e Event) {
 	}
 }
 
-func ToolDefs() []llm.ToolDef {
-	return []llm.ToolDef{
-		llm.Tool("read", "Read a file (with 1-based line offset and limit) or list a directory. Image files (png, jpg, gif, webp) are returned as an image you can see, not as text — use read to look at a screenshot or photo.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}`),
-		llm.Tool("write", "Create a file. By default it fails if the file already exists — use edit then. Pass overwrite:true to replace an existing file wholesale; prefer edit for a small change.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["path","content"]}`),
-		llm.Tool("edit", "Replace text in an existing file. Two forms: oldText (replaced exactly once) or startLine/endLine (1-based, inclusive; endLine defaults to startLine) to replace those lines with newText, ignoring oldText. The line form requires a known version from a read or full write in this session. Successful edits update that version only if the file still matched it before editing (and line count is unchanged); otherwise read the target lines again before a line edit.", `{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}},"required":["path","newText"]}`),
-		llm.Tool("bash", "Run a shell command in the workspace root, or pass killJobId to stop a running background job. Each call is a fresh shell; cd does not persist between calls — pass cwd to run in a subdirectory, or prefix the command with `cd <dir> && `. Timeout in seconds, default 120, max 600; a background:true job has no timeout unless one is passed. Pass background:true for a command that will not exit on its own (dev server, watcher): it returns at once with a job id, and its output is delivered at the next step. A never-ending job never blocks the turn from ending: the turn ends after a short drain wait, and you can read its partial output from the output file. Every result header names the directory the call ran in.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"},"background":{"type":"boolean"},"cwd":{"type":"string"},"killJobId":{"type":"string"}}}`),
-		llm.Tool("grep", "Search file contents with a regex. Prefer this over bash grep/rg. Returns file:line matches, capped (truncation is marked).", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"},"exclude":{"type":"string"},"context":{"type":"integer"},"maxMatches":{"type":"integer"}},"required":["pattern"]}`),
-		llm.Tool("glob", "List files matching a glob pattern, e.g. **/*.go. Prefer this over bash find/ls for discovering files.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer"}},"required":["pattern"]}`),
-		llm.Tool("load_skill", "Load the full text of an available skill by name when its guidance is needed for the current task. The skill names and one-line descriptions are in the system prompt. Pass reference (a file name from the skill's references/ footer) to read one reference file instead of the whole skill.", `{"type":"object","properties":{"name":{"type":"string"},"reference":{"type":"string"}},"required":["name"]}`),
-		llm.Tool("webfetch", "Fetch a URL and return its content as Markdown (HTML is converted to Markdown, keeping headings, lists, links, code and tables; scripts and styles are dropped). Use this to read web pages, docs and API responses instead of curl. Returns up to 30000 characters per call; use offset to page through a long page. format=text returns plain text instead of Markdown; timeout is seconds (default 30, max 120). Private, loopback (except localhost) and cloud-metadata addresses are refused, and cross-host redirects are not followed.", `{"type":"object","properties":{"url":{"type":"string"},"format":{"type":"string","enum":["markdown","text"]},"offset":{"type":"integer"},"timeout":{"type":"integer"}},"required":["url"]}`),
-		llm.Tool("ask_user", "Ask the user structured questions when a decision needs their input instead of guessing: 1-4 questions, each with 2-4 options (plus free-text Other). Use it in plan mode to clarify requirements, and anywhere a choice changes what you will do. The user picks options or types their own answer; their answers come back as this call's result.", `{"type":"object","properties":{"questions":{"type":"array","minItems":1,"maxItems":4,"items":{"type":"object","properties":{"question":{"type":"string"},"header":{"type":"string"},"multiSelect":{"type":"boolean"},"options":{"type":"array","minItems":2,"maxItems":4,"items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label"]}}},"required":["question","options"]}}},"required":["questions"]}`),
+func ToolDefs() []llm.ToolDef { return tools.Defs() }
+
+func (c *Config) validateArgs(name, args string) error {
+	for _, def := range c.Tools {
+		if def.Function.Name == name {
+			return toolargs.Validate(def.Function.Parameters, args)
+		}
 	}
+	return nil // The offered-tool gate reports unavailable tools separately.
+}
+
+func (c *Config) invalidArgs(msgs []llm.Message, tc llm.ToolCall, err error) []llm.Message {
+	obs := fmt.Sprintf("Error: invalid %s arguments: %v", tc.Function.Name, err)
+	c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err})
+	m := llm.Message{Role: "tool", ToolCallID: tc.ID, ToolError: true, Content: obs}
+	if c.Session != nil {
+		c.persist(m)
+	}
+	return append(msgs, m)
 }
 
 func (c *Config) ask(req ApprovalRequest) (bool, error) {
@@ -861,6 +869,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// (approval prompt, audit, dispatch) and updates the
 			// in-memory assistant message so subsequent steps stay in sync.
 			argsJSON := tc.Function.Arguments
+			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
+				msgs = c.invalidArgs(msgs, *tc, err)
+				stepHadExecution = true
+				recordLastError(&lastErrors, err.Error())
+				continue
+			}
 			if c.Exec != nil && c.Exec.Plugins != nil {
 				newArgs, deny := c.Exec.Plugins.RunToolCallHooks(ctx, tc.Function.Name, argsJSON)
 				if deny != "" {
@@ -880,6 +894,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				argsJSON = newArgs
 				tc.Function.Arguments = argsJSON
 				msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
+			}
+			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
+				msgs = c.invalidArgs(msgs, *tc, err)
+				stepHadExecution = true
+				recordLastError(&lastErrors, err.Error())
+				continue
 			}
 			// A tool the model was not offered in this turn's list
 			// is refused outright, before approval: the offered
@@ -929,6 +949,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				return lastText, total, denied
 			}
 			argsJSON = useArgs
+			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
+				msgs = c.invalidArgs(msgs, *tc, err)
+				stepHadExecution = true
+				recordLastError(&lastErrors, err.Error())
+				continue
+			}
 			tc.Function.Arguments = argsJSON
 			msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
 			callKey := CanonicalToolKey(tc.Function.Name, argsJSON)

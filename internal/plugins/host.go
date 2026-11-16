@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/MoeForge/moejs"
+	"minimalharness/internal/toolargs"
 )
 
 // installHostAPI installs the single `harness` global the plugin
@@ -266,6 +267,9 @@ func (p *Plugin) nativeRegisterTool(r *moejs.Realm, _ moejs.Value, args []moejs.
 	paramsJSON, err := json.Marshal(paramsMap)
 	if err != nil {
 		return moejs.Undefined(), fmt.Errorf("tool %q parameters are not JSON: %w", name, err)
+	}
+	if err := toolargs.Schema(paramsJSON); err != nil {
+		return moejs.Undefined(), fmt.Errorf("tool %q parameters: %w", name, err)
 	}
 	handler := moejs.Arg(args, 3)
 	if !handler.IsObject() {

@@ -67,13 +67,9 @@ func (h *fakePluginRunner) RunStopHooks(_ context.Context, _, _ string) string {
 // arguments split across two fragments (as real streams do).
 func toolCallSSE(id, name, args string) string {
 	half := len(args) / 2
-	esc := func(s string) string {
-		bs, _ := json.Marshal(s)
-		return string(bs[1 : len(bs)-1])
-	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":%q,\"function\":{\"name\":%q,\"arguments\":%q}}]}}]}\n\n", id, name, esc(args[:half]))
-	fmt.Fprintf(&sb, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":%q}}]}}]}\n\n", esc(args[half:]))
+	fmt.Fprintf(&sb, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":%q,\"function\":{\"name\":%q,\"arguments\":%q}}]}}]}\n\n", id, name, args[:half])
+	fmt.Fprintf(&sb, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":%q}}]}}]}\n\n", args[half:])
 	sb.WriteString("data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
 	sb.WriteString("data: [DONE]\n\n")
 	return sb.String()
@@ -293,5 +289,64 @@ func TestNonOfferedToolRefused(t *testing.T) {
 	}
 	if refused == nil || refused.ToolErr == nil {
 		t.Fatal("no tool_end with ToolErr for the refused write")
+	}
+}
+
+func TestInvalidArgumentsNeverReachHooksOrApproval(t *testing.T) {
+	hooks := &fakePluginRunner{rewrite: map[string]string{"write": `{"path":"file","content":"would be valid"}`}}
+	root := t.TempDir()
+	asks := 0
+	cfg := &Config{Client: &llm.Client{APIKey: "test", Model: "test", API: "chat"}, Exec: &tools.Executor{Root: root, Plugins: hooks}, Tools: ToolDefs(), Mode: "suggest", MaxSteps: 3, Ask: func(ApprovalRequest) (bool, error) { asks++; return true, nil }}
+	_, body := runTwoTurns(t, cfg, toolCallSSE("bad", "write", `{"path":"file"}`))
+	if hooks.callCalls != 0 || asks != 0 {
+		t.Fatalf("invalid args reached gates: hooks=%d asks=%d", hooks.callCalls, asks)
+	}
+	if _, err := os.Stat(filepath.Join(root, "file")); !os.IsNotExist(err) {
+		t.Fatalf("invalid call wrote file: %v", err)
+	}
+	if !strings.Contains(body, "required") {
+		t.Fatal("model did not receive validation error")
+	}
+}
+
+func TestHookRewriteRevalidatedBeforeApproval(t *testing.T) {
+	hooks := &fakePluginRunner{rewrite: map[string]string{"write": `{"path":"file"}`}}
+	root := t.TempDir()
+	asks := 0
+	cfg := &Config{Client: &llm.Client{APIKey: "test", Model: "test", API: "chat"}, Exec: &tools.Executor{Root: root, Plugins: hooks}, Tools: ToolDefs(), Mode: "suggest", MaxSteps: 3, Ask: func(ApprovalRequest) (bool, error) { asks++; return true, nil }}
+	_, body := runTwoTurns(t, cfg, toolCallSSE("bad", "write", `{"path":"file","content":"valid"}`))
+	if asks != 0 {
+		t.Fatal("invalid rewritten args reached approval")
+	}
+	if _, err := os.Stat(filepath.Join(root, "file")); !os.IsNotExist(err) {
+		t.Fatalf("invalid rewrite wrote file: %v", err)
+	}
+	if !strings.Contains(body, "required") {
+		t.Fatal("model did not receive rewritten validation error")
+	}
+}
+
+func TestContinuationRewriteRevalidatedBeforeApproval(t *testing.T) {
+	root := t.TempDir()
+	asks, confirmations := 0, 0
+	cfg := &Config{
+		Client: &llm.Client{APIKey: "test", Model: "test", API: "chat"},
+		Exec:   &tools.Executor{Root: root}, Tools: ToolDefs(), Mode: "suggest", MaxSteps: 3,
+		DoomLoopThreshold: 1,
+		Ask:               func(ApprovalRequest) (bool, error) { asks++; return true, nil },
+		ConfirmContinuation: func(ContinuationRequest) (ContinuationDecision, error) {
+			confirmations++
+			return ContinuationDecision{Outcome: ContinuationOnce, UpdatedArgs: `{"path":"file"}`}, nil
+		},
+	}
+	_, body := runTwoTurns(t, cfg, toolCallSSE("bad", "write", `{"path":"file","content":"valid"}`))
+	if confirmations != 1 || asks != 0 {
+		t.Fatalf("continuation confirmations=%d, approvals=%d", confirmations, asks)
+	}
+	if _, err := os.Stat(filepath.Join(root, "file")); !os.IsNotExist(err) {
+		t.Fatalf("invalid continuation wrote file: %v", err)
+	}
+	if !strings.Contains(body, "required") {
+		t.Fatal("model did not receive continuation validation error")
 	}
 }

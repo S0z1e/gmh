@@ -1097,3 +1097,35 @@ harness.registerTool("store_write", "Write.", {type:"object"}, () => {harness.wr
 		t.Fatalf("outside file = %q, %v", raw, err)
 	}
 }
+
+func TestInvalidPluginArgumentsDoNotRunHandler(t *testing.T) {
+	root := t.TempDir()
+	dir := writePlugin(t, root, "validate", "", "test.js", `harness.registerTool("validate","Validate input",{type:"object",properties:{value:{type:"integer",minimum:1,maximum:3}},required:["value"],additionalProperties:false},args=>{harness.writeFile("marker","ran");return "ok";});`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	for _, args := range []string{`{}`, `null`, `{"value":null}`, `{"value":"1"}`, `{"value":4}`, `{"value":1,"extra":true}`} {
+		if _, err := reg.Call(context.Background(), "validate", args); err == nil {
+			t.Fatalf("invalid plugin args accepted: %s", args)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "data", "marker")); !os.IsNotExist(err) {
+		t.Fatalf("invalid call ran handler: %v", err)
+	}
+	if _, err := reg.Call(context.Background(), "validate", `{"value":1}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "data", "marker")); err != nil {
+		t.Fatalf("valid handler not executed: %v", err)
+	}
+}
+
+func TestUnsupportedPluginSchemaRejectedAtRegistration(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "bad_schema", "", "test.js", `harness.registerTool("bad_schema","Unsupported schema",{type:"object",dependentRequired:{a:["b"]}},args=>"ok");`)
+	reg, errs := Load(root, nil)
+	if len(errs) == 0 || reg.Has("bad_schema") {
+		t.Fatal("unenforced plugin schema was advertised")
+	}
+}
