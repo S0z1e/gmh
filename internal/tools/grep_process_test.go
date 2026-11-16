@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -55,5 +56,27 @@ func TestGrepCancellationStopsProducerAfterOutput(t *testing.T) {
 	})
 	if lines != 1 || !errors.Is(err, context.Canceled) {
 		t.Fatalf("lines=%d error=%v", lines, err)
+	}
+}
+
+func TestGrepOutputCapPreservesExitedFailure(t *testing.T) {
+	payload := filepath.Join(t.TempDir(), "payload")
+	// The last 513 bytes fit in the pipe while the first record is consumed.
+	// Let the producer exit before crossing the output cap.
+	data := strings.Repeat("x", MaxGrepBytes-513) + "\n" + strings.Repeat("y", 513)
+	if err := os.WriteFile(payload, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	binary := fakeGrepProducer(t, "cat \"$1\"\nexit 2\n")
+	e := &Executor{Root: t.TempDir()}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	truncated, err := e.streamGrep(ctx, binary, []string{payload}, func(string) error {
+		time.Sleep(100 * time.Millisecond)
+		return nil
+	})
+	var exitErr *exec.ExitError
+	if !truncated || !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("producer failure hidden by cap: truncated=%v err=%v", truncated, err)
 	}
 }

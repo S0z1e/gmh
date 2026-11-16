@@ -104,6 +104,17 @@ func TestGrepDisplayCapKeepsExactCount(t *testing.T) {
 	}
 }
 
+func TestGrepFallbackSkipsBinaryFiles(t *testing.T) {
+	e := setupGrepRoot(t)
+	if err := os.WriteFile(filepath.Join(e.Root, "binary.dat"), []byte("\x00TODO\x00"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := e.grepFallback(context.Background(), e.Root, GrepArgs{Pattern: "TODO"}, 10, 0)
+	if err != nil || r.Count != 3 || r.CountLowerBound || strings.Contains(r.Text, "binary.dat") {
+		t.Fatalf("binary file broke text search: %+v %v", r, err)
+	}
+}
+
 func TestGrepFindsMatchesAcrossFiles(t *testing.T) {
 	ex := setupGrepRoot(t)
 	out, _, err := ex.Grep(context.Background(), GrepArgs{Pattern: "TODO"})

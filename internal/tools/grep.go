@@ -122,7 +122,7 @@ func (e *Executor) grepRg(ctx context.Context, dir string, a GrepArgs, maxMatche
 }
 
 func (e *Executor) grepFallback(ctx context.Context, dir string, a GrepArgs, maxMatches, ctxLines int) (ToolResult, error) {
-	args := []string{"-rn", "--exclude-dir=.git", "--exclude-dir=node_modules"}
+	args := []string{"-rnI", "--exclude-dir=.git", "--exclude-dir=node_modules"}
 	if ctxLines > 0 {
 		args = append(args, "-C", fmt.Sprint(ctxLines))
 	}
@@ -204,6 +204,11 @@ func (e *Executor) streamGrep(ctx context.Context, binary string, args []string,
 		return truncated, readErr
 	}
 	if truncated {
+		// Killing for the cap produces a signal exit (or cancellation).
+		// A positive failure status was produced independently; keep it.
+		if exitErr, ok := waitErr.(*exec.ExitError); ok && exitErr.ExitCode() > 1 {
+			return true, fmt.Errorf("%s failed: %w", binary, waitErr)
+		}
 		return true, nil
 	}
 	if exitErr, ok := waitErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
