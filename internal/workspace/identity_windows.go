@@ -2,7 +2,6 @@ package workspace
 
 import (
 	"fmt"
-	"strings"
 
 	"golang.org/x/sys/windows"
 )
@@ -12,14 +11,7 @@ const trustReadFlags = 0
 func directoryID(path string) (string, error) {
 	// Identify supplies an absolute path; preserve support for long paths when
 	// opening directly through Win32 rather than os.Open's internal conversion.
-	if !strings.HasPrefix(path, `\\?\`) {
-		if strings.HasPrefix(path, `\\`) {
-			path = `\\?\UNC\` + path[2:]
-		} else {
-			path = `\\?\` + path
-		}
-	}
-	name, err := windows.UTF16PtrFromString(path)
+	name, err := windows.UTF16PtrFromString(windowsMetadataPath(path))
 	if err != nil {
 		return "", err
 	}
