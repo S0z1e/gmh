@@ -10,6 +10,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 type Identity struct {
@@ -26,10 +29,6 @@ func Identify(path string) (Identity, error) {
 	if err != nil {
 		return Identity{}, err
 	}
-	canonical, err = directorySpelling(canonical)
-	if err != nil {
-		return Identity{}, err
-	}
 	id, err := directoryID(canonical)
 	if err != nil {
 		return Identity{}, err
@@ -37,39 +36,16 @@ func Identify(path string) (Identity, error) {
 	return Identity{Path: canonical, FileID: id}, nil
 }
 
-// EvalSymlinks on Unix preserves the caller's casing and Unicode spelling.
-// Resolve each directory entry's actual name so aliases share both the saved
-// decision and its revocation, without collapsing distinct case-sensitive paths.
-func directorySpelling(path string) (string, error) {
-	parent := filepath.Dir(path)
-	if parent == path {
-		return path, nil
-	}
-	parent, err := directorySpelling(parent)
-	if err != nil {
-		return "", err
-	}
-	entries, err := os.ReadDir(parent)
-	if err != nil {
-		return "", err
-	}
-	name := filepath.Base(path)
-	for _, entry := range entries {
-		if entry.Name() == name {
-			return filepath.Join(parent, name), nil
-		}
-	}
-	wanted, err := os.Stat(filepath.Join(parent, name))
-	if err != nil {
-		return "", err
-	}
-	for _, entry := range entries {
-		info, err := entry.Info()
-		if err == nil && os.SameFile(wanted, info) {
-			return filepath.Join(parent, entry.Name()), nil
-		}
-	}
-	return "", fmt.Errorf("workspace directory changed while identifying %s", path)
+// EvalSymlinks preserves some case/Unicode aliases, including UNC volumes.
+// Fold only the lookup key, and always pair it with the directory incarnation:
+// distinct directories on case-sensitive filesystems retain distinct records.
+// This does not require read permission on otherwise searchable ancestors.
+func pathKey(path string) string {
+	return norm.NFC.String(cases.Fold().String(norm.NFC.String(filepath.ToSlash(path))))
+}
+
+func sameIdentity(a, b Identity) bool {
+	return a.FileID != "" && a.FileID == b.FileID && pathKey(a.Path) == pathKey(b.Path)
 }
 
 func trustDir() (string, error) {
@@ -81,7 +57,7 @@ func trustDir() (string, error) {
 }
 
 func trustName(id Identity) string {
-	sum := sha256.Sum256([]byte(id.Path))
+	sum := sha256.Sum256([]byte(pathKey(id.Path) + "\x00" + id.FileID))
 	return hex.EncodeToString(sum[:]) + ".json"
 }
 
@@ -91,6 +67,9 @@ type trustRecord struct {
 }
 
 func Trusted(id Identity) (bool, error) {
+	if id.FileID == "" {
+		return false, nil // No stable incarnation available: never reuse trust.
+	}
 	dir, err := trustDir()
 	if err != nil {
 		return false, err
@@ -138,7 +117,7 @@ func Trusted(id Identity) (bool, error) {
 	if err := json.Unmarshal(data, &record); err != nil {
 		return false, fmt.Errorf("invalid workspace trust record: %w", err)
 	}
-	return record.Version == 1 && record.Workspace == id, nil
+	return record.Version == 2 && sameIdentity(record.Workspace, id), nil
 }
 
 // Decide accepts only a direct user action, never a value from project config.
@@ -147,6 +126,9 @@ func Trusted(id Identity) (bool, error) {
 func Decide(id Identity, action string) error {
 	if action != "trust" && action != "untrust" {
 		return fmt.Errorf("workspace-trust must be trust or untrust")
+	}
+	if action == "trust" && id.FileID == "" {
+		return fmt.Errorf("cannot persist workspace trust: this filesystem does not expose a directory creation identity")
 	}
 	dir, err := trustDir()
 	if err != nil {
@@ -165,7 +147,7 @@ func Decide(id Identity, action string) error {
 		}
 		return syncDirectory(dir)
 	}
-	data, err := json.Marshal(trustRecord{Version: 1, Workspace: id})
+	data, err := json.Marshal(trustRecord{Version: 2, Workspace: id})
 	if err != nil {
 		return err
 	}

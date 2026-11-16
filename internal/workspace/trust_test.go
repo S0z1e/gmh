@@ -27,7 +27,7 @@ func TestCaseAliasRevokesOriginalDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id != aliased {
+	if !sameIdentity(id, aliased) || trustName(id) != trustName(aliased) {
 		t.Fatalf("case alias has different identity: %+v vs %+v", id, aliased)
 	}
 	if err := Decide(id, "trust"); err != nil {
@@ -86,8 +86,112 @@ func TestNormalizationDoesNotMergeDistinctDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first == second || first.Path == second.Path {
+	if sameIdentity(first, second) || trustName(first) == trustName(second) {
 		t.Fatalf("distinct directories merged: %+v %+v", first, second)
+	}
+}
+
+func TestTrustIdentityHandlesVolumeAndUnicodeAliases(t *testing.T) {
+	for _, pair := range [][2]string{
+		{`\\Server\Share\Repo`, `\\SERVER\SHARE\repo`},
+		{"/projects/caf\u00e9", "/PROJECTS/cafe\u0301"},
+	} {
+		a := Identity{Path: pair[0], FileID: "same-incarnation"}
+		b := Identity{Path: pair[1], FileID: a.FileID}
+		if !sameIdentity(a, b) || trustName(a) != trustName(b) {
+			t.Fatalf("aliases differ: %+v %+v", a, b)
+		}
+		b.FileID = "different-incarnation"
+		if sameIdentity(a, b) || trustName(a) == trustName(b) {
+			t.Fatal("different incarnations share trust")
+		}
+	}
+}
+
+func TestTrustDoesNotSurviveDeleteAndRecreate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := filepath.Join(t.TempDir(), "workspace")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	id, err := Identify(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Decide(id, "trust"); err != nil {
+		t.Fatal(err)
+	}
+	// Ordinary directory-content changes must not invalidate trust.
+	p := filepath.Join(root, "file")
+	if err := os.WriteFile(p, []byte("changed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := Identify(root)
+	if err != nil || !sameIdentity(changed, id) {
+		t.Fatalf("content change invalidated identity: %+v %v", changed, err)
+	}
+	for i := 0; i < 128; i++ {
+		if err := os.Remove(root); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(root, 0700); err != nil {
+			t.Fatal(err)
+		}
+		replacement, err := Identify(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if trusted, err := Trusted(replacement); err != nil || trusted {
+			t.Fatalf("replacement %d inherited trust: %+v %v", i, replacement, err)
+		}
+	}
+}
+
+func TestIdentifyThroughSearchOnlyAncestor(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ancestor := t.TempDir()
+	root := filepath.Join(ancestor, "workspace")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(ancestor, 0711); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(ancestor, 0700)
+	id, err := Identify(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Decide(id, "trust"); err != nil {
+		t.Fatal(err)
+	}
+	if trusted, err := Trusted(id); err != nil || !trusted {
+		t.Fatalf("accessible workspace unusable: %v %v", trusted, err)
+	}
+}
+
+func TestMissingIncarnationNeverReusesTrust(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	id := Identity{Path: t.TempDir()}
+	if trusted, err := Trusted(id); trusted || err != nil {
+		t.Fatalf("missing incarnation trusted: %v %v", trusted, err)
+	}
+	if err := Decide(id, "trust"); err == nil {
+		t.Fatal("persisted trust without incarnation")
+	}
+}
+
+func TestIdentifySearchOnlyWorkspace(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0711); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(root, 0700)
+	if _, err := Identify(root); err != nil {
+		t.Fatal(err)
 	}
 }
 

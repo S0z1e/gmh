@@ -12,7 +12,11 @@ Workspaces start untrusted. Run `harness --workspace-trust trust` (or the
 same flag with `harness-tui`) to save trust for this canonical directory.
 Future runs reuse the decision. `--workspace-trust untrust` revokes it.
 Decisions live under `~/.minimal-harness/trust/`, bind the directory identity,
-and do not apply to child directories or a replacement directory.
+including creation time, and do not apply to child or replacement directories.
+Case/Unicode aliases of the same directory share the decision. Filesystems
+without a creation identity remain untrusted;
+global and explicit configuration still work there. Older trust-record formats
+require a new explicit decision.
 
 Untrusted workspaces use global configuration; project config, plugins,
 project instructions, project skills and startup Git commands are disabled.
