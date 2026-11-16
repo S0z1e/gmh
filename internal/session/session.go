@@ -3,7 +3,6 @@
 package session
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"minimalharness/internal/privatefile"
@@ -108,8 +107,12 @@ func New(id string) (*Store, error) {
 			path = filepath.Join(dir, id+".jsonl")
 		}
 	}
-	f, err := privatefile.Open(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
+	f, err := privatefile.Open(path, os.O_CREATE|os.O_APPEND|os.O_RDWR)
 	if err != nil {
+		return nil, err
+	}
+	if err := recoverTail(f); err != nil {
+		f.Close()
 		return nil, err
 	}
 	return &Store{ID: id, Path: path, file: f}, nil
@@ -128,8 +131,16 @@ func (s *Store) Append(m llm.Message) error {
 	if len(b)+1 >= maxRecordBytes {
 		return fmt.Errorf("session message exceeds the %d-byte record limit", maxRecordBytes)
 	}
-	_, err = s.file.Write(append(b, '\n'))
-	return err
+	return s.writeRecord(b)
+}
+
+// writeRecord runs under mu. A successful append is synced before the caller
+// may dispatch a side effect depending on that record.
+func (s *Store) writeRecord(b []byte) error {
+	if _, err := s.file.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	return s.file.Sync()
 }
 
 // clearMarkerRole marks a /clear point in the JSONL. Everything before
@@ -165,8 +176,7 @@ func (s *Store) MarkCompactMessages(msgs []llm.Message) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.file.Write(append(b, '\n'))
-	return err
+	return s.writeRecord(b)
 }
 
 // CheckpointFits reports whether a replacement can be loaded as one session
@@ -335,17 +345,7 @@ func Load(id string) ([]llm.Message, error) {
 	}
 	defer f.Close()
 	var msgs []llm.Message
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), maxRecordBytes)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var m llm.Message
-		if err := json.Unmarshal(line, &m); err != nil {
-			continue
-		}
+	_, _, _, err = scanRecords(f, func(line []byte, m llm.Message) {
 		if m.Role == clearMarkerRole || m.Role == compactMarkerRole {
 			// /clear or /compact point: forget everything before it
 			// (file keeps it).
@@ -356,7 +356,7 @@ func Load(id string) ([]llm.Message, error) {
 				}
 				if err := json.Unmarshal(line, &checkpoint); err == nil && checkpoint.Messages != nil {
 					msgs = checkpoint.Messages
-					continue
+					return
 				}
 			}
 			if m.Role == compactMarkerRole && m.Content != "" {
@@ -364,11 +364,11 @@ func Load(id string) ([]llm.Message, error) {
 				m.Kind = "summary"
 				msgs = append(msgs, m)
 			}
-			continue
+			return
 		}
 		msgs = append(msgs, m)
-	}
-	if err := sc.Err(); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
 	return RepairToolBatches(msgs), nil
