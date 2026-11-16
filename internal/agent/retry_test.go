@@ -245,8 +245,8 @@ func TestRunCutOffAlwaysFails(t *testing.T) {
 	if got := atomic.LoadInt32(calls); got != 4 {
 		t.Fatalf("LLM calls = %d, want 4", got)
 	}
-	if got := countKind(events, EventStepDiscard); got != 3 {
-		t.Fatalf("step_discard events = %d, want 3", got)
+	if got := countKind(events, EventStepDiscard); got != 4 {
+		t.Fatalf("step_discard events = %d, want 4", got)
 	}
 	if got := countKind(events, EventStepRetry); got != 3 {
 		t.Fatalf("step_retry events = %d, want 3", got)

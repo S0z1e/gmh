@@ -165,7 +165,7 @@ func effortThinkingBudget(effort string, maxTokens int) int {
 // anthropicEvent is the common envelope for Messages SSE events.
 type anthropicEvent struct {
 	Type  string `json:"type"`
-	Index int    `json:"index"`
+	Index *int   `json:"index"`
 	Delta struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
@@ -429,26 +429,23 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 		kind  string
 		args  strings.Builder
 		block AnthropicContentBlock
+		done  bool
 	}
 	accs := map[int]*acc{}
 	order := []int{}
 
-	lines := newIdleLineScanner(resp.Body, c.idleTimeout(), c.Model)
+	lines := newSSEScanner(resp.Body, c.idleTimeout(), c.Model, "anthropic")
 	defer lines.close()
 	sawStop := false
 	for {
-		raw, ok, scanErr := lines.next()
+		data, ok, scanErr := lines.next()
 		if !ok {
 			if scanErr != nil {
 				return scanErr
 			}
 			break
 		}
-		line := strings.TrimSpace(raw)
-		if line == "" || !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		data = strings.TrimSpace(data)
 		if data == "[DONE]" {
 			break
 		}
@@ -456,19 +453,29 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			return err
 		}
 		var ev anthropicEvent
-		if err := json.Unmarshal([]byte(data), &ev); err != nil {
-			continue
+		if err := decodeStreamJSON("anthropic", data, &ev); err != nil {
+			return err
+		}
+		if ev.Type == "" {
+			return protocolError("anthropic", "missing event type")
+		}
+		idx := 0
+		if ev.Type == "content_block_start" || ev.Type == "content_block_delta" || ev.Type == "content_block_stop" {
+			if ev.Index == nil || *ev.Index < 0 {
+				return protocolError("anthropic", "missing or negative block index")
+			}
+			idx = *ev.Index
 		}
 		switch ev.Type {
 		case "message_start":
 			recordUsage(ev.Message.Usage)
 		case "content_block_start":
-			a, ok := accs[ev.Index]
-			if !ok {
-				a = &acc{}
-				accs[ev.Index] = a
-				order = append(order, ev.Index)
+			if _, ok := accs[idx]; ok {
+				return protocolError("anthropic", "duplicate content block index %d", idx)
 			}
+			a := &acc{}
+			accs[idx] = a
+			order = append(order, idx)
 			a.kind = ev.ContentBlock.Type
 			a.id = ev.ContentBlock.ID
 			a.name = ev.ContentBlock.Name
@@ -483,9 +490,16 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 				onThinking(a.block.Thinking)
 			}
 		case "content_block_delta":
+			current, ok := accs[idx]
+			if !ok || current.done {
+				return protocolError("anthropic", "delta outside open content block %d", idx)
+			}
 			switch ev.Delta.Type {
 			case "text_delta":
-				if a := accs[ev.Index]; a != nil {
+				if current.kind != "text" {
+					return protocolError("anthropic", "text delta in non-text block")
+				}
+				if a := accs[idx]; a != nil {
 					a.block.Text += ev.Delta.Text
 				}
 				if ev.Delta.Text != "" {
@@ -495,7 +509,10 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 					}
 				}
 			case "thinking_delta":
-				if a := accs[ev.Index]; a != nil {
+				if current.kind != "thinking" {
+					return protocolError("anthropic", "thinking delta in non-thinking block")
+				}
+				if a := accs[idx]; a != nil {
 					a.block.Thinking += ev.Delta.Thinking
 				}
 				// Thinking is display-only: forward it, never add
@@ -504,40 +521,52 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 					onThinking(ev.Delta.Thinking)
 				}
 			case "signature_delta":
+				if current.kind != "thinking" {
+					return protocolError("anthropic", "signature delta in non-thinking block")
+				}
 				// Opaque replay data, not text: accumulate it and
 				// never forward it to onThinking.
-				if a := accs[ev.Index]; a != nil {
+				if a := accs[idx]; a != nil {
 					a.block.Signature += ev.Delta.Signature
 				}
 			case "input_json_delta":
-				a, ok := accs[ev.Index]
-				if !ok {
-					a = &acc{}
-					accs[ev.Index] = a
-					order = append(order, ev.Index)
+				if current.kind != "tool_use" && current.kind != "server_tool_use" {
+					return protocolError("anthropic", "input JSON delta in non-tool block")
 				}
-				a.args.WriteString(ev.Delta.PartialJSON)
+				current.args.WriteString(ev.Delta.PartialJSON)
 				// redacted_thinking has no text: there is nothing
 				// to forward, so it is ignored entirely.
 			}
+		case "content_block_stop":
+			a, ok := accs[idx]
+			if !ok || a.done {
+				return protocolError("anthropic", "stop outside open content block %d", idx)
+			}
+			a.done = true
 		case "message_delta":
 			msg.FinishReason = ev.Delta.StopReason
 			recordUsage(ev.Usage)
 		case "message_stop":
 			sawStop = true
 		}
+		if sawStop {
+			break
+		}
 	}
 	// A stream that ends without message_stop was cut off mid-reply;
 	// fail loudly instead of running a half-accumulated tool call
 	// as if it were complete.
 	if !sawStop {
-		return fmt.Errorf("stream ended without message_stop")
+		return protocolError("anthropic", "stream ended without message_stop")
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	for _, idx := range order {
 		a := accs[idx]
+		if !a.done && msg.FinishReason != "max_tokens" {
+			return protocolError("anthropic", "content block %d is unfinished", idx)
+		}
 		if a.kind == "tool_use" && (a.id == "" || a.name == "") {
-			return fmt.Errorf("Anthropic tool_use is missing its id or name")
+			return protocolError("anthropic", "tool_use is missing its id or name")
 		}
 		if a.kind == "tool_use" && a.args.Len() > 0 {
 			a.block.Input = json.RawMessage(a.args.String())
@@ -547,7 +576,7 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			if msg.FinishReason == "max_tokens" {
 				continue
 			}
-			return fmt.Errorf("Anthropic tool_use %q returned invalid JSON input", a.id)
+			return protocolError("anthropic", "tool_use %q returned invalid JSON input", a.id)
 		}
 		if a.block.Type != "" {
 			msg.AnthropicContent = append(msg.AnthropicContent, a.block)
@@ -567,8 +596,5 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			Function: FunctionCall{Name: a.name, Arguments: args},
 		})
 	}
-	if onDone != nil {
-		onDone(msg, usage)
-	}
-	return nil
+	return completeStream("anthropic", msg, usage, onDone)
 }

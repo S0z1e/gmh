@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"minimalharness/internal/textutil"
 	"os"
@@ -618,10 +619,9 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 		if err == nil {
 			return attempt, nil
 		}
-		if doneSeen || ctx.Err() != nil || !llm.IsRetryable(err) || attempt == attempts {
-			return attempt, err
-		}
-		if outputSeen {
+		retry := !doneSeen && ctx.Err() == nil && llm.IsRetryable(err) && attempt < attempts
+		var protocolErr *llm.ProtocolError
+		if !doneSeen && outputSeen && (retry || errors.As(err, &protocolErr)) {
 			// The stream was cut off after showing partial output:
 			// discard the partial reply before replaying. The
 			// assistant message and usage need no reset here: they
@@ -629,10 +629,17 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 			// blocks the retry above. Only the caller's thinking
 			// accumulator holds per-attempt state, and onRetry
 			// resets it.
-			c.emit(Event{Kind: EventStepDiscard, Text: fmt.Sprintf("LLM stream cut off after partial output (%v); discarding the partial reply", err), RetryAttempt: attempt + 1})
+			next := 0
+			if retry {
+				next = attempt + 1
+			}
+			c.emit(Event{Kind: EventStepDiscard, Text: fmt.Sprintf("LLM stream cut off after partial output (%v); discarding the partial reply", err), RetryAttempt: next})
 			if onRetry != nil {
 				onRetry()
 			}
+		}
+		if !retry {
+			return attempt, err
 		}
 		delay := retryDelay(attempt, llm.RetryAfter(err))
 		c.emit(Event{Kind: EventStepRetry, Text: fmt.Sprintf("%s failed (attempt %d/%d): %v; retrying in %s", operation, attempt, attempts, err, delay), RetryAttempt: attempt + 1})

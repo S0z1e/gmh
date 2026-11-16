@@ -355,7 +355,7 @@ func TestUnavailableToolsNeverReachHooksOrApproval(t *testing.T) {
 	for _, tc := range []struct{ name, args string }{
 		{"write", `{"path":"file"}`},
 		{"write", `{"path":"file","content":"valid"}`},
-		{"disabled_plugin", `null`},
+		{"disabled_plugin", `{}`},
 	} {
 		t.Run(tc.name+tc.args, func(t *testing.T) {
 			hooks := &fakePluginRunner{}

@@ -61,6 +61,10 @@ func IsRetryable(err error) bool {
 	if errors.Is(err, ErrIdleTimeout) {
 		return true
 	}
+	var protocol *ProtocolError
+	if errors.As(err, &protocol) {
+		return true
+	}
 	var stream *StreamError
 	if errors.As(err, &stream) {
 		return stream.retryable()

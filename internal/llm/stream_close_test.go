@@ -44,8 +44,8 @@ func TestStreamCancelsRequestBeforeClosingBody(t *testing.T) {
 		t.Run(api, func(t *testing.T) {
 			payload := map[string]string{
 				"chat":      "data: [DONE]\n\n",
-				"responses": "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\ndata: [DONE]\n\n",
-				"anthropic": "data: {\"type\":\"message_stop\"}\n\ndata: [DONE]\n\n",
+				"responses": "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+				"anthropic": "data: {\"type\":\"message_stop\"}\n\n",
 			}[api]
 			reading := make(chan struct{})
 			exited := make(chan struct{})
@@ -87,7 +87,7 @@ func TestStreamRepeatedCompletion(t *testing.T) {
 				case "responses":
 					fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n")
 				case "anthropic":
-					fmt.Fprint(w, "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n")
+					fmt.Fprint(w, protocolEvent(map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})+protocolEvent(map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "OK"}})+protocolEvent(map[string]any{"type": "content_block_stop", "index": 0})+protocolTerminal(api))
 				}
 				w.(http.Flusher).Flush()
 			}))

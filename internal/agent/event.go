@@ -55,13 +55,13 @@ const (
 	// Text says which attempt failed and how long the wait is;
 	// RetryAttempt is the attempt number about to run.
 	EventStepRetry EventKind = "step_retry"
-	// EventStepDiscard fires before a retry of an LLM call whose
+	// EventStepDiscard fires when a corrupt partial reply is abandoned, or before a retry whose
 	// stream was cut off after partial output: it tells every
 	// renderer to drop everything streamed for the current step
 	// so far — text deltas and thinking deltas — because the
 	// stream is being replayed from scratch. Nothing from the
 	// discarded attempt enters history or the session. RetryAttempt
-	// is the attempt number about to run, like EventStepRetry.
+	// is the attempt number about to run, or 0 when no retry remains.
 	EventStepDiscard EventKind = "step_discard"
 )
 
