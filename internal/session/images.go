@@ -34,7 +34,14 @@ func readImageBlob(root *os.Root, digest string) ([]byte, error) {
 	if !validImageDigest(digest) {
 		return nil, fmt.Errorf("invalid image digest")
 	}
-	f, err := root.Open(digest)
+	before, err := root.Lstat(digest)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, fmt.Errorf("image blob is not a regular file")
+	}
+	f, err := root.OpenFile(digest, os.O_RDONLY|imageBlobReadFlags, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +50,7 @@ func readImageBlob(root *os.Root, digest string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Size() > maxImageBlobBytes {
+	if !info.Mode().IsRegular() || !os.SameFile(before, info) || info.Size() > maxImageBlobBytes {
 		return nil, fmt.Errorf("invalid image blob size or type")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxImageBlobBytes+1))
