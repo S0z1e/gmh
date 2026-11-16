@@ -70,13 +70,7 @@ func recoverTail(f *os.File) error {
 		if err := backup.Sync(); err != nil {
 			return err
 		}
-		dir, err := os.Open(filepath.Dir(f.Name()))
-		if err != nil {
-			return err
-		}
-		err = dir.Sync()
-		dir.Close()
-		if err != nil {
+		if err := syncRecoveryDirectory(filepath.Dir(f.Name())); err != nil {
 			return err
 		}
 		if err := f.Truncate(end); err != nil {

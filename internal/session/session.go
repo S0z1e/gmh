@@ -107,12 +107,21 @@ func New(id string) (*Store, error) {
 			path = filepath.Join(dir, id+".jsonl")
 		}
 	}
-	f, err := privatefile.Open(path, os.O_CREATE|os.O_APPEND|os.O_RDWR)
+	// Windows append handles cannot truncate, even with O_RDWR. Repair
+	// through a separate read/write handle, then reopen for append-only use.
+	f, err := privatefile.Open(path, os.O_CREATE|os.O_RDWR)
 	if err != nil {
 		return nil, err
 	}
 	if err := recoverTail(f); err != nil {
 		f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	f, err = privatefile.Open(path, os.O_APPEND|os.O_WRONLY)
+	if err != nil {
 		return nil, err
 	}
 	return &Store{ID: id, Path: path, file: f}, nil
