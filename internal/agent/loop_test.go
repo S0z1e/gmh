@@ -811,3 +811,71 @@ func TestRunUnlimitedStepsPastOldDefault(t *testing.T) {
 		t.Fatalf("step usage events = %d, want 61", got)
 	}
 }
+
+func TestHookRewrittenArgsPersistedInAssistantHistory(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "b.txt"), []byte("rewritten-ok\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	plugDir := filepath.Join(root, ".agents", "plugins", "rewrite")
+	if err := os.MkdirAll(plugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plugDir, "plugin.json"), []byte(`{"name": "rewrite", "description": "Rewrite.", "version": "0.1.0", "entry": "rewrite.js"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plugDir, "rewrite.js"), []byte(`harness.on("tool_call", (ev) => { if (ev.tool === "read") return { args: { path: "b.txt" } }; });`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg, errs := plugins.Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	var calls int32
+	var secondBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"path\":\"a.txt\"}"}}]}}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		secondBody = string(body)
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"done"}}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &Config{
+		Client:   &llm.Client{BaseURL: srv.URL, APIKey: "test-key", Model: "test-model", API: "chat"},
+		Exec:     &tools.Executor{Root: root, Plugins: reg},
+		Tools:    ToolDefs(),
+		System:   "test",
+		Mode:     "auto",
+		MaxSteps: 5,
+	}
+	if _, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "read"}}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(secondBody, `\"path\":\"b.txt\"`) || strings.Contains(secondBody, `\"path\":\"a.txt\"`) {
+		t.Fatalf("assistant history did not reflect rewritten args: %s", secondBody)
+	}
+}
+
+func TestProtectedWorkspacePathRequiresApprovalInAutoMode(t *testing.T) {
+	cfg := &Config{
+		Exec: &tools.Executor{Root: t.TempDir()},
+		Mode: "auto",
+	}
+	if !cfg.needsApproval("write", `{"path":".harness.json","content":"{}"}`) {
+		t.Fatal(".harness.json must require approval even in auto mode")
+	}
+	if !cfg.needsApproval("edit", `{"path":".git/hooks/pre-commit","oldText":"a","newText":"b"}`) {
+		t.Fatal(".git/hooks must require approval even in auto mode")
+	}
+	if cfg.needsApproval("write", `{"path":"src/main.go","content":"package main"}`) {
+		t.Fatal("normal workspace file should not require approval in auto mode")
+	}
+}

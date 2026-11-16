@@ -1,6 +1,8 @@
 package tools
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -152,10 +154,17 @@ func splitSegments(cmd string) []string {
 
 func credentialPath(path string) bool {
 	path = strings.ToLower(path)
-	for _, base := range []string{"~", "$home", "${home}"} {
-		for _, dir := range []string{"/.ssh", "/.aws", "/.config/gcloud", "/.kube", "/.docker"} {
-			prefix := base + dir
-			if strings.Contains(path, prefix) {
+	bases := []string{"~", "$home", "${home}"}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		bases = append(bases, strings.ToLower(filepath.Clean(home)))
+	}
+	credTargets := []string{
+		"/.ssh", "/.aws", "/.config/gcloud", "/.kube", "/.docker",
+		"/.gnupg", "/.netrc", "/.npmrc", "/.pypirc", "/.minimal-harness",
+	}
+	for _, base := range bases {
+		for _, dir := range credTargets {
+			if strings.Contains(path, base+dir) {
 				return true
 			}
 		}

@@ -106,10 +106,10 @@ func (c *Config) emit(e Event) {
 
 func ToolDefs() []llm.ToolDef {
 	return []llm.ToolDef{
-		llm.Tool("read", "Read a file (with offset/limit) or list a directory. Image files (png, jpg, gif, webp) are returned as an image you can see, not as text — use read to look at a screenshot or photo.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}`),
+		llm.Tool("read", "Read a file (with 1-based line offset and limit) or list a directory. Image files (png, jpg, gif, webp) are returned as an image you can see, not as text — use read to look at a screenshot or photo.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}`),
 		llm.Tool("write", "Create a file. By default it fails if the file already exists — use edit then. Pass overwrite:true to replace an existing file wholesale; prefer edit for a small change.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["path","content"]}`),
-		llm.Tool("edit", "Replace text in an existing file. Two forms: oldText (replaced exactly once) or startLine/endLine (1-based, inclusive; endLine defaults to startLine) to replace those lines with newText, ignoring oldText. The line form requires a known version from a read or full write in this session. Successful edits update that version only if the file still matched it before editing; otherwise read the target lines again before a line edit.", `{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}},"required":["path","newText"]}`),
-		llm.Tool("bash", "Run a shell command in the workspace root. Each call is a fresh shell; cd does not persist between calls — pass cwd to run in a subdirectory, or prefix the command with `cd <dir> && `. Timeout in seconds, default 120, max 600; a background:true job has no timeout unless one is passed. Pass background:true for a command that will not exit on its own (dev server, watcher): it returns at once with a job id, and its output is delivered at the next step. A never-ending job never blocks the turn from ending: the turn ends after a short drain wait, and you can read its partial output from the output file. Every result header names the directory the call ran in.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"},"background":{"type":"boolean"},"cwd":{"type":"string"}},"required":["command"]}`),
+		llm.Tool("edit", "Replace text in an existing file. Two forms: oldText (replaced exactly once) or startLine/endLine (1-based, inclusive; endLine defaults to startLine) to replace those lines with newText, ignoring oldText. The line form requires a known version from a read or full write in this session. Successful edits update that version only if the file still matched it before editing (and line count is unchanged); otherwise read the target lines again before a line edit.", `{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}},"required":["path","newText"]}`),
+		llm.Tool("bash", "Run a shell command in the workspace root, or pass killJobId to stop a running background job. Each call is a fresh shell; cd does not persist between calls — pass cwd to run in a subdirectory, or prefix the command with `cd <dir> && `. Timeout in seconds, default 120, max 600; a background:true job has no timeout unless one is passed. Pass background:true for a command that will not exit on its own (dev server, watcher): it returns at once with a job id, and its output is delivered at the next step. A never-ending job never blocks the turn from ending: the turn ends after a short drain wait, and you can read its partial output from the output file. Every result header names the directory the call ran in.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"},"background":{"type":"boolean"},"cwd":{"type":"string"},"killJobId":{"type":"string"}}}`),
 		llm.Tool("grep", "Search file contents with a regex. Prefer this over bash grep/rg. Returns file:line matches, capped (truncation is marked).", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"},"exclude":{"type":"string"},"context":{"type":"integer"},"maxMatches":{"type":"integer"}},"required":["pattern"]}`),
 		llm.Tool("glob", "List files matching a glob pattern, e.g. **/*.go. Prefer this over bash find/ls for discovering files.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer"}},"required":["pattern"]}`),
 		llm.Tool("load_skill", "Load the full text of an available skill by name when its guidance is needed for the current task. The skill names and one-line descriptions are in the system prompt. Pass reference (a file name from the skill's references/ footer) to read one reference file instead of the whole skill.", `{"type":"object","properties":{"name":{"type":"string"},"reference":{"type":"string"}},"required":["name"]}`),
@@ -195,7 +195,15 @@ func (c *Config) askUser(ctx context.Context, argsJSON string) (string, error) {
 	return FormatAnswers(req, ans), nil
 }
 
-func (c *Config) needsApproval(name string) bool {
+func (c *Config) needsApproval(name, argsJSON string) bool {
+	if name == "write" || name == "edit" {
+		var target struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal([]byte(argsJSON), &target) == nil && c.Exec != nil && tools.IsProtectedWorkspacePath(c.Exec.Root, target.Path) {
+			return true
+		}
+	}
 	if c.Mode == "auto" {
 		return false
 	}
@@ -238,6 +246,10 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (tools.ToolResul
 			text += fmt.Sprintf(" Read partial output with read %q.", job.OutputFile)
 		}
 		return tools.ToolResult{Text: text, Status: tools.ResultBackground, OutputFile: job.OutputFile}, job, nil
+	}
+	if strings.TrimSpace(args.KillJobID) != "" {
+		res, err := c.Exec.Dispatch(ctx, "bash", tc.Function.Arguments)
+		return res, nil, err
 	}
 	if args.Background {
 		job, err := c.Exec.BashBackground(ctx, args)
@@ -423,9 +435,17 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 	// job must not hold back results that are already ready. One
 	// goroutine per job signals a shared channel when its job
 	// finishes.
+	drainStop := make(chan struct{})
+	defer close(drainStop)
 	done := make(chan *tools.Job, len(freshJobs))
 	for _, job := range freshJobs {
-		go func(j *tools.Job) { <-j.Done(); done <- j }(job)
+		go func(j *tools.Job) {
+			select {
+			case <-j.Done():
+				done <- j
+			case <-drainStop:
+			}
+		}(job)
 	}
 	bound := c.drainTimeout()
 	timer := time.NewTimer(bound)
@@ -750,6 +770,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		total.Add(usage)
 		c.emit(Event{Kind: EventStepUsage, Usage: usage})
 		lastText = assistant.Content
+		assistantIdx := len(msgs)
 		msgs = append(msgs, assistant)
 		if c.Session != nil {
 			c.persist(assistant)
@@ -821,7 +842,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		// blocked-after-3-failures rule: refusals count too, so unavailable tools cannot trap an unlimited run.
 		stepHadExecution := false
 		stepAllFailed := true
-		for _, tc := range assistant.ToolCalls {
+		for i := range assistant.ToolCalls {
+			tc := &assistant.ToolCalls[i]
 			if c.persistErr != nil {
 				return lastText, total, c.persistErr
 			}
@@ -836,8 +858,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// still applies to anything the hooks let through — a
 			// hook can add a gate, never remove one. A rewrite
 			// replaces the args the rest of this path sees
-			// (approval prompt, audit, dispatch); the assistant
-			// message already in history keeps what the model asked.
+			// (approval prompt, audit, dispatch) and updates the
+			// in-memory assistant message so subsequent steps stay in sync.
 			argsJSON := tc.Function.Arguments
 			if c.Exec != nil && c.Exec.Plugins != nil {
 				newArgs, deny := c.Exec.Plugins.RunToolCallHooks(ctx, tc.Function.Name, argsJSON)
@@ -857,6 +879,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				}
 				argsJSON = newArgs
 				tc.Function.Arguments = argsJSON
+				msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
 			}
 			// A tool the model was not offered in this turn's list
 			// is refused outright, before approval: the offered
@@ -907,6 +930,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			argsJSON = useArgs
 			tc.Function.Arguments = argsJSON
+			msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
 			callKey := CanonicalToolKey(tc.Function.Name, argsJSON)
 			// Repeat-failure circuit breaker: a call that already
 			// failed FailureDenyAfter times this turn is denied
@@ -934,7 +958,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				recordLastError(&lastErrors, obs)
 				continue
 			}
-			if c.needsApproval(tc.Function.Name) {
+			if c.needsApproval(tc.Function.Name, tc.Function.Arguments) {
 				req := ApprovalRequest{ToolName: tc.Function.Name, Arguments: tc.Function.Arguments}
 				c.emit(Event{Kind: EventApproval, Text: req.Prompt(), ToolName: req.ToolName, ToolArgs: req.Arguments})
 				ok, err := c.ask(req)
@@ -979,7 +1003,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			case "ask_user":
 				res.Text, err = c.askUser(ctx, argsJSON)
 			case "bash":
-				res, job, err = c.execBash(ctx, tc)
+				res, job, err = c.execBash(ctx, *tc)
 				if job != nil {
 					pending = append(pending, pendingJob{callID: tc.ID, job: job})
 				}

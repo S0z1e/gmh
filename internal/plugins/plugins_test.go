@@ -372,7 +372,7 @@ func TestTodoPluginRoundTrip(t *testing.T) {
 		t.Fatalf("todo_list after done = %q, %v", out, err)
 	}
 	// State persisted on disk in the data dir.
-	data, err := os.ReadFile(filepath.Join(root, ".agents", "plugins", "todo", "data", "todos.json"))
+	data, err := os.ReadFile(filepath.Join(root, ".agents", "plugins", "todo", "data", "todos-default.json"))
 	if err != nil {
 		t.Fatalf("state file missing: %v", err)
 	}
@@ -385,6 +385,28 @@ func TestTodoPluginRoundTrip(t *testing.T) {
 	// registry.
 	if got := reg.RunBeforeAgentStartHooks(ctx, "s1", "default"); got != "[plugin todo] Open todos (1): #2 call mom" {
 		t.Fatalf("before_agent_start = %q", got)
+	}
+	// Session-owned state stays isolated and follows a rename.
+	currentSession := "s1"
+	reg.SessionGetter = func() string { return currentSession }
+	if out, err := reg.Call(ctx, "todo_list", `{}`); err != nil || out != "No todos." {
+		t.Fatalf("fresh session inherited standalone todos: %q, %v", out, err)
+	}
+	if _, err := reg.Call(ctx, "todo_add", `{"text":"session todo"}`); err != nil {
+		t.Fatal(err)
+	}
+	currentSession = "s2"
+	if got := reg.RunBeforeAgentStartHooks(ctx, currentSession, "default"); got != "" {
+		t.Fatalf("new session inherited todos: %q", got)
+	}
+	reg.RunSessionRenameHooks(ctx, "renamed", "s1")
+	currentSession = "renamed"
+	if got := reg.RunBeforeAgentStartHooks(ctx, currentSession, "default"); got != "[plugin todo] Open todos (1): #1 session todo" {
+		t.Fatalf("renamed session lost todos: %q", got)
+	}
+	currentSession = "s1"
+	if out, err := reg.Call(ctx, "todo_list", `{}`); err != nil || out != "No todos." {
+		t.Fatalf("reused session inherited renamed todos: %q, %v", out, err)
 	}
 	// No todos at all: no contribution.
 	root2 := t.TempDir()

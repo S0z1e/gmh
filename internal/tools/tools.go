@@ -176,7 +176,7 @@ func (e *Executor) Read(a ReadArgs) (string, error) {
 		copy(digest[:], h.Sum(nil))
 		e.rememberSnapshot(a.Path, digest)
 	}
-	start := max(a.Offset, 0)
+	start := max(a.Offset-1, 0)
 	reader := bufio.NewReader(f)
 	var out strings.Builder
 	for line := 0; ; line++ {
@@ -259,10 +259,15 @@ func (e *Executor) Write(a WriteArgs) (string, error) {
 	if err := r.MkdirAll(filepath.Dir(rel), 0755); err != nil {
 		return "", err
 	}
-	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
-	if a.Overwrite {
-		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	if a.Overwrite && statErr == nil {
+		e.invalidateSnapshot(a.Path)
+		if err := atomicWriteFile(r, rel, []byte(a.Content)); err != nil {
+			return "", err
+		}
+		e.rememberSnapshot(a.Path, sha256.Sum256([]byte(a.Content)))
+		return "overwrote " + a.Path, nil
 	}
+	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
 	f, err := r.OpenFile(rel, flags, 0644)
 	if err != nil {
 		return "", err
@@ -279,9 +284,6 @@ func (e *Executor) Write(a WriteArgs) (string, error) {
 		return "", closeErr
 	}
 	e.rememberSnapshot(a.Path, sha256.Sum256([]byte(a.Content)))
-	if statErr == nil {
-		return "overwrote " + a.Path, nil
-	}
 	return "wrote " + a.Path, nil
 }
 
@@ -324,7 +326,10 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	s := string(data)
+	raw := string(data)
+	s := strings.ReplaceAll(raw, "\r\n", "\n")
+	normOld := strings.ReplaceAll(a.OldText, "\r\n", "\n")
+	normNew := strings.ReplaceAll(a.NewText, "\r\n", "\n")
 	if a.StartLine > 0 {
 		expected, ok := e.snapshots[p]
 		if !ok {
@@ -333,27 +338,27 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 		if sha256.Sum256(data) != expected {
 			return "", fmt.Errorf("file changed since last read or write: %s; read the target lines again before editing", a.Path)
 		}
-		return e.editLines(p, s, a)
+		return e.editLines(p, raw, s, a, normNew)
 	}
 	if a.StartLine < 0 {
 		return "", fmt.Errorf("startLine must be >= 1, got %d in %s", a.StartLine, a.Path)
 	}
-	if n := strings.Count(s, a.OldText); n != 1 {
-		return "", editMatchError(a.Path, s, a.OldText, n)
+	if n := strings.Count(s, normOld); n != 1 {
+		return "", editMatchError(a.Path, s, normOld, n)
 	}
 	expected, known := e.snapshots[p]
-	known = known && sha256.Sum256(data) == expected
-	if err := e.writeExisting(p, []byte(strings.Replace(s, a.OldText, a.NewText, 1)), known); err != nil {
+	known = known && sha256.Sum256(data) == expected && strings.Count(normOld, "\n") == strings.Count(normNew, "\n")
+	start := strings.Index(s, normOld)
+	if err := e.writeExisting(p, replaceNormalizedRange(raw, start, start+len(normOld), normNew), known); err != nil {
 		return "", err
 	}
 	return "edited " + a.Path, nil
 }
 
 // editLines replaces lines StartLine..EndLine (1-based, inclusive)
-// with NewText. The file's trailing-newline behaviour is preserved:
-// the split keeps the trailing "" sentinel, and NewText's own
-// trailing newline is honoured the same way.
-func (e *Executor) editLines(p, s string, a EditArgs) (string, error) {
+// with normNew. The normalized range excludes the final line separator,
+// preserving the file's original separators outside the replacement.
+func (e *Executor) editLines(p, raw, s string, a EditArgs, normNew string) (string, error) {
 	parts, n := splitFileLines(s)
 	end := a.EndLine
 	if end == 0 {
@@ -367,11 +372,16 @@ func (e *Executor) editLines(p, s string, a EditArgs) (string, error) {
 	case end > n:
 		return "", fmt.Errorf("endLine %d is beyond the last line (%d) in %s", end, n, a.Path)
 	}
-	newParts := make([]string, 0, len(parts)+1)
-	newParts = append(newParts, parts[:a.StartLine-1]...)
-	newParts = append(newParts, strings.Split(a.NewText, "\n")...)
-	newParts = append(newParts, parts[end:]...)
-	if err := e.writeExisting(p, []byte(strings.Join(newParts, "\n")), true); err != nil {
+	start := 0
+	for _, part := range parts[:a.StartLine-1] {
+		start += len(part) + 1
+	}
+	endOffset := start + end - a.StartLine
+	for _, part := range parts[a.StartLine-1 : end] {
+		endOffset += len(part)
+	}
+	keepSnapshot := strings.Count(normNew, "\n") == end-a.StartLine
+	if err := e.writeExisting(p, replaceNormalizedRange(raw, start, endOffset, normNew), keepSnapshot); err != nil {
 		return "", err
 	}
 	return "edited " + a.Path, nil
@@ -539,7 +549,8 @@ type BashArgs struct {
 	// With no per-call timeout, an explicit background job has NO
 	// timeout: a dev server must outlive any cap (a per-call
 	// timeout, when given, is still honored).
-	Background bool `json:"background,omitempty"`
+	Background bool   `json:"background,omitempty"`
+	KillJobID  string `json:"killJobId,omitempty"`
 }
 
 // bashDir resolves the effective working directory for one bash
@@ -596,6 +607,9 @@ func (e *Executor) Bash(ctx context.Context, a BashArgs) (string, error) {
 }
 
 func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, error) {
+	if strings.TrimSpace(a.KillJobID) != "" {
+		return e.killJob(a.KillJobID)
+	}
 	if reason := DeniedCommand(a.Command); reason != "" {
 		e.audit(AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
 		return ToolResult{}, fmt.Errorf("denied by policy: %s", reason)
@@ -858,15 +872,35 @@ func (e *Executor) LoadSkill(a LoadSkillArgs) (string, error) {
 	return match.Load()
 }
 
+// killJob stops a running background job and returns its output so far.
+func (e *Executor) killJob(id string) (ToolResult, error) {
+	job := e.registry().Get(id)
+	if job == nil {
+		return ToolResult{}, fmt.Errorf("unknown background job %q", id)
+	}
+	job.Cancel()
+	select {
+	case <-job.Done():
+	case <-time.After(5 * time.Second):
+	}
+	res, ok := job.Result()
+	if ok {
+		job.MarkDelivered()
+		return ToolResult{Text: fmt.Sprintf("Stopped background job %s (exit %d).\nOutput:\n%s", job.ID, res.ExitCode, truncate(res.Output, 32*1024)), ExitCode: &res.ExitCode, OutputFile: job.OutputFile}, nil
+	}
+	return ToolResult{Text: fmt.Sprintf("Signalled background job %s to stop.", job.ID), OutputFile: job.OutputFile}, nil
+}
+
+// writeExisting atomically replaces an existing file while preserving its mode.
 // keepSnapshot requires the caller to have validated the original bytes against
-// a known version. Matching oldText alone says nothing about surrounding lines.
+// a known version and preserved line numbers.
 func (e *Executor) writeExisting(path string, data []byte, keepSnapshot bool) error {
 	r, rel, err := fileguard.Root(e.Root, path)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
-	if err := r.WriteFile(rel, data, 0644); err != nil {
+	if err := atomicWriteFile(r, rel, data); err != nil {
 		e.invalidateSnapshot(path)
 		return err
 	}
@@ -876,6 +910,27 @@ func (e *Executor) writeExisting(path string, data []byte, keepSnapshot bool) er
 		e.invalidateSnapshot(path)
 	}
 	return nil
+}
+
+// IsProtectedWorkspacePath reports whether path points to harness config,
+// plugins, or git internals that should always require explicit approval.
+func IsProtectedWorkspacePath(root, path string) bool {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	full := filepath.Clean(path)
+	if !filepath.IsAbs(full) {
+		full = filepath.Join(abs, full)
+	}
+	rel, err := filepath.Rel(abs, full)
+	if err != nil {
+		return false
+	}
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	return rel == ".harness.json" ||
+		rel == ".git" || strings.HasPrefix(rel, ".git/") ||
+		rel == ".agents/plugins" || strings.HasPrefix(rel, ".agents/plugins/")
 }
 
 func (e *Executor) snapshotPath(path string) string {

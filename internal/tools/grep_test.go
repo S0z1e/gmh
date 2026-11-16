@@ -99,3 +99,14 @@ func TestGrepStaysInsideRoot(t *testing.T) {
 		t.Fatal("expected error for path outside root")
 	}
 }
+
+func TestParseGrepFallbackLine(t *testing.T) {
+	path, lineNo, text, isCtx, ok := parseGrepFallbackLine("a.go:12:func main() {}")
+	if !ok || isCtx || path != "a.go" || lineNo != 12 || text != "func main() {}" {
+		t.Fatalf("match parse = (%q, %d, %q, %v, %v)", path, lineNo, text, isCtx, ok)
+	}
+	path, lineNo, text, isCtx, ok = parseGrepFallbackLine("sub/b-file.go-11-package sub")
+	if !ok || !isCtx || path != "sub/b-file.go" || lineNo != 11 || text != "package sub" {
+		t.Fatalf("context parse = (%q, %d, %q, %v, %v)", path, lineNo, text, isCtx, ok)
+	}
+}

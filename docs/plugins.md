@@ -244,7 +244,7 @@ it is back in default mode.
 Cost: moejs is the one non-stdlib dependency outside the TUI, and it
 adds ~8 MB to the stripped binary (core harness ~8 MB → ~16 MB).
 The shipped pilot is `.agents/plugins/todo/` — `todo_add` /
-`todo_list` / `todo_done`, state in its `data/todos.json`.
+`todo_list` / `todo_done`, state in `data/todos-<session>.json`.
 
 Tool handlers can return `{text: "...", isError: true}` to report a failure,
 or throw an error. `{text: "...", isError: false}` reports success. A plain
@@ -253,12 +253,14 @@ comes from an output prefix. Result hooks may rewrite text but cannot turn a
 failed execution into success.
 
 `harness.getSession()` returns the current session id (empty in a standalone
-registry). The built-in plan plugin stores `plan-<session>.json` separately
-for each session. Existing project-wide `plan.json` files are retained but
-are not imported automatically, so a fresh session cannot inherit an old
-plan. The todo plugin retains its project-wide list.
+registry). The built-in plan and todo plugins store `plan-<session>.json`
+and `todos-<session>.json` separately for each session; a standalone registry
+uses `default` in place of the session id. Existing project-wide `plan.json`
+and `todos.json` files are retained but are not imported automatically, so a
+fresh session cannot inherit an old plan or todo list.
 
 `session_rename` receives `{session, previous}` after the transcript is renamed.
 A plugin storing state by session id can move it here; return values are ignored,
 and errors warn without undoing the transcript rename. The built-in plan plugin
-moves the plan and retires its old filename.
+moves the plan and retires its old filename; the todo plugin does the same
+for its list.

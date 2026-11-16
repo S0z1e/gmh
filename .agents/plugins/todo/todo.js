@@ -2,14 +2,18 @@
 // plugin system: it proves discovery, tool registration, the jailed
 // store, and state that persists between turns.
 //
-// State is one JSON file, todos.json, in the plugin's own data dir
+// State is one JSON file per session, todos-<session>.json, in the data dir
 // (harness.readFile / harness.writeFile are jailed there: the
 // plugin cannot read or write anywhere else, and cannot run bash).
 // A missing state file means an empty list.
 
+function todoPath() {
+  return "todos-" + (harness.getSession() || "default") + ".json";
+}
+
 function loadTodos() {
   try {
-    const raw = harness.readFile("todos.json");
+    const raw = harness.readFile(todoPath());
     const items = JSON.parse(raw);
     return Array.isArray(items) ? items : [];
   } catch (e) {
@@ -19,7 +23,7 @@ function loadTodos() {
 }
 
 function saveTodos(items) {
-  harness.writeFile("todos.json", JSON.stringify(items, null, 2));
+  harness.writeFile(todoPath(), JSON.stringify(items, null, 2));
 }
 
 function nextId(items) {
@@ -106,4 +110,12 @@ harness.on("before_agent_start", () => {
     "): " +
     open.map((t) => "#" + t.id + " " + t.text).join("; ")
   );
+});
+
+harness.on("session_rename", (event) => {
+  let raw;
+  try { raw = harness.readFile("todos-" + event.previous + ".json"); }
+  catch (e) { return; }
+  harness.writeFile("todos-" + event.session + ".json", raw);
+  harness.writeFile("todos-" + event.previous + ".json", "[]");
 });

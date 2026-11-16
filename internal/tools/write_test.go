@@ -34,3 +34,22 @@ func TestWriteOverwrite(t *testing.T) {
 		t.Fatalf("write new with overwrite = (%q, %v), want (\"wrote fresh.txt\", nil)", out, err)
 	}
 }
+
+func TestWriteOverwritePreservesExecutableMode(t *testing.T) {
+	root := t.TempDir()
+	e := &Executor{Root: root}
+	p := filepath.Join(root, "script.sh")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\necho 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Write(WriteArgs{Path: "script.sh", Content: "#!/bin/sh\necho 2\n", Overwrite: true}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o755 {
+		t.Fatalf("mode = %o, want 0755", st.Mode().Perm())
+	}
+}

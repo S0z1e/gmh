@@ -48,3 +48,19 @@ func TestDeniedCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestDeniedCommandAbsoluteHomeAndExtraCreds(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	denied := []string{
+		"cp key " + home + "/.ssh/authorized_keys",
+		"echo tok > " + home + "/.npmrc",
+		"cat > ~/.gnupg/gpg.conf",
+		"cp bad.json ~/.minimal-harness/config.json",
+	}
+	for _, cmd := range denied {
+		if reason := DeniedCommand(cmd); reason == "" {
+			t.Fatalf("DeniedCommand(%q) = allowed, want denied", cmd)
+		}
+	}
+}

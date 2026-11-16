@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"minimalharness/internal/fileguard"
+	"minimalharness/internal/textutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,13 +42,13 @@ var contextFileNames = []string{"AGENTS.md", "CLAUDE.md"}
 func ProjectContext(root string) string {
 	var files strings.Builder
 	for _, f := range findContextFiles(root) {
-		data, err := os.ReadFile(f.path)
+		data, err := fileguard.ReadFile(f.dir, f.name)
 		if err != nil {
 			continue
 		}
 		text := string(data)
 		if len(data) > maxContextFileBytes {
-			text = string(data[:maxContextFileBytes]) + "\n[truncated: file continues, first 8 KiB shown]"
+			text = textutil.Prefix(text, maxContextFileBytes) + "\n[truncated: file continues, first 8 KiB shown]"
 		}
 		fmt.Fprintf(&files, "\n\nProject context (%s):\n%s", f.display, text)
 	}
@@ -62,6 +64,8 @@ func ProjectContext(root string) string {
 }
 
 type contextFile struct {
+	dir     string
+	name    string
 	path    string
 	display string // path relative to the root, or the bare name
 }
@@ -86,7 +90,7 @@ func findContextFiles(root string) []contextFile {
 				if rel, err := filepath.Rel(abs, p); err == nil {
 					display = rel
 				}
-				out = append(out, contextFile{path: p, display: display})
+				out = append(out, contextFile{dir: dir, name: name, path: p, display: display})
 			}
 		}
 		parent := filepath.Dir(dir)

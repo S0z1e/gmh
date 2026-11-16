@@ -345,3 +345,97 @@ func TestTextEditsWithoutKnownVersionDoNotEnableLineEdit(t *testing.T) {
 		t.Fatalf("unread line edit changed the file: %q", got)
 	}
 }
+
+func TestEditPreservesCRLF(t *testing.T) {
+	root := t.TempDir()
+	e := &Executor{Root: root}
+	writeEditFile(t, root, "crlf.txt", "line1\r\nline2\r\nline3\r\n")
+	if _, err := e.Edit(EditArgs{Path: "crlf.txt", OldText: "line2", NewText: "LINE2"}); err != nil {
+		t.Fatalf("CRLF edit failed: %v", err)
+	}
+	got := readEditFile(t, root, "crlf.txt")
+	if got != "line1\r\nLINE2\r\nline3\r\n" {
+		t.Fatalf("CRLF lost: %q", got)
+	}
+}
+
+func TestEditLineRangeInvalidatesSnapshotOnLineCountChange(t *testing.T) {
+	root := t.TempDir()
+	e := &Executor{Root: root}
+	writeEditFile(t, root, "lines.txt", "a\nb\nc\n")
+	if _, err := e.Read(ReadArgs{Path: "lines.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Edit(EditArgs{Path: "lines.txt", StartLine: 2, NewText: "b1\nb2"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Edit(EditArgs{Path: "lines.txt", StartLine: 3, NewText: "C"}); err == nil {
+		t.Fatal("line edit after line-count change should require re-read")
+	}
+}
+
+func TestEditPreservesExecutableMode(t *testing.T) {
+	root := t.TempDir()
+	e := &Executor{Root: root}
+	p := filepath.Join(root, "run.sh")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\necho old\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Edit(EditArgs{Path: "run.sh", OldText: "echo old", NewText: "echo new"}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o755 {
+		t.Fatalf("mode = %o, want 0755", st.Mode().Perm())
+	}
+}
+
+func TestEditPreservesMixedLineEndings(t *testing.T) {
+	for _, lineForm := range []bool{false, true} {
+		t.Run(map[bool]string{false: "text", true: "line"}[lineForm], func(t *testing.T) {
+			root := t.TempDir()
+			e := &Executor{Root: root}
+			writeEditFile(t, root, "mixed.txt", "a\r\nb\nc\r\nd")
+			if _, err := e.Read(ReadArgs{Path: "mixed.txt"}); err != nil {
+				t.Fatal(err)
+			}
+			args := EditArgs{Path: "mixed.txt", OldText: "b", NewText: "B\nB2"}
+			if lineForm {
+				args.StartLine = 2
+			}
+			if _, err := e.Edit(args); err != nil {
+				t.Fatal(err)
+			}
+			if got := readEditFile(t, root, "mixed.txt"); got != "a\r\nB\nB2\nc\r\nd" {
+				t.Fatalf("unrelated line endings changed: %q", got)
+			}
+		})
+	}
+}
+
+func TestEditMatchesNormalizedCRLF(t *testing.T) {
+	root := t.TempDir()
+	e := &Executor{Root: root}
+	writeEditFile(t, root, "mixed.txt", "a\nb\r\nc\r\nd\n")
+	if _, err := e.Edit(EditArgs{Path: "mixed.txt", OldText: "b\nc", NewText: "B\nC"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readEditFile(t, root, "mixed.txt"); got != "a\nB\r\nC\r\nd\n" {
+		t.Fatalf("file = %q", got)
+	}
+}
+
+func TestEditPreservesCRLFOnLastLine(t *testing.T) {
+	root := t.TempDir()
+	e := &Executor{Root: root}
+	writeEditFile(t, root, "crlf.txt", "a\r\nb")
+	if _, err := e.Edit(EditArgs{Path: "crlf.txt", OldText: "b", NewText: "B\nC"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readEditFile(t, root, "crlf.txt"); got != "a\r\nB\r\nC" {
+		t.Fatalf("file = %q", got)
+	}
+}

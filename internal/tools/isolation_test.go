@@ -65,8 +65,57 @@ func TestWorkspaceAllowsInternalSymlink(t *testing.T) {
 func TestReadPagesBeyondFirstMiB(t *testing.T) {
 	root := t.TempDir()
 	os.WriteFile(filepath.Join(root, "large.txt"), []byte(strings.Repeat("1234567\n", 150000)+"tail-marker\n"), 0600)
-	out, err := (&Executor{Root: root}).Read(ReadArgs{Path: "large.txt", Offset: 150000, Limit: 1})
+	out, err := (&Executor{Root: root}).Read(ReadArgs{Path: "large.txt", Offset: 150001, Limit: 1})
 	if err != nil || !strings.Contains(out, "tail-marker") {
 		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
+func TestWorkspaceWritesPreserveFileSymlinks(t *testing.T) {
+	for _, operation := range []string{"edit", "overwrite"} {
+		for _, linkTarget := range []string{"real/f", "nested/next", "dir-link/../f"} {
+			t.Run(operation+"/"+linkTarget, func(t *testing.T) {
+				root := t.TempDir()
+				if err := os.MkdirAll(filepath.Join(root, "real", "sub"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Join(root, "nested"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, "real", "f"), []byte("old\n"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("../real/f", filepath.Join(root, "nested", "next")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("real/sub", filepath.Join(root, "dir-link")); err != nil {
+					t.Fatal(err)
+				}
+				alias := filepath.Join(root, "alias")
+				if err := os.Symlink(linkTarget, alias); err != nil {
+					t.Fatal(err)
+				}
+				e := &Executor{Root: root}
+				var err error
+				if operation == "edit" {
+					_, err = e.Edit(EditArgs{Path: "alias", OldText: "old", NewText: "new"})
+				} else {
+					_, err = e.Write(WriteArgs{Path: "alias", Content: "new\n", Overwrite: true})
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if target, err := os.Readlink(alias); err != nil || target != linkTarget {
+					t.Fatalf("symlink = %q, %v", target, err)
+				}
+				if got := readEditFile(t, root, "real/f"); got != "new\n" {
+					t.Fatalf("target = %q", got)
+				}
+				st, err := os.Stat(alias)
+				if err != nil || st.Mode().Perm() != 0755 {
+					t.Fatalf("target mode changed: %v, %v", st, err)
+				}
+			})
+		}
 	}
 }

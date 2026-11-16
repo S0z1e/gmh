@@ -174,6 +174,9 @@ func (e *Executor) grepFallback(ctx context.Context, dir string, a GrepArgs, max
 	if a.Include != "" {
 		args = append(args, "--include="+a.Include)
 	}
+	if a.Exclude != "" {
+		args = append(args, "--exclude="+a.Exclude)
+	}
 	args = append(args, "--", a.Pattern, dir)
 
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -191,29 +194,63 @@ func (e *Executor) grepFallback(ctx context.Context, dir string, a GrepArgs, max
 		return "", 0, fmt.Errorf("grep failed: %w", err)
 	}
 	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
-	total := len(lines)
-	if total == 1 && lines[0] == "" {
+	if len(lines) == 1 && lines[0] == "" {
 		return "no matches for " + a.Pattern, 0, nil
 	}
 	var hits []grepHit
+	total := 0
 	for _, l := range lines {
-		// grep -rn output: path:line:text (context lines use - as separator)
-		parts := strings.SplitN(l, ":", 3)
-		if len(parts) < 3 {
+		if l == "--" {
 			continue
 		}
-		rel, rerr := filepath.Rel(e.Root, parts[0])
-		if rerr != nil {
-			rel = parts[0]
+		path, lineNo, text, isCtx, ok := parseGrepFallbackLine(l)
+		if !ok {
+			continue
 		}
-		lineNo := 0
-		fmt.Sscanf(parts[1], "%d", &lineNo)
-		hits = append(hits, grepHit{path: rel, line: lineNo, text: parts[2]})
+		if !isCtx {
+			total++
+			if total > maxMatches {
+				continue
+			}
+		} else if total >= maxMatches {
+			continue
+		}
+		rel, rerr := filepath.Rel(e.Root, path)
+		if rerr != nil {
+			rel = path
+		}
+		hits = append(hits, grepHit{path: rel, line: lineNo, text: text, ctx: isCtx})
 	}
-	if len(hits) > maxMatches {
-		hits = hits[:maxMatches]
+	if total == 0 {
+		return "no matches for " + a.Pattern, 0, nil
 	}
 	return formatGrepHits(hits, total, maxMatches), total, nil
+}
+
+// parseGrepFallbackLine parses grep -rn output ("path:line:text" or context "path-line-text").
+func parseGrepFallbackLine(l string) (path string, lineNo int, text string, isCtx bool, ok bool) {
+	if parts := strings.SplitN(l, ":", 3); len(parts) == 3 {
+		var n int
+		if _, err := fmt.Sscanf(parts[1], "%d", &n); err == nil && n > 0 && fmt.Sprint(n) == parts[1] {
+			return parts[0], n, parts[2], false, true
+		}
+	}
+	for i := 0; i < len(l); i++ {
+		if l[i] != '-' {
+			continue
+		}
+		rest := l[i+1:]
+		dash := strings.IndexByte(rest, '-')
+		if dash <= 0 {
+			continue
+		}
+		numStr := rest[:dash]
+		var n int
+		if _, err := fmt.Sscanf(numStr, "%d", &n); err == nil && n > 0 && fmt.Sprint(n) == numStr {
+			return l[:i], n, rest[dash+1:], true, true
+		}
+	}
+	return "", 0, "", false, false
 }
 
 func formatGrepHits(hits []grepHit, total, maxMatches int) string {

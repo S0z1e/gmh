@@ -502,6 +502,9 @@ func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[str
 	ch := make(chan doResult, 1)
 	go func() {
 		resp, err := c.httpClient().Do(req)
+		if reqCtx.Err() != nil && resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
 		ch <- doResult{resp, err}
 	}()
 	timer := time.NewTimer(c.idleTimeout())
