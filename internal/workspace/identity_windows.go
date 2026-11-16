@@ -2,28 +2,42 @@ package workspace
 
 import (
 	"fmt"
-	"os"
-	"syscall"
+	"strings"
+
+	"golang.org/x/sys/windows"
 )
 
 const trustReadFlags = 0
 
 func directoryID(path string) (string, error) {
-	f, err := os.Open(path)
+	// Identify supplies an absolute path; preserve support for long paths when
+	// opening directly through Win32 rather than os.Open's internal conversion.
+	if !strings.HasPrefix(path, `\\?\`) {
+		if strings.HasPrefix(path, `\\`) {
+			path = `\\?\UNC\` + path[2:]
+		} else {
+			path = `\\?\` + path
+		}
+	}
+	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-	info, err := f.Stat()
+	// Query metadata without GENERIC_READ / FILE_LIST_DIRECTORY. Traversable
+	// directories may permit attributes while denying directory enumeration.
+	handle, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
 	if err != nil {
 		return "", err
 	}
-	if !info.IsDir() {
+	defer windows.CloseHandle(handle)
+	var stat windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &stat); err != nil {
+		return "", err
+	}
+	if stat.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
 		return "", fmt.Errorf("workspace root is not a directory: %s", path)
-	}
-	var stat syscall.ByHandleFileInformation
-	if err := syscall.GetFileInformationByHandle(syscall.Handle(f.Fd()), &stat); err != nil {
-		return "", err
 	}
 	return fmt.Sprintf("%d:%d:%d:%d:%d", stat.VolumeSerialNumber, stat.FileIndexHigh, stat.FileIndexLow, stat.CreationTime.HighDateTime, stat.CreationTime.LowDateTime), nil
 }
