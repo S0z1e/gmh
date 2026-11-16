@@ -719,16 +719,17 @@ func hookMessagesResult(p *Plugin, res moejs.Value) ([]llm.Message, bool) {
 }
 
 // rehydrateImages restores image bytes on a context hook's rewritten
-// history: the hook input JSON carries paths only (Data is json:"-"),
+// history: hook input JSON carries immutable references (Data is json:"-"),
 // so a verbatim round-trip would silently drop the bytes. Images are
-// matched by path; an image the hook invented (no matching path in
+// matched by origin and digest; an image the hook invented (no matching reference in
 // the original) is dropped — a hook cannot inject image bytes it
 // never had.
 func rehydrateImages(orig, rewritten []llm.Message) []llm.Message {
-	byPath := map[string]llm.Image{}
+	type key struct{ path, digest string }
+	byImage := map[key]llm.Image{}
 	for _, m := range orig {
 		for _, img := range m.Images {
-			byPath[img.Path] = img
+			byImage[key{img.Path, img.Digest}] = img
 		}
 	}
 	for i := range rewritten {
@@ -737,9 +738,8 @@ func rehydrateImages(orig, rewritten []llm.Message) []llm.Message {
 		}
 		kept := rewritten[i].Images[:0]
 		for _, img := range rewritten[i].Images {
-			if src, ok := byPath[img.Path]; ok {
-				img.Data = src.Data
-				kept = append(kept, img)
+			if src, ok := byImage[key{img.Path, img.Digest}]; ok {
+				kept = append(kept, src)
 			}
 		}
 		rewritten[i].Images = kept

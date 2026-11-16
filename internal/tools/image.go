@@ -2,7 +2,9 @@ package tools
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -97,7 +99,9 @@ func (e *Executor) loadImage(f *os.File, displayPath, mt string) (llm.Image, err
 	if len(data) > MaxImageBytes {
 		return llm.Image{}, fmt.Errorf("image exceeds size cap")
 	}
+	digest := sha256.Sum256(data)
 	img := llm.Image{
+		Digest:    hex.EncodeToString(digest[:]),
 		Path:      displayPath,
 		MediaType: mt,
 		Data:      base64.StdEncoding.EncodeToString(data),

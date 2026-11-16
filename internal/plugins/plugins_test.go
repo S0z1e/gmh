@@ -973,6 +973,26 @@ harness.on("context", (e) => {
 	}
 }
 
+func TestContextHookPreservesDistinctImageVersionsAndUnavailableState(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "echoctx", "", "e.js", `harness.on("context",(e)=>e.messages);`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	orig := []llm.Message{
+		{Role: "user", Images: []llm.Image{{Path: "same.png", Digest: strings.Repeat("a", 64), Data: "first"}}},
+		{Role: "user", Images: []llm.Image{{Path: "same.png", Digest: strings.Repeat("b", 64), Data: "second"}}},
+		{Role: "user", Images: []llm.Image{{Path: "same.png", Digest: strings.Repeat("c", 64), Unavailable: "missing blob"}}},
+	}
+	got := reg.RunContextHooks(context.Background(), "s1", "default", orig)
+	for i := range orig {
+		if len(got[i].Images) != 1 || got[i].Images[0] != orig[i].Images[0] {
+			t.Fatalf("image version changed: %+v", got)
+		}
+	}
+}
+
 func TestSessionBeforeCompactHooks(t *testing.T) {
 	root := t.TempDir()
 	writePlugin(t, root, "aaa", "", "a.js", `harness.on("session_before_compact", (e) => "Keep the plan (session " + e.session + ", " + e.messages + " messages).");`)
