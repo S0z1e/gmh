@@ -18,6 +18,7 @@ package rpc
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -138,6 +139,7 @@ type Server struct {
 	questSeq    int
 
 	turnMu      sync.Mutex
+	turnCtx     context.Context
 	turnCancel  context.CancelFunc
 	turnAborted bool
 
@@ -655,12 +657,26 @@ func (s *Server) ask(req agent.ApprovalRequest) (bool, error) {
 // shuts down. It is a separate channel from approval_request on
 // purpose: the doom-loop question is not a permission.
 func (s *Server) confirmContinuation(req agent.ContinuationRequest) (agent.ContinuationDecision, error) {
+	s.turnMu.Lock()
+	ctx := s.turnCtx
+	s.turnMu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
+	}
 	s.continuationsMu.Lock()
 	s.contSeq++
 	id := fmt.Sprintf("cont-%d", s.contSeq)
 	ch := make(chan agent.ContinuationDecision, 1)
 	s.continuations[id] = ch
 	s.continuationsMu.Unlock()
+	defer func() {
+		s.continuationsMu.Lock()
+		delete(s.continuations, id)
+		s.continuationsMu.Unlock()
+	}()
 	s.writeEvent(Event{
 		Type: "continuation_request", ID: id, Tool: req.ToolName,
 		Prompt: req.InputPreview, RepeatCount: req.RepeatCount, Threshold: req.Threshold,
@@ -668,12 +684,28 @@ func (s *Server) confirmContinuation(req agent.ContinuationRequest) (agent.Conti
 	select {
 	case dec := <-ch:
 		return dec, nil
+	case <-ctx.Done():
+		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, ctx.Err()
 	case <-s.done:
 		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, errShutdown
 	}
 }
 
 func (s *Server) handleContinuationResponse(req Request) {
+	dec := agent.ContinuationDecision{Outcome: agent.ContinuationOutcome(req.Decision), UpdatedArgs: req.UpdatedArgs}
+	switch dec.Outcome {
+	case agent.ContinuationOnce, agent.ContinuationSession, agent.ContinuationDeny:
+	default:
+		s.respond(req, nil, fmt.Errorf("unknown continuation decision %q", req.Decision))
+		return
+	}
+	if dec.UpdatedArgs != "" {
+		var args map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(dec.UpdatedArgs), &args); err != nil || args == nil {
+			s.respond(req, nil, fmt.Errorf("updated_args must be a JSON object"))
+			return
+		}
+	}
 	s.continuationsMu.Lock()
 	ch, ok := s.continuations[req.ContinuationID]
 	if ok {
@@ -682,13 +714,6 @@ func (s *Server) handleContinuationResponse(req Request) {
 	s.continuationsMu.Unlock()
 	if !ok {
 		s.respond(req, nil, fmt.Errorf("unknown continuation id %q", req.ContinuationID))
-		return
-	}
-	dec := agent.ContinuationDecision{Outcome: agent.ContinuationOutcome(req.Decision), UpdatedArgs: req.UpdatedArgs}
-	switch dec.Outcome {
-	case agent.ContinuationOnce, agent.ContinuationSession, agent.ContinuationDeny:
-	default:
-		s.respond(req, nil, fmt.Errorf("unknown continuation decision %q", req.Decision))
 		return
 	}
 	select {
@@ -877,12 +902,14 @@ func (s *Server) runTurn(req Request) {
 	s.turnMu.Lock()
 	s.turnAborted = false
 	ctx, cancel := context.WithCancel(context.Background())
+	s.turnCtx = ctx
 	s.turnCancel = cancel
 	s.turnMu.Unlock()
 	s.writeEvent(Event{Type: "turn_started", Text: truncateRunes(req.Message, 200)})
 	s.runner.Handle(ctx, req.Message)
 	s.turnMu.Lock()
 	s.turnCancel = nil
+	s.turnCtx = nil
 	aborted := s.turnAborted
 	s.turnMu.Unlock()
 	cancel()
