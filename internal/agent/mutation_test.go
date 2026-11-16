@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -117,6 +118,8 @@ func TestDanglingProtectedAliasesRequireApproval(t *testing.T) {
 		{"reverse-plugins", "alias/p.js", "real-plugins/p.js", map[string]string{"alias": "real-plugins", ".agents/plugins": "../real-plugins"}},
 		{"direct-plugins", "real-plugins/p.js", "real-plugins/p.js", map[string]string{".agents/plugins": "../real-plugins"}},
 		{"reverse-git", "alias/config", "real-git/config", map[string]string{"alias": "real-git", ".git": "real-git"}},
+		{"normalized-config", "cafe\u0301", "cafe\u0301", map[string]string{".harness.json": "caf\u00e9"}},
+		{"normalized-plugins", "cafe\u0301/p.js", "cafe\u0301/p.js", map[string]string{".agents/plugins": "../caf\u00e9"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -151,5 +154,33 @@ func TestDanglingProtectedAliasesRequireApproval(t *testing.T) {
 				t.Fatalf("denied target created: %v", err)
 			}
 		})
+	}
+}
+
+func TestLongProtectedSymlinkChain(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 12; i++ {
+		name, next := fmt.Sprint("alias", i), fmt.Sprint("alias", i+1)
+		if i == 0 {
+			name = ".harness.json"
+		}
+		if i == 11 {
+			next = "actual"
+		}
+		if err := os.Symlink(next, filepath.Join(root, name)); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "actual"), []byte("KEEP"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e := &tools.Executor{Root: root}
+	m, err := e.PrepareMutation("actual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if !m.Protected || !tools.IsProtectedWorkspacePath(root, "actual") {
+		t.Fatal("long protected alias classified as unprotected")
 	}
 }

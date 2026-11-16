@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // Target binds a mutation to a parent directory and leaf name, following
@@ -44,6 +46,10 @@ func Prepare(base, path string) (*Target, error) {
 
 // ResolveTarget borrows r; closing the target closes only its child handles.
 func ResolveTarget(r *os.Root, name string) (target *Target, err error) {
+	return resolveTarget(r, name, false)
+}
+
+func resolveTarget(r *os.Root, name string, allowDirectory bool) (target *Target, err error) {
 	if filepath.IsAbs(name) || filepath.VolumeName(name) != "" {
 		return nil, fmt.Errorf("target must be relative to workspace")
 	}
@@ -111,7 +117,7 @@ func ResolveTarget(r *os.Root, name string) (target *Target, err error) {
 			continue
 		}
 		if len(parts) == 0 {
-			if !info.Mode().IsRegular() {
+			if !info.Mode().IsRegular() && !(allowDirectory && info.IsDir()) {
 				return nil, fmt.Errorf("cannot replace non-regular file: %s", name)
 			}
 			t.Parent, t.Name, t.Info = parent, part, info
@@ -238,21 +244,19 @@ func (t *Target) ReadFile() ([]byte, error) {
 // Touches recognizes filesystem aliases of a protected file or directory,
 // including case aliases and alternate names of a protected root itself.
 func (t *Target) Touches(path string, directory bool) bool {
-	protected, err := t.root.Stat(path)
+	// Use the same resolver and symlink limit as the mutation itself.
+	resolved, err := resolveTarget(t.root, path, directory)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// A protected symlink can point at a not-yet-created leaf
-			// or subtree. Compare its resolved destination even when
-			// there is no inode to compare with SameFile yet.
-			missing, resolveErr := ResolveTarget(t.root, path)
-			if resolveErr == nil {
-				defer missing.Close()
-				want := strings.ToLower(filepath.ToSlash(missing.Path))
-				got := strings.ToLower(filepath.ToSlash(t.Path))
-				return got == want || directory && strings.HasPrefix(got, want+"/")
-			}
-		}
 		return false
+	}
+	defer resolved.Close()
+	protected := resolved.Info
+	if protected == nil {
+		// No inode exists yet. Conservatively recognize case and Unicode
+		// canonical equivalents, including normalization-insensitive macOS.
+		want := normalizedPath(resolved.Path)
+		got := normalizedPath(t.Path)
+		return got == want || directory && strings.HasPrefix(got, want+"/")
 	}
 	if t.Info != nil && os.SameFile(t.Info, protected) {
 		return true
@@ -266,4 +270,8 @@ func (t *Target) Touches(path string, directory bool) bool {
 		}
 	}
 	return false
+}
+
+func normalizedPath(path string) string {
+	return norm.NFC.String(strings.ToLower(filepath.ToSlash(path)))
 }
