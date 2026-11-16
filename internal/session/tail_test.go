@@ -282,3 +282,46 @@ func TestBackupCleanupPreservesSimilarlyNamedSession(t *testing.T) {
 		t.Fatalf("other session changed: %+v %v", msgs, err)
 	}
 }
+
+func TestBackupLifecyclePreservesOtherSessionsBackups(t *testing.T) {
+	for _, action := range []string{"rename", "delete"} {
+		t.Run(action, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			if err := os.MkdirAll(Dir(), 0700); err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{"old", "old.jsonl-torn-keep"} {
+				path := filepath.Join(Dir(), id+".jsonl")
+				if err := os.WriteFile(path, []byte(`{"role":"user","content":"private`), 0600); err != nil {
+					t.Fatal(err)
+				}
+				s, err := New(id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				s.Close()
+			}
+			otherPath := filepath.Join(Dir(), "old.jsonl-torn-keep.jsonl")
+			other, err := recoveryBackups(otherPath)
+			if err != nil || len(other) != 1 {
+				t.Fatalf("other backup missing: %v %v", other, err)
+			}
+			want, err := os.ReadFile(other[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if action == "rename" {
+				err = RenameSession("old", "new")
+			} else {
+				err = DeleteSession("old")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(other[0])
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("other backup changed: %q %v", got, err)
+			}
+		})
+	}
+}

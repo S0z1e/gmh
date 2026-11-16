@@ -3,6 +3,7 @@ package session
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"minimalharness/internal/llm"
+	"minimalharness/internal/privatefile"
 )
 
 // scanRecords ignores only a damaged, unterminated final record. Complete
@@ -62,7 +64,7 @@ func recoverTail(f *os.File) error {
 		return err
 	}
 	if torn {
-		backup, err := os.CreateTemp(filepath.Dir(f.Name()), filepath.Base(f.Name())+"-torn-*.bak")
+		backup, err := privatefile.Open(f.Name()+"-torn-"+rand.Text()+".bak", os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 		if err != nil {
 			return err
 		}
@@ -105,9 +107,23 @@ func recoveryBackups(path string) ([]string, error) {
 	prefix := filepath.Base(path) + "-torn-"
 	var backups []string
 	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) && strings.HasSuffix(entry.Name(), ".bak") {
+		if !entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) && strings.HasSuffix(entry.Name(), ".bak") && validBackupID(strings.TrimSuffix(strings.TrimPrefix(entry.Name(), prefix), ".bak")) {
 			backups = append(backups, filepath.Join(dir, entry.Name()))
 		}
 	}
 	return backups, nil
+}
+
+// rand.Text uses the RFC 4648 base32 alphabet. Restricting the nonce prevents
+// another valid session ID (and its backups) from matching this session family.
+func validBackupID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, ch := range id {
+		if !(ch >= 'A' && ch <= 'Z') && !(ch >= '2' && ch <= '7') {
+			return false
+		}
+	}
+	return true
 }
