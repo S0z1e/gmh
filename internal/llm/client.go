@@ -150,6 +150,9 @@ type streamChunk struct {
 // --- Responses API wire shapes ---
 
 type responsesTool struct {
+	// Keep optional tool arguments optional; Responses otherwise attempts
+	// to normalize schemas into strict mode, changing their contract.
+	Strict      bool            `json:"strict"`
 	Type        string          `json:"type"`
 	Name        string          `json:"name"`
 	Description string          `json:"description"`

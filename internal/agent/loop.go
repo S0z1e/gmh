@@ -113,7 +113,7 @@ func (c *Config) validateArgs(name, args string) error {
 			return toolargs.Validate(def.Function.Parameters, args)
 		}
 	}
-	return nil // The offered-tool gate reports unavailable tools separately.
+	return fmt.Errorf("tool %s not offered in this turn", name)
 }
 
 func (c *Config) invalidArgs(msgs []llm.Message, tc llm.ToolCall, err error) []llm.Message {
@@ -869,6 +869,29 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// (approval prompt, audit, dispatch) and updates the
 			// in-memory assistant message so subsequent steps stay in sync.
 			argsJSON := tc.Function.Arguments
+			// A tool the model was not offered in this turn's list
+			// is refused outright, before approval: the offered
+			// list is the enforcement, not just a hint. Without
+			// this, a model that hallucinates a write call from
+			// the system prompt (which still lists all seven
+			// built-ins) would bypass plan mode — and a call for
+			// a disabled plugin's tool would run too. The model
+			// gets an error observation, like a hook denial, and
+			// the refusal is audited.
+			if !toolOffered(c.Tools, tc.Function.Name) {
+				stepHadExecution = true
+				recordLastError(&lastErrors, "tool not offered: "+tc.Function.Name)
+				obs := fmt.Sprintf("Tool %s is not available in this turn. Do not retry this tool call; explain and propose an alternative.", tc.Function.Name)
+				if c.Session != nil {
+					_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "tool not offered in this turn"})
+				}
+				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: fmt.Errorf("tool %s not offered in this turn", tc.Function.Name)})
+				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: true})
+				if c.Session != nil {
+					c.persist(msgs[len(msgs)-1])
+				}
+				continue
+			}
 			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
 				msgs = c.invalidArgs(msgs, *tc, err)
 				stepHadExecution = true
@@ -899,29 +922,6 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				msgs = c.invalidArgs(msgs, *tc, err)
 				stepHadExecution = true
 				recordLastError(&lastErrors, err.Error())
-				continue
-			}
-			// A tool the model was not offered in this turn's list
-			// is refused outright, before approval: the offered
-			// list is the enforcement, not just a hint. Without
-			// this, a model that hallucinates a write call from
-			// the system prompt (which still lists all seven
-			// built-ins) would bypass plan mode — and a call for
-			// a disabled plugin's tool would run too. The model
-			// gets an error observation, like a hook denial, and
-			// the refusal is audited.
-			if !toolOffered(c.Tools, tc.Function.Name) {
-				stepHadExecution = true
-				recordLastError(&lastErrors, "tool not offered: "+tc.Function.Name)
-				obs := fmt.Sprintf("Tool %s is not available in this turn. Do not retry this tool call; explain and propose an alternative.", tc.Function.Name)
-				if c.Session != nil {
-					_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "tool not offered in this turn"})
-				}
-				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: fmt.Errorf("tool %s not offered in this turn", tc.Function.Name)})
-				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: true})
-				if c.Session != nil {
-					c.persist(msgs[len(msgs)-1])
-				}
 				continue
 			}
 			// Doom-loop guard: an identical call for the fifth

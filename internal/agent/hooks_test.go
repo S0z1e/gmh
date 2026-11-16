@@ -350,3 +350,29 @@ func TestContinuationRewriteRevalidatedBeforeApproval(t *testing.T) {
 		t.Fatal("model did not receive continuation validation error")
 	}
 }
+
+func TestUnavailableToolsNeverReachHooksOrApproval(t *testing.T) {
+	for _, tc := range []struct{ name, args string }{
+		{"write", `{"path":"file"}`},
+		{"write", `{"path":"file","content":"valid"}`},
+		{"disabled_plugin", `null`},
+	} {
+		t.Run(tc.name+tc.args, func(t *testing.T) {
+			hooks := &fakePluginRunner{}
+			asks := 0
+			cfg := &Config{
+				Client: &llm.Client{APIKey: "test", Model: "test", API: "chat"},
+				Exec:   &tools.Executor{Root: t.TempDir(), Plugins: hooks},
+				Tools:  ToolsForMode(ToolModePlan, ToolDefs()), Mode: "suggest", MaxSteps: 3,
+				Ask: func(ApprovalRequest) (bool, error) { asks++; return true, nil },
+			}
+			_, body := runTwoTurns(t, cfg, toolCallSSE("unavailable", tc.name, tc.args))
+			if hooks.callCalls != 0 || asks != 0 {
+				t.Fatalf("unavailable tool reached hooks=%d approvals=%d", hooks.callCalls, asks)
+			}
+			if !strings.Contains(body, "not available in this turn") {
+				t.Fatal("model did not receive unavailable-tool error")
+			}
+		})
+	}
+}
