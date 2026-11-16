@@ -421,7 +421,7 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		if name == "bash" && strings.Contains(ev.ToolOutput, "still running in the background") {
 			return m, nil
 		}
-		return m, tea.Println(toolEndBlock(name, args, ev.ToolOutput, ev.ToolDetail, ev.ToolCount, ev.ToolErr))
+		return m, tea.Println(toolEndBlock(name, args, ev.ToolOutput, ev.ToolDetail, ev.ToolCount, ev.ToolCountLowerBound, ev.ToolErr))
 	case agent.EventStepUsage:
 		// Usage lines are printed by the runner via PrintMsg, through
 		// the same queue, so they land after the reply text.
@@ -510,7 +510,7 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 // reports it as an observation starting "User denied") is a muted
 // row with a "(denied)" suffix, never a green tick. All of it sits
 // under the 3-space gutter, like the assistant text.
-func toolEndBlock(name, argsJSON, output, detail string, count int, toolErr error) string {
+func toolEndBlock(name, argsJSON, output, detail string, count int, countLowerBound bool, toolErr error) string {
 	summary := toolSummary(name, argsJSON)
 	if name == "bash" {
 		return indentBlock(bashBlock(summary, output, toolErr != nil))
@@ -535,7 +535,9 @@ func toolEndBlock(name, argsJSON, output, detail string, count int, toolErr erro
 	// grep/glob report how many matches they found — the count
 	// comes from the tool, never invented here.
 	if (name == "grep" || name == "glob") && count >= 0 {
-		if count == 1 {
+		if countLowerBound {
+			summary += fmt.Sprintf(" (at least %d matches)", count)
+		} else if count == 1 {
 			summary += " (1 match)"
 		} else {
 			summary += fmt.Sprintf(" (%d matches)", count)

@@ -1135,7 +1135,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					breaker.ObserveSuccess(callKey)
 				}
 			}
-			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
+			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolTruncated: res.Truncated, ToolCountLowerBound: res.CountLowerBound, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
 			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil})
 			if c.Session != nil {
 				c.persist(msgs[len(msgs)-1])

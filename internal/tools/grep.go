@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -39,9 +40,15 @@ type grepHit struct {
 // Grep searches for Pattern under Path using ripgrep when available,
 // falling back to grep -r with a warning when rg is missing.
 // Results are capped; truncation is always reported, never silent.
+// The count is a lower bound when the text marks an incomplete search.
 func (e *Executor) Grep(ctx context.Context, a GrepArgs) (string, int, error) {
+	r, err := e.grepResult(ctx, a)
+	return r.Text, r.Count, err
+}
+
+func (e *Executor) grepResult(ctx context.Context, a GrepArgs) (ToolResult, error) {
 	if strings.TrimSpace(a.Pattern) == "" {
-		return "", 0, fmt.Errorf("grep: empty pattern")
+		return ToolResult{}, fmt.Errorf("grep: empty pattern")
 	}
 	root := a.Path
 	if root == "" {
@@ -49,7 +56,7 @@ func (e *Executor) Grep(ctx context.Context, a GrepArgs) (string, int, error) {
 	}
 	dir, err := e.resolve(root)
 	if err != nil {
-		return "", 0, err
+		return ToolResult{}, err
 	}
 	maxMatches := a.MaxMatches
 	if maxMatches <= 0 {
@@ -69,11 +76,12 @@ func (e *Executor) Grep(ctx context.Context, a GrepArgs) (string, int, error) {
 	if _, err := exec.LookPath("rg"); err == nil {
 		return e.grepRg(ctx, dir, a, maxMatches, ctxLines)
 	}
-	out, n, err := e.grepFallback(ctx, dir, a, maxMatches, ctxLines)
-	return "warning: ripgrep (rg) not found, fell back to grep -r\n" + out, n, err
+	out, err := e.grepFallback(ctx, dir, a, maxMatches, ctxLines)
+	out.Text = "warning: ripgrep (rg) not found, fell back to grep -r\n" + out.Text
+	return out, err
 }
 
-func (e *Executor) grepRg(ctx context.Context, dir string, a GrepArgs, maxMatches, ctxLines int) (string, int, error) {
+func (e *Executor) grepRg(ctx context.Context, dir string, a GrepArgs, maxMatches, ctxLines int) (ToolResult, error) {
 	args := []string{"--json", "--line-number", "--no-heading"}
 	if ctxLines > 0 {
 		args = append(args, "-C", fmt.Sprint(ctxLines))
@@ -87,29 +95,8 @@ func (e *Executor) grepRg(ctx context.Context, dir string, a GrepArgs, maxMatche
 	// rg respects .gitignore by default and skips hidden files.
 	args = append(args, "--", a.Pattern, dir)
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "rg", args...)
-	cmd.Dir = e.Root
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", 0, err
-	}
-	if err := cmd.Start(); err != nil {
-		return "", 0, err
-	}
-
-	var hits []grepHit
-	total := 0
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	readBytes := 0
-	for scanner.Scan() {
-		line := scanner.Text()
-		readBytes += len(line) + 1
-		if readBytes > MaxGrepBytes {
-			break
-		}
+	matches := grepMatches{root: e.Root, max: maxMatches}
+	truncated, err := e.streamGrep(ctx, "rg", args, func(line string) error {
 		var ev struct {
 			Type string `json:"type"`
 			Data struct {
@@ -123,50 +110,18 @@ func (e *Executor) grepRg(ctx context.Context, dir string, a GrepArgs, maxMatche
 			} `json:"data"`
 		}
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			continue
+			return fmt.Errorf("invalid rg output: %w", err)
 		}
 		if ev.Type != "match" && ev.Type != "context" {
-			continue
+			return nil
 		}
-		if ev.Type == "match" {
-			total++
-			if total > maxMatches {
-				continue // keep counting, stop collecting
-			}
-		} else if total > maxMatches {
-			continue // context belonging to a match past the cap
-		}
-		rel, rerr := filepath.Rel(e.Root, ev.Data.Path.Text)
-		if rerr != nil {
-			rel = ev.Data.Path.Text
-		}
-		hits = append(hits, grepHit{
-			path: rel,
-			line: ev.Data.LineNumber,
-			text: strings.TrimRight(ev.Data.Lines.Text, "\n"),
-			ctx:  ev.Type == "context",
-		})
-	}
-	// rg exits 1 when there are no matches; that is not an error here.
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 && total == 0 {
-			return "no matches for " + a.Pattern, 0, nil
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", 0, fmt.Errorf("grep timed out after 30s")
-		}
-		// Any other exit is still reported, with whatever was found.
-		if total == 0 {
-			return "", 0, fmt.Errorf("rg failed: %w", err)
-		}
-	}
-	if total == 0 {
-		return "no matches for " + a.Pattern, 0, nil
-	}
-	return formatGrepHits(hits, total, maxMatches), total, nil
+		matches.add(ev.Data.Path.Text, ev.Data.LineNumber, strings.TrimRight(ev.Data.Lines.Text, "\n"), ev.Type == "context")
+		return nil
+	})
+	return matches.result(a.Pattern, truncated, err != nil), err
 }
 
-func (e *Executor) grepFallback(ctx context.Context, dir string, a GrepArgs, maxMatches, ctxLines int) (string, int, error) {
+func (e *Executor) grepFallback(ctx context.Context, dir string, a GrepArgs, maxMatches, ctxLines int) (ToolResult, error) {
 	args := []string{"-rn", "--exclude-dir=.git", "--exclude-dir=node_modules"}
 	if ctxLines > 0 {
 		args = append(args, "-C", fmt.Sprint(ctxLines))
@@ -179,52 +134,124 @@ func (e *Executor) grepFallback(ctx context.Context, dir string, a GrepArgs, max
 	}
 	args = append(args, "--", a.Pattern, dir)
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "grep", args...)
-	cmd.Dir = e.Root
-	out, err := cmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return "no matches for " + a.Pattern, 0, nil
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", 0, fmt.Errorf("grep timed out after 30s")
-		}
-		return "", 0, fmt.Errorf("grep failed: %w", err)
-	}
-	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
-	if len(lines) == 1 && lines[0] == "" {
-		return "no matches for " + a.Pattern, 0, nil
-	}
-	var hits []grepHit
-	total := 0
-	for _, l := range lines {
+	matches := grepMatches{root: e.Root, max: maxMatches}
+	truncated, err := e.streamGrep(ctx, "grep", args, func(l string) error {
 		if l == "--" {
-			continue
+			return nil
 		}
 		path, lineNo, text, isCtx, ok := parseGrepFallbackLine(l)
 		if !ok {
-			continue
+			return fmt.Errorf("invalid grep output")
 		}
-		if !isCtx {
-			total++
-			if total > maxMatches {
-				continue
+		matches.add(path, lineNo, text, isCtx)
+		return nil
+	})
+	return matches.result(a.Pattern, truncated, err != nil), err
+}
+
+// streamGrep reads at most MaxGrepBytes+1 bytes, including an oversized
+// single record. On a cap or parsing/read error, stop and reap the producer
+// before returning instead of waiting with its stdout pipe left full.
+func (e *Executor) streamGrep(ctx context.Context, binary string, args []string, consume func(string) error) (bool, error) {
+	searchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	processCtx, stop := context.WithCancel(searchCtx)
+	defer stop()
+	cmd := exec.CommandContext(processCtx, binary, args...)
+	cmd.Dir = e.Root
+	configureProcess(cmd)
+	cmd.Cancel = func() error { return killProcessTree(cmd) }
+	cmd.WaitDelay = time.Second
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return false, err
+	}
+	if err := cmd.Start(); err != nil {
+		return false, err
+	}
+	reader := bufio.NewReader(io.LimitReader(stdout, MaxGrepBytes+1))
+	readBytes := 0
+	truncated := false
+	var readErr error
+	for {
+		line, err := reader.ReadString('\n')
+		readBytes += len(line)
+		if readBytes > MaxGrepBytes {
+			truncated = true
+			break
+		}
+		if len(line) > 0 {
+			if readErr = consume(strings.TrimSuffix(line, "\n")); readErr != nil {
+				break
 			}
-		} else if total >= maxMatches {
-			continue
 		}
-		rel, rerr := filepath.Rel(e.Root, path)
-		if rerr != nil {
-			rel = path
+		if err != nil {
+			if err != io.EOF {
+				readErr = err
+			}
+			break
 		}
-		hits = append(hits, grepHit{path: rel, line: lineNo, text: text, ctx: isCtx})
 	}
-	if total == 0 {
-		return "no matches for " + a.Pattern, 0, nil
+	if truncated || readErr != nil {
+		stop()
+		_ = stdout.Close()
 	}
-	return formatGrepHits(hits, total, maxMatches), total, nil
+	waitErr := cmd.Wait()
+	if err := searchCtx.Err(); err != nil {
+		return truncated, fmt.Errorf("grep: %w", err)
+	}
+	if readErr != nil {
+		return truncated, readErr
+	}
+	if truncated {
+		return true, nil
+	}
+	if exitErr, ok := waitErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+		waitErr = nil
+	}
+	if waitErr != nil {
+		return false, fmt.Errorf("%s failed: %w", binary, waitErr)
+	}
+	return false, nil
+}
+
+type grepMatches struct {
+	root  string
+	max   int
+	hits  []grepHit
+	total int
+}
+
+func (m *grepMatches) add(path string, line int, text string, context bool) {
+	if !context {
+		m.total++
+	}
+	if m.total > m.max {
+		return
+	}
+	rel, err := filepath.Rel(m.root, path)
+	if err != nil {
+		rel = path
+	}
+	m.hits = append(m.hits, grepHit{path: rel, line: line, text: text, ctx: context})
+}
+
+func (m *grepMatches) result(pattern string, outputLimit, failed bool) ToolResult {
+	incomplete := outputLimit || failed
+	text := formatGrepHits(m.hits, m.total, m.max, incomplete)
+	if incomplete {
+		reason := "search incomplete"
+		if outputLimit {
+			reason = "search output limit reached"
+		}
+		if text != "" {
+			text += "\n"
+		}
+		text += fmt.Sprintf("... [truncated: %d matches shown, at least %d matches; %s]", min(m.total, m.max), m.total, reason)
+	} else if m.total == 0 {
+		text = "no matches for " + pattern
+	}
+	return ToolResult{Text: text, Count: m.total, Truncated: incomplete || m.total > m.max, CountLowerBound: incomplete}
 }
 
 // parseGrepFallbackLine parses grep -rn output ("path:line:text" or context "path-line-text").
@@ -253,7 +280,7 @@ func parseGrepFallbackLine(l string) (path string, lineNo int, text string, isCt
 	return "", 0, "", false, false
 }
 
-func formatGrepHits(hits []grepHit, total, maxMatches int) string {
+func formatGrepHits(hits []grepHit, total, maxMatches int, incomplete bool) string {
 	var b strings.Builder
 	for _, h := range hits {
 		if h.ctx {
@@ -262,7 +289,7 @@ func formatGrepHits(hits []grepHit, total, maxMatches int) string {
 			fmt.Fprintf(&b, "%s:%d: %s\n", h.path, h.line, h.text)
 		}
 	}
-	if total > maxMatches {
+	if !incomplete && total > maxMatches {
 		fmt.Fprintf(&b, "... [truncated: %d matches shown, %d total]\n", maxMatches, total)
 	}
 	return strings.TrimRight(b.String(), "\n")

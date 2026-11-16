@@ -2,10 +2,14 @@ package tools
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func setupGrepRoot(t *testing.T) *Executor {
@@ -24,6 +28,80 @@ func setupGrepRoot(t *testing.T) *Executor {
 		t.Fatal(err)
 	}
 	return &Executor{Root: root}
+}
+
+func TestGrepOutputCapReturnsCollectedMatches(t *testing.T) {
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skip("ripgrep unavailable")
+	}
+	e := &Executor{Root: t.TempDir()}
+	if err := os.WriteFile(filepath.Join(e.Root, "many.txt"), []byte(strings.Repeat("MATCH payload\n", 150000)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, count, err := e.Grep(ctx, GrepArgs{Pattern: "MATCH", MaxMatches: 10})
+	if err != nil {
+		t.Fatalf("output cap lost matches: %v", err)
+	}
+	if count < 10 || !strings.Contains(out, "MATCH payload") || !strings.Contains(out, "at least") || !strings.Contains(out, "output limit") {
+		t.Fatalf("incomplete count not marked: count=%d output=%s", count, out)
+	}
+}
+
+func TestGrepLongLineIsBounded(t *testing.T) {
+	e := &Executor{Root: t.TempDir()}
+	if err := os.WriteFile(filepath.Join(e.Root, "long.txt"), []byte("MATCH\n"+strings.Repeat("MATCH", MaxGrepBytes)+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, count, err := e.Grep(ctx, GrepArgs{Pattern: "MATCH"})
+	if err != nil || count < 1 || !strings.Contains(out, "long.txt:1:") || !strings.Contains(out, "output limit") || len(out) > MaxGrepBytes+1024 {
+		t.Fatalf("unbounded or lost long-line result: bytes=%d count=%d err=%v", len(out), count, err)
+	}
+}
+
+func TestGrepCanceledContextIsPreserved(t *testing.T) {
+	e := setupGrepRoot(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := e.Grep(ctx, GrepArgs{Pattern: "TODO"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation = %v", err)
+	}
+}
+
+func TestGrepFallbackIsBounded(t *testing.T) {
+	if _, err := exec.LookPath("grep"); err != nil {
+		t.Skip("grep unavailable")
+	}
+	for _, longLine := range []bool{false, true} {
+		t.Run(fmt.Sprint(longLine), func(t *testing.T) {
+			e := &Executor{Root: t.TempDir()}
+			content := strings.Repeat("MATCH payload\n", 150000)
+			if longLine {
+				content = "MATCH\n" + strings.Repeat("MATCH", MaxGrepBytes) + "\n"
+			}
+			if err := os.WriteFile(filepath.Join(e.Root, "many.txt"), []byte(content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			r, err := e.grepFallback(ctx, e.Root, GrepArgs{Pattern: "MATCH"}, 10, 0)
+			if err != nil || r.Count < 1 || !r.Truncated || !r.CountLowerBound || !strings.Contains(r.Text, "many.txt:1:") || strings.Contains(r.Text, " total]") || len(r.Text) > MaxGrepBytes+1024 {
+				t.Fatalf("fallback result: count=%d truncated=%v lower=%v bytes=%d err=%v", r.Count, r.Truncated, r.CountLowerBound, len(r.Text), err)
+			}
+		})
+	}
+}
+
+func TestGrepDisplayCapKeepsExactCount(t *testing.T) {
+	e := setupGrepRoot(t)
+	r, err := e.Dispatch(context.Background(), "grep", `{"pattern":"TODO","maxMatches":1}`)
+	if err != nil || r.Count != 3 || !r.Truncated || r.CountLowerBound {
+		t.Fatalf("exact capped result: %+v %v", r, err)
+	}
 }
 
 func TestGrepFindsMatchesAcrossFiles(t *testing.T) {

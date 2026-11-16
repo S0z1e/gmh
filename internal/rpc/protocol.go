@@ -141,8 +141,9 @@ type Event struct {
 	// for grep/glob, the match count (0 omitted; the output text
 	// says "no matches" then). The GUI renders these; the model
 	// never sees them.
-	Detail string `json:"detail,omitempty"`
-	Count  int    `json:"count,omitempty"`
+	Detail          string `json:"detail,omitempty"`
+	Count           int    `json:"count,omitempty"`
+	CountLowerBound bool   `json:"count_lower_bound,omitempty"`
 	// tool_backgrounded / tool_background_done.
 	Job string `json:"job,omitempty"`
 	// background_wait: the waiting job ids, comma-separated.

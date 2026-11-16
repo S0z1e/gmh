@@ -324,6 +324,26 @@ func TestToolEndCarriesDetailAndCount(t *testing.T) {
 	d.quit(t)
 }
 
+func TestGrepToolEndMarksIncompleteCount(t *testing.T) {
+	a, runner, root := setupTestApp(t, "auto", []fakeStep{
+		{kind: "tool", tool: "grep", args: map[string]any{"pattern": "MATCH", "maxMatches": 10}},
+		{kind: "text", text: "Done."},
+	})
+	if err := os.WriteFile(filepath.Join(root, "many.txt"), []byte(strings.Repeat("MATCH payload\n", 150000)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "find MATCH"})
+	d.waitFor("response", 5*time.Second)
+	ev := d.waitFor("tool_end", 5*time.Second)
+	if ev["error"] != nil || ev["truncated"] != true || ev["count_lower_bound"] != true || ev["count"].(float64) < 10 || !strings.Contains(ev["output"].(string), "at least") {
+		t.Fatalf("incomplete grep count misreported: %v", ev)
+	}
+	d.waitFor("agent_settled", 10*time.Second)
+	d.quit(t)
+}
+
 func TestBasicTurnAuto(t *testing.T) {
 	a, runner, root := setupTestApp(t, "auto", []fakeStep{
 		{kind: "tool", tool: "read", args: map[string]any{"path": "t.txt"}},

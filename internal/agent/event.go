@@ -124,6 +124,10 @@ type Event struct {
 	// found, for ToolEnd. Only those two tools set it; other tools
 	// leave it 0.
 	ToolCount int
+	// ToolTruncated marks omitted results; ToolCountLowerBound distinguishes
+	// an incomplete search count from an exact total with capped display.
+	ToolTruncated       bool
+	ToolCountLowerBound bool
 	// JobID names the background job for the background events.
 	JobID string
 	// Usage is the per-call usage for StepUsage, the turn total for Done.

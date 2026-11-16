@@ -808,7 +808,7 @@ func (s *Server) onEvent(ev agent.Event) {
 		s.writeEvent(Event{Type: "tool_start", Tool: ev.ToolName, ToolCallID: ev.ToolCallID, InvocationID: ev.InvocationID, Args: parseToolArgs(ev.ToolArgs)})
 	case agent.EventToolEnd:
 		out, trunc := capOutput(ev.ToolOutput, maxToolOutputChars)
-		e := Event{Type: "tool_end", Tool: ev.ToolName, ToolCallID: ev.ToolCallID, InvocationID: ev.InvocationID, Output: out, Truncated: trunc, Status: string(ev.ToolStatus), ExitCode: ev.ToolExitCode, OutputFile: ev.ToolOutputFile}
+		e := Event{Type: "tool_end", Tool: ev.ToolName, ToolCallID: ev.ToolCallID, InvocationID: ev.InvocationID, Output: out, Truncated: trunc || ev.ToolTruncated, CountLowerBound: ev.ToolCountLowerBound, Status: string(ev.ToolStatus), ExitCode: ev.ToolExitCode, OutputFile: ev.ToolOutputFile}
 		if ev.ToolErr != nil {
 			e.Error = ev.ToolErr.Error()
 		}

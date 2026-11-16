@@ -660,13 +660,15 @@ const (
 )
 
 type ToolResult struct {
-	Status     ResultStatus
-	ExitCode   *int
-	OutputFile string
-	Text       string
-	Images     []llm.Image
-	Detail     string
-	Count      int
+	Status          ResultStatus
+	ExitCode        *int
+	OutputFile      string
+	Text            string
+	Images          []llm.Image
+	Detail          string
+	Count           int
+	Truncated       bool // Result omits matches or bytes.
+	CountLowerBound bool // Search ended before its total count was known.
 }
 
 // maxDetailChars caps display-only detail: a huge write must not
@@ -830,8 +832,7 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 			return ToolResult{}, fmt.Errorf("bad grep args: %w", err)
 		}
-		out, n, err := e.Grep(ctx, a)
-		return ToolResult{Text: out, Count: n}, err
+		return e.grepResult(ctx, a)
 	case "glob":
 		var a GlobArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
