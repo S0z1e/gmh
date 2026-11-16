@@ -50,7 +50,7 @@ func readImageBlob(root *os.Root, digest string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || !os.SameFile(before, info) || info.Size() > maxImageBlobBytes {
+	if !info.Mode().IsRegular() || info.Size() > maxImageBlobBytes {
 		return nil, fmt.Errorf("invalid image blob size or type")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxImageBlobBytes+1))
