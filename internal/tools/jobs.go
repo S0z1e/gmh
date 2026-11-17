@@ -293,6 +293,7 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		cmd = exec.CommandContext(runCtx, "bash", "-c", command)
 		cmd.Dir = dir
 	}
+	cmd.Env = bashEnvironment(e.BashEnv)
 	// Own process group, killed as a whole on timeout/abort (see
 	// Cancel below). Without this, only the direct bash child died
 	// and grandchildren lingered as orphans.

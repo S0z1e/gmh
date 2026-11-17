@@ -272,6 +272,7 @@ func Setup(p Params) (*App, error) {
 	pluginReg.SessionGetter = a.sessionID
 
 	executor := &tools.Executor{Root: absRoot, UntrustedWorkspace: !trusted, ImageInput: slices.Contains(mdl.Input, "image"), Plugins: pluginReg}
+	executor.BashEnv = cfg.BashEnv
 	// Bash output files live in this session's directory (never in
 	// the project tree): the loop's read tool can pull them, and a
 	// new session / resume re-points the executor (see newSession

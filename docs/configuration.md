@@ -134,6 +134,18 @@ disables backgrounding), `denyInsteadOfPrompt`, `contextLimit`,
 environment variable > model value > project file > global file > the
 default, so existing flag/env usage keeps working unchanged.
 
+`bashEnv` replaces the list of environment variables inherited by Bash,
+including background and sandboxed jobs. Omit it for OS basics: `PATH`,
+`HOME`, user/shell/locale/terminal names, temporary-directory variables,
+and Windows system/profile/application directories. Provider keys, arbitrary
+application variables, proxy/SSH-agent settings and shell startup variables
+are excluded by default. Add required variables explicitly, for example
+`"bashEnv": ["PATH", "HOME", "LANG", "GOCACHE", "HTTPS_PROXY"]`.
+An empty list (`"bashEnv": []`) disables optional inheritance; Windows may
+retain required system variables, and Bash may initialize its own variables.
+Project overrides require workspace trust. This controls
+environment inheritance; Bash retains its existing filesystem permissions.
+
 With that file in place, `harness` needs nothing but the keys — no
 `OPENAI_BASE_URL` / `OPENAI_MODEL` / `OPENAI_API_MODE` exports.
 Switch providers without editing the file:

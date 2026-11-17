@@ -66,7 +66,7 @@ func TestBashSandboxedFakeBwrap(t *testing.T) {
 	root := t.TempDir()
 	log := filepath.Join(t.TempDir(), "bwrap.log")
 	t.Setenv("BWRAP_LOG", log)
-	e := &Executor{Root: root, Sandbox: true, BwrapPath: writeFakeBwrap(t)}
+	e := &Executor{Root: root, Sandbox: true, BwrapPath: writeFakeBwrap(t), BashEnv: append(append([]string{}, defaultBashEnv...), "BWRAP_LOG")}
 	out, err := e.Bash(context.Background(), BashArgs{Command: "echo hi"})
 	if err != nil || out != "hi\n" {
 		t.Fatalf("sandboxed bash = %q, err %v", out, err)

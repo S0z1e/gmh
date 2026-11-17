@@ -53,6 +53,9 @@ type Executor struct {
 	// BashTimeout overrides the default 120s bash timeout (0 = default).
 	// The per-call timeout argument still caps at 600s.
 	BashTimeout time.Duration
+	// BashEnv names the inherited environment variables. nil uses OS basics;
+	// an empty list inherits none. Provider credentials require explicit opt-in.
+	BashEnv []string
 	// BackgroundThreshold is how long a bash call may run before the
 	// loop backgrounds it (0 = never background; DefaultBackgroundThreshold
 	// when Setup leaves it unset).
