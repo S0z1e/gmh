@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -66,11 +67,11 @@ func contained(base, path string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func directories(root, target string) ([]string, string, error) {
+func directories(handle *os.Root, root, target, home string) ([]string, string, error) {
 	dir := root
 	resolved := root
 	if target != "" && target != "." {
-		binding, err := fileguard.Prepare(root, target)
+		binding, err := fileguard.ResolveTarget(handle, target)
 		if err != nil {
 			return nil, "", err
 		}
@@ -79,14 +80,6 @@ func directories(root, target string) ([]string, string, error) {
 		dir = filepath.Dir(resolved)
 	}
 	var ancestors []string
-	home, _ := os.UserHomeDir()
-	if home != "" {
-		if value, err := canonicalRoot(home); err == nil {
-			home = value
-		} else {
-			home = ""
-		}
-	}
 	for parent, level := root, 0; level < MaxAncestorLevels; level++ {
 		ancestors = append(ancestors, parent)
 		next := filepath.Dir(parent)
@@ -117,6 +110,9 @@ func Resolve(ctx context.Context, root, target string) (Snapshot, error) {
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
 	}
+	if !utf8.ValidString(root) || !utf8.ValidString(target) {
+		return Snapshot{}, fmt.Errorf("guidance paths must be valid UTF-8")
+	}
 	requestedRoot, err := filepath.Abs(root)
 	if err != nil {
 		return Snapshot{}, err
@@ -131,7 +127,21 @@ func Resolve(ctx context.Context, root, target string) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	dirs, resolved, err := directories(root, target)
+	if !utf8.ValidString(root) {
+		return Snapshot{}, fmt.Errorf("guidance root must be valid UTF-8")
+	}
+	if filepath.IsAbs(target) && contained(root, target) {
+		target, err = filepath.Rel(root, target)
+		if err != nil {
+			return Snapshot{}, err
+		}
+	}
+	roots, err := openSourceRoots(root)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	defer roots.close()
+	dirs, resolved, err := directories(roots.workspace, root, target, roots.homePath)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -139,8 +149,8 @@ func Resolve(ctx context.Context, root, target string) (Snapshot, error) {
 	total := 0
 	for _, dir := range dirs {
 		for _, name := range names {
-			data, err := readSource(ctx, dir, name)
-			if os.IsNotExist(err) {
+			data, err := roots.read(ctx, dir, name)
+			if errors.Is(err, errSourceAbsent) {
 				continue
 			}
 			if err != nil {
@@ -153,6 +163,19 @@ func Resolve(ctx context.Context, root, target string) (Snapshot, error) {
 			prefix := textutil.Prefix(string(data), PrefixBytes)
 			out.Files = append(out.Files, File{Path: filepath.Join(dir, name), Scope: dir, SHA256: digest(data), Bytes: len(data), Prefix: prefix, More: len(prefix) < len(data)})
 		}
+	}
+	if err := roots.check(); err != nil {
+		return Snapshot{}, err
+	}
+	_, currentTarget, err := directories(roots.workspace, root, target, roots.homePath)
+	if err != nil || currentTarget != resolved {
+		return Snapshot{}, fmt.Errorf("guidance target changed during discovery")
+	}
+	if !utf8.ValidString(resolved) {
+		return Snapshot{}, fmt.Errorf("guidance target must be valid UTF-8")
+	}
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
 	}
 	// The full byte digest of each source already commits to all its text.
 	manifest := out
@@ -168,15 +191,127 @@ func Resolve(ctx context.Context, root, target string) (Snapshot, error) {
 	return out, nil
 }
 
-func readSource(ctx context.Context, dir, name string) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	root, rel, err := fileguard.Root(dir, name)
+var errSourceAbsent = errors.New("instruction source absent")
+
+type sourceRoots struct {
+	workspace, home         *os.Root
+	workspacePath, homePath string
+	workspaceInfo, homeInfo os.FileInfo
+}
+
+func openSourceRoots(root string) (*sourceRoots, error) {
+	out := &sourceRoots{workspacePath: root}
+	var err error
+	out.workspace, err = os.OpenRoot(root)
 	if err != nil {
 		return nil, err
 	}
-	defer root.Close()
+	out.workspaceInfo, err = out.workspace.Stat(".")
+	if err != nil {
+		out.close()
+		return nil, err
+	}
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		if canonical, err := canonicalRoot(home); err == nil && contained(canonical, root) {
+			out.homePath = canonical
+			if canonical != root {
+				out.home, err = os.OpenRoot(canonical)
+				if err != nil {
+					out.close()
+					return nil, err
+				}
+				out.homeInfo, err = out.home.Stat(".")
+				if err != nil {
+					out.close()
+					return nil, err
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+func (r *sourceRoots) close() {
+	if r.home != nil {
+		r.home.Close()
+	}
+	if r.workspace != nil {
+		r.workspace.Close()
+	}
+}
+
+func (r *sourceRoots) check() error {
+	for _, entry := range []struct {
+		path string
+		info os.FileInfo
+	}{{r.workspacePath, r.workspaceInfo}, {r.homePath, r.homeInfo}} {
+		if entry.info == nil {
+			continue
+		}
+		current, err := os.Stat(entry.path)
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(entry.info, current) {
+			return fmt.Errorf("instruction scope root changed while reading")
+		}
+	}
+	return nil
+}
+
+func (r *sourceRoots) read(ctx context.Context, dir, name string) ([]byte, error) {
+	base, handle := r.workspacePath, r.workspace
+	if !contained(base, dir) {
+		base, handle = r.homePath, r.home
+		if handle == nil || !contained(base, dir) {
+			return nil, fmt.Errorf("instruction scope outside allowed roots")
+		}
+	}
+	relative, err := filepath.Rel(base, dir)
+	if err != nil {
+		return nil, err
+	}
+	observed, err := handle.Lstat(relative)
+	if os.IsNotExist(err) {
+		return nil, errSourceAbsent
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !observed.IsDir() {
+		return nil, fmt.Errorf("instruction scope changed during discovery")
+	}
+	scope, err := handle.OpenRoot(relative)
+	if err != nil {
+		return nil, err
+	}
+	defer scope.Close()
+	actual, err := scope.Stat(".")
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(observed, actual) {
+		return nil, fmt.Errorf("instruction scope changed during discovery")
+	}
+	data, readErr := readSource(ctx, scope, name)
+	current, err := handle.Stat(relative)
+	if err != nil || !os.SameFile(actual, current) {
+		return nil, fmt.Errorf("instruction scope changed while reading")
+	}
+	return data, readErr
+}
+
+func readSource(ctx context.Context, root *os.Root, rel string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := root.Lstat(rel); err != nil {
+		if os.IsNotExist(err) {
+			return nil, errSourceAbsent
+		}
+		return nil, err
+	}
 	file, err := root.OpenFile(rel, os.O_RDONLY|nonblockRead, 0)
 	if err != nil {
 		return nil, err
@@ -191,6 +326,10 @@ func readSource(ctx context.Context, dir, name string) ([]byte, error) {
 	}
 	if info.Size() > MaxSourceBytes {
 		return nil, fmt.Errorf("instruction source exceeds %d bytes", MaxSourceBytes)
+	}
+	change, err := changeTime(file, info)
+	if err != nil {
+		return nil, err
 	}
 	var data []byte
 	reader := io.LimitReader(file, MaxSourceBytes+1)
@@ -215,7 +354,11 @@ func readSource(ctx context.Context, dir, name string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) || int64(len(data)) != after.Size() {
+	afterChange, err := changeTime(file, after)
+	if err != nil {
+		return nil, err
+	}
+	if change != afterChange || after.Mode() != info.Mode() || !os.SameFile(info, after) || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) || int64(len(data)) != after.Size() {
 		return nil, fmt.Errorf("instruction source changed while reading")
 	}
 	if !utf8.Valid(data) {
@@ -238,6 +381,9 @@ type Chunk struct {
 // hash. It cannot become a general read exception for unrelated ancestor files.
 // Offset and Next are byte offsets and must lie on UTF8 boundaries.
 func Read(ctx context.Context, root, target, path, expectedHash string, offset, limit int) (Chunk, error) {
+	if !utf8.ValidString(path) {
+		return Chunk{}, fmt.Errorf("guidance source path must be valid UTF-8")
+	}
 	if offset < 0 || limit < 4 || limit > PrefixBytes {
 		return Chunk{}, fmt.Errorf("invalid guidance byte range")
 	}
@@ -261,7 +407,15 @@ func Read(ctx context.Context, root, target, path, expectedHash string, offset, 
 		if source.SHA256 != expectedHash {
 			return Chunk{}, fmt.Errorf("instruction source changed; refresh guidance before continuing")
 		}
-		data, err := readSource(ctx, source.Scope, filepath.Base(source.Path))
+		roots, err := openSourceRoots(snapshot.Root)
+		if err != nil {
+			return Chunk{}, err
+		}
+		data, err := roots.read(ctx, source.Scope, filepath.Base(source.Path))
+		if err == nil {
+			err = roots.check()
+		}
+		roots.close()
 		if err != nil {
 			return Chunk{}, err
 		}
@@ -273,6 +427,9 @@ func Read(ctx context.Context, root, target, path, expectedHash string, offset, 
 		}
 		text := textutil.Prefix(string(data[offset:]), limit)
 		next := offset + len(text)
+		if err := ctx.Err(); err != nil {
+			return Chunk{}, err
+		}
 		return Chunk{Path: source.Path, SHA256: expectedHash, Offset: offset, Next: next, Bytes: len(data), Text: text, More: next < len(data)}, nil
 	}
 	return Chunk{}, fmt.Errorf("instruction source does not apply to target")

@@ -215,3 +215,83 @@ func TestAggregateSourceLimitDoesNotSilentlyDropInstructions(t *testing.T) {
 		t.Fatal("aggregate source budget was not enforced")
 	}
 }
+
+func TestDanglingInstructionSourceMustNotDisappear(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	if err := os.Symlink("missing-guide", filepath.Join(root, "AGENTS.md")); err != nil {
+		t.Skip(err)
+	}
+	if _, err := Resolve(context.Background(), root, "new.go"); err == nil {
+		t.Fatal("existing but broken instruction source silently disappeared")
+	}
+}
+
+type scopeSwapContext struct {
+	context.Context
+	calls int
+	swap  func()
+}
+
+func (c *scopeSwapContext) Err() error {
+	c.calls++
+	if c.calls == 4 {
+		c.swap()
+	}
+	return nil
+}
+func TestInstructionParentSwapCannotEscapeWorkspace(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	sub := filepath.Join(root, "sub")
+	if err := os.Mkdir(sub, 0700); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	put(t, filepath.Join(outside, "AGENTS.md"), "OUTSIDE SECRET")
+	ctx := &scopeSwapContext{Context: context.Background(), swap: func() {
+		if err := os.Rename(sub, sub+"-old"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, sub); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	snapshot, err := Resolve(ctx, root, "sub/new.go")
+	if err == nil {
+		t.Fatalf("reopened scoped source outside workspace: %+v", snapshot)
+	}
+}
+
+func TestCanonicalRootTargetCanBeReusedThroughAlias(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	root := filepath.Join(base, "real")
+	alias := filepath.Join(base, "alias")
+	put(t, filepath.Join(root, "AGENTS.md"), "rules")
+	if err := os.Symlink("real", alias); err != nil {
+		t.Skip(err)
+	}
+	snap, err := Resolve(context.Background(), alias, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := Resolve(context.Background(), alias, snap.Target)
+	if err != nil || snap.SHA256 != replay.SHA256 {
+		t.Fatalf("canonical root target not reusable: %+v %v", replay, err)
+	}
+	if _, err := Read(context.Background(), alias, snap.Target, snap.Files[0].Path, snap.Files[0].SHA256, 0, 128); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInvalidPathBytesCannotAliasManifestIdentity(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	if _, err := Resolve(context.Background(), root, "sub\xff/new.go"); err == nil {
+		t.Fatal("non-UTF8 target identity accepted")
+	}
+	if _, err := Read(context.Background(), root, "new.go", "bad\xff/AGENTS.md", "", 0, 128); err == nil {
+		t.Fatal("non-UTF8 source identity accepted")
+	}
+}
