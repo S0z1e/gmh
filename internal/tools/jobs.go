@@ -505,6 +505,30 @@ func (e *Executor) SessionCanceller() func() {
 // Jobs returns a snapshot of all background jobs for this Executor.
 func (e *Executor) Jobs() []*Job { return e.registry().List() }
 
+// HasRunningWorkspaceJobs includes retained sessions sharing this Executor's
+// workspace, without exposing another session's job IDs or output.
+func (e *Executor) HasRunningWorkspaceJobs() bool {
+	e.jobsMu.Lock()
+	registries := map[*JobRegistry]bool{}
+	if e.jobs != nil {
+		registries[e.jobs] = true
+	}
+	for _, registry := range e.sessionJobs {
+		if registry != nil {
+			registries[registry] = true
+		}
+	}
+	e.jobsMu.Unlock()
+	for registry := range registries {
+		for _, job := range registry.List() {
+			if _, done := job.Result(); !done {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (e *Executor) registry() *JobRegistry {
 	e.jobsMu.Lock()
 	defer e.jobsMu.Unlock()

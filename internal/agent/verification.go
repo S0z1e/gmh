@@ -15,17 +15,19 @@ import (
 const maxVerificationFeedback = 3
 
 type verificationRun struct {
-	policy      *verification.Policy
-	baseline    *verification.Snapshot
-	baselineErr error
-	touched     bool
-	latest      map[string]verification.Evidence
-	feedback    int
+	policy            *verification.Policy
+	baseline          *verification.Snapshot
+	baselineErr       error
+	touched           bool
+	mutationAttempted bool
+	latest            map[string]verification.Evidence
+	feedback          int
 }
 
 type verificationAttempt struct {
 	invocationID, toolCallID string
 	checks                   []verification.Check
+	cwd                      string
 	before                   verification.Snapshot
 	captureErr               error
 	started                  time.Time
@@ -49,6 +51,11 @@ func (c *Config) verificationStart(ctx context.Context, name, args string) *veri
 		return nil
 	}
 	c.verificationTouch(ctx)
+	switch name {
+	case "read", "grep", "glob", "load_skill", "ask_user", "webfetch":
+	default:
+		v.mutationAttempted = true
+	}
 	if name != "bash" {
 		return nil
 	}
@@ -57,6 +64,7 @@ func (c *Config) verificationStart(ctx context.Context, name, args string) *veri
 		return nil
 	}
 	var checks []verification.Check
+	var cwd string
 	for _, check := range v.policy.Required {
 		if check.Command != a.Command {
 			continue
@@ -70,20 +78,20 @@ func (c *Config) verificationStart(ctx context.Context, name, args string) *veri
 			continue
 		}
 		checks = append(checks, check)
+		cwd = actual
 	}
 	if len(checks) == 0 {
 		return nil
 	}
 	state, err := verification.Capture(ctx, c.Exec.Root, v.policy.Exclude)
-	return &verificationAttempt{checks: checks, before: state, captureErr: err, started: time.Now().UTC(), foreground: !a.Background}
+	return &verificationAttempt{checks: checks, cwd: cwd, before: state, captureErr: err, started: time.Now().UTC(), foreground: !a.Background}
 }
 
 func (c *Config) verificationFinish(ctx context.Context, a *verificationAttempt, res tools.ToolResult, runErr error) []llm.Message {
 	if a == nil || c.verifier == nil {
 		return nil
 	}
-	dir, _ := a.checks[0].Directory(c.Exec.Root)
-	record := verification.Evidence{InvocationID: a.invocationID, ToolCallID: a.toolCallID, Command: a.checks[0].Command, Cwd: dir, Version: a.before.Version, ExitCode: res.ExitCode, Started: a.started, Finished: time.Now().UTC()}
+	record := verification.Evidence{InvocationID: a.invocationID, ToolCallID: a.toolCallID, Command: a.checks[0].Command, Cwd: a.cwd, Version: a.before.Version, ExitCode: res.ExitCode, Started: a.started, Finished: time.Now().UTC()}
 	state, err := verification.Capture(ctx, c.Exec.Root, c.verifier.policy.Exclude)
 	switch {
 	case runErr != nil:
@@ -112,24 +120,33 @@ func (c *Config) verificationFinish(ctx context.Context, a *verificationAttempt,
 }
 
 // verificationGate returns whether completion evidence is current, or the
-// missing/failed requirements to feed back. A plain question without mutations
-// or verification attempts makes no task-level completion claim.
+// missing/failed requirements to feed back. Unchanged questions, reads and
+// check-only turns make no task-level completion claim.
 func (c *Config) verificationGate(ctx context.Context) (TaskOutcome, string) {
 	v := c.verifier
 	if v == nil || !v.touched {
 		return "", ""
 	}
+	// Check jobs before taking the terminal snapshot. A job finishing after
+	// a snapshot could otherwise make that snapshot stale before certification.
+	running := c.Exec.HasRunningWorkspaceJobs()
+	if running && (v.mutationAttempted || len(v.latest) > 0) {
+		return "", "Background work is still running; required verification cannot certify the final workspace yet."
+	}
 	state, err := verification.Capture(ctx, c.Exec.Root, v.policy.Exclude)
 	if err != nil {
+		// Pure questions/reads make no completion claim. Unsupported inputs must
+		// still fail closed after any potentially mutating dispatch or check.
+		if !v.mutationAttempted && len(v.latest) == 0 {
+			return "", ""
+		}
 		return "", "Cannot verify workspace version: " + err.Error()
 	}
-	if v.baselineErr == nil && v.baseline != nil && v.baseline.Version == state.Version && len(v.latest) == 0 {
+	if v.baselineErr == nil && v.baseline != nil && v.baseline.Version == state.Version {
 		return "", ""
 	}
-	for _, job := range c.Exec.Jobs() {
-		if _, done := job.Result(); !done {
-			return "", "Background work is still running; required verification cannot certify the final workspace yet."
-		}
+	if running {
+		return "", "Background work is still running; required verification cannot certify the final workspace yet."
 	}
 	var missing []string
 	for _, check := range v.policy.Required {

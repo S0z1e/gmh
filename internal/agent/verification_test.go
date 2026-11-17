@@ -258,6 +258,10 @@ func TestRequiredVerificationWhitespaceCwdUsesActualBashDefault(t *testing.T) {
 func TestRequiredVerificationWaitsForRunningJobs(t *testing.T) {
 	cfg := verificationConfig(t, "true")
 	cfg.verifier = &verificationRun{policy: cfg.Verification, latest: map[string]verification.Evidence{}}
+	cfg.verificationTouch(context.Background())
+	if err := os.WriteFile(filepath.Join(cfg.Exec.Root, "input"), []byte("changed"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	attempt := cfg.verificationStart(context.Background(), "bash", `{"command":"true"}`)
 	zero := 0
 	cfg.verificationFinish(context.Background(), attempt, tools.ToolResult{ExitCode: &zero}, nil)
@@ -314,5 +318,137 @@ func TestRequiredVerificationPersistenceFailureCannotComplete(t *testing.T) {
 		if event.TaskOutcome == OutcomeCompleted {
 			t.Fatal("completion published before evidence persisted")
 		}
+	}
+}
+
+func TestRequiredVerificationQuestionInUnsupportedWorkspace(t *testing.T) {
+	for _, read := range []bool{false, true} {
+		t.Run(fmt.Sprint(read), func(t *testing.T) {
+			cfg := verificationConfig(t, "true")
+			cfg.Exec.Plugins = &fakePluginRunner{}
+			if err := os.WriteFile(filepath.Join(cfg.Exec.Root, "input"), []byte("unchanged"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("input", filepath.Join(cfg.Exec.Root, "alias")); err != nil {
+				t.Skip(err)
+			}
+			steps := []string{textSSE("answer to question")}
+			if read {
+				steps = append([]string{verificationTool("read", map[string]any{"path": "input"})}, steps...)
+			}
+			_, _, err := runVerification(t, cfg, steps...)
+			if err != nil || cfg.LastTaskOutcome != "" {
+				t.Fatalf("question wrongly required verification: outcome=%s err=%v", cfg.LastTaskOutcome, err)
+			}
+		})
+	}
+}
+
+func TestRequiredVerificationRetargetedPolicyCwdDoesNotRelabelExecution(t *testing.T) {
+	command := "test -f pass && ln -sfn second ../link"
+	cfg := verificationConfig(t, command)
+	for _, dir := range []string{"first", "second"} {
+		if err := os.Mkdir(filepath.Join(cfg.Exec.Root, dir), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(cfg.Exec.Root, "first", "pass"), []byte("pass"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("first", filepath.Join(cfg.Exec.Root, "link")); err != nil {
+		t.Skip(err)
+	}
+	cfg.Verification.Required[0].Cwd = "link"
+	cfg.Verification.Exclude = []string{"link"}
+	_, _, err := runVerification(t, cfg, verificationWrite("input", "changed"), verificationTool("bash", map[string]any{"command": command, "cwd": "first"}))
+	requireVerificationFailure(t, cfg, err)
+	want, err := (verification.Check{Name: "test", Command: command, Cwd: "first"}).Directory(cfg.Exec.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record := cfg.verifier.latest["test"]; record.Cwd != want {
+		t.Fatalf("execution relabeled: %+v", record)
+	}
+}
+
+func TestRequiredVerificationIncludesOtherSessionsRunningJobs(t *testing.T) {
+	cfg := verificationConfig(t, "true")
+	cfg.Exec.SwitchSession("first")
+	job, err := cfg.Exec.BashBackground(context.Background(), tools.BashArgs{Command: "sleep 30", Background: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { job.Cancel(); <-job.Done() }()
+	cfg.Exec.SwitchSession("second")
+	_, _, err = runVerification(t, cfg, verificationWrite("input", "changed"), verificationBash("true"))
+	requireVerificationFailure(t, cfg, err)
+	if len(cfg.Exec.Jobs()) != 0 {
+		t.Fatal("other session job output leaked")
+	}
+}
+
+func TestRequiredVerificationUnchangedChecksDoNotClaimCompletion(t *testing.T) {
+	for _, command := range []string{"true", "exit 1"} {
+		t.Run(command, func(t *testing.T) {
+			cfg := verificationConfig(t, command)
+			_, bodies, err := runVerification(t, cfg, verificationBash(command))
+			if err != nil || cfg.LastTaskOutcome != "" || len(bodies) != 2 {
+				t.Fatalf("read-only outcome=%s calls=%d err=%v", cfg.LastTaskOutcome, len(bodies), err)
+			}
+		})
+	}
+}
+
+type verificationCaptureContext struct {
+	context.Context
+	onErr func()
+}
+
+func (c verificationCaptureContext) Err() error { c.onErr(); return c.Context.Err() }
+
+func TestRequiredVerificationJobFinishingAfterSnapshotCannotCertifyStaleFiles(t *testing.T) {
+	cfg := verificationConfig(t, "true")
+	ctx := context.Background()
+	cfg.verifier = &verificationRun{policy: cfg.Verification, latest: map[string]verification.Evidence{}}
+	cfg.verificationTouch(ctx)
+	if err := os.WriteFile(filepath.Join(cfg.Exec.Root, "input"), []byte("before"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	attempt := cfg.verificationStart(ctx, "bash", `{"command":"true"}`)
+	result, err := cfg.Exec.Dispatch(ctx, "bash", `{"command":"true"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.verificationFinish(ctx, attempt, result, err)
+	trigger := filepath.Join(t.TempDir(), "release")
+	job, err := cfg.Exec.BashBackground(ctx, tools.BashArgs{Command: fmt.Sprintf("while test ! -f %q; do sleep 0.01; done; printf changed > input", trigger), Background: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { job.Cancel(); <-job.Done() }()
+	calls := 0
+	if _, err := verification.Capture(verificationCaptureContext{Context: ctx, onErr: func() { calls++ }}, cfg.Exec.Root, nil); err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	// If the gate captures while a writer is live, release that writer just
+	// after the terminal version is formed. Its new bytes must not be certified
+	// using the old snapshot merely because it has finished by the job scan.
+	gateCtx := verificationCaptureContext{Context: ctx, onErr: func() {
+		seen++
+		if seen == calls {
+			if err := os.WriteFile(trigger, []byte("go"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-job.Done():
+			case <-time.After(3 * time.Second):
+				t.Fatal("background writer did not finish")
+			}
+		}
+	}}
+	outcome, missing := cfg.verificationGate(gateCtx)
+	if outcome == OutcomeCompleted || missing == "" {
+		t.Fatalf("stale completion=%s missing=%s", outcome, missing)
 	}
 }

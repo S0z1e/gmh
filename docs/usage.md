@@ -49,7 +49,8 @@
   files must run again against the final version. All required checks passing at
   the current version permits `outcome: completed`; missing, failed or stale
   evidence gets up to three feedback rounds, then `verification_failed` and a
-  nonzero `-p` exit. Unchanged questions make no completion claim.
+  nonzero `-p` exit. Unchanged questions, reads and check-only turns make no
+  completion claim or require verification retries.
   Versions cover workspace files, directories and permissions, excluding `.git`
   and explicitly listed relative output paths. Exclude only generated inputs
   that do not need certification. Limits are 50,000 entries, 16 MiB per file and
