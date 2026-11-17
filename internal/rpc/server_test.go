@@ -1102,8 +1102,8 @@ func TestCompactedEventManual(t *testing.T) {
 
 	d.send(map[string]any{"id": "c1", "type": "compact"})
 	ev := d.waitFor("compacted", 5*time.Second)
-	if ev["messages"] != float64(1) {
-		t.Fatalf("compacted messages = %v, want 1", ev["messages"])
+	if ev["messages"] != float64(3) {
+		t.Fatalf("compacted messages = %v, want 3", ev["messages"])
 	}
 	// The fake's usage is completion 5 for every call, and the
 	// compact call's completion is the summary itself.
@@ -1114,13 +1114,13 @@ func TestCompactedEventManual(t *testing.T) {
 	if resp["id"] != "c1" || resp["type"] != "response" {
 		t.Fatalf("compact response = %v", resp)
 	}
-	// History afterwards is the summary alone.
+	// History retains the current task and source facts beside the summary.
 	data := d.query(t, "h1", "history", nil)
 	msgs, _ := data["messages"].([]any)
-	if len(msgs) != 1 {
-		t.Fatalf("post-compact history = %d messages, want 1", len(msgs))
+	if len(msgs) != 3 {
+		t.Fatalf("post-compact history = %d messages, want 3", len(msgs))
 	}
-	only, _ := msgs[0].(map[string]any)
+	only, _ := msgs[1].(map[string]any)
 	if only["role"] != "user" || !strings.Contains(fmt.Sprintf("%v", only["content"]), "Previous conversation summary:") {
 		t.Fatalf("post-compact message = %v", only)
 	}
@@ -1163,8 +1163,8 @@ func TestCompactedEventAuto(t *testing.T) {
 	d.waitFor("response", 5*time.Second)
 	// doCompact runs inside the turn, before agent_settled.
 	ev := d.waitFor("compacted", 5*time.Second)
-	if ev["messages"] != float64(3) || ev["summary_tokens"] != float64(5) {
-		t.Fatalf("compacted = %v, want messages 3 summary_tokens 5", ev)
+	if ev["messages"] != float64(4) || ev["summary_tokens"] != float64(5) {
+		t.Fatalf("compacted = %v, want messages 4 summary_tokens 5", ev)
 	}
 	d.waitFor("agent_settled", 5*time.Second)
 	d.quit(t)

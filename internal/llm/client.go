@@ -41,6 +41,7 @@ type Message struct {
 	// Execution provenance is stored in sessions, never sent to providers.
 	ToolInvocations []ToolInvocation `json:"tool_invocations,omitempty"`
 	InvocationID    string           `json:"invocation_id,omitempty"`
+	Observation     *ToolObservation `json:"observation,omitempty"`
 
 	// Images are attached images (user messages only). The session
 	// file stores their path and media type, never the bytes; the

@@ -93,7 +93,7 @@ func TestPruneCheckpointPersistsAndPreservesNewestBatch(t *testing.T) {
 }
 
 func TestCheckpointFallsBackToSummaryWithoutEnoughHeadroom(t *testing.T) {
-	msgs := []llm.Message{{Role: "user", Kind: "task", Content: strings.Repeat("task ", 10000)}}
+	msgs := []llm.Message{{Role: "user", Kind: "task", Content: "keep the sources"}, {Role: "assistant", Content: strings.Repeat("decision", 5000)}}
 	msgs = appendFixtureBatch(msgs, 0, 1000)
 	calls := 0
 	cfg := &Config{ContextLimit: 20000, CompactHistory: func(context.Context, []llm.Message) (string, llm.Usage, error) {
@@ -233,7 +233,8 @@ func TestGraceCheckpointUsageIncludesFinalAttempt(t *testing.T) {
 					return "summary", llm.Usage{PromptTokens: 5, CompletionTokens: 2, TotalTokens: 7}, nil
 				},
 			}
-			_, usage, ok := cfg.graceCall(context.Background(), []llm.Message{{Role: "user", Kind: "summary", Content: strings.Repeat("x", 24000)}}, "summarize now")
+			cfg.LastPromptTokens = 8000
+			_, usage, ok := cfg.graceCall(context.Background(), []llm.Message{{Role: "user", Kind: "task", Content: "finish"}}, "summarize now")
 			if usage.TotalTokens != 30 || events.TotalTokens != 30 || ok != (finish == "stop") {
 				t.Fatalf("usage=%d events=%d ok=%t", usage.TotalTokens, events.TotalTokens, ok)
 			}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"minimalharness/internal/session"
 	"minimalharness/internal/textutil"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -261,7 +262,13 @@ func estimatePromptTokens(msgs []llm.Message, defs []llm.ToolDef) int {
 }
 
 func (c *Config) promptView(msgs []llm.Message) []llm.Message {
-	return truncateToolResults(session.RepairToolBatches(msgs), toolResultMaxChars)
+	out := truncateToolResults(session.RepairToolBatches(msgs), toolResultMaxChars)
+	for i := range out {
+		if out[i].Kind == "checkpoint" {
+			out[i].Content = checkpointNotice + out[i].Content
+		}
+	}
+	return out
 }
 
 func (c *Config) contextBudget() int {
@@ -342,8 +349,12 @@ func (c *Config) pruneCheckpoint(msgs []llm.Message) ([]llm.Message, bool) {
 	}
 	out := append([]llm.Message(nil), base...)
 	target := c.contextBudget() * 3 / 5
+	callNames := make(map[string]string)
 	for i := 0; i < newestBatch; i++ {
-		if view[i].Role != "tool" || len(view[i].Content) <= len(prunedToolResultPlaceholder) {
+		for _, call := range view[i].ToolCalls {
+			callNames[call.ID] = call.Function.Name
+		}
+		if view[i].Role != "tool" || view[i].ToolError || callNames[view[i].ToolCallID] == "ask_user" || len(view[i].Content) <= len(prunedToolResultPlaceholder) {
 			continue
 		}
 		view[i].Content = prunedToolResultPlaceholder
@@ -358,8 +369,8 @@ func (c *Config) pruneCheckpoint(msgs []llm.Message) ([]llm.Message, bool) {
 	return nil, false
 }
 
-// Compact manually replaces history by a summary, using the same checkpoint as
-// automatic compaction. The automatic path additionally retains the active task.
+// Compact manually replaces narration, retaining the same source facts and
+// rollback boundary as automatic compaction.
 func (c *Config) Compact(ctx context.Context, history []llm.Message) ([]llm.Message, llm.Usage, error) {
 	return c.compactMessages(ctx, history, false)
 }
@@ -373,9 +384,37 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 			history = append(history, m)
 		}
 	}
+	sources, err := c.checkpointSources(history)
+	if err != nil {
+		return nil, llm.Usage{}, fmt.Errorf("load compaction sources: %w", err)
+	}
+	state, beforeTask, task, err := c.compactState(sources)
+	if err != nil {
+		return nil, llm.Usage{}, fmt.Errorf("preserve compaction facts: %w", err)
+	}
+	archiveName := ""
+	if c.Session != nil {
+		archiveName = fmt.Sprintf("%s-pre-compact-%d", c.Session.ID, time.Now().UnixNano())
+		state, err = checkpoint.Merge(state, checkpoint.Delta{Artifacts: []checkpoint.Artifact{{Kind: "transcript", Path: filepath.Join(session.Dir(), archiveName+".jsonl"), Source: "pre-compaction transcript"}}})
+		if err != nil {
+			return nil, llm.Usage{}, err
+		}
+	}
+	facts, err := checkpointMessage(state)
+	if err != nil {
+		return nil, llm.Usage{}, err
+	}
+	// A single consolidated state goes to the summarizer. The rollback baseline
+	// and all previous snapshots are already included in this validated state.
+	var summaryHistory []llm.Message
+	for _, m := range history {
+		if m.Kind != "checkpoint" {
+			summaryHistory = append(summaryHistory, m)
+		}
+	}
+	summaryHistory = append(summaryHistory, facts)
 	var summary string
 	var usage llm.Usage
-	var err error
 	if c.CompactHistory != nil {
 		if err := c.budgetRequest(); err != nil {
 			return nil, llm.Usage{}, err
@@ -385,7 +424,7 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 		if c.resources != nil {
 			before = c.resources.attempts
 		}
-		summary, usage, err = c.CompactHistory(ctx, history)
+		summary, usage, err = c.CompactHistory(ctx, summaryHistory)
 		// This legacy callback cannot distinguish omitted usage from explicit zero.
 		// Treat an all-zero report as unknown rather than invent evidence.
 		var measured *llm.Usage
@@ -403,7 +442,7 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 			err = budgetErr
 		}
 	} else {
-		summary, usage, err = c.Summarize(ctx, history, nil)
+		summary, usage, err = c.Summarize(ctx, summaryHistory, nil)
 	}
 	if err != nil {
 		return nil, usage, fmt.Errorf("compact before next model call: %w", err)
@@ -411,14 +450,19 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 	if strings.TrimSpace(summary) == "" {
 		return nil, usage, fmt.Errorf("compaction returned an empty summary")
 	}
-	replacement := []llm.Message{{Role: "user", Kind: "summary", Content: "Previous conversation summary:\n" + summary}}
-	if keepTask {
-		for i := len(history) - 1; i >= 0; i-- {
-			if session.IsTurnStart(history[i]) {
-				replacement = append(replacement, history[i])
-				break
-			}
+	var replacement []llm.Message
+	if hasCheckpointFacts(beforeTask) {
+		baseline, err := checkpointMessage(beforeTask)
+		if err != nil {
+			return nil, usage, err
 		}
+		replacement = append(replacement, baseline)
+	}
+	if task != nil {
+		replacement = append(replacement, *task)
+	}
+	replacement = append(replacement, llm.Message{Role: "user", Kind: "summary", Content: "Previous conversation summary:\n" + summary}, facts)
+	if keepTask {
 		// Context hooks may replace the task message entirely. The app's
 		// current snapshot is appended after those hooks, so retain it
 		// independently of whether a task marker remains in the view.
@@ -429,12 +473,22 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 			}
 		}
 	}
-	return c.commitCheckpoint(append(system, replacement...), usage)
+	if err := ctx.Err(); err != nil {
+		return nil, usage, err
+	}
+	// Read immutable image blobs rather than the mutable original paths. The
+	// next request in this turn needs the retained task's bytes too.
+	session.HydrateImages(replacement)
+	return c.commitCheckpointNamed(append(system, replacement...), usage, archiveName)
 }
 
 // commitCheckpoint persists both pruning and summaries through the same atomic
 // session marker. Resume therefore keeps exactly the view sent after a rewrite.
 func (c *Config) commitCheckpoint(msgs []llm.Message, usage llm.Usage) ([]llm.Message, llm.Usage, error) {
+	return c.commitCheckpointNamed(msgs, usage, "")
+}
+
+func (c *Config) commitCheckpointNamed(msgs []llm.Message, usage llm.Usage, archiveName string) ([]llm.Message, llm.Usage, error) {
 	var system, replacement []llm.Message
 	for _, m := range msgs {
 		if m.Role == "system" {
@@ -443,10 +497,19 @@ func (c *Config) commitCheckpoint(msgs []llm.Message, usage llm.Usage) ([]llm.Me
 			replacement = append(replacement, m)
 		}
 	}
+	if c.ContextLimit > 0 && estimatePromptTokens(c.promptView(msgs), c.Tools) >= c.contextBudget() {
+		return nil, usage, fmt.Errorf("preserved checkpoint exceeds context input budget; reduce the task or select a larger context window")
+	}
+	if c.Session != nil && !session.CheckpointFits(replacement) {
+		return nil, usage, fmt.Errorf("preserved checkpoint exceeds session record limit")
+	}
 	archive := ""
 	var err error
 	if c.Session != nil {
-		archive, err = c.Session.ArchiveCopy(fmt.Sprintf("%s-pre-compact-%d", c.Session.ID, time.Now().UnixNano()))
+		if archiveName == "" {
+			archiveName = fmt.Sprintf("%s-pre-compact-%d", c.Session.ID, time.Now().UnixNano())
+		}
+		archive, err = c.Session.ArchiveCopy(archiveName)
 		if err == nil {
 			err = c.Session.MarkCompactMessages(replacement)
 		}

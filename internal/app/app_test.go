@@ -1273,7 +1273,7 @@ func TestDoCompactRunsSessionBeforeCompactHooks(t *testing.T) {
 	if !strings.Contains(strings.Join(printed, "\n"), "[compact]") {
 		t.Fatalf("compact did not print its summary line: %v", printed)
 	}
-	if len(a.History) != 1 || a.History[0].Role != "user" || !strings.Contains(a.History[0].Content, "Previous conversation summary:") || !strings.Contains(a.History[0].Content, "hi there") {
-		t.Fatalf("history after compact = %+v, want the summary as one user message", a.History)
+	if len(a.History) != 3 || a.History[0].Kind != "task" || a.History[1].Kind != "summary" || !strings.Contains(a.History[1].Content, "hi there") || a.History[2].Kind != "checkpoint" {
+		t.Fatalf("history after compact = %+v, want the active task, summary and source facts", a.History)
 	}
 }

@@ -50,6 +50,7 @@ type Job struct {
 
 	ID      string
 	Command string
+	Cwd     string
 	// OutputFile is the per-call file holding the full stdout+stderr
 	// ("" when OutputDir was unset); it grows while the job runs.
 	OutputFile string
@@ -445,7 +446,7 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	runCtx, cancel := context.WithCancel(context.Background())
 	identity := invocationFromContext(ctx)
 	key, _ := ctx.Value(failureKeyContext{}).(string)
-	job := &Job{InvocationID: identity.id, ToolCallID: identity.callID, failureKey: key, Command: a.Command, OutputFile: outPath, Started: time.Now(), done: make(chan struct{}), cancel: cancel}
+	job := &Job{InvocationID: identity.id, ToolCallID: identity.callID, failureKey: key, Command: a.Command, Cwd: dir, OutputFile: outPath, Started: time.Now(), done: make(chan struct{}), cancel: cancel}
 	if foreground {
 		job.stopParent = context.AfterFunc(ctx, cancel)
 	}

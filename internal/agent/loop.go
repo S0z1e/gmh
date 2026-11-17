@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"minimalharness/internal/checkpoint"
 	"minimalharness/internal/failureguard"
 	"minimalharness/internal/input"
 	"minimalharness/internal/llm"
@@ -391,7 +392,7 @@ func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) (
 		obs, toolErr := jobResultMessage(p.job, res)
 		obs = c.progressJob(p.job, res, obs)
 		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID, ToolCallID: p.job.ToolCallID, InvocationID: p.job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: p.job.OutputFile})
-		msgs = append(msgs, llm.Message{Role: "user", Kind: "job", InvocationID: p.job.InvocationID, Content: obs})
+		msgs = append(msgs, completedJobMessage(p.job, res, obs))
 		if c.Session != nil {
 			c.persist(msgs[len(msgs)-1])
 		}
@@ -471,7 +472,7 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 		obs, toolErr := jobResultMessage(job, res)
 		obs = c.progressJob(job, res, obs)
 		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
-		msgs = append(msgs, llm.Message{Role: "user", Kind: "job", InvocationID: job.InvocationID, Content: obs})
+		msgs = append(msgs, completedJobMessage(job, res, obs))
 		if c.Session != nil {
 			c.persist(msgs[len(msgs)-1])
 		}
@@ -512,7 +513,7 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 			obs, toolErr := jobResultMessage(job, res)
 			obs = c.progressJob(job, res, obs)
 			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
-			msgs = append(msgs, llm.Message{Role: "user", Kind: "job", InvocationID: job.InvocationID, Content: obs})
+			msgs = append(msgs, completedJobMessage(job, res, obs))
 			if c.Session != nil {
 				c.persist(msgs[len(msgs)-1])
 			}
@@ -543,7 +544,11 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 						fmt.Fprintf(&b, "\n- %s (job %s): still running.", job.Command, job.ID)
 					}
 				}
-				msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: b.String()})
+				var snapshots []checkpoint.Job
+				for _, job := range still {
+					snapshots = append(snapshots, snapshotJob(job, false))
+				}
+				msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: b.String(), Observation: &llm.ToolObservation{Tool: "bash", Jobs: snapshots}})
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
@@ -714,6 +719,16 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	c.LastTaskOutcome = ""
 	c.LastTurnBudget = nil
 	c.verifier = nil
+	for _, m := range history {
+		if m.Kind == "checkpoint" {
+			if _, err := checkpoint.Decode([]byte(m.Content)); err != nil {
+				c.LastTerminalReason = TerminalError
+				err = fmt.Errorf("invalid historical checkpoint: %w", err)
+				c.emit(Event{Kind: EventError, Err: err, TerminalReason: TerminalError})
+				return "", llm.Usage{}, err
+			}
+		}
+	}
 	if c.Verification != nil && len(c.Verification.Required) > 0 {
 		if err := c.Verification.Validate(); err != nil {
 			c.LastTerminalReason = TerminalError
@@ -1306,8 +1321,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				}
 			}
 
+			observation := executionObservation(tc.Function.Name, argsJSON, callKey, res.Text, res.OutputFile, err, job)
 			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolTruncated: res.Truncated, ToolCountLowerBound: res.CountLowerBound, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
-			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil})
+			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil, Observation: observation})
 			if c.Session != nil {
 				c.persist(msgs[len(msgs)-1])
 			}

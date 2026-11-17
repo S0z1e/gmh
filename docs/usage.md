@@ -160,8 +160,8 @@
   contextWindow, image input) and history replays through the new
   API on the next turn. The switch lasts for the session only; it
   does not rewrite the config file.
-- Compaction: `/compact` summarises the conversation into a 6-section
-  brief and replaces history with it; the original transcript is
+- Compaction: `/compact` replaces narration with a 6-section brief alongside
+  program-preserved source facts and the latest task; the original transcript is
   saved to `<session>-pre-compact-<time>.jsonl`. It also triggers
   inside the tool loop, before the next model call, when measured
   usage plus new content reaches 70% of the window (`-context-limit`, default: the model's `contextWindow`,
@@ -170,10 +170,21 @@
   Retries are labelled `Compaction` in `step_retry` events. Failed or truncated
   summaries never replace history. If retries are exhausted, the turn stops
   with an explicit failure report rather than an empty answer.
+  Source facts retain original human instructions, assistant statements and user
+  answers, latest verification attempts (including failures), unresolved errors,
+  invocation IDs, job observations and image/output/transcript references.
+  They are historical data: permissions and current verification still use live
+  policy and fresh evidence. A baseline before the latest task lets rollback
+  remove that task's facts; older compressed turns remain in transcript archives.
+  Summary requests have a separate 128 KiB input cap and reserve the configured
+  output limit within the context window. Optional narration uses a bounded
+  recent suffix with explicit omissions and head/tail excerpts. Mandatory source
+  facts are never clipped: exceeding their 256 KiB, 2048-entry, 64 KiB per-text
+  limits, or the next request's context budget, fails without replacing history.
 - Context checkpoints: normal requests use one fixed 32 KiB cap per tool
   result and never prune by age. At the compaction boundary, the harness first
-  tries replacing older tool outputs with a fixed placeholder, keeping the
-  latest tool batch. It commits that view only if it brings estimated/projected
+  tries replacing older successful tool outputs with a fixed placeholder, keeping
+  failed observations and the latest tool batch. It commits that view only if it brings estimated/projected
   input below 60% of the trigger budget; otherwise it generates a summary.
   Both paths archive the full transcript and persist the replacement atomically,
   so resume retains the checkpoint. This trades larger input between checkpoints

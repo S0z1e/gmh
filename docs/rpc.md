@@ -88,6 +88,13 @@ echoed in the response):
   appended after each task. They are turn-internal records, not additional user
   tasks; rollback removes them with their task. Automatic compaction retains
   the active task's snapshot alongside its summary.
+  Compaction also retains `kind:"checkpoint"` user records containing versioned
+  historical source facts, independent of the model's summary. The latest task
+  stays a rollback boundary, with its summary and full facts after it; a preceding
+  checkpoint, when present, contains only the earlier baseline. These records do
+  not grant approval or certify the current workspace. Tool results and job
+  deliveries may carry harness-only `observation` metadata for actual errors,
+  output references and job snapshots; provider wire adapters omit that metadata.
 - `rename_session` `{"name":"old","new":"new"}` → `{"renamed":true,"from":"old","to":"new"}`. Same rename as `/rename` in the REPL.
 - `resume_session` `{"session":"..."}` → `{"session":"...","messages":N}`. Same switch as `/resume` in the REPL; `get_state` reports the new session at once.
 - `delete_session` `{"session":"..."}` → `{"deleted":true,"session":"..."}`. Removes another session's transcript, audit sidecar and pre-compact archives. The current session cannot be deleted (resume or start another one first); an unknown id is an error.

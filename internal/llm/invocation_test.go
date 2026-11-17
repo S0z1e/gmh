@@ -10,7 +10,7 @@ func TestInvocationReplayUsesEffectiveArgumentsWithoutLeakingProvenance(t *testi
 	args := `{"path":"actual"}`
 	history := []Message{
 		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call", Type: "function", Function: FunctionCall{Name: "read", Arguments: args}}}, ToolInvocations: []ToolInvocation{{ID: "invocation", ToolCallID: "call", ToolName: "read", OriginalArguments: `{"path":"requested"}`, Arguments: args}}, AnthropicContent: []AnthropicContentBlock{{Type: "tool_use", ID: "call", Name: "read", Input: json.RawMessage(`{"path":"requested"}`)}}},
-		{Role: "tool", ToolCallID: "call", InvocationID: "invocation", Content: "done"},
+		{Role: "tool", ToolCallID: "call", InvocationID: "invocation", Content: "done", Observation: &ToolObservation{Tool: "read", Fingerprint: "private-fingerprint", OutputFile: "private-output"}},
 	}
 	_, responses := toResponsesInput(history)
 	_, anthropic := toAnthropicMessages(history)
@@ -19,7 +19,7 @@ func TestInvocationReplayUsesEffectiveArgumentsWithoutLeakingProvenance(t *testi
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(string(data), "actual") || strings.Contains(string(data), "requested") || strings.Contains(string(data), "invocation") {
+		if !strings.Contains(string(data), "actual") || strings.Contains(string(data), "requested") || strings.Contains(string(data), "invocation") || strings.Contains(string(data), "private-") || strings.Contains(string(data), "observation") {
 			t.Fatalf("%s replay diverged or leaked provenance: %s", name, data)
 		}
 	}
