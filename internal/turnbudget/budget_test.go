@@ -213,3 +213,32 @@ func TestInvalidUsageCannotRefundOrEraseOtherConsumption(t *testing.T) {
 		t.Fatal("overflowed counters remained exact")
 	}
 }
+
+func TestDecimalCostBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cap   float64
+		costs []float64
+	}{
+		{"tenths", 1, []float64{.1, .1, .1, .1, .1, .1, .1, .1, .1, .1}},
+		{"mixed", .3, []float64{.1, .2}},
+		{"tiny", 3e-20, []float64{1e-20, 2e-20}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := tracker(t, &Policy{MaxCostUSD: dollars(tc.cap)})
+			for _, cost := range tc.costs {
+				if err := b.CheckRequest(b.State().Started); err != nil {
+					t.Fatal("stopped before cap:", err)
+				}
+				if err := b.RecordUsage(Usage{CostUSD: dollars(cost)}); err != nil {
+					t.Fatal("rejected exact-cap response:", err)
+				}
+			}
+			if b.State().RecordedCostUSD != tc.cap {
+				t.Fatalf("cost=%g want %g", b.State().RecordedCostUSD, tc.cap)
+			}
+			exhausted(t, b.CheckRequest(b.State().Started), "cost_usd")
+			exhausted(t, b.RecordUsage(Usage{CostUSD: dollars(math.SmallestNonzeroFloat64)}), "cost_usd")
+		})
+	}
+}

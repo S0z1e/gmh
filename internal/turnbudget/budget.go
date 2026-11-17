@@ -5,6 +5,8 @@ package turnbudget
 import (
 	"fmt"
 	"math"
+	"math/big"
+	"strconv"
 	"time"
 )
 
@@ -130,6 +132,11 @@ type State struct {
 type Tracker struct {
 	state       State
 	unavailable *Unavailable
+	// Interpret each finite float's shortest round-trip decimal as its USD
+	// amount. Accumulate and compare those decimals exactly, without rounding
+	// each request to a fixed unit (which could erase tiny billable amounts).
+	cost      big.Rat
+	costLimit big.Rat
 }
 
 func New(policy *Policy, started time.Time, ratesAvailable bool) (*Tracker, error) {
@@ -140,7 +147,9 @@ func New(policy *Policy, started time.Time, ratesAvailable bool) (*Tracker, erro
 	if limits.CostUSD > 0 && !ratesAvailable {
 		return nil, &Unavailable{Resource: "cost_usd", Reason: "no configured rates"}
 	}
-	return &Tracker{state: State{Started: started, Limits: limits, TokensComplete: true, CostComplete: true}}, nil
+	b := &Tracker{state: State{Started: started, Limits: limits, TokensComplete: true, CostComplete: true}}
+	b.costLimit.Set(decimal(limits.CostUSD))
+	return b, nil
 }
 func (b *Tracker) State() State { return b.state }
 func (b *Tracker) Deadline() (time.Time, bool) {
@@ -169,7 +178,7 @@ func (b *Tracker) CheckRequest(now time.Time) error {
 	if l.Tokens > 0 && s.ReportedTokens >= l.Tokens {
 		return &Exceeded{Resource: "tokens", Limit: float64(l.Tokens), Used: float64(s.ReportedTokens)}
 	}
-	if l.CostUSD > 0 && s.RecordedCostUSD >= l.CostUSD {
+	if l.CostUSD > 0 && b.cost.Cmp(&b.costLimit) >= 0 {
 		return &Exceeded{Resource: "cost_usd", Limit: l.CostUSD, Used: s.RecordedCostUSD}
 	}
 	return nil
@@ -216,11 +225,21 @@ func (b *Tracker) RecordUsage(u Usage) error {
 	}
 	if u.CostUSD == nil {
 		b.state.CostComplete = false
-	} else if !finiteNonnegative(*u.CostUSD) || !finiteNonnegative(b.state.RecordedCostUSD+*u.CostUSD) {
+	} else if !finiteNonnegative(*u.CostUSD) {
 		b.state.CostComplete = false
 		b.unmetered("cost_usd", "invalid or overflowing usage")
 	} else {
-		b.state.RecordedCostUSD += *u.CostUSD
+		next := new(big.Rat).Add(&b.cost, decimal(*u.CostUSD))
+		amount, _ := next.Float64()
+		if !finiteNonnegative(amount) {
+			b.state.CostComplete = false
+			b.unmetered("cost_usd", "invalid or overflowing usage")
+		} else {
+			b.cost.Set(next)
+			// State is a float for reporting; only the exact decimal sum
+			// above is used for enforcement, even below float resolution.
+			b.state.RecordedCostUSD = amount
+		}
 	}
 	l, s := b.state.Limits, b.state
 	if l.Tokens > 0 && !s.TokensComplete {
@@ -235,7 +254,7 @@ func (b *Tracker) RecordUsage(u Usage) error {
 	if l.Tokens > 0 && s.ReportedTokens > l.Tokens {
 		return &Exceeded{Resource: "tokens", Limit: float64(l.Tokens), Used: float64(s.ReportedTokens)}
 	}
-	if l.CostUSD > 0 && s.RecordedCostUSD > l.CostUSD {
+	if l.CostUSD > 0 && b.cost.Cmp(&b.costLimit) > 0 {
 		return &Exceeded{Resource: "cost_usd", Limit: l.CostUSD, Used: s.RecordedCostUSD}
 	}
 	return nil
@@ -247,3 +266,10 @@ func (b *Tracker) unmetered(resource, reason string) error {
 	return b.unavailable
 }
 func finiteNonnegative(n float64) bool { return n >= 0 && !math.IsNaN(n) && !math.IsInf(n, 0) }
+
+// decimal accepts only validated finite floats; FormatFloat always produces a
+// decimal that Rat.SetString can parse, including scientific notation.
+func decimal(n float64) *big.Rat {
+	r, _ := new(big.Rat).SetString(strconv.FormatFloat(n, 'g', -1, 64))
+	return r
+}
