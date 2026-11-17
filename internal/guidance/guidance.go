@@ -361,6 +361,17 @@ func readSource(ctx context.Context, root *os.Root, rel string) ([]byte, error) 
 	if change != afterChange || after.Mode() != info.Mode() || !os.SameFile(info, after) || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) || int64(len(data)) != after.Size() {
 		return nil, fmt.Errorf("instruction source changed while reading")
 	}
+	current, err := root.Stat(rel)
+	if err != nil || !os.SameFile(after, current) || current.Mode() != after.Mode() || current.Size() != after.Size() || !current.ModTime().Equal(after.ModTime()) {
+		return nil, fmt.Errorf("instruction source path changed while reading")
+	}
+	currentChange, err := changeTime(file, current)
+	if err != nil {
+		return nil, err
+	}
+	if currentChange != afterChange {
+		return nil, fmt.Errorf("instruction source changed while reading")
+	}
 	if !utf8.Valid(data) {
 		return nil, fmt.Errorf("instruction source is not valid UTF-8")
 	}

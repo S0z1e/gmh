@@ -46,3 +46,25 @@ func TestSameSizeRewriteWithRestoredMtimeIsRejected(t *testing.T) {
 		t.Fatal("accepted mixed source bytes while mtime/size were restored")
 	}
 }
+
+func TestInstructionSymlinkReplacementDuringReadIsRejected(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	path := filepath.Join(root, "AGENTS.md")
+	put(t, filepath.Join(root, "first.md"), strings.Repeat("A", 64<<10))
+	put(t, filepath.Join(root, "second.md"), strings.Repeat("B", 64<<10))
+	if err := os.Symlink("first.md", path); err != nil {
+		t.Fatal(err)
+	}
+	ctx := &scopeSwapContext{Context: context.Background(), swap: func() {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("second.md", path); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	if _, err := Resolve(ctx, root, "new.go"); err == nil {
+		t.Fatal("source symlink changed while descriptor stayed unchanged")
+	}
+}
