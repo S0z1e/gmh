@@ -243,7 +243,8 @@ type Client struct {
 	API           string // "chat" (default), "responses" or "anthropic"
 	// MaxTokens is the per-response output budget, sent by all three
 	// modes (chat: max_tokens, responses: max_output_tokens,
-	// anthropic: max_tokens). 0 = defaultAnthropicMaxTokens.
+	// anthropic: max_tokens). 0 leaves OpenAI modes unspecified and uses
+	// defaultAnthropicMaxTokens for Anthropic.
 	MaxTokens int
 	// SamplingParams (e.g. temperature, top_p) is merged into every
 	// request body of the two OpenAI modes. Anthropic
@@ -284,6 +285,18 @@ type Client struct {
 	// x-api-key are never taken from here: auth is the client's job.
 	Headers map[string]string
 	HTTP    *http.Client
+}
+
+// OutputTokenLimit reports the output reservation actually sent by this client.
+// Zero means the provider chooses its own limit.
+func (c *Client) OutputTokenLimit() int {
+	if c.MaxTokens > 0 {
+		return c.MaxTokens
+	}
+	if c.Mode() == "anthropic" {
+		return defaultAnthropicMaxTokens
+	}
+	return 0
 }
 
 // Mode returns the normalised API mode.

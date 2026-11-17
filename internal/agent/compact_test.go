@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -34,8 +35,8 @@ func TestShouldCompact(t *testing.T) {
 
 func TestSummaryCapsToolArgumentsWithoutSplittingUTF8(t *testing.T) {
 	args := strings.Repeat("中", 10000) + "END-SENTINEL"
-	prompt := BuildCompactPrompt([]llm.Message{{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: "write", Arguments: args}}}}}, nil)
-	if strings.Contains(prompt, "END-SENTINEL") || len(prompt) > 2500 || !utf8.ValidString(prompt) {
+	prompt := testCompactPrompt(t, []llm.Message{{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: "write", Arguments: args}}}}}, nil)
+	if !strings.Contains(prompt, "END-SENTINEL") || len(prompt) > 2500 || !utf8.ValidString(prompt) {
 		t.Fatal("summary tool arguments were not safely bounded")
 	}
 }
@@ -113,7 +114,7 @@ func TestBuildCompactPromptHasSixSections(t *testing.T) {
 		{Role: "assistant", Content: "done", ToolCalls: []llm.ToolCall{{ID: "1", Function: llm.FunctionCall{Name: "write", Arguments: "{}"}}}},
 		{Role: "tool", Content: "created test.go", ToolCallID: "1"},
 	}
-	prompt := BuildCompactPrompt(history, nil)
+	prompt := testCompactPrompt(t, history, nil)
 	for _, section := range []string{
 		"1. Task summary", "2. Key files", "3. Decisions",
 		"4. Pending", "5. Errors and fixes", "6. Next steps",
@@ -133,7 +134,7 @@ func TestBuildCompactPromptTruncatesToolResults(t *testing.T) {
 	history := []llm.Message{
 		{Role: "tool", Content: strings.Repeat("x", 2000), ToolCallID: "1"},
 	}
-	prompt := BuildCompactPrompt(history, nil)
+	prompt := testCompactPrompt(t, history, nil)
 	if strings.Contains(prompt, strings.Repeat("x", 2000)) {
 		t.Fatal("tool result was not truncated in the summary prompt")
 	}
@@ -151,7 +152,7 @@ func TestBuildCompactPromptExtrasPosition(t *testing.T) {
 		"[plugin plan] Keep the current plan in the summary.",
 		"[plugin todo] Keep the open todos.",
 	}
-	prompt := BuildCompactPrompt(history, extras)
+	prompt := testCompactPrompt(t, history, extras)
 	sec6 := strings.Index(prompt, "6. Next steps")
 	extra := strings.Index(prompt, "Additional instructions from plugins:")
 	first := strings.Index(prompt, "[plugin plan]")
@@ -167,10 +168,76 @@ func TestBuildCompactPromptExtrasPosition(t *testing.T) {
 
 func TestBuildCompactPromptNoExtrasBlock(t *testing.T) {
 	history := []llm.Message{{Role: "user", Content: "do the thing"}}
-	if prompt := BuildCompactPrompt(history, nil); strings.Contains(prompt, "Additional instructions") {
+	if prompt := testCompactPrompt(t, history, nil); strings.Contains(prompt, "Additional instructions") {
 		t.Fatalf("extras block present with no extras:\n%s", prompt)
 	}
-	if prompt := BuildCompactPrompt(history, []string{}); strings.Contains(prompt, "Additional instructions") {
+	if prompt := testCompactPrompt(t, history, []string{}); strings.Contains(prompt, "Additional instructions") {
 		t.Fatalf("extras block present with empty extras:\n%s", prompt)
+	}
+}
+
+func testCompactPrompt(t *testing.T, history []llm.Message, extras []string) string {
+	t.Helper()
+	prompt, err := BuildCompactPrompt(history, extras)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return prompt
+}
+
+func TestSummaryRequestHasIndependentBound(t *testing.T) {
+	history := []llm.Message{{Role: "user", Kind: "checkpoint", Content: `{"version":1}`}}
+	for i := 0; i < 10000; i++ {
+		history = append(history, llm.Message{Role: "assistant", Content: strings.Repeat("x", 1000)})
+	}
+	history = append(history, llm.Message{Role: "tool", Content: "HEAD ERROR" + strings.Repeat("中", 10000) + "TAIL ERROR"})
+	prompt, err := buildCompactPrompt(history, nil, 12000)
+	if err != nil || len(prompt) > 12000 || !utf8.ValidString(prompt) || !strings.Contains(prompt, "TAIL ERROR") || !strings.Contains(prompt, "omitted") {
+		t.Fatalf("unbounded or incomplete narration: bytes=%d err=%v", len(prompt), err)
+	}
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var request struct {
+			Messages []llm.Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+		}
+		if n := estimatePromptTokens(request.Messages, nil); n > 2800 {
+			t.Errorf("summary sent over budget: %d", n)
+		}
+		fmt.Fprint(w, textSSE("summary"))
+	}))
+	defer srv.Close()
+	cfg := &Config{ContextLimit: 4000, Client: &llm.Client{BaseURL: srv.URL, Model: "mock", APIKey: "test", MaxTokens: 500}}
+	if _, _, err := cfg.Summarize(context.Background(), history, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := cfg.Summarize(context.Background(), history, []string{strings.Repeat("x", 12000)}); err == nil || calls.Load() != 1 {
+		t.Fatalf("oversized extras called provider: %v calls=%d", err, calls.Load())
+	}
+	mandatory := []llm.Message{{Role: "user", Kind: "checkpoint", Content: strings.Repeat("x", 12000)}}
+	if _, _, err := cfg.Summarize(context.Background(), mandatory, nil); err == nil || calls.Load() != 1 {
+		t.Fatalf("oversized mandatory state called provider: %v calls=%d", err, calls.Load())
+	}
+}
+
+func TestSummaryCannotDropSourcesWithoutStructuredFacts(t *testing.T) {
+	history := []llm.Message{{Role: "user", Kind: "task", Content: strings.Repeat("preserve every instruction ", 1000)}}
+	before := history[0].Content
+	cfg := &Config{ContextLimit: 1000, Client: &llm.Client{MaxTokens: 100}}
+	if _, _, err := cfg.Summarize(context.Background(), history, nil); err == nil || !strings.Contains(err.Error(), "input budget") {
+		t.Fatalf("unprotected source text silently clipped: %v", err)
+	}
+	if history[0].Content != before {
+		t.Fatal("failed summary changed source history")
+	}
+}
+
+func TestSummaryReservesAnthropicDefaultOutput(t *testing.T) {
+	cfg := &Config{ContextLimit: 16000, Client: &llm.Client{API: "anthropic"}}
+	if _, _, err := cfg.Summarize(context.Background(), nil, nil); err == nil || !strings.Contains(err.Error(), "no context input budget") {
+		t.Fatalf("default output budget was not reserved before dispatch: %v", err)
 	}
 }

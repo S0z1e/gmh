@@ -353,10 +353,7 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			InputSchema: t.Function.Parameters,
 		})
 	}
-	maxTokens := c.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = defaultAnthropicMaxTokens
-	}
+	maxTokens := c.OutputTokenLimit()
 	anthReq := anthropicRequest{
 		Model: c.Model, MaxTokens: maxTokens, System: system,
 		Messages: anthMsgs, Tools: atools, Stream: true,

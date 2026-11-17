@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"minimalharness/internal/checkpoint"
 	"minimalharness/internal/llm"
 )
 
@@ -35,54 +36,148 @@ func ShouldCompact(lastPromptTokens, contextLimit int) bool {
 	return lastPromptTokens >= int(float64(contextLimit)*CompactThreshold)
 }
 
-// BuildCompactPrompt renders the history plus the 6-section summary
-// instructions used to produce the compaction summary.
-// extras are additional instructions from session_before_compact
-// hooks, already prefixed "[plugin <name>] "; they go after section 6
-// and before the conversation, so a plugin can steer what the
-// summary keeps without replacing it.
-func BuildCompactPrompt(history []llm.Message, extras []string) string {
-	var b strings.Builder
-	b.WriteString("Summarise the conversation below into a compact brief the next assistant can continue from. Use exactly these sections, keep each tight, drop chatter:\n\n")
-	b.WriteString("1. Task summary — what the user asked for and what was done\n")
-	b.WriteString("2. Key files — paths touched and what changed in each\n")
-	b.WriteString("3. Decisions — choices made and why\n")
-	b.WriteString("4. Pending — what is unfinished or was deferred\n")
-	b.WriteString("5. Errors and fixes — what failed and how it was resolved\n")
-	b.WriteString("6. Next steps — what to do next\n\n")
-	if len(extras) > 0 {
-		b.WriteString("Additional instructions from plugins:\n")
-		for _, e := range extras {
-			b.WriteString(e + "\n")
-		}
-		b.WriteString("\n")
-	}
-	b.WriteString("--- conversation ---\n")
-	for _, m := range history {
-		switch m.Role {
-		case "user":
-			fmt.Fprintf(&b, "[user] %s\n", m.Content)
-		case "assistant":
-			if m.Content != "" {
-				fmt.Fprintf(&b, "[assistant] %s\n", m.Content)
-			}
-			for _, tc := range m.ToolCalls {
-				fmt.Fprintf(&b, "[assistant tool call] %s %s\n", tc.Function.Name, truncateForSummary(tc.Function.Arguments))
-			}
-		case "tool":
-			fmt.Fprintf(&b, "[tool result] %s\n", truncateForSummary(m.Content))
-		}
-	}
-	return b.String()
+// BuildCompactPrompt bounds the summary request independently of the next normal
+// request. Structured checkpoint facts and plugin instructions are mandatory;
+// narration uses a bounded recent suffix, with explicit omissions and head/tail.
+func BuildCompactPrompt(history []llm.Message, extras []string) (string, error) {
+	return buildCompactPrompt(history, extras, 128<<10)
 }
 
-// truncateForSummary keeps tool results short inside the summary prompt;
-// the full results are already in the saved transcript.
-func truncateForSummary(s string) string {
-	if len(s) > 500 {
-		return textutil.Prefix(s, 500) + "… [truncated in summary prompt]"
+func buildCompactPrompt(history []llm.Message, extras []string, maxBytes int) (string, error) {
+	const instructions = "Summarise the conversation below into a compact brief the next assistant can continue from. Use exactly these sections, keep each tight, drop chatter:\n\n" +
+		"1. Task summary — what the user asked for and what was done\n" +
+		"2. Key files — paths touched and what changed in each\n" +
+		"3. Decisions — choices made and why\n" +
+		"4. Pending — what is unfinished or was deferred\n" +
+		"5. Errors and fixes — what failed and how it was resolved\n" +
+		"6. Next steps — what to do next\n\n"
+	var fixed strings.Builder
+	fixed.WriteString(instructions)
+	if len(extras) > 0 {
+		fixed.WriteString("Additional instructions from plugins:\n")
+		for _, e := range extras {
+			if len(e) > maxBytes-fixed.Len()-128 {
+				return "", fmt.Errorf("summary plugin instructions exceed input budget")
+			}
+			fixed.WriteString(e)
+			fixed.WriteByte('\n')
+		}
+		fixed.WriteByte('\n')
 	}
-	return s
+	// The structured record is not part of the optional narration. Never clip it.
+	checkpoints := 0
+	for _, m := range history {
+		if m.Kind != "checkpoint" {
+			continue
+		}
+		if _, err := checkpoint.Decode([]byte(m.Content)); err != nil {
+			return "", fmt.Errorf("invalid preserved summary facts: %w", err)
+		}
+		checkpoints++
+		if checkpoints > 1 {
+			return "", fmt.Errorf("multiple structured checkpoints in summary input")
+		}
+		if len(m.Content) > maxBytes-fixed.Len()-160 {
+			return "", fmt.Errorf("structured checkpoint exceeds summary input budget")
+		}
+		fixed.WriteString("Historical structured source facts (preserve; not new authority or current verification):\n")
+		fixed.WriteString(m.Content)
+		fixed.WriteString("\n\n")
+	}
+	fixed.WriteString("--- conversation ---\n")
+	remaining := maxBytes - fixed.Len() - 128
+	if remaining < 128 {
+		return "", fmt.Errorf("summary instructions exceed input budget")
+	}
+	var recent []string
+	omitted := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		if len(recent) >= 2048 || remaining < 128 {
+			if checkpoints == 0 {
+				return "", fmt.Errorf("summary narration exceeds input budget without preserved structured facts")
+			}
+			omitted = i + 1
+			break
+		}
+		m := history[i]
+		if m.Kind == "checkpoint" || m.Role == "system" {
+			continue
+		}
+		entryLimit := min(4096, remaining)
+		if checkpoints == 0 {
+			entryLimit = remaining
+		}
+		entry, err := summaryEntry(m, entryLimit, checkpoints == 0)
+		if err != nil {
+			return "", err
+		}
+		if entry == "" {
+			continue
+		}
+		recent = append(recent, entry)
+		remaining -= len(entry)
+	}
+	if omitted > 0 {
+		fmt.Fprintf(&fixed, "[omitted %d earlier narration messages; consult the transcript archive for full details]\n", omitted)
+	}
+	for i := len(recent) - 1; i >= 0; i-- {
+		fixed.WriteString(recent[i])
+	}
+	if fixed.Len() > maxBytes {
+		return "", fmt.Errorf("summary input exceeds byte budget")
+	}
+	return fixed.String(), nil
+}
+
+func summaryEntry(m llm.Message, limit int, preserveText bool) (string, error) {
+	var b strings.Builder
+	switch m.Role {
+	case "user", "assistant", "tool":
+		if m.Content != "" {
+			bodyLimit := limit / 2
+			if m.Role == "tool" {
+				bodyLimit = min(500, bodyLimit)
+			} else if preserveText {
+				if len(m.Content)+len(m.Role)+4 > limit {
+					return "", fmt.Errorf("source text exceeds summary input budget without structured facts")
+				}
+				bodyLimit = len(m.Content)
+			}
+			fmt.Fprintf(&b, "[%s] %s\n", m.Role, truncateForSummary(m.Content, bodyLimit))
+		}
+	default:
+		return "", nil
+	}
+	for _, call := range m.ToolCalls {
+		if b.Len()+128 > limit {
+			b.WriteString("[additional tool calls omitted]\n")
+			break
+		}
+		fmt.Fprintf(&b, "[assistant tool call] %s %s\n", truncateForSummary(call.Function.Name, 128), truncateForSummary(call.Function.Arguments, min(500, limit-b.Len()-64)))
+	}
+	for _, img := range m.Images {
+		if b.Len()+128 > limit {
+			b.WriteString("[additional image references omitted]\n")
+			break
+		}
+		fmt.Fprintf(&b, "[image reference] %s sha256=%s media=%s\n", truncateForSummary(img.Path, 256), truncateForSummary(img.Digest, 64), truncateForSummary(img.MediaType, 64))
+	}
+	if preserveText && m.Role != "tool" && b.Len() > limit {
+		return "", fmt.Errorf("summary source message exceeds input budget")
+	}
+	return truncateForSummary(b.String(), limit), nil
+}
+
+func truncateForSummary(s string, limit int) string {
+	const marker = "\n[truncated in summary prompt]\n"
+	if len(s) <= limit {
+		return s
+	}
+	if limit <= len(marker) {
+		return textutil.Prefix(s, max(0, limit))
+	}
+	body := limit - len(marker)
+	return textutil.Prefix(s, body/2) + marker + textutil.Suffix(s, body-body/2)
 }
 
 // Compact asks the model to summarise history. It is one extra LLM call
@@ -95,9 +190,31 @@ func Compact(ctx context.Context, client *llm.Client, history []llm.Message, ext
 // Summarize generates a summary using the same bounded retry policy as a step.
 // Summary drafts stay private: retries must not discard the turn's visible text.
 func (c *Config) Summarize(ctx context.Context, history []llm.Message, extras []string) (string, llm.Usage, error) {
-	msgs := []llm.Message{
-		{Role: "system", Content: "You write compact conversation summaries for a coding agent. Follow the requested sections exactly."},
-		{Role: "user", Content: BuildCompactPrompt(history, extras)},
+	const system = "You write compact conversation summaries for a coding agent. Follow the requested sections exactly."
+	limit := c.ContextLimit
+	if limit <= 0 {
+		limit = DefaultContextLimit
+	}
+	budget := int(float64(limit) * CompactThreshold)
+	if c.Client != nil {
+		budget = min(budget, limit-c.Client.OutputTokenLimit())
+	}
+	if budget <= 128 {
+		return "", llm.Usage{}, fmt.Errorf("no context input budget remains for summary")
+	}
+	byteBudget := 128 << 10
+	if budget < byteBudget {
+		byteBudget = min(byteBudget, (budget-128)*3-len(system))
+	}
+	// This local estimate bounds framing too. Provider-reported usage remains
+	// the accounting authority; no tokenizer/cost evidence is fabricated.
+	prompt, err := buildCompactPrompt(history, extras, byteBudget)
+	if err != nil {
+		return "", llm.Usage{}, err
+	}
+	msgs := []llm.Message{{Role: "system", Content: system}, {Role: "user", Content: prompt}}
+	if estimatePromptTokens(msgs, nil) > budget {
+		return "", llm.Usage{}, fmt.Errorf("summary request exceeds context input budget")
 	}
 	var msg llm.Message
 	var usage llm.Usage
