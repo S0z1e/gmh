@@ -185,7 +185,7 @@
 - Step budget: steps are unlimited by default (like Claude Code,
   Codex, Gemini, Qwen, OpenCode and Pi): a turn runs until the model
   stops calling tools, an error ends it, or the task is blocked
-  (3 consecutive all-failed steps). The bounds are auto-compaction
+  (three failed attempts without proven progress). The bounds are auto-compaction
   at 70% of the window plus the doom-loop guard (5 consecutive
   identical calls) and the stop-hook veto cap (8). Pass
   `-max-steps N` to opt into a hard cap; when a cap hits, the model
@@ -198,21 +198,32 @@
   used to settle with an empty text and no report at all. Grace requests use
   the same context checkpoint guard. A failed final attempt adds no assistant
   message, but any completed checkpoint and reported usage are retained.
-- Repeat-failure circuit breaker (after Qoder's denial circuit
-  breaker, adapted): the doom-loop guard only sees consecutive
-  repeats, so a call that keeps failing with other work in between
-  never trips it. The breaker counts failures per tool call
-  (tool name + canonical arguments) within one turn: the 2nd
-  failure warns in the observation, and the 4th identical attempt
-  is denied before it runs, as a tool error with reason
-  `repeated_tool_failure_denied` — distinct from the doom-loop
-  guard's `repeated_tool_call_denied`, which means the continuation
-  was refused. A success clears the count, and counts reset every
-  turn. A denied call counts as a failed fix attempt for the
-  blocked guard, so three consecutive denied-or-failed steps still
-  end the turn `blocked`. The breaker never touches the LLM retry
-  path (`step_retry`/idle): that counts failed LLM calls, not tool
-  calls, and works independently.
+- Repeat failures are counted by the effective tool name and canonical arguments,
+  within one turn, including asynchronous Bash results. The second failure warns;
+  after three, the same invocation needs proven changed state to run again.
+  At most two changed-state probes are admitted per invocation and eight per turn.
+  Returning to a known failed or previously admitted version cannot open a probe.
+  Invalid input, policy denial, environment, transient and verification failures
+  are distinguished; edits do not repair an unchanged input or policy rejection.
+  Denials carry `repeated_tool_failure_denied`, separately from a user refusing the
+  doom-loop continuation prompt (`repeated_tool_call_denied`).
+- When a tool batch leaves three failed attempts without proven state or result
+  progress, the turn settles `blocked`, with one tool-free grace report. Successful reads, unchanged writes
+  and unrelated commands returning success do not reset this count. A successful
+  rerun of a previously failing invocation, or a proven workspace change after
+  a successful mutating tool, does. Failed commands' own generated output files
+  are included in their post-failure baseline and do not look like a later repair.
+  Background results use the original effective invocation, even when collected
+  by a later turn. Counts reset for each turn; successful probes do not refund
+  that turn's probe allowance. Model request retries remain independent.
+- State evidence uses the bounded workspace capture described under verification,
+  including its `verification.exclude` settings. Unknown, unstable, unsupported
+  or oversized captures cannot prove a repair. Capture is only attempted during
+  failure handling or repair checks, at most 64 times per turn and five seconds
+  per capture; normal successful turns need no snapshots for the failure guard.
+  If evidence is unavailable or the probe allowance is exhausted, report the
+  blocker and start a new turn after choosing a different approach or fixing
+  the capture scope.
 - Timeouts: a model entry may set `timeoutSeconds` (total per-request
   cap, default 600) and `idleTimeoutSeconds` (silence cap while
   streaming, default 60). A stream that produces no SSE line for the

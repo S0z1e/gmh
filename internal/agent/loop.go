@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"minimalharness/internal/failureguard"
 	"minimalharness/internal/input"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
@@ -96,6 +97,7 @@ type Config struct {
 	doomLoop          *DoomLoopGuard
 	persistErr        error
 	persistErrEmitted bool
+	progress          *turnProgress
 }
 
 // DoomLoop returns the Config's guard, creating it on first use.
@@ -387,6 +389,7 @@ func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) (
 	for _, p := range done {
 		res, _ := p.job.Result()
 		obs, toolErr := jobResultMessage(p.job, res)
+		obs = c.progressJob(p.job, res, obs)
 		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID, ToolCallID: p.job.ToolCallID, InvocationID: p.job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: p.job.OutputFile})
 		msgs = append(msgs, llm.Message{Role: "user", Kind: "job", InvocationID: p.job.InvocationID, Content: obs})
 		if c.Session != nil {
@@ -466,6 +469,7 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 	for _, job := range doneJobs {
 		res, _ := job.Result()
 		obs, toolErr := jobResultMessage(job, res)
+		obs = c.progressJob(job, res, obs)
 		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
 		msgs = append(msgs, llm.Message{Role: "user", Kind: "job", InvocationID: job.InvocationID, Content: obs})
 		if c.Session != nil {
@@ -506,6 +510,7 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 		case job := <-done:
 			res, _ := job.Result()
 			obs, toolErr := jobResultMessage(job, res)
+			obs = c.progressJob(job, res, obs)
 			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
 			msgs = append(msgs, llm.Message{Role: "user", Kind: "job", InvocationID: job.InvocationID, Content: obs})
 			if c.Session != nil {
@@ -557,10 +562,8 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 // model forever.
 const MaxStopBlocks = 8
 
-// MaxFailedFixAttempts is the consecutive all-failed tool steps
-// after which the task is marked blocked instead of looping: the
-// model tried (differently — identical repeats are the doom-loop
-// guard's job) and every attempt failed.
+// MaxFailedFixAttempts bounds failed tool attempts without proven state change
+// or a successful rerun of a previously failing invocation.
 const MaxFailedFixAttempts = 3
 
 // maxLLMAttempts returns the per-step LLM attempt budget.
@@ -767,17 +770,27 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 		}
 	}
-	// stopBlocks counts consecutive turn-end vetoes in this turn;
-	// failedFixes counts consecutive steps whose tool calls all
-	// failed (a step with any success resets it).
 	stopBlocks := 0
-	failedFixes := 0
-	// breaker counts failed tool calls per fingerprint within
-	// this turn (a new breaker per Run: counts never leak into
-	// the next turn). lastErrors keeps the last few failed
-	// observations for the blocked-grace summary.
-	breaker := NewFailureBreaker()
-	var lastErrors []string
+	c.progress = &turnProgress{ctx: ctx, jobs: make(map[string]bool)}
+	defer func() { c.progress = nil }()
+	finishBlocked := func() (string, llm.Usage, error) {
+		blocked := fmt.Errorf("task blocked: %d tool attempts failed without proven state or result progress", MaxFailedFixAttempts)
+		if ctx.Err() == nil {
+			graceText, graceUsage, ok := c.graceCall(ctx, msgs, blockedGracePrompt(blocked, c.progress.lastErrors))
+			total.Add(graceUsage)
+			if ok {
+				lastText = graceText
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			c.LastTerminalReason = TerminalAbort
+			c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+			return lastText, total, err
+		}
+		c.LastTerminalReason = TerminalBlocked
+		c.emit(Event{Kind: EventError, Err: blocked, Text: lastText, Usage: total, TerminalReason: TerminalBlocked})
+		return lastText, total, blocked
+	}
 
 	for step := 0; !hasCap || step < steps; step++ {
 		// Finished background jobs report in at the next step,
@@ -880,6 +893,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		}
 		if len(assistant.ToolCalls) == 0 {
 			if len(pending) == 0 {
+				if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {
+					return finishBlocked()
+				}
 				if assistant.Refusal != "" || assistant.FinishReason == "refusal" || assistant.FinishReason == "content_filter" || strings.TrimSpace(lastText) == "" {
 					message := "model returned an empty answer without tool calls"
 					if assistant.Refusal != "" || assistant.FinishReason == "refusal" || assistant.FinishReason == "content_filter" {
@@ -965,10 +981,6 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		}
 		// Execute tool calls in order. (Parallel batches are v0.2; serial
 		// avoids two tools writing the same file at once.)
-		// stepHadExecution / stepAllFailed track this step for the
-		// blocked-after-3-failures rule: refusals count too, so unavailable tools cannot trap an unlimited run.
-		stepHadExecution := false
-		stepAllFailed := true
 		for i := range assistant.ToolCalls {
 			tc := &assistant.ToolCalls[i]
 			if c.persistErr != nil {
@@ -1017,8 +1029,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if !toolOffered(c.Tools, tc.Function.Name) {
 				// No validated invocation exists; only the request ID is durable.
 				inv.ID = ""
-				stepHadExecution = true
-				recordLastError(&lastErrors, "tool not offered: "+tc.Function.Name)
+				c.progressFailure(CanonicalToolKey(tc.Function.Name, argsJSON), failureguard.PolicyDenied)
+				recordLastError(&c.progress.lastErrors, "tool not offered: "+tc.Function.Name)
 				obs := fmt.Sprintf("Tool %s is not available in this turn. Do not retry this tool call; explain and propose an alternative.", tc.Function.Name)
 				if c.Session != nil {
 					_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "tool not offered in this turn"})
@@ -1033,8 +1045,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
 				msgs = c.invalidArgs(msgs, *tc, err)
-				stepHadExecution = true
-				recordLastError(&lastErrors, err.Error())
+				c.progressFailure(CanonicalToolKey(tc.Function.Name, argsJSON), failureguard.InvalidInput)
+				recordLastError(&c.progress.lastErrors, err.Error())
 				continue
 			}
 			c.verificationTouch(ctx)
@@ -1042,8 +1054,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				newArgs, deny := c.Exec.Plugins.RunToolCallHooks(ctx, tc.Function.Name, argsJSON)
 				if deny != "" {
 					inv.ID = ""
-					stepHadExecution = true
-					recordLastError(&lastErrors, "plugin denied tool call")
+					c.progressFailure(CanonicalToolKey(tc.Function.Name, argsJSON), failureguard.PolicyDenied)
+					recordLastError(&c.progress.lastErrors, "plugin denied tool call")
 					obs := "Denied by plugin " + deny + ". Do not retry this tool call; explain and propose an alternative."
 					if c.Session != nil {
 						_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: deny})
@@ -1065,8 +1077,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
 				msgs = c.invalidArgs(msgs, *tc, err)
-				stepHadExecution = true
-				recordLastError(&lastErrors, err.Error())
+				c.progressFailure(CanonicalToolKey(tc.Function.Name, argsJSON), failureguard.InvalidInput)
+				recordLastError(&c.progress.lastErrors, err.Error())
 				continue
 			}
 			if bound := c.verificationArguments(tc.Function.Name, argsJSON); bound != argsJSON {
@@ -1115,8 +1127,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			argsJSON = useArgs
 			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
 				msgs = c.invalidArgs(msgs, *tc, err)
-				stepHadExecution = true
-				recordLastError(&lastErrors, err.Error())
+				c.progressFailure(CanonicalToolKey(tc.Function.Name, argsJSON), failureguard.InvalidInput)
+				recordLastError(&c.progress.lastErrors, err.Error())
 				continue
 			}
 			tc.Function.Arguments = argsJSON
@@ -1131,8 +1143,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				mutation, err = c.Exec.PrepareMutation(target.Path)
 				if err != nil {
 					msgs = c.invalidArgs(msgs, *tc, err)
-					stepHadExecution = true
-					recordLastError(&lastErrors, err.Error())
+					c.progressFailure(CanonicalToolKey(tc.Function.Name, argsJSON), failureguard.Environment)
+					recordLastError(&c.progress.lastErrors, err.Error())
 					continue
 				}
 				inv.TargetPath = mutation.TargetPath
@@ -1148,19 +1160,18 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			startTool(argsJSON)
 			callKey := CanonicalToolKey(tc.Function.Name, argsJSON)
-			// Repeat-failure circuit breaker: a call that already
-			// failed FailureDenyAfter times this turn is denied
-			// before it runs — repeating it cannot make progress,
-			// and the turn must not burn steps on it. Unlike the
-			// doom-loop denial, this does not end the turn: the
-			// model gets the denial as a tool error and can try
-			// something else. It counts as a failed fix attempt
-			// for the blocked guard (the model did try to fix
-			// something; the harness refused on evidence of prior
-			// failure), unlike a hook/approval denial, which never
-			// executed. Checked before approval, so the user is
-			// never asked about a call that will be denied.
-			if denied, failures := breaker.Check(callKey); denied {
+			// The guard admits a bounded retry only with proven changed state.
+			// Check before approval, and keep one immutable key for async results.
+			decision := c.progressAdmit(callKey)
+			if err := ctx.Err(); err != nil {
+				closeMutation()
+				c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
+				c.LastTerminalReason = TerminalAbort
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+				return lastText, total, err
+			}
+			if decision.Denied {
+				failures := decision.Failures
 				obs := RepeatedFailureDeniedMessage(tc.Function.Name, failures)
 				if c.Session != nil {
 					_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool failure denied"})
@@ -1170,8 +1181,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
-				stepHadExecution = true
-				recordLastError(&lastErrors, obs)
+				c.progress.failures++
+				recordLastError(&c.progress.lastErrors, obs)
 				closeMutation()
 				continue
 			}
@@ -1205,9 +1216,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					return lastText, total, err
 				}
 				if !ok {
-					stepHadExecution = true
+					c.progressFailure(callKey, failureguard.PolicyDenied)
 					obs := "User denied this tool call. Do not retry it; explain and propose an alternative."
-					recordLastError(&lastErrors, obs)
+					recordLastError(&c.progress.lastErrors, obs)
 					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: fmt.Errorf("tool call denied by user")})
 					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 					if c.Session != nil {
@@ -1224,7 +1235,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
 				return lastText, total, err
 			}
-			toolCtx := tools.WithInvocation(ctx, inv.ID, tc.ID)
+			toolCtx := tools.WithFailureKey(tools.WithInvocation(ctx, inv.ID, tc.ID), callKey)
 			if mutation != nil {
 				toolCtx = tools.WithMutation(toolCtx, mutation)
 			}
@@ -1272,27 +1283,21 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				obs = c.Exec.Plugins.RunToolResultHooks(ctx, tc.Function.Name, argsJSON, obs, err)
 			}
 
-			// A finished (not backgrounded) call whose observation
-			// differs from the previous one for the same call is
-			// making progress: the doom-loop streak clears. A
-			// backgrounded call has no result yet, so neither
-			// guard sees it here — its result surfaces later as a
-			// user message, not a tool result.
 			if job == nil {
 				c.DoomLoop().Observe(callKey, obs)
-				stepHadExecution = true
-				failed := err != nil
-				if failed {
-					failures := breaker.ObserveFailure(callKey)
-					if failures >= FailureWarnAfter {
-						obs += "\n" + FailureNote(tc.Function.Name, failures)
+				if ctx.Err() == nil && c.budgetError() == nil {
+					if err != nil {
+						failures := c.progressFailure(callKey, failureKind(err, attempt != nil))
+						if failures >= FailureWarnAfter {
+							obs += "\n" + FailureNote(tc.Function.Name, failures)
+						}
+						recordLastError(&c.progress.lastErrors, obs)
+					} else {
+						c.progressSuccess(callKey, tc.Function.Name)
 					}
-					recordLastError(&lastErrors, obs)
-				} else {
-					stepAllFailed = false
-					breaker.ObserveSuccess(callKey)
 				}
 			}
+
 			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolTruncated: res.Truncated, ToolCountLowerBound: res.CountLowerBound, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
 			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil})
 			if c.Session != nil {
@@ -1319,40 +1324,25 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				return lastText, total, budgetErr
 			}
 		}
-		// Three consecutive steps whose tool calls all failed mark
-		// the task blocked: the model is trying and failing, and
-		// looping further only burns context. Any success resets
-		// the count.
-		if stepHadExecution {
-			if stepAllFailed {
-				failedFixes++
-			} else {
-				failedFixes = 0
-			}
-			if failedFixes >= MaxFailedFixAttempts {
-				if len(pending) > 0 {
-					msgs, _ = c.drainPending(ctx, msgs, pending)
+		if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {
+			if len(pending) > 0 {
+				var err error
+				msgs, err = c.drainPending(ctx, msgs, pending)
+				if err != nil {
+					c.LastTerminalReason = TerminalAbort
+					c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+					return lastText, total, err
 				}
-				blocked := fmt.Errorf("task blocked: %d consecutive steps ended with only failed tool calls; the last error was not fixed by retrying", MaxFailedFixAttempts)
-				// Blocked-grace summary, mirroring the step-cap
-				// grace: a turn that ends blocked otherwise
-				// settles with whatever text the last tool-call
-				// step had — usually nothing — so the GUI gets
-				// no report at all (the bookstore run's verify
-				// turn settled blocked with an empty text). One
-				// tool-less final call asks for a short summary
-				// of what was verified, what failed and what is
-				// left. Only a complete answer is persisted.
-				if ctx.Err() == nil {
-					graceText, graceUsage, ok := c.graceCall(ctx, msgs, blockedGracePrompt(blocked, lastErrors))
-					total.Add(graceUsage)
-					if ok {
-						lastText = graceText
+				remaining := pending[:0]
+				for _, p := range pending {
+					if !p.job.Delivered() {
+						remaining = append(remaining, p)
 					}
 				}
-				c.LastTerminalReason = TerminalBlocked
-				c.emit(Event{Kind: EventError, Err: blocked, Text: lastText, TerminalReason: TerminalBlocked})
-				return lastText, total, blocked
+				pending = remaining
+			}
+			if c.progress.failures >= MaxFailedFixAttempts {
+				return finishBlocked()
 			}
 		}
 	}

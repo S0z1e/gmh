@@ -186,8 +186,8 @@ arrived, a later error ends the turn instead. A turn that still fails reports
   turn), `"error"` (LLM/provider failure),
   `"repeated_tool_call_denied"` (the user denied a repeated call at
   the continuation prompt, or no prompt was available) or `"blocked"`
-  (3 consecutive steps whose tool calls all failed — the task was
-  marked blocked instead of looping). `aborted` is
+  (three failed tool attempts without proven state or result progress,
+  including background failures). `aborted` is
   true only when the GUI aborted the turn — and an aborted turn
   carries no `error` string: cancellation is semantic, not an error.
   Any other failure is in `error`. `text` is the turn's final answer

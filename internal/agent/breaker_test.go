@@ -16,45 +16,7 @@ import (
 	"minimalharness/internal/tools"
 )
 
-// The breaker denies only after FailureDenyAfter failures of the
-// same fingerprint, warns from the 2nd, and a success clears the
-// count; different fingerprints are independent.
-func TestFailureBreaker(t *testing.T) {
-	b := NewFailureBreaker()
-	key := CanonicalToolKey("bash", `{"command":"false"}`)
-	other := CanonicalToolKey("bash", `{"command":"true"}`)
-
-	if denied, n := b.Check(key); denied || n != 0 {
-		t.Fatalf("fresh Check = (%v, %d), want (false, 0)", denied, n)
-	}
-	if n := b.ObserveFailure(key); n != 1 {
-		t.Fatalf("1st failure count = %d, want 1", n)
-	}
-	if denied, n := b.Check(key); denied || n != 1 {
-		t.Fatalf("Check after 1 = (%v, %d), want (false, 1)", denied, n)
-	}
-	if n := b.ObserveFailure(key); n != 2 {
-		t.Fatalf("2nd failure count = %d, want 2", n)
-	}
-	if n := b.ObserveFailure(key); n != 3 {
-		t.Fatalf("3rd failure count = %d, want 3", n)
-	}
-	if denied, n := b.Check(key); !denied || n != 3 {
-		t.Fatalf("Check after 3 = (%v, %d), want (true, 3)", denied, n)
-	}
-	// A denial does not increment the count: Check stays denied
-	// at 3, it never grows past the threshold.
-	if denied, n := b.Check(key); !denied || n != 3 {
-		t.Fatalf("Check again = (%v, %d), want (true, 3)", denied, n)
-	}
-	if denied, _ := b.Check(other); denied {
-		t.Fatal("a different fingerprint must not be denied")
-	}
-	// A success clears the count.
-	b.ObserveSuccess(key)
-	if denied, n := b.Check(key); denied || n != 0 {
-		t.Fatalf("Check after success = (%v, %d), want (false, 0)", denied, n)
-	}
+func TestFailureMessages(t *testing.T) {
 	if got := FailureNote("bash", 2); !strings.Contains(got, "already failed 2 times") || !strings.Contains(got, "One more failure") {
 		t.Fatalf("2nd-failure note = %q", got)
 	}
@@ -76,13 +38,9 @@ func jsonString(s string) string {
 	return string(b)
 }
 
-// The loop-level breaker test: the same failing bash command runs
-// three times (interleaved with successful reads, so the blocked
-// guard does not end the turn first), and the 4th identical
-// attempt is denied WITHOUT executing — proved by the side effect:
-// the command appends a line to tick.txt on every execution, and
-// the file must hold exactly 3 lines.
-func TestRunRepeatFailureBreaker(t *testing.T) {
+// Successful reads no longer hide repeated failures. The third failed
+// execution settles blocked and receives one tool-free grace report.
+func TestRunRepeatFailureNoProgressStopsWithGrace(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -95,9 +53,9 @@ func TestRunRepeatFailureBreaker(t *testing.T) {
 		n := atomic.AddInt32(&calls, 1)
 		var body string
 		switch n {
-		case 1, 2, 4, 6:
+		case 1, 2, 4:
 			body = fmt.Sprintf("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":%s}}]}}]}\n\n", jsonString(string(failArgs)))
-		case 3, 5:
+		case 3:
 			body = fmt.Sprintf("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":%s}}]}}]}\n\n", jsonString(string(readArgs)))
 		default:
 			body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n"
@@ -122,44 +80,34 @@ func TestRunRepeatFailureBreaker(t *testing.T) {
 		},
 	}
 	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "run the failing command four times"}})
-	if err != nil {
-		t.Fatalf("Run error = %v, want nil (end_turn)", err)
+	if err == nil {
+		t.Fatal("no-progress failures did not block")
 	}
-	if cfg.LastTerminalReason != TerminalEndTurn {
-		t.Fatalf("terminal reason = %q, want end_turn", cfg.LastTerminalReason)
+	if cfg.LastTerminalReason != TerminalBlocked {
+		t.Fatalf("terminal reason = %q, want blocked", cfg.LastTerminalReason)
 	}
 	if text != "done" {
 		t.Fatalf("final text = %q, want \"done\"", text)
 	}
-	if got := atomic.LoadInt32(&calls); got != 7 {
-		t.Fatalf("LLM calls = %d, want 7 (6 steps + final answer)", got)
+	if got := atomic.LoadInt32(&calls); got != 5 {
+		t.Fatalf("LLM calls = %d, want 5 (four steps + grace)", got)
 	}
 	data, err := os.ReadFile(filepath.Join(root, "tick.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if lines := strings.Count(string(data), "\n"); lines != 3 {
-		t.Fatalf("tick.txt has %d lines, want 3 — the denied 4th attempt must not have run", lines)
+		t.Fatalf("tick.txt has %d lines, want 3 — no extra failing attempt may run", lines)
 	}
-	// The 2nd failure warns, the 4th attempt is denied with the
-	// distinct reason.
-	var warned, denied bool
+	// The second failure still provides an early warning.
+	var warned bool
 	for _, e := range toolEnds {
 		if strings.Contains(e.ToolOutput, "already failed 2 times") {
 			warned = true
 		}
-		if strings.Contains(e.ToolOutput, RepeatedToolFailureReason) {
-			denied = true
-			if e.ToolErr == nil {
-				t.Fatal("denied tool_end has no ToolErr")
-			}
-		}
 	}
 	if !warned {
 		t.Fatalf("no tool_end warned about the 2nd failure: %+v", toolEnds)
-	}
-	if !denied {
-		t.Fatalf("no tool_end denied the 4th attempt: %+v", toolEnds)
 	}
 }
 
@@ -199,7 +147,7 @@ func TestFailureBreakerResetsEachTurn(t *testing.T) {
 		Mode:   "auto",
 	}
 	// Turn 1: the bash call fails 3 times (reads in between).
-	if _, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "turn one"}}); err != nil {
+	if _, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "turn one"}}); err == nil || cfg.LastTerminalReason != TerminalBlocked {
 		t.Fatalf("turn 1 error = %v", err)
 	}
 	// Turn 2: the same call must EXECUTE again — a leaked count

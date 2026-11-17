@@ -625,7 +625,7 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 	}
 	if reason := DeniedCommand(a.Command); reason != "" {
 		e.audit(ctx, AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
-		return ToolResult{}, fmt.Errorf("denied by policy: %s", reason)
+		return ToolResult{}, &PolicyError{Reason: reason}
 	}
 	dir, err := e.bashDir(a)
 	if err != nil {

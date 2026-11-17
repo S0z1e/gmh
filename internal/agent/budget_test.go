@@ -702,7 +702,7 @@ func TestBudgetContinuationExpiryPersistsUnexecutedSuffix(t *testing.T) {
 }
 
 func TestBudgetCallerAbortBeforeDispatchAlwaysEmitsTerminal(t *testing.T) {
-	for _, cancelAt := range []int{1, 2} {
+	for _, cancelAt := range []int{1, 2, 3} {
 		t.Run(fmt.Sprint(cancelAt), func(t *testing.T) {
 			c := budgetConfig(t, &turnbudget.Policy{MaxDurationSeconds: capInt(0)})
 			command := "printf ran > never"

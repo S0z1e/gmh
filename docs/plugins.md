@@ -203,11 +203,12 @@ harness.on("stop", (input) => {
 });
 ```
 
-Separately, the loop marks a task blocked on its own: after 3
-consecutive steps whose tool calls all failed, the turn ends with
-the structured terminal reason `"blocked"` instead of looping.
-Any successful tool call resets the count; denials and refusals
-do not count as fix attempts.
+Separately, the loop marks a task blocked on its own: after three failed tool attempts
+without proven state or result progress, the turn ends with the structured
+terminal reason `"blocked"`. Denials and refusals count. Successful reads and
+unchanged writes do not reset failures; a proven workspace change after a
+successful mutating tool or a successful rerun of a previously failing
+invocation does. Background failures use the same guard.
 
 | Hook | Input | Return | On failure |
 | --- | --- | --- | --- |

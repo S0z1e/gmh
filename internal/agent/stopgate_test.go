@@ -146,9 +146,9 @@ func TestThreeFailedFixAttemptsMarkBlocked(t *testing.T) {
 	}
 }
 
-// TestFailedFixCounterResetsOnSuccess: a failed step followed by a
-// successful read does not accumulate toward the blocked rule.
-func TestFailedFixCounterResetsOnSuccess(t *testing.T) {
+// A single failure does not force a blocked outcome merely because the model
+// reads context and then provides its final response.
+func TestSuccessfulReadCanPrecedeFinalResponseAfterOneFailure(t *testing.T) {
 	root := t.TempDir()
 	// One real file the model can read successfully on the second step.
 	if err := os.WriteFile(filepath.Join(root, "ok.txt"), []byte("hello"), 0o644); err != nil {

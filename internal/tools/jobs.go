@@ -46,6 +46,7 @@ type Job struct {
 	// Invocation identity is immutable from construction.
 	InvocationID string
 	ToolCallID   string
+	failureKey   string
 
 	ID      string
 	Command string
@@ -73,6 +74,9 @@ type Job struct {
 
 // Done closes when the command finishes (success, failure or timeout).
 func (j *Job) Done() <-chan struct{} { return j.done }
+
+// FailureKey is the immutable effective invocation captured when this job began.
+func (j *Job) FailureKey() string { return j.failureKey }
 
 // FinishedAt reports when the job finished; ok is false while running.
 func (j *Job) FinishedAt() (time.Time, bool) {
@@ -426,7 +430,7 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	}
 	if reason := DeniedCommand(a.Command); reason != "" {
 		e.audit(ctx, AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
-		return nil, fmt.Errorf("denied by policy: %s", reason)
+		return nil, &PolicyError{Reason: reason}
 	}
 	dir, err := e.bashDir(a)
 	if err != nil {
@@ -440,7 +444,8 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	outPath := e.nextOutputFile()
 	runCtx, cancel := context.WithCancel(context.Background())
 	identity := invocationFromContext(ctx)
-	job := &Job{InvocationID: identity.id, ToolCallID: identity.callID, Command: a.Command, OutputFile: outPath, Started: time.Now(), done: make(chan struct{}), cancel: cancel}
+	key, _ := ctx.Value(failureKeyContext{}).(string)
+	job := &Job{InvocationID: identity.id, ToolCallID: identity.callID, failureKey: key, Command: a.Command, OutputFile: outPath, Started: time.Now(), done: make(chan struct{}), cancel: cancel}
 	if foreground {
 		job.stopParent = context.AfterFunc(ctx, cancel)
 	}
