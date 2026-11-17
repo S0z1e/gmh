@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"minimalharness/internal/failureguard"
 	"minimalharness/internal/llm"
+	"minimalharness/internal/session"
 	"minimalharness/internal/tools"
 )
 
@@ -187,12 +189,17 @@ func TestFailureProgressToolFreeDrainRechecksBlocked(t *testing.T) {
 }
 
 func TestFailureProgressRuntimeInputErrorsCannotBeRepairedByEdit(t *testing.T) {
-	for _, call := range []llm.ToolCall{
+	calls := []llm.ToolCall{
 		budgetCall("glob", "glob", `{"pattern":""}`),
 		budgetCall("grep", "grep", `{"pattern":""}`),
+		budgetCall("bash", "bash", `{"command":"true","timeout":1.0}`),
 		budgetCall("question", "ask_user", `{"questions":[{"question":"choose","options":[{"label":"same"},{"label":"same"}]}]}`),
-	} {
-		t.Run(call.Function.Name, func(t *testing.T) {
+	}
+	if _, err := exec.LookPath("rg"); err == nil {
+		calls = append(calls, budgetCall("bad-glob", "glob", `{"pattern":"["}`), budgetCall("bad-regex", "grep", `{"pattern":"["}`))
+	}
+	for _, call := range calls {
+		t.Run(call.ID, func(t *testing.T) {
 			c := budgetConfig(t, nil)
 			ctx := context.Background()
 			c.progress = &turnProgress{ctx: ctx, jobs: make(map[string]bool)}
@@ -201,6 +208,8 @@ func TestFailureProgressRuntimeInputErrorsCannotBeRepairedByEdit(t *testing.T) {
 				var err error
 				if call.Function.Name == "ask_user" {
 					_, err = c.askUser(ctx, call.Function.Arguments)
+				} else if call.Function.Name == "bash" {
+					_, _, err = c.execBash(ctx, call)
 				} else {
 					_, err = c.Exec.Dispatch(ctx, call.Function.Name, call.Function.Arguments)
 				}
@@ -216,5 +225,91 @@ func TestFailureProgressRuntimeInputErrorsCannotBeRepairedByEdit(t *testing.T) {
 				t.Fatalf("invalid runtime input admitted a state probe: %+v", d)
 			}
 		})
+	}
+}
+
+func TestFailureProgressHarnessBookkeepingCannotProveRepair(t *testing.T) {
+	for _, separateOutput := range []bool{false, true} {
+		t.Run(fmt.Sprint(separateOutput), func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", root)
+			c := budgetConfig(t, nil)
+			c.Exec.Root = root
+			store, err := session.Open("progress-in-home", session.OpenOptions{Workspace: root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			c.Session = store
+			c.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
+			c.Exec.OutputDir = filepath.Join(session.Dir(), "outputs")
+			if separateOutput {
+				c.Exec.OutputDir = filepath.Join(root, "custom-output")
+			}
+			c.progress = &turnProgress{ctx: context.Background(), jobs: make(map[string]bool)}
+			if revision := c.progressRevision(); revision == "" {
+				t.Fatal("a bounded workspace containing bookkeeping must still have usable proof")
+			}
+			c.progress = nil
+			fail := verificationBash("exit 1")
+			events, _, err := runVerification(t, c, fail, verificationBash("true"), fail, verificationBash("true"), fail, textSSE("blocked report"))
+			if err == nil || c.LastTerminalReason != TerminalBlocked {
+				t.Fatalf("transcript/audit/output updates invented progress: reason=%s err=%v events=%d", c.LastTerminalReason, err, len(events))
+			}
+			// Likewise, recording four invocations in one accepted batch must
+			// not turn the fourth identical attempt into a state-change probe.
+			var batch []llm.ToolCall
+			for _, id := range []string{"a", "b", "c", "d"} {
+				batch = append(batch, budgetCall(id, "bash", `{"command":"exit 1"}`))
+			}
+			events, _, err = runVerification(t, c, budgetSSE("", batch, nil, true), textSSE("blocked report"))
+			denied := false
+			for _, e := range events {
+				if e.Kind == EventToolEnd && e.ToolCallID == "d" && strings.Contains(e.ToolOutput, RepeatedToolFailureReason) {
+					denied = true
+				}
+			}
+			if err == nil || !denied {
+				t.Fatalf("invocation bookkeeping reopened the fourth attempt: denied=%v err=%v", denied, err)
+			}
+		})
+	}
+}
+
+func TestFailureProgressBookkeepingAliasesPreserveProductChanges(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Skip(err)
+	}
+	c := budgetConfig(t, nil)
+	c.Exec.Root = alias
+	c.Exec.OutputDir = filepath.Join(alias, "custom-output")
+	c.progress = &turnProgress{ctx: context.Background(), jobs: make(map[string]bool)}
+	before := c.progressRevision()
+	if before == "" {
+		t.Fatal("aliased workspace produced unknown proof")
+	}
+	for _, file := range []string{filepath.Join(session.Dir(), "transcript"), filepath.Join(c.Exec.OutputDir, "output")} {
+		if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, []byte("bookkeeping"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after := c.progressRevision(); after != before {
+		t.Fatalf("aliased bookkeeping changed product proof: before=%s after=%s", before, after)
+	}
+	if err := os.WriteFile(filepath.Join(root, "product"), []byte("fixed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if after := c.progressRevision(); after == "" || after == before {
+		t.Fatal("product change was hidden with bookkeeping")
+	}
+	c.Exec.OutputDir = root
+	if after := c.progressRevision(); after != "" {
+		t.Fatal("overlapping product/output root fabricated a usable version")
 	}
 }

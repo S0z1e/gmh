@@ -3,13 +3,19 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"minimalharness/internal/failureguard"
+	"minimalharness/internal/session"
 	"minimalharness/internal/tools"
 	"minimalharness/internal/verification"
+	"minimalharness/internal/workdir"
 )
 
 const maxProgressCaptures = 64
@@ -39,13 +45,88 @@ func (c *Config) progressRevision() string {
 	defer cancel()
 	var exclude []string
 	if c.Verification != nil {
-		exclude = c.Verification.Exclude
+		exclude = append(exclude, c.Verification.Exclude...)
 	}
+	owned, err := c.progressBookkeepingExclusions()
+	if err != nil {
+		return ""
+	}
+	exclude = append(exclude, owned...)
 	state, err := verification.Capture(ctx, c.Exec.Root, exclude)
 	if err != nil || c.Exec.HasRunningWorkspaceJobs() {
 		return ""
 	}
 	return state.Version
+}
+
+// Harness transcripts, audits, leases, archives, blobs and output logs are
+// observations of work, never evidence that the work itself was repaired.
+func (c *Config) progressBookkeepingExclusions() ([]string, error) {
+	root, err := workdir.Canonical(c.Exec.Root, "")
+	if err != nil {
+		return nil, err
+	}
+	lexicalRoot, err := filepath.Abs(c.Exec.Root)
+	if err != nil {
+		return nil, err
+	}
+	paths := []string{filepath.Dir(session.Dir()), c.Exec.OutputDir}
+	if c.Session != nil {
+		paths = append(paths, c.Session.Path, c.Session.AuditPath())
+	}
+	var exclude []string
+	add := func(base, path string) error {
+		if !strings.EqualFold(filepath.VolumeName(base), filepath.VolumeName(path)) {
+			return nil // An owned path on another volume is outside this workspace.
+		}
+		rel, err := filepath.Rel(base, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return fmt.Errorf("workspace root overlaps harness bookkeeping")
+		}
+		if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+			exclude = append(exclude, rel)
+		}
+		return nil
+	}
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := add(lexicalRoot, abs); err != nil {
+			return nil, err
+		}
+		// Resolve existing aliases, including ancestors of directories that
+		// the first Bash call has not created yet.
+		ancestor, suffix := abs, ""
+		for {
+			if _, err := os.Lstat(ancestor); err == nil {
+				break
+			} else if !os.IsNotExist(err) {
+				return nil, err
+			}
+			parent := filepath.Dir(ancestor)
+			if parent == ancestor {
+				return nil, fmt.Errorf("cannot resolve harness bookkeeping path")
+			}
+			suffix = filepath.Join(filepath.Base(ancestor), suffix)
+			ancestor = parent
+		}
+		canonical, err := filepath.EvalSymlinks(ancestor)
+		if err != nil {
+			return nil, err
+		}
+		if err := add(root, filepath.Join(canonical, suffix)); err != nil {
+			return nil, err
+		}
+	}
+	return exclude, nil
 }
 
 func (c *Config) progressAdmit(key string) failureguard.Decision {

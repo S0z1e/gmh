@@ -63,6 +63,8 @@ func (e *Executor) globRg(ctx context.Context, dir, pattern string, limit int) (
 		return "", 0, err
 	}
 	cmd := exec.CommandContext(ctx, "rg", "--files", "-g", pattern, "--", rel)
+	var diagnostics searchDiagnostics
+	cmd.Stderr = &diagnostics
 	cmd.Dir = e.Root
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -96,7 +98,7 @@ func (e *Executor) globRg(ctx context.Context, dir, pattern string, limit int) (
 			return "", 0, fmt.Errorf("glob timed out after 30s")
 		}
 		if len(paths) == 0 {
-			return "", 0, fmt.Errorf("rg --files failed: %w", err)
+			return "", 0, searchError("rg --files", err, diagnostics)
 		}
 	}
 	sort.Strings(paths)
@@ -106,6 +108,11 @@ func (e *Executor) globRg(ctx context.Context, dir, pattern string, limit int) (
 // globWalk is the stdlib fallback: walk the tree, match each relative
 // path against the pattern segment by segment, skipping hidden dirs.
 func (e *Executor) globWalk(dir, pattern string, limit int) (string, int, error) {
+	for _, segment := range strings.Split(pattern, "/") {
+		if _, err := filepath.Match(segment, ""); err != nil {
+			return "", 0, &InputError{Err: fmt.Errorf("glob: %w", err)}
+		}
+	}
 	var paths []string
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {

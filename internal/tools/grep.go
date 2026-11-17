@@ -158,6 +158,8 @@ func (e *Executor) streamGrep(ctx context.Context, binary string, args []string,
 	processCtx, stop := context.WithCancel(searchCtx)
 	defer stop()
 	cmd := exec.CommandContext(processCtx, binary, args...)
+	var diagnostics searchDiagnostics
+	cmd.Stderr = &diagnostics
 	cmd.Dir = e.Root
 	configureProcess(cmd)
 	cmd.Cancel = func() error { return killProcessTree(cmd) }
@@ -207,7 +209,7 @@ func (e *Executor) streamGrep(ctx context.Context, binary string, args []string,
 		// Killing for the cap produces a signal exit (or cancellation).
 		// A positive failure status was produced independently; keep it.
 		if exitErr, ok := waitErr.(*exec.ExitError); ok && exitErr.ExitCode() > 1 {
-			return true, fmt.Errorf("%s failed: %w", binary, waitErr)
+			return true, searchError(binary, waitErr, diagnostics)
 		}
 		return true, nil
 	}
@@ -215,7 +217,7 @@ func (e *Executor) streamGrep(ctx context.Context, binary string, args []string,
 		waitErr = nil
 	}
 	if waitErr != nil {
-		return false, fmt.Errorf("%s failed: %w", binary, waitErr)
+		return false, searchError(binary, waitErr, diagnostics)
 	}
 	return false, nil
 }

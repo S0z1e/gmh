@@ -283,7 +283,7 @@ func toolOffered(tools []llm.ToolDef, name string) bool {
 func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (tools.ToolResult, *tools.Job, error) {
 	var args tools.BashArgs
 	if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-		return tools.ToolResult{}, nil, fmt.Errorf("bad bash args: %w", err)
+		return tools.ToolResult{}, nil, &tools.InputError{Err: fmt.Errorf("bad bash args: %w", err)}
 	}
 	backgrounded := func(job *tools.Job) (tools.ToolResult, *tools.Job, error) {
 		c.emit(Event{Kind: EventToolBackgrounded, ToolName: "bash", ToolCallID: tc.ID, InvocationID: job.InvocationID, ToolArgs: tc.Function.Arguments, JobID: job.ID})
