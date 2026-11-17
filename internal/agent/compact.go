@@ -271,8 +271,9 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 		}
 		if c.resources == nil || c.resources.attempts == before {
 			// A total alone proves tokens, not an input/output price breakdown.
-			breakdownKnown := measured != nil && (usage.PromptTokens != 0 || usage.CompletionTokens != 0)
-			c.recordBudgetUsage(measured, started, measured != nil, breakdownKnown)
+			breakdownKnown := usage.PromptTokens != 0 || usage.CompletionTokens != 0
+			tokensKnown := breakdownKnown || usage.TotalTokens != 0
+			c.recordBudgetUsage(measured, started, tokensKnown, breakdownKnown)
 		}
 		if budgetErr := c.budgetError(); budgetErr != nil {
 			err = budgetErr

@@ -10,6 +10,18 @@ import (
 	"testing"
 )
 
+func TestTraceWireUsagePreservesInvalidAndOmittedTotals(t *testing.T) {
+	for _, total := range []int{-1, 20} {
+		o := &requestObservation{}
+		ctx := context.WithValue(context.Background(), traceKey{}, o)
+		traceWireUsage(ctx, Usage{TotalTokens: total}, fmt.Sprintf(`{"usage":{"total_tokens":%d}}`, total), false)
+		traceWireUsage(ctx, Usage{PromptTokens: 10}, `{"usage":{"prompt_tokens":10}}`, false)
+		if o.trace.Usage.TotalTokens != total || o.trace.TokensComplete || o.trace.PriceCountsComplete {
+			t.Fatalf("omitted total lost or completed: %+v", o.trace)
+		}
+	}
+}
+
 func TestRequestTraceComparesActualWireRequests(t *testing.T) {
 	status := http.StatusOK
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

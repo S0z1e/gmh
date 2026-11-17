@@ -159,7 +159,7 @@ func (r Rates) BudgetCost(u Usage, t time.Time) (*big.Rat, bool) {
 		return nil, false
 	}
 	in, out, cached := r.at(t)
-	if !u.CacheUsageReported && in != cached {
+	if u.PromptTokens > 0 && !u.CacheUsageReported && in != cached {
 		return nil, false
 	}
 	amount := new(big.Rat)

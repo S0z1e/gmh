@@ -21,6 +21,7 @@ type turnResources struct {
 	parent            context.Context
 	failure           error
 	recorded, emitted bool
+	settled           bool
 	text              string
 }
 
@@ -102,6 +103,11 @@ func (c *Config) recordBudgetUsage(usage *llm.Usage, started time.Time, tokensCo
 
 func (c *Config) budgetTerminal(e Event) Event {
 	err := c.budgetError()
+	if c.resources != nil {
+		// Settlement precedes persistence and the synchronous event callback.
+		// Time spent publishing this outcome cannot change the settled result.
+		c.resources.settled = true
+	}
 	if err == nil || c.persistErr != nil {
 		return e
 	}
@@ -153,11 +159,13 @@ func (c *Config) finishBudget(text *string, runErr *error) {
 		return
 	}
 	defer func() { c.resources = nil }()
-	if err := c.budgetError(); err != nil {
-		if !r.emitted {
+	if !r.settled {
+		if err := c.budgetError(); err != nil {
 			c.emit(Event{Kind: EventError, Err: err, Text: *text, TerminalReason: TerminalError})
 		}
-		*text, *runErr = r.text, err
+	}
+	if r.emitted {
+		*text, *runErr = r.text, r.failure
 	}
 	if r.tracker != nil {
 		s := r.tracker.State()

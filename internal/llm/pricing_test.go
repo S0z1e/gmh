@@ -129,3 +129,13 @@ func TestBudgetRatesRequireEveryComponentAndAcceptExplicitZero(t *testing.T) {
 		}
 	}
 }
+
+func TestBudgetCostZeroInputNeedsNoCacheCounter(t *testing.T) {
+	r := Rates{InputPerMTok: 1, OutputPerMTok: 1, CachedPerMTok: .5, Configured: true, Complete: true}
+	for _, output := range []int{0, 1} {
+		cost, known := r.BudgetCost(Usage{PromptTokens: 0, CompletionTokens: output, TotalTokens: output}, time.Unix(0, 0))
+		if !known || cost == nil || cost.RatString() != []string{"0", "1/1000000"}[output] {
+			t.Fatalf("zero input has known zero cached tokens: output=%d cost=%v known=%v", output, cost, known)
+		}
+	}
+}

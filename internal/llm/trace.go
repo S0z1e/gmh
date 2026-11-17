@@ -50,6 +50,8 @@ type traceKey struct{}
 type requestObservation struct {
 	trace   RequestTrace
 	started time.Time
+	// Keep a wire total separately from totals derived from partial counters.
+	wireTotal *int
 }
 
 // WithRequestObserver observes each Stream attempt, including failed attempts.

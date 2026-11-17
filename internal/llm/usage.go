@@ -169,7 +169,8 @@ func (u Usage) String() string {
 // traceWireUsage preserves missing/null scalar counters separately from zero.
 // A reported total can establish tokens even when the price breakdown is absent.
 func traceWireUsage(ctx context.Context, usage Usage, data string, responses bool) {
-	if observer, _ := ctx.Value(traceKey{}).(*requestObservation); observer == nil {
+	observer, _ := ctx.Value(traceKey{}).(*requestObservation)
+	if observer == nil {
 		return
 	}
 	var envelope struct {
@@ -197,6 +198,27 @@ func traceWireUsage(ctx context.Context, usage Usage, data string, responses boo
 		input, output = counts.Input, counts.Output
 	}
 	complete := input != nil && output != nil
+	// Usage objects are cumulative snapshots, not deltas. Missing counters do
+	// not erase earlier evidence, while explicit zeros replace previous values.
+	// Completeness still depends on the current final wire object below.
+	if previous := observer.trace.Usage; previous != nil {
+		if input == nil {
+			usage.PromptTokens = previous.PromptTokens
+		}
+		if output == nil {
+			usage.CompletionTokens = previous.CompletionTokens
+		}
+	}
+	if counts.Total != nil {
+		observer.wireTotal = counts.Total
+	}
+	usage.TotalTokens = 0
+	if observer.wireTotal != nil {
+		usage.TotalTokens = *observer.wireTotal
+	}
+	if sum := usage.PromptTokens + usage.CompletionTokens; usage.TotalTokens >= 0 && sum > usage.TotalTokens {
+		usage.TotalTokens = sum
+	}
 	final := !responses || envelope.Type == "response.completed" || envelope.Type == "response.incomplete"
 	traceUsage(ctx, usage, final && (counts.Total != nil || complete), final && complete)
 }

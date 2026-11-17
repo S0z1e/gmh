@@ -476,6 +476,88 @@ func TestBudgetResponsesNonterminalUsageRemainsPartial(t *testing.T) {
 	}
 }
 
+func TestBudgetPartialUsageRetainsEarlierCounters(t *testing.T) {
+	for _, api := range []string{"chat", "responses"} {
+		for _, final := range []string{`{}`, `{"output_tokens":3}`, `{"input_tokens":0,"output_tokens":0,"total_tokens":0}`} {
+			t.Run(api+"/"+final, func(t *testing.T) {
+				response := "data: {\"type\":\"response.created\",\"response\":{\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":" + final + "}}\n\n"
+				if api == "chat" {
+					final = strings.ReplaceAll(strings.ReplaceAll(final, "input_tokens", "prompt_tokens"), "output_tokens", "completion_tokens")
+					response = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}],\"usage\":{\"prompt_tokens\":10}}\n\ndata: {\"usage\":" + final + "}\n\ndata: [DONE]\n\n"
+				}
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					fmt.Fprint(w, response)
+				}))
+				defer srv.Close()
+				c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(100)})
+				c.Client = &llm.Client{BaseURL: srv.URL, API: api, Model: "fake", APIKey: "fake"}
+				_, _, err := c.Run(context.Background(), []llm.Message{{Role: "user", Content: "work"}})
+				want := int64(10)
+				if strings.Contains(final, ":3") {
+					want = 13
+				}
+				complete := strings.Contains(final, "total_tokens")
+				if complete {
+					want = 0 // A present zero supersedes earlier usage; an absent counter does not.
+				}
+				if c.LastTurnBudget.ReportedTokens != want || c.LastTurnBudget.TokensComplete != complete || (err == nil) != complete {
+					t.Fatalf("state=%+v err=%v want tokens=%d complete=%v", c.LastTurnBudget, err, want, complete)
+				}
+			})
+		}
+	}
+}
+
+func TestBudgetCustomCompactionAncillaryFieldsDoNotProveZeroTokens(t *testing.T) {
+	c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(100)})
+	c.CompactHistory = func(context.Context, []llm.Message) (string, llm.Usage, error) {
+		return "summary", llm.Usage{CacheUsageReported: true, ReasoningTokens: 2}, nil
+	}
+	ctx, cancel, err := c.startBudget(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	_, _, err = c.compactMessages(ctx, []llm.Message{{Role: "user", Content: "work"}}, true)
+	if err == nil || c.resources.tracker.State().TokensComplete {
+		t.Fatalf("ancillary-only report became complete zero: %+v err=%v", c.resources.tracker.State(), err)
+	}
+}
+
+func TestBudgetTerminalSettlementPrecedesEventCallback(t *testing.T) {
+	for _, tokens := range []*int{newInt(1), nil} {
+		t.Run(fmt.Sprint(tokens != nil), func(t *testing.T) {
+			c := budgetConfig(t, &turnbudget.Policy{MaxDurationSeconds: capInt(1), MaxTokens: capInt(100)})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, budgetSSE("done", nil, tokens, true))
+			}))
+			defer srv.Close()
+			c.Client = &llm.Client{BaseURL: srv.URL, API: "chat", Model: "fake", APIKey: "fake"}
+			var terminal []Event
+			c.OnEvent = func(e Event) {
+				if e.Kind == EventDone || e.Kind == EventError {
+					terminal = append(terminal, e)
+					deadline, _ := c.resources.tracker.Deadline()
+					time.Sleep(time.Until(deadline) + 10*time.Millisecond)
+				}
+			}
+			text, _, err := c.Run(context.Background(), []llm.Message{{Role: "user", Content: "work"}})
+			if len(terminal) != 1 {
+				t.Fatalf("conflicting terminal events: %+v", terminal)
+			}
+			if tokens != nil {
+				if err != nil || text != "done" || c.LastTerminalReason != TerminalEndTurn {
+					t.Fatalf("published success changed: text=%q reason=%s err=%v", text, c.LastTerminalReason, err)
+				}
+			} else if err == nil || c.LastTerminalReason != TerminalBudgetUnavailable || terminal[0].Err.Error() != err.Error() {
+				t.Fatalf("published budget failure changed: event=%+v err=%v", terminal[0], err)
+			}
+		})
+	}
+}
+
 func TestBudgetCustomCompactionTotalOnlyIsNotFreePricing(t *testing.T) {
 	c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(1)})
 	c.UsageRates = llm.Rates{InputPerMTok: 1, OutputPerMTok: 1, CachedPerMTok: 1, Configured: true, Complete: true}
