@@ -29,6 +29,7 @@ import (
 	"minimalharness/internal/llm"
 	"minimalharness/internal/skills"
 	"minimalharness/internal/toolargs"
+	"minimalharness/internal/workdir"
 )
 
 const (
@@ -580,14 +581,7 @@ type BashArgs struct {
 // shell itself is not jailed outside the sandbox — an approved
 // bash call can cd anywhere — so cwd is validated, not jailed.
 func (e *Executor) bashDir(a BashArgs) (string, error) {
-	dir := e.Root
-	if strings.TrimSpace(a.Cwd) != "" {
-		dir = a.Cwd
-		if !filepath.IsAbs(dir) {
-			dir = filepath.Join(e.Root, dir)
-		}
-		dir = filepath.Clean(dir)
-	}
+	dir := workdir.Resolve(e.Root, a.Cwd)
 	info, err := os.Stat(dir)
 	if err != nil {
 		return "", fmt.Errorf("invalid cwd %q: %v", a.Cwd, err)

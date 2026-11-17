@@ -5,6 +5,7 @@ package verification
 
 import (
 	"fmt"
+	"minimalharness/internal/workdir"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,26 +37,11 @@ func (c Check) Directory(root string) (string, error) {
 	if strings.TrimSpace(c.Name) == "" || strings.TrimSpace(c.Command) == "" {
 		return "", fmt.Errorf("verification requires name and command")
 	}
-	root, err := filepath.Abs(root)
+	dir, err := workdir.Canonical(root, c.Cwd)
 	if err != nil {
 		return "", err
 	}
-	root, err = filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", err
-	}
-	dir := c.Cwd
-	if strings.TrimSpace(dir) == "" {
-		dir = "."
-	}
-	if !filepath.IsAbs(dir) {
-		dir = filepath.Join(root, dir)
-	}
-	dir, err = filepath.EvalSymlinks(dir)
-	if err != nil {
-		return "", err
-	}
-	dir, err = filepath.Abs(dir)
+	root, err = workdir.Canonical(root, "")
 	if err != nil {
 		return "", err
 	}

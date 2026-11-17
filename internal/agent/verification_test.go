@@ -452,3 +452,33 @@ func TestRequiredVerificationJobFinishingAfterSnapshotCannotCertifyStaleFiles(t 
 		t.Fatalf("stale completion=%s missing=%s", outcome, missing)
 	}
 }
+
+func TestRequiredVerificationUsesBashLexicalCwdNormalization(t *testing.T) {
+	for _, explicitPolicy := range []bool{false, true} {
+		t.Run(fmt.Sprint(explicitPolicy), func(t *testing.T) {
+			command := "test -f root-only"
+			cfg := verificationConfig(t, command)
+			if err := os.MkdirAll(filepath.Join(cfg.Exec.Root, "sub", "deep"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("sub/deep", filepath.Join(cfg.Exec.Root, "link")); err != nil {
+				t.Skip(err)
+			}
+			cfg.Verification.Exclude = []string{"link"}
+			// Preserve the absolute link/.. spelling: filepath.Join would clean it.
+			actual := cfg.Exec.Root + string(filepath.Separator) + "link" + string(filepath.Separator) + ".."
+			cfg.Verification.Required[0].Cwd = "sub"
+			if explicitPolicy {
+				cfg.Verification.Required[0].Cwd = actual
+			}
+			_, _, err := runVerification(t, cfg, verificationWrite("root-only", "present only at root"), verificationTool("bash", map[string]any{"command": command, "cwd": actual}))
+			if explicitPolicy {
+				if err != nil || cfg.LastTaskOutcome != OutcomeCompleted {
+					t.Fatalf("actual root check outcome=%s err=%v", cfg.LastTaskOutcome, err)
+				}
+			} else {
+				requireVerificationFailure(t, cfg, err)
+			}
+		})
+	}
+}
