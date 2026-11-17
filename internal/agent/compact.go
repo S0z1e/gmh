@@ -273,8 +273,8 @@ func (c *Config) promptView(msgs []llm.Message) []llm.Message {
 
 func (c *Config) contextBudget() int {
 	budget := int(float64(c.ContextLimit) * CompactThreshold)
-	if c.Client != nil && c.Client.MaxTokens > 0 {
-		budget = min(budget, c.ContextLimit-c.Client.MaxTokens)
+	if c.Client != nil {
+		budget = min(budget, c.ContextLimit-c.Client.OutputTokenLimit())
 	}
 	return budget
 }
@@ -497,7 +497,11 @@ func (c *Config) commitCheckpointNamed(msgs []llm.Message, usage llm.Usage, arch
 			replacement = append(replacement, m)
 		}
 	}
-	if c.ContextLimit > 0 && estimatePromptTokens(c.promptView(msgs), c.Tools) >= c.contextBudget() {
+	request := msgs
+	if len(system) == 0 {
+		request = append([]llm.Message{{Role: "system", Content: c.System + verificationInstructions(c.Verification)}}, msgs...)
+	}
+	if c.ContextLimit > 0 && estimatePromptTokens(c.promptView(request), c.Tools) >= c.contextBudget() {
 		return nil, usage, fmt.Errorf("preserved checkpoint exceeds context input budget; reduce the task or select a larger context window")
 	}
 	if c.Session != nil && !session.CheckpointFits(replacement) {

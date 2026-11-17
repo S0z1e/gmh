@@ -12,5 +12,8 @@ type ToolObservation struct {
 	Cwd         string              `json:"cwd,omitempty"`
 	OutputFile  string              `json:"output_file,omitempty"`
 	Failure     *checkpoint.Excerpt `json:"failure,omitempty"`
-	Jobs        []checkpoint.Job    `json:"jobs,omitempty"`
+	// Answer is present only for an actual human reply, before display hooks.
+	// A missing value is not evidence that a human accepted anything.
+	Answer *string          `json:"answer,omitempty"`
+	Jobs   []checkpoint.Job `json:"jobs,omitempty"`
 }

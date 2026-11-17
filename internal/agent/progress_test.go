@@ -208,7 +208,7 @@ func TestFailureProgressRuntimeInputErrorsCannotBeRepairedByEdit(t *testing.T) {
 			for i := 0; i < 3; i++ {
 				var err error
 				if call.Function.Name == "ask_user" {
-					_, err = c.askUser(ctx, call.Function.Arguments)
+					_, _, err = c.askUser(ctx, call.Function.Arguments)
 				} else if call.Function.Name == "bash" {
 					_, _, err = c.execBash(ctx, call)
 				} else {

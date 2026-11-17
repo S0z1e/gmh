@@ -322,8 +322,8 @@ func TestPruneCheckpointRetainsUserAnswer(t *testing.T) {
 		t.Fatalf("answer not preserved as a source: %v", err)
 	}
 	for _, source := range state.Decisions {
-		if source.Content == history[2].Content && !strings.HasPrefix(source.Source, "user_answer/") {
-			t.Fatal("answer speaker was lost")
+		if source.Content == history[2].Content && !strings.HasPrefix(source.Source, "unattributed_tool/") {
+			t.Fatal("legacy display text was attributed to a human without evidence")
 		}
 	}
 }
@@ -356,5 +356,92 @@ func TestStructuredCheckpointLegacyJobsKeepDistinctFailures(t *testing.T) {
 	state, _, _, err := (&Config{Exec: exec}).compactState(history)
 	if err != nil || len(state.Failures) != 2 || len(state.Jobs) != 2 {
 		t.Fatalf("legacy job identity collision: %+v %v", state, err)
+	}
+}
+
+func TestCheckpointOriginalUserAnswerSurvivesDisplayRewrite(t *testing.T) {
+	args := `{"questions":[{"question":"API?","options":["keep","change"]}]}`
+	call := llm.ToolCall{ID: "answer", Type: "function", Function: llm.FunctionCall{Name: "ask_user", Arguments: args}}
+	obs := executionObservation("ask_user", args, CanonicalToolKey("ask_user", args), "Keep the public API.", "", nil, nil)
+	answer := "Keep the public API."
+	obs.Answer = &answer
+	history := []llm.Message{{Role: "assistant", ToolCalls: []llm.ToolCall{call}}, {Role: "tool", ToolCallID: "answer", Content: "Display hook says change the API.", Observation: obs}}
+	state, _, _, err := (&Config{}).compactState(history)
+	if err != nil || !sourceHas(state.Decisions, "Keep the public API.") || sourceHas(state.Decisions, "Display hook says change the API.") {
+		t.Fatalf("human answer replaced by presentation: %+v %v", state.Decisions, err)
+	}
+}
+
+func TestCheckpointPreflightReservesAnthropicDefaultOutput(t *testing.T) {
+	cfg := &Config{ContextLimit: 20000, Client: &llm.Client{API: "anthropic"}, CompactHistory: func(context.Context, []llm.Message) (string, llm.Usage, error) { return "summary", llm.Usage{}, nil }}
+	history := []llm.Message{{Role: "system", Content: strings.Repeat("x", 20000)}, {Role: "user", Kind: "task", Content: "work"}}
+	if _, _, err := cfg.Compact(context.Background(), history); err == nil {
+		t.Fatal("committed checkpoint that exceeds actual input reservation")
+	}
+}
+func TestCheckpointManualPreflightIncludesConfiguredSystem(t *testing.T) {
+	cfg := &Config{ContextLimit: 1000, System: strings.Repeat("x", 4000), CompactHistory: func(context.Context, []llm.Message) (string, llm.Usage, error) { return "summary", llm.Usage{}, nil }}
+	history := []llm.Message{{Role: "user", Kind: "task", Content: "work"}}
+	if _, _, err := cfg.Compact(context.Background(), history); err == nil {
+		t.Fatal("manual compaction ignored system in next request")
+	}
+}
+
+func TestCheckpointDoesNotAttributeQuestionFallbackToHuman(t *testing.T) {
+	args := `{"questions":[{"question":"Which?","options":[{"label":"A"},{"label":"B"}]}]}`
+	for _, name := range []string{"headless", "cancelled", "empty"} {
+		t.Run(name, func(t *testing.T) {
+			cfg := &Config{}
+			if name != "headless" {
+				cfg.AskQuestion = func(QuestionRequest) (QuestionAnswers, error) {
+					if name == "cancelled" {
+						return QuestionAnswers{}, context.Canceled
+					}
+					return QuestionAnswers{}, nil
+				}
+			}
+			text, answer, err := cfg.askUser(context.Background(), args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			call := llm.ToolCall{ID: "ask", Function: llm.FunctionCall{Name: "ask_user", Arguments: args}}
+			observation := executionObservation("ask_user", args, CanonicalToolKey("ask_user", args), text, "", nil, nil)
+			observation.Answer = answer
+			state, _, _, err := cfg.compactState([]llm.Message{{Role: "assistant", ToolCalls: []llm.ToolCall{call}}, {Role: "tool", ToolCallID: "ask", Content: text, Observation: observation}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, record := range state.Decisions {
+				if strings.HasPrefix(record.Source, "user_answer/") {
+					t.Fatalf("generated fallback attributed to human: %+v", record)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckpointHumanReplyKeepsOriginalWhitespaceAndProvenance(t *testing.T) {
+	args := `{"questions":[{"question":"Which?","options":[{"label":"A"},{"label":"B"}]}]}`
+	original := "\n    preserve this indentation\n"
+	cfg := &Config{AskQuestion: func(QuestionRequest) (QuestionAnswers, error) {
+		return QuestionAnswers{Answers: []QuestionAnswer{{Question: 0, Custom: original}}}, nil
+	}}
+	text, answer, err := cfg.askUser(context.Background(), args)
+	if err != nil || answer == nil {
+		t.Fatalf("missing actual answer: %v", err)
+	}
+	var decoded struct {
+		Answers []QuestionAnswer `json:"answers"`
+	}
+	if err := json.Unmarshal([]byte(*answer), &decoded); err != nil || len(decoded.Answers) != 1 || decoded.Answers[0].Custom != original {
+		t.Fatalf("original reply changed: %s, %v", *answer, err)
+	}
+	obs := executionObservation("ask_user", args, CanonicalToolKey("ask_user", args), text, "", nil, nil)
+	obs.Answer = answer
+	for _, display := range []string{"", "plugin display"} {
+		state, _, _, err := cfg.compactState([]llm.Message{{Role: "tool", Content: display, Observation: obs}})
+		if err != nil || len(state.Decisions) != 1 || state.Decisions[0].Content != *answer || !strings.HasPrefix(state.Decisions[0].Source, "user_answer/") {
+			t.Fatalf("actual reply lost behind display: %+v %v", state.Decisions, err)
+		}
 	}
 }

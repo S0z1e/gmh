@@ -134,7 +134,10 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 		}
 		speaker := m.Role + "/" + m.Kind
 		if m.Role == "tool" && (calls[m.ToolCallID].name == "ask_user" || m.Observation != nil && m.Observation.Tool == "ask_user") {
-			speaker = "user_answer/ask_user"
+			speaker = "unattributed_tool/ask_user"
+			if m.Observation != nil && m.Observation.Answer != nil {
+				speaker = "user_answer/ask_user"
+			}
 		}
 		source := fmt.Sprintf("%s:%s:%d:%s", speaker, epoch, i, factDigest(string(raw)))
 		var d checkpoint.Delta
@@ -234,8 +237,14 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 				if info.fingerprint != "" && !backgroundLaunch {
 					d.ResolvedFailures = append(d.ResolvedFailures, info.fingerprint)
 				}
-				if info.name == "ask_user" && strings.TrimSpace(m.Content) != "" {
-					d.Decisions = append(d.Decisions, checkpoint.Text{Source: source, Content: m.Content})
+				if info.name == "ask_user" {
+					answer := m.Content
+					if m.Observation != nil && m.Observation.Answer != nil {
+						answer = *m.Observation.Answer
+					}
+					if strings.TrimSpace(answer) != "" {
+						d.Decisions = append(d.Decisions, checkpoint.Text{Source: source, Content: answer})
+					}
 				}
 			}
 		}

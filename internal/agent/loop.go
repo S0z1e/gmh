@@ -226,20 +226,34 @@ func (c *Config) checkRepeatedCall(ctx context.Context, toolName, argsJSON strin
 // ask them through the AskQuestion seam, and render the answers
 // as the observation. Invalid arguments and a cancelled question
 // are observations, not turn errors, so the model can recover.
-func (c *Config) askUser(ctx context.Context, argsJSON string) (string, error) {
+func (c *Config) askUser(ctx context.Context, argsJSON string) (string, *string, error) {
 	req, err := ParseAskUserArgs(argsJSON)
 	if err != nil {
-		return "", &tools.InputError{Err: err}
+		return "", nil, &tools.InputError{Err: err}
 	}
 	if c.AskQuestion == nil || ctx.Err() != nil {
-		return "No one is available to answer questions right now. Proceed with your best judgement and state the assumptions you made.", nil
+		return "No one is available to answer questions right now. Proceed with your best judgement and state the assumptions you made.", nil, nil
 	}
 	req.Context = ctx
 	ans, err := c.AskQuestion(req)
 	if err != nil {
-		return "The questions were cancelled. Proceed with your best judgement and state the assumptions you made.", nil
+		return "The questions were cancelled. Proceed with your best judgement and state the assumptions you made.", nil, nil
 	}
-	return FormatAnswers(req, ans), nil
+	for _, a := range ans.Answers {
+		if a.Question >= 0 && a.Question < len(req.Questions) && (len(a.Selected) > 0 || strings.TrimSpace(a.Custom) != "") {
+			text := FormatAnswers(req, ans)
+			data, err := json.Marshal(struct {
+				Questions []Question       `json:"questions"`
+				Answers   []QuestionAnswer `json:"answers"`
+			}{req.Questions, ans.Answers})
+			if err != nil {
+				return "", nil, err
+			}
+			source := string(data)
+			return text, &source, nil
+		}
+	}
+	return "No answers were provided. Proceed with your best judgement and state the assumptions you made.", nil, nil
 }
 
 func (c *Config) needsApproval(name, argsJSON string) bool {
@@ -1277,9 +1291,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			var err error
 			var res tools.ToolResult
 			var job *tools.Job
+			var humanAnswer *string
 			switch tc.Function.Name {
 			case "ask_user":
-				res.Text, err = c.askUser(ctx, argsJSON)
+				res.Text, humanAnswer, err = c.askUser(ctx, argsJSON)
 			case "bash":
 				if attempt != nil && attempt.foreground {
 					res, err = c.Exec.Dispatch(toolCtx, "bash", argsJSON)
@@ -1322,6 +1337,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 
 			observation := executionObservation(tc.Function.Name, argsJSON, callKey, res.Text, res.OutputFile, err, job)
+			observation.Answer = humanAnswer
 			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolTruncated: res.Truncated, ToolCountLowerBound: res.CountLowerBound, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
 			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil, Observation: observation})
 			if c.Session != nil {
