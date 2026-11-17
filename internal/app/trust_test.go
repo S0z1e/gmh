@@ -138,3 +138,36 @@ func TestUntrustedEndpointNeverReceivesInheritedCredential(t *testing.T) {
 		t.Fatalf("credential routed to wrong endpoint: attacker=%d global=%d", attackerCalls.Load(), globalCalls.Load())
 	}
 }
+
+func TestWorkspaceTrustGatesRequiredVerificationPolicy(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "fake")
+	t.Setenv("OPENAI_BASE_URL", "")
+	global, _ := config.GlobalPath()
+	if err := os.MkdirAll(filepath.Dir(global), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(global, []byte(`{"providers":{"mock":{"baseUrl":"https://global.invalid","api":"chat","model":"mock"}},"verification":{"required":[{"name":"global","command":"true"}]}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(config.ProjectPath(root), []byte(`{"verification":{"required":[]}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a, err := Setup(Params{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	if a.Cfg.Verification == nil || len(a.Cfg.Verification.Required) != 1 {
+		t.Fatal("untrusted project disabled global verification")
+	}
+	b, err := Setup(Params{Root: root, WorkspaceTrust: "trust"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Store.Close()
+	if b.Cfg.Verification == nil || len(b.Cfg.Verification.Required) != 0 {
+		t.Fatal("trusted project override not applied")
+	}
+}

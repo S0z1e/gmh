@@ -60,6 +60,7 @@ import (
 	"regexp"
 	"strings"
 
+	"minimalharness/internal/verification"
 	"minimalharness/internal/workspace"
 )
 
@@ -193,15 +194,16 @@ type File struct {
 	API     string `json:"api"`
 	Model   string `json:"model"`
 
-	Mode                string   `json:"mode"`
-	BashTimeoutSeconds  *int     `json:"bashTimeoutSeconds"`
-	BashEnv             []string `json:"bashEnv"`
-	BgThresholdSeconds  *int     `json:"bgThresholdSeconds"`
-	DenyInsteadOfPrompt *bool    `json:"denyInsteadOfPrompt"`
-	Sandbox             *bool    `json:"sandbox"`
-	ContextLimit        *int     `json:"contextLimit"`
-	AnthropicMaxTokens  *int     `json:"anthropicMaxTokens"`
-	TUITheme            string   `json:"tuiTheme"`
+	Mode                string               `json:"mode"`
+	BashTimeoutSeconds  *int                 `json:"bashTimeoutSeconds"`
+	BashEnv             []string             `json:"bashEnv"`
+	Verification        *verification.Policy `json:"verification"`
+	BgThresholdSeconds  *int                 `json:"bgThresholdSeconds"`
+	DenyInsteadOfPrompt *bool                `json:"denyInsteadOfPrompt"`
+	Sandbox             *bool                `json:"sandbox"`
+	ContextLimit        *int                 `json:"contextLimit"`
+	AnthropicMaxTokens  *int                 `json:"anthropicMaxTokens"`
+	TUITheme            string               `json:"tuiTheme"`
 	// Plugins is the optional plugins section (nil = unset: nothing
 	// is disabled). A project file's section replaces the global
 	// one, like a provider's models list.
@@ -339,6 +341,12 @@ func Merge(dst, src *File) {
 	}
 	if src.BashEnv != nil {
 		dst.BashEnv = append([]string{}, src.BashEnv...)
+	}
+	if src.Verification != nil {
+		policy := *src.Verification
+		policy.Required = append([]verification.Check(nil), policy.Required...)
+		policy.Exclude = append([]string(nil), policy.Exclude...)
+		dst.Verification = &policy
 	}
 	if src.BgThresholdSeconds != nil {
 		dst.BgThresholdSeconds = src.BgThresholdSeconds
@@ -607,6 +615,9 @@ func Validate(f *File) error {
 	}
 	if f.BashTimeoutSeconds != nil && *f.BashTimeoutSeconds <= 0 {
 		return fmt.Errorf("bashTimeoutSeconds must be > 0")
+	}
+	if err := f.Verification.Validate(); err != nil {
+		return err
 	}
 	for _, name := range f.BashEnv {
 		if !validEnvName(name) {

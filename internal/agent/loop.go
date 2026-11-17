@@ -20,6 +20,7 @@ import (
 	"minimalharness/internal/session"
 	"minimalharness/internal/toolargs"
 	"minimalharness/internal/tools"
+	"minimalharness/internal/verification"
 )
 
 type Config struct {
@@ -33,6 +34,8 @@ type Config struct {
 	OnCompact      func(history []llm.Message, usage llm.Usage, archive string)
 	MaxSteps       int
 	Session        *session.Store
+	Verification   *verification.Policy
+	verifier       *verificationRun
 	// OnEvent receives every loop event; the caller renders them.
 	// (There is no OnText: streamed text arrives as TextDelta events.)
 	OnEvent func(Event)
@@ -663,6 +666,15 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	c.persistErr = nil
 	c.LastTerminalReason = ""
 	c.LastTaskOutcome = ""
+	c.verifier = nil
+	if c.Verification != nil && len(c.Verification.Required) > 0 {
+		if err := c.Verification.Validate(); err != nil {
+			c.LastTerminalReason = TerminalError
+			c.emit(Event{Kind: EventError, Err: err, TerminalReason: TerminalError})
+			return "", llm.Usage{}, err
+		}
+		c.verifier = &verificationRun{policy: c.Verification, latest: map[string]verification.Evidence{}}
+	}
 	defer func() {
 		if c.persistErr != nil {
 			runErr = c.persistErr
@@ -677,7 +689,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	// of the context window plus the doom-loop / blocked guards. A
 	// positive MaxSteps opts into a hard cap with the grace summary.
 	hasCap := steps > 0
-	msgs := append([]llm.Message{{Role: "system", Content: c.System}}, history...)
+	msgs := append([]llm.Message{{Role: "system", Content: c.System + verificationInstructions(c.Verification)}}, history...)
 	var total llm.Usage
 	var lastText string
 	// pending background bash jobs, in call order. Their results are
@@ -832,6 +844,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				// up to MaxStopBlocks feedback rounds. A further veto stops
 				// with an incomplete outcome, never a successful end_turn.
 				if ctx.Err() == nil && c.Exec != nil && c.Exec.Plugins != nil {
+					c.verificationTouch(ctx)
 					sessionID := ""
 					if c.Session != nil {
 						sessionID = c.Session.ID
@@ -854,8 +867,24 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 						continue
 					}
 				}
+				outcome, missing := c.verificationGate(ctx)
+				if missing != "" {
+					if c.verifier.feedback >= maxVerificationFeedback {
+						err := fmt.Errorf("required verification failed: %s", missing)
+						c.persist(llm.Message{Role: "user", Kind: "task_outcome", Content: "[harness task outcome]\nVerification failed: " + missing})
+						c.LastTerminalReason = TerminalVerificationFailed
+						c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalVerificationFailed, TaskOutcome: OutcomeVerificationFailed})
+						return lastText, total, err
+					}
+					c.verifier.feedback++
+					msg := llm.Message{Role: "user", Kind: "verification", Content: "[harness required verification]\n" + missing}
+					msgs = append(msgs, msg)
+					c.persist(msg)
+					c.emit(Event{Kind: EventStopBlocked, Text: missing})
+					continue
+				}
 				c.LastTerminalReason = TerminalEndTurn
-				c.emit(Event{Kind: EventDone, Text: lastText, Usage: total, TerminalReason: TerminalEndTurn})
+				c.emit(Event{Kind: EventDone, Text: lastText, Usage: total, TerminalReason: TerminalEndTurn, TaskOutcome: outcome})
 				return lastText, total, nil
 			}
 			// The model stopped calling tools but background jobs are
@@ -940,6 +969,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				recordLastError(&lastErrors, err.Error())
 				continue
 			}
+			c.verificationTouch(ctx)
 			if c.Exec != nil && c.Exec.Plugins != nil {
 				newArgs, deny := c.Exec.Plugins.RunToolCallHooks(ctx, tc.Function.Name, argsJSON)
 				if deny != "" {
@@ -1108,6 +1138,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if mutation != nil {
 				toolCtx = tools.WithMutation(toolCtx, mutation)
 			}
+			attempt := c.verificationStart(toolCtx, tc.Function.Name, argsJSON)
+			if attempt != nil {
+				attempt.invocationID, attempt.toolCallID = inv.ID, tc.ID
+			}
 			var obs string
 			var err error
 			var res tools.ToolResult
@@ -1116,7 +1150,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			case "ask_user":
 				res.Text, err = c.askUser(ctx, argsJSON)
 			case "bash":
-				res, job, err = c.execBash(toolCtx, *tc)
+				if attempt != nil && attempt.foreground {
+					res, err = c.Exec.Dispatch(toolCtx, "bash", argsJSON)
+				} else {
+					res, job, err = c.execBash(toolCtx, *tc)
+				}
 				if job != nil {
 					pending = append(pending, pendingJob{callID: tc.ID, job: job})
 				}
@@ -1162,6 +1200,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil})
 			if c.Session != nil {
 				c.persist(msgs[len(msgs)-1])
+			}
+			for _, evidence := range c.verificationFinish(ctx, attempt, res, err) {
+				msgs = append(msgs, evidence)
+				c.persist(evidence)
 			}
 			// A read image comes back with its bytes: attach them as
 			// a user message right after the tool result, so the next
@@ -1352,6 +1394,7 @@ func (c *Config) ResetSessionState() {
 	c.lastPromptEstimate = 0
 	c.LastTerminalReason = ""
 	c.LastTaskOutcome = ""
+	c.verifier = nil
 }
 
 // persist latches a storage failure. The loop stops before its next action;

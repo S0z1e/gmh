@@ -398,6 +398,7 @@ func Setup(p Params) (*App, error) {
 		Mode:                mode,
 		MaxSteps:            p.MaxSteps,
 		Session:             store,
+		Verification:        cfg.Verification,
 		DenyInsteadOfPrompt: deny,
 	}
 

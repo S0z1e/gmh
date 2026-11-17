@@ -18,14 +18,16 @@ type Check struct {
 }
 
 type Evidence struct {
-	Check    string    `json:"check"`
-	Command  string    `json:"command"`
-	Cwd      string    `json:"cwd"`
-	Version  string    `json:"version"`
-	ExitCode *int      `json:"exit_code"`
-	Started  time.Time `json:"started"`
-	Finished time.Time `json:"finished"`
-	Error    string    `json:"error,omitempty"`
+	InvocationID string    `json:"invocation_id,omitempty"`
+	ToolCallID   string    `json:"tool_call_id,omitempty"`
+	Check        string    `json:"check"`
+	Command      string    `json:"command"`
+	Cwd          string    `json:"cwd"`
+	Version      string    `json:"version"`
+	ExitCode     *int      `json:"exit_code"`
+	Started      time.Time `json:"started"`
+	Finished     time.Time `json:"finished"`
+	Error        string    `json:"error,omitempty"`
 }
 
 // Directory is the canonical, in-workspace cwd whose files the version covers.
@@ -43,7 +45,7 @@ func (c Check) Directory(root string) (string, error) {
 		return "", err
 	}
 	dir := c.Cwd
-	if dir == "" {
+	if strings.TrimSpace(dir) == "" {
 		dir = "."
 	}
 	if !filepath.IsAbs(dir) {

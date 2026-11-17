@@ -15,6 +15,8 @@ const (
 
 func TaskOutcomeForReason(reason TerminalReason) TaskOutcome {
 	switch reason {
+	case TerminalVerificationFailed:
+		return OutcomeVerificationFailed
 	case TerminalAbort:
 		return OutcomeAborted
 	case TerminalBlocked, TerminalRepeatedToolCallDenied:

@@ -34,6 +34,31 @@
   is complete. A stop hook that keeps vetoing after three feedback rounds stops
   with an explicit incomplete error, preserved for resume. `-p` returns a
   nonzero exit status when the turn fails, including a cap or blocked task.
+- Required verification is opt-in in global, explicit or trusted project config:
+
+  ```json
+  {"verification":{"required":[{"name":"tests","command":"go test ./...","cwd":"."}],"exclude":["build","node_modules"]}}
+  ```
+
+  The model runs these exact commands with the normal Bash tool after its final
+  edits, in the foreground and subject to approval, denylist, timeout, sandbox
+  and environment rules. These commands are never launched automatically.
+  Each result records its invocation, canonical cwd, exit code, start/end times
+  and workspace content version in the transcript. A later failed attempt replaces
+  an earlier pass; edits after a pass invalidate it. Checks that modify included
+  files must run again against the final version. All required checks passing at
+  the current version permits `outcome: completed`; missing, failed or stale
+  evidence gets up to three feedback rounds, then `verification_failed` and a
+  nonzero `-p` exit. Unchanged questions make no completion claim.
+  Versions cover workspace files, directories and permissions, excluding `.git`
+  and explicitly listed relative output paths. Exclude only generated inputs
+  that do not need certification. Limits are 50,000 entries, 16 MiB per file and
+  128 MiB total content; unsupported files (including symlinks), concurrent
+  capture changes or missing directory identity fail closed. External files,
+  services, environment changes and the semantic quality of tests are outside
+  this proof. An omitted policy inherits global settings; `{"verification":{"required":[]}}`
+  disables them when supplied by an authorized config. Untrusted project config
+  cannot replace global verification requirements.
 - Modes: `-mode suggest` (default, ask before write/edit/bash, webfetch and plugin tools),
   `-mode auto` (no prompts, use only on a disposable copy).
 - Editing: `edit` takes either `oldText` (must match exactly once —
