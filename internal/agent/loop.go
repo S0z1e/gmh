@@ -755,6 +755,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	// fed back as user messages when the turn would otherwise end
 	// (see drainPending).
 	var pending []pendingJob
+	c.progress = &turnProgress{ctx: ctx, jobs: make(map[string]bool)}
+	defer func() { c.progress = nil }()
 	// Re-attach jobs from earlier turns whose results were never
 	// delivered: a job that finished after its turn ended — or
 	// after a bounded drain gave up on it — still owes the model
@@ -767,12 +769,15 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		for _, job := range c.Exec.Jobs() {
 			if !job.Delivered() {
 				pending = append(pending, pendingJob{callID: "", job: job})
+			} else {
+				// Already delivered before this turn: its outcome belongs to
+				// earlier history. A job stopped during this turn must still
+				// be accounted even if killJob delivered its output directly.
+				c.progress.jobs[job.ID] = true
 			}
 		}
 	}
 	stopBlocks := 0
-	c.progress = &turnProgress{ctx: ctx, jobs: make(map[string]bool)}
-	defer func() { c.progress = nil }()
 	finishBlocked := func() (string, llm.Usage, error) {
 		blocked := fmt.Errorf("task blocked: %d tool attempts failed without proven state or result progress", MaxFailedFixAttempts)
 		if ctx.Err() == nil {

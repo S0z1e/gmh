@@ -190,6 +190,7 @@ func TestFailureProgressToolFreeDrainRechecksBlocked(t *testing.T) {
 
 func TestFailureProgressRuntimeInputErrorsCannotBeRepairedByEdit(t *testing.T) {
 	calls := []llm.ToolCall{
+		budgetCall("edit-range", "edit", `{"path":"missing","startLine":3,"endLine":1,"newText":"fixed"}`),
 		budgetCall("glob", "glob", `{"pattern":""}`),
 		budgetCall("grep", "grep", `{"pattern":""}`),
 		budgetCall("bash", "bash", `{"command":"true","timeout":1.0}`),
@@ -311,5 +312,95 @@ func TestFailureProgressBookkeepingAliasesPreserveProductChanges(t *testing.T) {
 	c.Exec.OutputDir = root
 	if after := c.progressRevision(); after != "" {
 		t.Fatal("overlapping product/output root fabricated a usable version")
+	}
+}
+
+func TestFailureProgressStoppedJobOutputCannotProveRepair(t *testing.T) {
+	c := budgetConfig(t, nil)
+	c.progress = &turnProgress{ctx: context.Background(), jobs: make(map[string]bool)}
+	c.progressFailure("first", failureguard.Environment)
+	c.progressFailure("second", failureguard.Environment)
+	call := budgetCall("job", "bash", `{"command":"printf failed > job-output; while :; do sleep 1; done","background":true}`)
+	ctx := tools.WithFailureKey(context.Background(), CanonicalToolKey("bash", call.Function.Arguments))
+	_, job, err := c.execBash(ctx, call)
+	if err != nil || job == nil {
+		t.Fatalf("launch: %v", err)
+	}
+	defer c.Exec.CancelJobs()
+	deadline := time.After(3 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(c.Exec.Root, "job-output")); err == nil {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("job did not write fixture")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	stop := budgetCall("stop", "bash", fmt.Sprintf(`{"killJobId":%q}`, job.ID))
+	if _, _, err := c.execBash(context.Background(), stop); err != nil {
+		t.Fatal(err)
+	}
+	c.progressSuccess(CanonicalToolKey("bash", stop.Function.Arguments), "bash")
+	if c.progress.failures != 3 {
+		t.Fatalf("stopped-job output invented progress: failures=%d", c.progress.failures)
+	}
+	c.progressReadyJobs()
+	if c.progress.failures != 3 {
+		t.Fatal("stopped job counted more than once")
+	}
+}
+
+func TestFailureProgressPriorDeliveredJobsStayInPriorTurn(t *testing.T) {
+	c := budgetConfig(t, nil)
+	for i := 0; i < 3; i++ {
+		job, err := c.Exec.BashBackground(context.Background(), tools.BashArgs{Command: "exit 1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-job.Done():
+		case <-time.After(3 * time.Second):
+			t.Fatal("fixture did not exit")
+		}
+		job.MarkDelivered()
+	}
+	if err := os.WriteFile(filepath.Join(c.Exec.Root, "source"), []byte("same"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := runVerification(t, c, verificationTool("read", map[string]any{"path": "source"}), textSSE("done"))
+	if err != nil || c.LastTerminalReason != TerminalEndTurn {
+		t.Fatalf("prior delivered jobs entered fresh guard: %v", err)
+	}
+}
+func TestFailureProgressWorkspaceWithinBookkeepingHasUnknownProof(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	output := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.MkdirAll(session.Dir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(session.Dir(), alias); err != nil {
+		t.Skip(err)
+	}
+	for _, tc := range []struct{ name, root, output string }{
+		{"sessions", session.Dir(), ""},
+		{"nested", filepath.Join(session.Dir(), "nested"), ""},
+		{"alias", alias, ""},
+		{"custom-output", filepath.Join(output, "nested"), output},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.MkdirAll(tc.root, 0700); err != nil {
+				t.Fatal(err)
+			}
+			c := budgetConfig(t, nil)
+			c.Exec.Root = tc.root
+			c.Exec.OutputDir = tc.output
+			c.progress = &turnProgress{ctx: context.Background(), jobs: make(map[string]bool)}
+			if got := c.progressRevision(); got != "" {
+				t.Fatalf("workspace inside harness bookkeeping invented usable proof: %s", got)
+			}
+		})
 	}
 }

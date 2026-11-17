@@ -88,6 +88,14 @@ func (c *Config) progressBookkeepingExclusions() ([]string, error) {
 		}
 		if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
 			exclude = append(exclude, rel)
+		} else {
+			inside, err := filepath.Rel(path, base)
+			if err != nil {
+				return err
+			}
+			if inside != ".." && !strings.HasPrefix(inside, ".."+string(filepath.Separator)) && !filepath.IsAbs(inside) {
+				return fmt.Errorf("workspace root is inside harness bookkeeping")
+			}
 		}
 		return nil
 	}
@@ -239,7 +247,7 @@ func (c *Config) progressReadyJobs() {
 	}
 	var ready []*tools.Job
 	for _, job := range c.Exec.Jobs() {
-		if !job.Delivered() && !c.progress.jobs[job.ID] {
+		if !c.progress.jobs[job.ID] {
 			if _, done := job.Result(); done {
 				ready = append(ready, job)
 			}

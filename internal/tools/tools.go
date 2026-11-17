@@ -312,6 +312,16 @@ type EditArgs struct {
 	EndLine   int `json:"endLine,omitempty"`
 }
 
+func (a EditArgs) validateRange() error {
+	if a.StartLine < 0 {
+		return &InputError{Err: fmt.Errorf("startLine must be >= 1, got %d in %s", a.StartLine, a.Path)}
+	}
+	if a.StartLine > 0 && a.EndLine != 0 && a.EndLine < a.StartLine {
+		return &InputError{Err: fmt.Errorf("endLine %d is before startLine %d in %s", a.EndLine, a.StartLine, a.Path)}
+	}
+	return nil
+}
+
 // splitFileLines splits file content into lines without terminators.
 // A trailing newline does not create an extra line: "a\nb\n" is 2
 // lines, and the returned parts keep the trailing "" sentinel so a
@@ -331,6 +341,9 @@ func splitFileLines(s string) ([]string, int) {
 func (e *Executor) Edit(a EditArgs) (string, error) { return e.edit(a, nil) }
 
 func (e *Executor) edit(a EditArgs, target *fileguard.Target) (string, error) {
+	if err := a.validateRange(); err != nil {
+		return "", err
+	}
 	e.editMu.Lock()
 	defer e.editMu.Unlock()
 	if target == nil {
@@ -359,9 +372,6 @@ func (e *Executor) edit(a EditArgs, target *fileguard.Target) (string, error) {
 			return "", fmt.Errorf("file changed since last read or write: %s; read the target lines again before editing", a.Path)
 		}
 		return e.editLines(target, p, raw, s, a, normNew)
-	}
-	if a.StartLine < 0 {
-		return "", &InputError{Err: fmt.Errorf("startLine must be >= 1, got %d in %s", a.StartLine, a.Path)}
 	}
 	if n := strings.Count(s, normOld); n != 1 {
 		return "", editMatchError(a.Path, s, normOld, n)
@@ -787,6 +797,9 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 		var a EditArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 			return ToolResult{}, &InputError{Err: fmt.Errorf("bad edit args: %w", err)}
+		}
+		if err := a.validateRange(); err != nil {
+			return ToolResult{}, err
 		}
 		target, err := e.mutationTarget(ctx, a.Path)
 		if err != nil {
