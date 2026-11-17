@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"minimalharness/internal/session"
 	"minimalharness/internal/textutil"
@@ -187,6 +188,11 @@ func Compact(ctx context.Context, client *llm.Client, history []llm.Message, ext
 	return (&Config{Client: client}).Summarize(ctx, history, extras)
 }
 
+// summaryInputError proves that no provider attempt was made. The app delegates
+// through the legacy CompactHistory callback, whose zero usage otherwise means
+// an unmetered attempt rather than a known preflight rejection.
+type summaryInputError struct{ error }
+
 // Summarize generates a summary using the same bounded retry policy as a step.
 // Summary drafts stay private: retries must not discard the turn's visible text.
 func (c *Config) Summarize(ctx context.Context, history []llm.Message, extras []string) (string, llm.Usage, error) {
@@ -200,7 +206,7 @@ func (c *Config) Summarize(ctx context.Context, history []llm.Message, extras []
 		budget = min(budget, limit-c.Client.OutputTokenLimit())
 	}
 	if budget <= 128 {
-		return "", llm.Usage{}, fmt.Errorf("no context input budget remains for summary")
+		return "", llm.Usage{}, &summaryInputError{fmt.Errorf("no context input budget remains for summary")}
 	}
 	byteBudget := 128 << 10
 	if budget < byteBudget {
@@ -210,11 +216,11 @@ func (c *Config) Summarize(ctx context.Context, history []llm.Message, extras []
 	// the accounting authority; no tokenizer/cost evidence is fabricated.
 	prompt, err := buildCompactPrompt(history, extras, byteBudget)
 	if err != nil {
-		return "", llm.Usage{}, err
+		return "", llm.Usage{}, &summaryInputError{err}
 	}
 	msgs := []llm.Message{{Role: "system", Content: system}, {Role: "user", Content: prompt}}
 	if estimatePromptTokens(msgs, nil) > budget {
-		return "", llm.Usage{}, fmt.Errorf("summary request exceeds context input budget")
+		return "", llm.Usage{}, &summaryInputError{fmt.Errorf("summary request exceeds context input budget")}
 	}
 	var msg llm.Message
 	var usage llm.Usage
@@ -386,7 +392,8 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 		if usage != (llm.Usage{}) {
 			measured = &usage
 		}
-		if c.resources == nil || c.resources.attempts == before {
+		var inputErr *summaryInputError
+		if !errors.As(err, &inputErr) && (c.resources == nil || c.resources.attempts == before) {
 			// A total alone proves tokens, not an input/output price breakdown.
 			breakdownKnown := usage.PromptTokens != 0 || usage.CompletionTokens != 0
 			tokensKnown := breakdownKnown || usage.TotalTokens != 0

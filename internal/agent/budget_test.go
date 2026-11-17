@@ -326,6 +326,28 @@ func TestBudgetCustomCompactionUsingSummarizeDoesNotDoubleCharge(t *testing.T) {
 	}
 }
 
+func TestBudgetSummaryPreflightDoesNotInventProviderAttempt(t *testing.T) {
+	for _, p := range []*turnbudget.Policy{{MaxTokens: capInt(100)}, {MaxCostUSD: capUSD(1)}} {
+		c := budgetConfig(t, p)
+		c.ContextLimit = 100
+		c.Client = &llm.Client{API: "chat"}
+		c.UsageRates = llm.Rates{Configured: true, Complete: true}
+		c.CompactHistory = func(ctx context.Context, history []llm.Message) (string, llm.Usage, error) {
+			return c.Summarize(ctx, history, nil)
+		}
+		ctx, cancel, err := c.startBudget(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = c.compactMessages(ctx, []llm.Message{{Role: "user", Content: "work"}}, true)
+		cancel()
+		state := c.resources.tracker.State()
+		if err == nil || !strings.Contains(err.Error(), "no context input budget") || c.resources.attempts != 0 || !state.TokensComplete || !state.CostComplete || c.resources.failure != nil {
+			t.Fatalf("preflight fabricated a request: err=%v attempts=%d state=%+v failure=%v", err, c.resources.attempts, state, c.resources.failure)
+		}
+	}
+}
+
 func TestBudgetDeadlineCancelsProviderAndPreservesUserAbort(t *testing.T) {
 	for _, abort := range []bool{false, true} {
 		t.Run(fmt.Sprint(abort), func(t *testing.T) {
