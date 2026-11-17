@@ -67,9 +67,8 @@ func TestStopHookBlocksOnceThenEnds(t *testing.T) {
 	}
 }
 
-// TestStopHookCapAllowsEnd: a hook that always vetoes cannot trap
-// the turn forever — after MaxStopBlocks vetoes the turn ends anyway.
-func TestStopHookCapAllowsEnd(t *testing.T) {
+// A persistent veto ends the turn with an explicit incomplete outcome.
+func TestStopHookCapReportsIncomplete(t *testing.T) {
 	root := t.TempDir()
 	hooks := &fakePluginRunner{stopBlocks: 99, stopReason: "always block"}
 	var calls int32
@@ -87,8 +86,8 @@ func TestStopHookCapAllowsEnd(t *testing.T) {
 		MaxSteps: 20,
 	}
 	text, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "go"}})
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || cfg.LastTerminalReason != TerminalStopCap || cfg.LastTaskOutcome != OutcomeIncomplete {
+		t.Fatalf("reason=%s outcome=%s err=%v", cfg.LastTerminalReason, cfg.LastTaskOutcome, err)
 	}
 	if text != "done" {
 		t.Fatalf("final text = %q, want done", text)

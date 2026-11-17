@@ -165,8 +165,16 @@ GUI to drop it), so streamed text is never duplicated. Only a
 completed message is never replayed: once the done message has
 arrived, a later error ends the turn instead. A turn that still fails reports
 `(after 4 attempts)` in the step error.
+- `agent_settled` has separate `reason` (why the turn stopped) and optional
+  `outcome` (a task result). `end_turn` alone does not assert completion and
+  omits `outcome`. Error/cap exits report `incomplete`, blocked/denied exits
+  report `blocked`, and cancellation reports `aborted`. Stop hooks can supply
+  at most three feedback rounds; another veto ends with `reason: stop_cap`,
+  `outcome: incomplete` and an error. The final veto is retained in resumed
+  conversation context. Completion/required-verification records are a separate
+  contract; consumers must not infer `completed` from a missing outcome.
 - `agent_settled` — exactly one per turn, whatever happened:
-  `{"text":"...","usage":{...},"session_usage":{...},"cost_usd":null|N,"session_cost_usd":null|N,"fee":"...","aborted":false,"reason":"end_turn"|"output_limit"|"max_turns"|"abort"|"error"|"repeated_tool_call_denied"|"blocked","error":null|"...","tool_mode":"default"|"plan"}`.
+  `{"text":"...","usage":{...},"session_usage":{...},"cost_usd":null|N,"session_cost_usd":null|N,"fee":"...","aborted":false,"reason":"end_turn"|"output_limit"|"max_turns"|"abort"|"error"|"repeated_tool_call_denied"|"blocked"|"stop_cap","error":null|"...","tool_mode":"default"|"plan"}`.
   `reason` is the structured terminal reason: `"end_turn"` (the model
   finished), `"max_turns"` (step cap), `"abort"` (the GUI aborted the
   turn), `"error"` (LLM/provider failure),

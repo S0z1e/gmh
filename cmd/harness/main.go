@@ -171,6 +171,9 @@ func main() {
 
 	if *printMode != "" {
 		runner.Handle(ctx, *printMode)
+		if runner.LastErr != nil {
+			os.Exit(1)
+		}
 		return
 	}
 

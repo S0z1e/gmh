@@ -79,6 +79,7 @@ type Config struct {
 	// LastTerminalReason is why the most recent Run ended, in the
 	// structured form the RPC server reports as agent_settled.reason.
 	LastTerminalReason TerminalReason
+	LastTaskOutcome    TaskOutcome
 
 	// doomLoop is the per-Config guard: its streak and session
 	// allowlist outlive one turn, like Qwen's agent-context guard.
@@ -95,6 +96,12 @@ func (c *Config) DoomLoop() *DoomLoopGuard {
 }
 
 func (c *Config) emit(e Event) {
+	if e.Kind == EventDone || e.Kind == EventError {
+		if e.TaskOutcome == "" {
+			e.TaskOutcome = TaskOutcomeForReason(e.TerminalReason)
+		}
+		c.LastTaskOutcome = e.TaskOutcome
+	}
 	if e.Kind == EventToolEnd || e.Kind == EventToolBackgroundDone {
 		if e.ToolErr != nil {
 			e.ToolStatus = tools.ResultError
@@ -654,6 +661,8 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 // and returns the assistant's final text, total tokens used, and error.
 func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, runUsage llm.Usage, runErr error) {
 	c.persistErr = nil
+	c.LastTerminalReason = ""
+	c.LastTaskOutcome = ""
 	defer func() {
 		if c.persistErr != nil {
 			runErr = c.persistErr
@@ -820,14 +829,21 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				// hook may veto the end — e.g. a check the final
 				// answer failed. The reason is fed back to the
 				// model as a user message and the turn continues,
-				// up to MaxStopBlocks vetoes; after that the turn
-				// is allowed to end anyway.
-				if ctx.Err() == nil && c.Exec != nil && c.Exec.Plugins != nil && stopBlocks < MaxStopBlocks {
+				// up to MaxStopBlocks feedback rounds. A further veto stops
+				// with an incomplete outcome, never a successful end_turn.
+				if ctx.Err() == nil && c.Exec != nil && c.Exec.Plugins != nil {
 					sessionID := ""
 					if c.Session != nil {
 						sessionID = c.Session.ID
 					}
 					if reason := c.Exec.Plugins.RunStopHooks(ctx, sessionID, lastText); reason != "" {
+						if stopBlocks >= MaxStopBlocks {
+							err := fmt.Errorf("stop hook veto cap reached (%d); task incomplete: %s", MaxStopBlocks, reason)
+							c.persist(llm.Message{Role: "user", Kind: "task_outcome", Content: "[harness task outcome]\nTask incomplete: the stop hook veto limit was reached. Outstanding issue: " + reason})
+							c.LastTerminalReason = TerminalStopCap
+							c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalStopCap})
+							return lastText, total, err
+						}
 						stopBlocks++
 						c.emit(Event{Kind: EventStopBlocked, Text: reason})
 						blockMsg := llm.Message{Role: "user", Kind: "hook", Content: "A stop hook blocked the turn from ending: " + reason + " Address it before finishing, then answer again."}
@@ -1335,6 +1351,7 @@ func (c *Config) ResetSessionState() {
 	c.LastPromptTokens = 0
 	c.lastPromptEstimate = 0
 	c.LastTerminalReason = ""
+	c.LastTaskOutcome = ""
 }
 
 // persist latches a storage failure. The loop stops before its next action;

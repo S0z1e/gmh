@@ -77,6 +77,7 @@ const (
 	// TerminalEndTurn: the model finished with no more tool calls.
 	TerminalEndTurn     TerminalReason = "end_turn"
 	TerminalOutputLimit TerminalReason = "output_limit"
+	TerminalStopCap     TerminalReason = "stop_cap"
 	// TerminalMaxTurns: the step cap was hit.
 	TerminalMaxTurns TerminalReason = "max_turns"
 	// TerminalAbort: the turn was aborted (context cancelled).
@@ -140,6 +141,7 @@ type Event struct {
 	// TerminalReason says why the turn ended, for Done and Error.
 	// Empty for all other events.
 	TerminalReason TerminalReason
+	TaskOutcome    TaskOutcome
 	// RetryAttempt is the attempt number about to run, for
 	// EventStepRetry and EventStepDiscard. 0 for all other events.
 	RetryAttempt int

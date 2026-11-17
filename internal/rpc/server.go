@@ -65,10 +65,11 @@ type serverState struct {
 }
 
 type turnOutcome struct {
-	text   string
-	usage  llm.Usage
-	err    error
-	reason agent.TerminalReason
+	text    string
+	usage   llm.Usage
+	err     error
+	reason  agent.TerminalReason
+	outcome agent.TaskOutcome
 }
 
 type approvalAnswer struct {
@@ -835,14 +836,14 @@ func (s *Server) onEvent(ev agent.Event) {
 	case agent.EventApproval:
 		// Ignored: ask() emits approval_request itself, with the id.
 	case agent.EventDone:
-		s.turnOutcome = &turnOutcome{text: ev.Text, usage: ev.Usage, reason: ev.TerminalReason}
+		s.turnOutcome = &turnOutcome{text: ev.Text, usage: ev.Usage, reason: ev.TerminalReason, outcome: ev.TaskOutcome}
 	case agent.EventError:
 		// The text survives an error-ended turn: on a step cap it
 		// is the grace summary, otherwise the model's last message.
 		// Without it the GUI gets an empty agent_settled.text
 		// whenever a turn ends in error, even though the turn
 		// produced an answer.
-		s.turnOutcome = &turnOutcome{text: ev.Text, err: ev.Err, reason: ev.TerminalReason}
+		s.turnOutcome = &turnOutcome{text: ev.Text, err: ev.Err, reason: ev.TerminalReason, outcome: ev.TaskOutcome}
 	case agent.EventStopBlocked:
 		s.writeEvent(Event{Type: "stop_blocked", Text: ev.Text})
 	case agent.EventStepRetry:
@@ -923,9 +924,11 @@ func (s *Server) runTurn(req Request) {
 	var text string
 	var err error
 	reason := agent.TerminalReason("")
+	outcome := agent.TaskOutcome("")
 	if out := s.turnOutcome; out != nil {
 		text = out.text
 		reason = out.reason
+		outcome = out.outcome
 		if out.err == nil {
 			usage = out.usage
 		}
@@ -940,12 +943,16 @@ func (s *Server) runTurn(req Request) {
 		// discarded here; the GUI reads Aborted + Reason.
 		err = nil
 		reason = agent.TerminalAbort
+		outcome = agent.OutcomeAborted
 	} else if reason == "" {
 		if err != nil {
 			reason = agent.TerminalError
 		} else {
 			reason = agent.TerminalEndTurn
 		}
+	}
+	if outcome == "" {
+		outcome = agent.TaskOutcomeForReason(reason)
 	}
 	s.setStreaming(false)
 	s.refreshState()
@@ -957,6 +964,7 @@ func (s *Server) runTurn(req Request) {
 		Type: "agent_settled", Text: text, Usage: usageJSON(usage),
 		SessionUsage: usageJSON(st.sessionUsage), Fee: s.feeLabel(), Aborted: aborted,
 		Reason:   string(reason),
+		Outcome:  string(outcome),
 		ToolMode: st.toolMode,
 	}
 	if s.app.Rates.Configured {

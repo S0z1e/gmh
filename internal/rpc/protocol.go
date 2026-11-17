@@ -159,6 +159,9 @@ type Event struct {
 	// the turn ended. Aborted turns carry reason "abort" and no
 	// error string: cancellation is not an error.
 	Reason string `json:"reason,omitempty"`
+	// outcome is a separate task-level result. Omitted when no completion claim
+	// was established; end_turn alone does not mean the task is completed.
+	Outcome string `json:"outcome,omitempty"`
 	// continuation_request: how many identical calls were seen and
 	// the threshold that tripped the guard.
 	RepeatCount int `json:"repeat_count,omitempty"`

@@ -30,6 +30,10 @@
   streams request `stream_options: {"include_usage": true}` — without
   it a spec-compliant provider sends no usage object at all and the
   turn reports 0 tokens.
+- Turn status: a model ending its response does not establish that the task
+  is complete. A stop hook that keeps vetoing after three feedback rounds stops
+  with an explicit incomplete error, preserved for resume. `-p` returns a
+  nonzero exit status when the turn fails, including a cap or blocked task.
 - Modes: `-mode suggest` (default, ask before write/edit/bash, webfetch and plugin tools),
   `-mode auto` (no prompts, use only on a disposable copy).
 - Editing: `edit` takes either `oldText` (must match exactly once —

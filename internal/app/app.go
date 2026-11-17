@@ -1320,8 +1320,9 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		r.historyLoadErr = loadErr
 		r.LastErr = errors.Join(r.LastErr, loadErr)
 		r.App.Cfg.LastTerminalReason = agent.TerminalError
+		r.App.Cfg.LastTaskOutcome = agent.OutcomeIncomplete
 		if r.App.Cfg.OnEvent != nil {
-			r.App.Cfg.OnEvent(agent.Event{Kind: agent.EventError, Err: r.LastErr, Text: text, TerminalReason: agent.TerminalError})
+			r.App.Cfg.OnEvent(agent.Event{Kind: agent.EventError, Err: r.LastErr, Text: text, TerminalReason: agent.TerminalError, TaskOutcome: agent.OutcomeIncomplete})
 		}
 		r.Print("[error] %v", loadErr)
 	}
