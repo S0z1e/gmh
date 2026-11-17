@@ -228,7 +228,7 @@ func (c *Config) checkRepeatedCall(ctx context.Context, toolName, argsJSON strin
 func (c *Config) askUser(ctx context.Context, argsJSON string) (string, error) {
 	req, err := ParseAskUserArgs(argsJSON)
 	if err != nil {
-		return "", err
+		return "", &tools.InputError{Err: err}
 	}
 	if c.AskQuestion == nil || ctx.Err() != nil {
 		return "No one is available to answer questions right now. Proceed with your best judgement and state the assumptions you made.", nil
@@ -972,6 +972,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			pending = nil
 			if err != nil {
 				return lastText, total, err
+			}
+			if c.progress.failures >= MaxFailedFixAttempts {
+				return finishBlocked()
 			}
 			continue
 		}

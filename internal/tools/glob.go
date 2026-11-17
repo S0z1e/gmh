@@ -30,7 +30,7 @@ type GlobArgs struct {
 // truncation is always reported, never silent.
 func (e *Executor) Glob(ctx context.Context, a GlobArgs) (string, int, error) {
 	if strings.TrimSpace(a.Pattern) == "" {
-		return "", 0, fmt.Errorf("glob: empty pattern")
+		return "", 0, &InputError{Err: fmt.Errorf("glob: empty pattern")}
 	}
 	root := a.Path
 	if root == "" {

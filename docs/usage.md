@@ -211,8 +211,9 @@
   progress, the turn settles `blocked`, with one tool-free grace report. Successful reads, unchanged writes
   and unrelated commands returning success do not reset this count. A successful
   rerun of a previously failing invocation, or a proven workspace change after
-  a successful mutating tool, does. Failed commands' own generated output files
+  a successful foreground mutating tool, does. Failed commands' own generated output files
   are included in their post-failure baseline and do not look like a later repair.
+  Completed job failures are accounted before accepting state progress.
   Background results use the original effective invocation, even when collected
   by a later turn. Counts reset for each turn; successful probes do not refund
   that turn's probe allowance. Model request retries remain independent.

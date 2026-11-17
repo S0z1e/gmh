@@ -48,7 +48,7 @@ func (e *Executor) Grep(ctx context.Context, a GrepArgs) (string, int, error) {
 
 func (e *Executor) grepResult(ctx context.Context, a GrepArgs) (ToolResult, error) {
 	if strings.TrimSpace(a.Pattern) == "" {
-		return ToolResult{}, fmt.Errorf("grep: empty pattern")
+		return ToolResult{}, &InputError{Err: fmt.Errorf("grep: empty pattern")}
 	}
 	root := a.Path
 	if root == "" {

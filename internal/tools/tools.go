@@ -361,7 +361,7 @@ func (e *Executor) edit(a EditArgs, target *fileguard.Target) (string, error) {
 		return e.editLines(target, p, raw, s, a, normNew)
 	}
 	if a.StartLine < 0 {
-		return "", fmt.Errorf("startLine must be >= 1, got %d in %s", a.StartLine, a.Path)
+		return "", &InputError{Err: fmt.Errorf("startLine must be >= 1, got %d in %s", a.StartLine, a.Path)}
 	}
 	if n := strings.Count(s, normOld); n != 1 {
 		return "", editMatchError(a.Path, s, normOld, n)
@@ -386,9 +386,9 @@ func (e *Executor) editLines(target *fileguard.Target, p, raw, s string, a EditA
 	}
 	switch {
 	case a.StartLine < 1:
-		return "", fmt.Errorf("startLine must be >= 1, got %d in %s (file has %d lines)", a.StartLine, a.Path, n)
+		return "", &InputError{Err: fmt.Errorf("startLine must be >= 1, got %d in %s (file has %d lines)", a.StartLine, a.Path, n)}
 	case end < a.StartLine:
-		return "", fmt.Errorf("endLine %d is before startLine %d in %s (file has %d lines)", end, a.StartLine, a.Path, n)
+		return "", &InputError{Err: fmt.Errorf("endLine %d is before startLine %d in %s (file has %d lines)", end, a.StartLine, a.Path, n)}
 	case end > n:
 		return "", fmt.Errorf("endLine %d is beyond the last line (%d) in %s", end, n, a.Path)
 	}
@@ -740,7 +740,7 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 	for _, def := range Defs() {
 		if def.Function.Name == name {
 			if err := toolargs.Validate(def.Function.Parameters, argsJSON); err != nil {
-				return ToolResult{}, fmt.Errorf("bad %s args: %w", name, err)
+				return ToolResult{}, &InputError{Err: fmt.Errorf("bad %s args: %w", name, err)}
 			}
 			break
 		}
@@ -749,7 +749,7 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 	case "read":
 		var a ReadArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad read args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad read args: %w", err)}
 		}
 		if _, ok := MediaTypeForPath(a.Path); ok {
 			// The model chose the path, so the workspace jail
@@ -772,7 +772,7 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 	case "write":
 		var a WriteArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad write args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad write args: %w", err)}
 		}
 		target, err := e.mutationTarget(ctx, a.Path)
 		if err != nil {
@@ -786,7 +786,7 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 	case "edit":
 		var a EditArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad edit args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad edit args: %w", err)}
 		}
 		target, err := e.mutationTarget(ctx, a.Path)
 		if err != nil {
@@ -823,33 +823,33 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 	case "bash":
 		var a BashArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad bash args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad bash args: %w", err)}
 		}
 		return e.bashResult(ctx, a)
 	case "grep":
 		var a GrepArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad grep args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad grep args: %w", err)}
 		}
 		return e.grepResult(ctx, a)
 	case "glob":
 		var a GlobArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad glob args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad glob args: %w", err)}
 		}
 		out, n, err := e.Glob(ctx, a)
 		return ToolResult{Text: out, Count: n}, err
 	case "load_skill":
 		var a LoadSkillArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad load_skill args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad load_skill args: %w", err)}
 		}
 		out, err := e.LoadSkill(a)
 		return ToolResult{Text: out}, err
 	case "webfetch":
 		var a WebfetchArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad webfetch args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad webfetch args: %w", err)}
 		}
 		out, err := e.Webfetch(ctx, a)
 		return ToolResult{Text: out}, err
@@ -876,7 +876,7 @@ type LoadSkillArgs struct {
 func (e *Executor) LoadSkill(a LoadSkillArgs) (string, error) {
 	name := strings.TrimSpace(a.Name)
 	if name == "" {
-		return "", fmt.Errorf("load_skill needs a skill name")
+		return "", &InputError{Err: fmt.Errorf("load_skill needs a skill name")}
 	}
 	found := skills.DiscoverForTrust(e.Root, !e.UntrustedWorkspace)
 	var match *skills.Skill

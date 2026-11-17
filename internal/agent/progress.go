@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sort"
 	"time"
 
 	"minimalharness/internal/failureguard"
@@ -21,6 +22,8 @@ type turnProgress struct {
 	captures   int
 	lastErrors []string
 	jobs       map[string]bool
+	jobNotes   map[string]string
+	observed   int
 }
 
 // Capture only while handling failures or checking a possible repair. Ordinary
@@ -46,9 +49,16 @@ func (c *Config) progressRevision() string {
 }
 
 func (c *Config) progressAdmit(key string) failureguard.Decision {
+	c.progressReadyJobs()
 	d := c.progress.guard.Admit(key, "")
 	if d.Denied {
-		d = c.progress.guard.Admit(key, c.progressRevision())
+		observed := c.progress.observed
+		revision := c.progressRevision()
+		c.progressReadyJobs()
+		if observed != c.progress.observed {
+			revision = "" // A newly observed failure invalidates this progress comparison.
+		}
+		d = c.progress.guard.Admit(key, revision)
 		if d.StateProbe {
 			c.progress.failures = 0
 		}
@@ -59,12 +69,14 @@ func (c *Config) progressAdmit(key string) failureguard.Decision {
 func (c *Config) progressFailure(key string, kind failureguard.Kind) int {
 	p := c.progress
 	p.failures++
+	p.observed++
 	p.baseline = c.progressRevision()
 	return p.guard.ObserveFailure(key, kind, p.baseline)
 }
 
 func (c *Config) progressSuccess(key, tool string) {
 	p := c.progress
+	c.progressReadyJobs()
 	if p.guard.ObserveSuccess(key) {
 		p.failures = 0
 	}
@@ -75,14 +87,20 @@ func (c *Config) progressSuccess(key, tool string) {
 	case "read", "glob", "grep", "load_skill", "webfetch", "ask_user":
 		return
 	}
+	observed := p.observed
 	after := c.progressRevision()
-	if after != "" && p.baseline != "" && after != p.baseline {
+	c.progressReadyJobs()
+	if observed == p.observed && after != "" && p.baseline != "" && after != p.baseline {
 		p.failures = 0
 		p.baseline = after
 	}
 }
 
 func failureKind(err error, verificationCheck bool) failureguard.Kind {
+	var input *tools.InputError
+	if errors.As(err, &input) {
+		return failureguard.InvalidInput
+	}
 	var policy *tools.PolicyError
 	if errors.As(err, &policy) {
 		return failureguard.PolicyDenied
@@ -101,8 +119,11 @@ func failureKind(err error, verificationCheck bool) failureguard.Kind {
 // turn, independent of which path delivered it or whether persistence failed.
 func (c *Config) progressJob(job *tools.Job, res tools.JobResult, obs string) string {
 	p := c.progress
-	if p == nil || p.jobs[job.ID] || p.ctx.Err() != nil || c.budgetError() != nil {
+	if p == nil || p.ctx.Err() != nil || c.budgetError() != nil {
 		return obs
+	}
+	if p.jobs[job.ID] {
+		return obs + p.jobNotes[job.ID]
 	}
 	p.jobs[job.ID] = true
 	key := job.FailureKey()
@@ -114,11 +135,43 @@ func (c *Config) progressJob(job *tools.Job, res tools.JobResult, obs string) st
 	if res.Err != nil {
 		n := c.progressFailure(key, failureKind(res.Err, false))
 		if n >= FailureWarnAfter {
-			obs += "\n" + FailureNote("bash", n)
+			if p.jobNotes == nil {
+				p.jobNotes = make(map[string]string)
+			}
+			p.jobNotes[job.ID] = "\n" + FailureNote("bash", n)
+			obs += p.jobNotes[job.ID]
 		}
 		recordLastError(&p.lastErrors, obs)
 	} else {
-		c.progressSuccess(key, "bash")
+		// Process successes without claiming snapshot-based progress here:
+		// delivery cannot prove which concurrent job produced changed files.
+		if p.guard.ObserveSuccess(key) {
+			p.failures = 0
+		}
 	}
 	return obs
+}
+
+func (c *Config) progressReadyJobs() {
+	if c.Exec == nil || c.progress == nil {
+		return
+	}
+	var ready []*tools.Job
+	for _, job := range c.Exec.Jobs() {
+		if !job.Delivered() && !c.progress.jobs[job.ID] {
+			if _, done := job.Result(); done {
+				ready = append(ready, job)
+			}
+		}
+	}
+	sort.SliceStable(ready, func(i, j int) bool {
+		iTime, _ := ready[i].FinishedAt()
+		jTime, _ := ready[j].FinishedAt()
+		return iTime.Before(jTime)
+	})
+	for _, job := range ready {
+		res, _ := job.Result()
+		obs, _ := jobResultMessage(job, res)
+		c.progressJob(job, res, obs)
+	}
 }
