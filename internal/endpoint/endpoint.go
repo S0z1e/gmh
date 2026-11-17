@@ -31,6 +31,17 @@ func Key(raw string) string {
 		return base
 	}
 	u.Scheme = strings.ToLower(u.Scheme)
-	u.Host = strings.ToLower(u.Host)
+	// Unicode lowercasing can collapse distinct IDNA destinations (e.g. İ
+	// versus i). Fold only ASCII DNS casing and preserve IPv6 zone spelling.
+	host := []byte(u.Host)
+	for i, b := range host {
+		if b == '%' {
+			break
+		}
+		if b >= 'A' && b <= 'Z' {
+			host[i] = b + ('a' - 'A')
+		}
+	}
+	u.Host = string(host)
 	return u.String()
 }

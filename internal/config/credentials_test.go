@@ -70,3 +70,48 @@ func TestEquivalentEndpointAndDirectOverrideRemainUsable(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestProjectHeadersCannotAuthorizeAPIKeyBindings(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "fake-ambient-secret")
+	t.Setenv("PROVIDER_KEY", "fake-provider-secret")
+	for _, value := range []string{"\x00OPENAI_API_KEY", "$OPENAI_API_KEY", "$PROVIDER_KEY"} {
+		for _, name := range []string{"Authorization", "X-Api-Key", "Content-Type", "Accept", "X-Other"} {
+			f := &File{Providers: map[string]Provider{"inherited": {BaseURL: "https://old.invalid", APIKey: "$PROVIDER_KEY", Model: "m"}}}
+			Merge(f, &File{Providers: map[string]Provider{
+				"new":       {BaseURL: "https://new.invalid", Model: "m", Headers: map[string]string{name: value}},
+				"inherited": {BaseURL: "https://new.invalid", Headers: map[string]string{name: value}},
+			}})
+			for _, provider := range []string{"new", "inherited"} {
+				p := f.Providers[provider]
+				m, _ := p.ResolveModel("")
+				if _, _, err := p.ResolveCredentials(m, m.BaseURL, false); err == nil {
+					t.Fatalf("header %q authorized %s API key", name, provider)
+				}
+			}
+		}
+	}
+}
+
+func TestHeaderDeclarationDoesNotRebindAnotherHeader(t *testing.T) {
+	t.Setenv("SHARED_HEADER", "fake-shared-secret")
+	f := &File{Providers: map[string]Provider{"p": {BaseURL: "https://old.invalid", Model: "m", APIKey: "old", Headers: map[string]string{"X-Global": "$SHARED_HEADER"}}}}
+	Merge(f, &File{Providers: map[string]Provider{"p": {BaseURL: "https://new.invalid", APIKey: "explicit-new-key", Headers: map[string]string{"X-Other": "$SHARED_HEADER"}}}})
+	p := f.Providers["p"]
+	m, _ := p.ResolveModel("")
+	if _, _, err := p.ResolveCredentials(m, m.BaseURL, false); err == nil {
+		t.Fatal("declaring a different header rebound an inherited header")
+	}
+}
+
+func TestUnicodeDestinationCannotInheritGlobalCredentials(t *testing.T) {
+	f := &File{Providers: map[string]Provider{"p": {BaseURL: "https://api.openai.com/v1", Model: "m", APIKey: "fake-global-key"}}}
+	Merge(f, &File{Providers: map[string]Provider{"p": {BaseURL: "https://api.openaİ.com/v1"}}})
+	if err := Validate(f); err != nil {
+		t.Fatal(err)
+	}
+	p := f.Providers["p"]
+	m, _ := p.ResolveModel("")
+	if _, _, err := p.ResolveCredentials(m, m.BaseURL, false); err == nil {
+		t.Fatal("inherited key accepted at distinct IDNA destination")
+	}
+}

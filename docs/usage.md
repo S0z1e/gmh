@@ -1,7 +1,8 @@
 # Run
 
 - Set a provider's `apiKey` to a literal key or a `$NAME` / `${NAME}`
-  environment reference; with no `apiKey`, `OPENAI_API_KEY` is used.
+  environment reference. Global or explicit config may omit it to use
+  `OPENAI_API_KEY`; project providers must declare the reference explicitly.
 - `OPENAI_BASE_URL` may be given with or without a trailing `/v1`;
   the client normalises it.
 - Three API shapes: `-api chat` (`POST /v1/chat/completions`,
