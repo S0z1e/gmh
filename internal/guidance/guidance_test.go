@@ -1,0 +1,217 @@
+package guidance
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
+
+func put(t *testing.T, path, text string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScopeOrderTargetAndRefresh(t *testing.T) {
+	home, err := canonicalRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, "repo")
+	paths := []string{filepath.Join(home, "AGENTS.md"), filepath.Join(root, "AGENTS.md"), filepath.Join(root, "CLAUDE.md"), filepath.Join(root, "pkg", "AGENTS.md"), filepath.Join(root, "pkg", "deep", "AGENTS.md")}
+	for _, path := range paths {
+		put(t, path, path)
+	}
+	put(t, filepath.Join(root, "sibling", "AGENTS.md"), "unrelated instructions")
+	target := filepath.Join("pkg", "deep", "missing", "new.go")
+	snap, err := Resolve(context.Background(), root, target)
+	if err != nil || len(snap.Files) != len(paths) {
+		t.Fatalf("scope=%+v err=%v", snap, err)
+	}
+	for i, file := range snap.Files {
+		if file.Path != paths[i] || file.SHA256 != digest([]byte(paths[i])) {
+			t.Fatalf("wrong source order/identity: %+v", snap)
+		}
+	}
+	again, err := Resolve(context.Background(), root, target)
+	if err != nil || again.SHA256 != snap.SHA256 {
+		t.Fatal("unchanged scope not stable")
+	}
+	put(t, paths[3], "updated instructions")
+	changed, err := Resolve(context.Background(), root, target)
+	if err != nil || changed.SHA256 == snap.SHA256 || changed.Files[3].SHA256 == snap.Files[3].SHA256 {
+		t.Fatal("mid-session edit missed")
+	}
+	other, err := Resolve(context.Background(), root, "sibling/new.go")
+	if err != nil || len(other.Files) != 4 || other.Files[3].Prefix != "unrelated instructions" {
+		t.Fatalf("target scope did not switch: %+v %v", other, err)
+	}
+	if _, err := Resolve(context.Background(), root, "../outside.go"); err == nil {
+		t.Fatal("escaped target accepted")
+	}
+	if err := os.Remove(paths[3]); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := Resolve(context.Background(), root, target)
+	if err != nil || len(removed.Files) != len(paths)-1 || removed.SHA256 == changed.SHA256 {
+		t.Fatal("source removal was not observed")
+	}
+}
+
+func TestLongSourceCanBeReadInBoundedExactChunks(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, "repo")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, "AGENTS.md")
+	text := strings.Repeat("中🙂\n", 1500) + "TAIL instruction"
+	put(t, path, text)
+	snap, err := Resolve(context.Background(), root, "new.go")
+	if err != nil || len(snap.Files) != 1 {
+		t.Fatalf("%+v %v", snap, err)
+	}
+	source := snap.Files[0]
+	if !source.More || !utf8.ValidString(source.Prefix) || len(source.Prefix) > PrefixBytes || source.SHA256 != digest([]byte(text)) {
+		t.Fatalf("invalid long source: %+v", source)
+	}
+	assembled := source.Prefix
+	offset := len(assembled)
+	for offset < len(text) {
+		chunk, err := Read(context.Background(), root, "new.go", path, source.SHA256, offset, 1024)
+		if err != nil || chunk.Next <= offset || !utf8.ValidString(chunk.Text) || len(chunk.Text) > 1024 {
+			t.Fatalf("bad chunk %+v %v", chunk, err)
+		}
+		assembled += chunk.Text
+		offset = chunk.Next
+	}
+	if assembled != text {
+		t.Fatal("chunked source changed original bytes")
+	}
+	if _, err := Read(context.Background(), root, "new.go", path, source.SHA256, 1, 1024); err == nil {
+		t.Fatal("split UTF8 boundary accepted")
+	}
+	if _, err := Read(context.Background(), root, "new.go", path, source.SHA256, 0, PrefixBytes+1); err == nil {
+		t.Fatal("unbounded chunk accepted")
+	}
+	put(t, path, strings.Repeat("x", len(text)))
+	if _, err := Read(context.Background(), root, "new.go", path, source.SHA256, offset, 1024); err == nil {
+		t.Fatal("stale hash accepted")
+	}
+}
+
+func TestReadCannotAccessUnrelatedSources(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	a := filepath.Join(root, "a", "AGENTS.md")
+	b := filepath.Join(root, "b", "AGENTS.md")
+	put(t, a, "a rules")
+	put(t, b, "b rules")
+	if _, err := Read(context.Background(), root, "a/new.go", b, digest([]byte("b rules")), 0, 128); err == nil {
+		t.Fatal("sibling instruction source leaked into target scope")
+	}
+	secret := filepath.Join(filepath.Dir(root), "private.txt")
+	put(t, secret, "secret")
+	if _, err := Read(context.Background(), root, "a/new.go", secret, digest([]byte("secret")), 0, 128); err == nil {
+		t.Fatal("read became an arbitrary file exception")
+	}
+	if _, err := Read(context.Background(), root, "a/new.go", a, "", 0, 128); err == nil {
+		t.Fatal("missing source identity accepted")
+	}
+}
+
+func TestSourceBoundsAndCancellationFailExplicitly(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	path := filepath.Join(root, "AGENTS.md")
+	put(t, path, strings.Repeat("x", MaxSourceBytes+1))
+	if _, err := Resolve(context.Background(), root, "new.go"); err == nil {
+		t.Fatal("oversized instructions silently clipped")
+	}
+	put(t, path, string([]byte{0xff}))
+	if _, err := Resolve(context.Background(), root, "new.go"); err == nil {
+		t.Fatal("invalid source bytes repaired")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Resolve(ctx, "/does-not-exist", "new.go"); err != context.Canceled {
+		t.Fatalf("cancelled resolve did IO: %v", err)
+	}
+	put(t, path, "rules")
+	deep := strings.Repeat("sub/", MaxDirectories+1) + "file.go"
+	if _, err := Resolve(context.Background(), root, deep); err == nil {
+		t.Fatal("deep scope silently omitted instructions")
+	}
+}
+
+func TestSymlinkTargetUsesEffectiveDirectoryAndRejectsEscapes(t *testing.T) {
+	root, err := canonicalRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", t.TempDir())
+	put(t, filepath.Join(root, "real", "AGENTS.md"), "real rules")
+	if err := os.Symlink("real", filepath.Join(root, "alias")); err != nil {
+		t.Skip(err)
+	}
+	snap, err := Resolve(context.Background(), root, "alias/new.go")
+	if err != nil || len(snap.Files) != 1 || snap.Files[0].Scope != filepath.Join(root, "real") || snap.Target != filepath.Join(root, "real", "new.go") {
+		t.Fatalf("alias target scope incorrect: %+v %v", snap, err)
+	}
+	outside := t.TempDir()
+	put(t, filepath.Join(outside, "AGENTS.md"), "outside")
+	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Resolve(context.Background(), root, "escape/new.go"); err == nil {
+		t.Fatal("target escaped workspace")
+	}
+	if err := os.Symlink(filepath.Join(outside, "AGENTS.md"), filepath.Join(root, "AGENTS.md")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Resolve(context.Background(), root, "real/new.go"); err == nil {
+		t.Fatal("instruction source escaped its directory")
+	}
+}
+
+func TestRootAliasAndAbsoluteTargetRetainSourceIdentity(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	root := filepath.Join(base, "real")
+	alias := filepath.Join(base, "alias")
+	put(t, filepath.Join(root, "pkg", "AGENTS.md"), "rules")
+	if err := os.Symlink("real", alias); err != nil {
+		t.Skip(err)
+	}
+	actual, err := Resolve(context.Background(), root, "pkg/new.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	linked, err := Resolve(context.Background(), alias, filepath.Join(alias, "pkg", "new.go"))
+	if err != nil || actual.SHA256 != linked.SHA256 {
+		t.Fatalf("alias changed effective scope: %+v %v", linked, err)
+	}
+}
+
+func TestAggregateSourceLimitDoesNotSilentlyDropInstructions(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	dir := root
+	text := strings.Repeat("x", MaxSourceBytes)
+	for i := 0; i < 9; i++ {
+		put(t, filepath.Join(dir, "AGENTS.md"), text)
+		dir = filepath.Join(dir, "sub")
+	}
+	if _, err := Resolve(context.Background(), root, filepath.Join(dir, "new.go")); err == nil {
+		t.Fatal("aggregate source budget was not enforced")
+	}
+}
