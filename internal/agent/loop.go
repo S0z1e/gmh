@@ -1070,6 +1070,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// not be asked twice about the same call. A denied
 			// call ends the turn with the structured reason.
 			useArgs, allowed := c.checkRepeatedCall(ctx, tc.Function.Name, argsJSON)
+			if err := ctx.Err(); err != nil {
+				c.rejectBudgetTools(assistant.ToolCalls[i:], err)
+				c.LastTerminalReason = TerminalAbort
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+				return lastText, total, err
+			}
 			if !allowed {
 				if err := recordInvocation(argsJSON); err != nil {
 					return lastText, total, err
@@ -1203,6 +1209,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if err := ctx.Err(); err != nil {
 				closeMutation()
 				c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
+				c.LastTerminalReason = TerminalAbort
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
 				return lastText, total, err
 			}
 			toolCtx := tools.WithInvocation(ctx, inv.ID, tc.ID)
@@ -1216,6 +1224,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if err := ctx.Err(); err != nil {
 				closeMutation()
 				c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
+				c.LastTerminalReason = TerminalAbort
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
 				return lastText, total, err
 			}
 			var obs string

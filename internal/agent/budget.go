@@ -89,7 +89,7 @@ func (c *Config) recordBudgetUsage(usage *llm.Usage, started time.Time, tokensCo
 		}
 		measured.Tokens = &tokens
 		measured.TokensPartial = !tokensComplete
-		if priceCountsComplete && r.api != "anthropic" && tokens >= 0 {
+		if priceCountsComplete && r.api != "anthropic" && tokens >= 0 && tokens == int64(u.PromptTokens)+int64(u.CompletionTokens) {
 			if cost, known := r.rates.BudgetCost(u, started); known {
 				measured.ExactCostUSD = cost
 			}

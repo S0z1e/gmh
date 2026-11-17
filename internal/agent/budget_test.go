@@ -17,6 +17,7 @@ import (
 	"minimalharness/internal/session"
 	"minimalharness/internal/tools"
 	"minimalharness/internal/turnbudget"
+	"minimalharness/internal/verification"
 )
 
 func capInt(n int64) *int64     { return &n }
@@ -472,5 +473,92 @@ func TestBudgetResponsesNonterminalUsageRemainsPartial(t *testing.T) {
 	requireBudgetStop(t, c, events, err, TerminalBudgetUnavailable)
 	if c.LastTurnBudget.ReportedTokens != 2 || c.LastTurnBudget.TokensComplete {
 		t.Fatal("nonterminal counters treated as final")
+	}
+}
+
+func TestBudgetCustomCompactionTotalOnlyIsNotFreePricing(t *testing.T) {
+	c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(1)})
+	c.UsageRates = llm.Rates{InputPerMTok: 1, OutputPerMTok: 1, CachedPerMTok: 1, Configured: true, Complete: true}
+	c.CompactHistory = func(context.Context, []llm.Message) (string, llm.Usage, error) {
+		return "summary", llm.Usage{TotalTokens: 5}, nil
+	}
+	ctx, cancel, err := c.startBudget(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	_, _, err = c.compactMessages(ctx, []llm.Message{{Role: "user", Content: "work"}}, true)
+	if err == nil || c.resources.tracker.State().CostComplete || c.resources.tracker.State().ReportedTokens != 5 {
+		t.Fatalf("total-only callback recorded as free: %+v err=%v", c.resources.tracker.State(), err)
+	}
+}
+
+func TestBudgetContinuationExpiryPersistsUnexecutedSuffix(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c := budgetConfig(t, &turnbudget.Policy{MaxDurationSeconds: capInt(1)})
+	first := budgetCall("a", "write", `{"path":"a","content":"x"}`)
+	c.DoomLoop().AllowOnce(CanonicalToolKey(first.Function.Name, first.Function.Arguments))
+	c.DoomLoop().threshold = 2
+	c.ConfirmContinuation = func(req ContinuationRequest) (ContinuationDecision, error) {
+		<-req.Context.Done()
+		return ContinuationDecision{}, req.Context.Err()
+	}
+	store, err := session.Open("expired-continuation", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c.Session = store
+	calls := []llm.ToolCall{first, budgetCall("b", "write", `{"path":"b","content":"x"}`)}
+	events, _, err := runVerification(t, c, budgetSSE("", calls, nil, true))
+	requireBudgetStop(t, c, events, err, TerminalBudgetExceeded)
+	history, err := session.Load(store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := 0
+	for _, m := range history {
+		if m.Role == "tool" {
+			results++
+			if !strings.Contains(m.Content, "Not executed:") {
+				t.Fatalf("missing known unexecuted result: %+v", m)
+			}
+		}
+	}
+	if results != 2 {
+		t.Fatalf("results=%d", results)
+	}
+}
+
+func TestBudgetCallerAbortBeforeDispatchAlwaysEmitsTerminal(t *testing.T) {
+	for _, cancelAt := range []int{1, 2} {
+		t.Run(fmt.Sprint(cancelAt), func(t *testing.T) {
+			c := budgetConfig(t, &turnbudget.Policy{MaxDurationSeconds: capInt(0)})
+			command := "printf ran > never"
+			c.Verification = &verification.Policy{Required: []verification.Check{{Name: "check", Command: command}}}
+			parent, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			armed, checks := false, 0
+			ctx := verificationCaptureContext{Context: parent, onErr: func() {
+				if armed {
+					checks++
+					if checks == cancelAt {
+						cancel()
+					}
+				}
+			}}
+			c.OnEvent = func(e Event) {
+				if e.Kind == EventToolStart {
+					armed = true
+				}
+			}
+			events, _, err := runVerificationContext(t, c, ctx, verificationBash(command))
+			if err == nil || c.LastTerminalReason != TerminalAbort || c.LastTaskOutcome != OutcomeAborted || countKind(events, EventError) != 1 {
+				t.Fatalf("abort missing: reason=%s outcome=%s events=%+v err=%v", c.LastTerminalReason, c.LastTaskOutcome, events, err)
+			}
+			if _, err := os.Stat(filepath.Join(c.Exec.Root, "never")); !os.IsNotExist(err) {
+				t.Fatal("cancelled call executed")
+			}
+		})
 	}
 }
