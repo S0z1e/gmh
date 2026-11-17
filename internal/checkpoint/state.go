@@ -385,8 +385,13 @@ func validateJSONFields(d *json.Decoder, depth int) error {
 			if !ok {
 				return fmt.Errorf("invalid checkpoint JSON field")
 			}
-			// encoding/json matches struct fields without case sensitivity.
-			name = strings.ToLower(name)
+			// All version-one field names use lowercase ASCII. Reject aliases
+			// before encoding/json's Unicode folding can overwrite a field.
+			for _, c := range name {
+				if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_') {
+					return fmt.Errorf("noncanonical checkpoint JSON field %q", name)
+				}
+			}
 			if seen[name] {
 				return fmt.Errorf("duplicate checkpoint JSON field %q", name)
 			}

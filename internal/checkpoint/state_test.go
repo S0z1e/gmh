@@ -264,6 +264,15 @@ func TestDeltaValidatesEveryEntryBeforeReplacement(t *testing.T) {
 }
 
 func TestDecodeKeepsSourceUnicodeAndEncoderBounds(t *testing.T) {
+	for _, input := range []string{
+		`{"version":1,"constraints":[{"source":"keep","ſource":"changed","content":"instruction"}]}`,
+		`{"version":1,"constraints":[{"source":"keep","content":"instruction"}],"con\u017ftraints":[]}`,
+		`{"version":1,"constraints":[{"ſource":"changed","content":"instruction"}]}`,
+	} {
+		if _, err := Decode([]byte(input)); err == nil {
+			t.Fatal("noncanonical Unicode field could overwrite source facts")
+		}
+	}
 	for _, text := range []string{`\ud800`, `\udfff`, `\ud800x`, `\ud800\ud800`, `\udfff\ud800`} {
 		input := `{"version":1,"constraints":[{"source":"task","content":"` + text + `"}]}`
 		if _, err := Decode([]byte(input)); err == nil {
