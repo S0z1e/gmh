@@ -2,6 +2,7 @@ package verification
 
 import (
 	"context"
+	"minimalharness/internal/workspace"
 	"os"
 	"path/filepath"
 	"strings"
@@ -252,5 +253,30 @@ func TestCaptureDetectsConcurrentEditWithRestoredMtime(t *testing.T) {
 	state, err := Capture(ctx, root, nil)
 	if err == nil || state.Version != "" {
 		t.Fatalf("timestamp-restored edit produced stale version: %+v %v", state, err)
+	}
+}
+
+func TestSnapshotRootMustMatchIdentifiedIncarnation(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := workspace.Identify(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(root, root+"-old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := openSnapshotRoot(identity); err == nil {
+		opened.Close()
+		t.Fatal("different incarnation opened under original identity")
+	}
+	if got, err := Capture(context.Background(), root, make([]string, MaxExclusions+1)); err == nil || got.Version != "" {
+		t.Fatal("unbounded exclusions accepted")
 	}
 }

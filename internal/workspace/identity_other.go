@@ -19,3 +19,15 @@ func directoryID(path string) (string, error) {
 	}
 	return "", nil
 }
+
+// DirectoryFileID has no portable directory incarnation on this platform.
+func DirectoryFileID(f *os.File) (string, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("workspace root is not a directory")
+	}
+	return "", nil
+}

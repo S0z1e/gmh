@@ -16,11 +16,12 @@ import (
 )
 
 const (
-	MaxEntries   = 50000
-	MaxBytes     = 128 << 20
-	MaxFileBytes = 16 << 20
-	MaxPathBytes = 8 << 20
-	maxDepth     = 256
+	MaxEntries    = 50000
+	MaxBytes      = 128 << 20
+	MaxFileBytes  = 16 << 20
+	MaxPathBytes  = 8 << 20
+	MaxExclusions = 1024
+	maxDepth      = 256
 )
 
 type Snapshot struct {
@@ -55,8 +56,19 @@ func Capture(ctx context.Context, root string, exclude []string) (Snapshot, erro
 	if identity.FileID == "" {
 		return result, fmt.Errorf("verification requires a workspace creation identity")
 	}
+	if len(exclude) > MaxExclusions {
+		return result, fmt.Errorf("verification exceeds %d exclusions", MaxExclusions)
+	}
 	excludes := []string{".git"}
+	exclusionBytes := 0
 	for _, path := range exclude {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		exclusionBytes += len(path)
+		if exclusionBytes > MaxPathBytes {
+			return result, fmt.Errorf("verification exclusions exceed path byte limit")
+		}
 		clean := filepath.Clean(path)
 		if path == "" || filepath.IsAbs(path) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 			return result, fmt.Errorf("verification exclusion must be a relative path within the workspace")
@@ -72,7 +84,7 @@ func Capture(ctx context.Context, root string, exclude []string) (Snapshot, erro
 		}
 		return false
 	}
-	handle, err := os.OpenRoot(identity.Path)
+	handle, err := openSnapshotRoot(identity)
 	if err != nil {
 		return result, err
 	}

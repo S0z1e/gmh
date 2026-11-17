@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"fmt"
+	"os"
 
 	"golang.org/x/sys/windows"
 )
@@ -24,6 +25,15 @@ func directoryID(path string) (string, error) {
 		return "", err
 	}
 	defer windows.CloseHandle(handle)
+	return directoryHandleID(handle, path)
+}
+
+// DirectoryFileID identifies a pinned directory handle without reopening its path.
+func DirectoryFileID(f *os.File) (string, error) {
+	return directoryHandleID(windows.Handle(f.Fd()), f.Name())
+}
+
+func directoryHandleID(handle windows.Handle, path string) (string, error) {
 	var stat windows.ByHandleFileInformation
 	if err := windows.GetFileInformationByHandle(handle, &stat); err != nil {
 		return "", err

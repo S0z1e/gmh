@@ -11,6 +11,19 @@ func directoryID(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return identityFromInfo(info, path)
+}
+
+// DirectoryFileID identifies a pinned directory handle without reopening its path.
+func DirectoryFileID(f *os.File) (string, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	return identityFromInfo(info, f.Name())
+}
+
+func identityFromInfo(info os.FileInfo, path string) (string, error) {
 	if !info.IsDir() {
 		return "", fmt.Errorf("workspace root is not a directory: %s", path)
 	}

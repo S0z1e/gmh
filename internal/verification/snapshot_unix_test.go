@@ -4,6 +4,7 @@ package verification
 
 import (
 	"context"
+	"minimalharness/internal/workspace"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -42,5 +43,27 @@ func TestVersionPreservesRawFilenameBytes(t *testing.T) {
 	}
 	if capture(t, root).Version == before.Version {
 		t.Fatal("different raw filename bytes collided")
+	}
+}
+
+func TestSnapshotRootFIFOReplacementIsRejectedWithoutBlocking(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := workspace.Identify(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(root, root+"-old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(root, 0600); err != nil {
+		t.Skipf("FIFO unavailable: %v", err)
+	}
+	if opened, err := openSnapshotRoot(identity); err == nil {
+		opened.Close()
+		t.Fatal("FIFO opened as workspace")
 	}
 }
