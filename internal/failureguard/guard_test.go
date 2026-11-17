@@ -70,6 +70,35 @@ func TestFailedAttemptOutputsAndOldVersionsCannotOpenProbe(t *testing.T) {
 	}
 }
 
+func TestInitialAdmittedVersionsAreNotNewRepairStates(t *testing.T) {
+	var g failureguard.Guard
+	for i := 0; i < failureguard.DenyAfter; i++ {
+		before, after := fmt.Sprintf("before-%d", i), fmt.Sprintf("after-%d", i)
+		if d := g.Admit("build", before); d.Denied || d.StateProbe {
+			t.Fatal(d)
+		}
+		g.ObserveFailure("build", failureguard.Environment, after)
+	}
+	for i := 0; i < failureguard.DenyAfter; i++ {
+		for _, prefix := range []string{"before", "after"} {
+			if d := g.Admit("build", fmt.Sprintf("%s-%d", prefix, i)); !d.Denied {
+				t.Fatalf("previously admitted or failed version opened a probe: %+v", d)
+			}
+		}
+	}
+	// All six initial versions plus both sides of two failed probes fit the
+	// bounded history; remembering the initial attempts must not consume probes.
+	for i := 0; i < failureguard.MaxStateProbesPerCall; i++ {
+		if d := g.Admit("build", fmt.Sprintf("repair-%d", i)); d.Denied || !d.StateProbe {
+			t.Fatalf("new repair rejected: %+v", d)
+		}
+		g.ObserveFailure("build", failureguard.Environment, fmt.Sprintf("repair-output-%d", i))
+	}
+	if d := g.Admit("build", "third-repair"); !d.Denied {
+		t.Fatal("too many repair probes")
+	}
+}
+
 func TestUnknownOrUnrepairableEvidenceFailsClosed(t *testing.T) {
 	for _, kind := range []failureguard.Kind{failureguard.InvalidInput, failureguard.PolicyDenied, failureguard.Unknown, "", "unrecognized"} {
 		var g failureguard.Guard

@@ -18,7 +18,7 @@ const (
 	DenyAfter             = 3
 	MaxStateProbesPerCall = 2
 	MaxStateProbesPerTurn = 8
-	maxRememberedVersions = DenyAfter + 2*MaxStateProbesPerCall
+	maxRememberedVersions = 2 * (DenyAfter + MaxStateProbesPerCall)
 )
 
 // Decision describes admission of this attempt, not its execution result.
@@ -52,12 +52,10 @@ type Guard struct {
 // immediately, even if approval later prevents execution. Do not use Admit as a
 // read-only status query: asking twice cannot reserve the same probe twice.
 func (g *Guard) Admit(key, revision string) Decision {
-	h := g.calls[key]
-	if h == nil {
-		return Decision{Kind: Unknown}
-	}
+	h := g.entry(key)
 	d := Decision{Failures: h.failures, Kind: h.kind}
 	if h.failures < DenyAfter {
+		h.remember(revision)
 		return d
 	}
 	d.Denied = true
@@ -82,18 +80,23 @@ func (g *Guard) Admit(key, revision string) Decision {
 // not themselves count as a repair before the next attempt. Unknown evidence
 // replaces the previous version rather than silently reusing a stale version.
 func (g *Guard) ObserveFailure(key string, kind Kind, postRevision string) int {
+	h := g.entry(key)
+	h.failures++
+	h.kind, h.postRevision = normalizeKind(kind), postRevision
+	h.remember(postRevision)
+	return h.failures
+}
+
+func (g *Guard) entry(key string) *history {
 	if g.calls == nil {
 		g.calls = make(map[string]*history)
 	}
 	h := g.calls[key]
 	if h == nil {
-		h = &history{versions: make(map[string]struct{})}
+		h = &history{kind: Unknown, versions: make(map[string]struct{})}
 		g.calls[key] = h
 	}
-	h.failures++
-	h.kind, h.postRevision = normalizeKind(kind), postRevision
-	h.remember(postRevision)
-	return h.failures
+	return h
 }
 
 // ObserveSuccess clears only this fingerprint's history, returning whether a
