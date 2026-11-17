@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -572,6 +573,94 @@ func TestBudgetCustomCompactionTotalOnlyIsNotFreePricing(t *testing.T) {
 	_, _, err = c.compactMessages(ctx, []llm.Message{{Role: "user", Content: "work"}}, true)
 	if err == nil || c.resources.tracker.State().CostComplete || c.resources.tracker.State().ReportedTokens != 5 {
 		t.Fatalf("total-only callback recorded as free: %+v err=%v", c.resources.tracker.State(), err)
+	}
+}
+
+func TestBudgetCustomCompactionNormalizesProgrammaticCacheUsage(t *testing.T) {
+	for _, partial := range []bool{false, true} {
+		t.Run(fmt.Sprint(partial), func(t *testing.T) {
+			c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(1)})
+			c.UsageRates = llm.Rates{InputPerMTok: 2, OutputPerMTok: 1, CachedPerMTok: 1, Configured: true, Complete: true}
+			c.CompactHistory = func(context.Context, []llm.Message) (string, llm.Usage, error) {
+				u := llm.Usage{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110, CachedTokens: 50}
+				if partial {
+					u.CacheUsageSource = "partial"
+				}
+				return "summary", u, nil
+			}
+			ctx, cancel, err := c.startBudget(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cancel()
+			_, _, err = c.compactMessages(ctx, []llm.Message{{Role: "user", Content: "work"}}, true)
+			state := c.resources.tracker.State()
+			if partial {
+				if err == nil || state.CostComplete {
+					t.Fatalf("partial cache split accepted: %+v err=%v", state, err)
+				}
+			} else if err != nil || !state.CostComplete || state.RecordedCostUSD != .00016 {
+				t.Fatalf("programmatic cache split lost: %+v err=%v", state, err)
+			}
+		})
+	}
+}
+
+func TestBudgetOutcomeStorageFailureEmitsOneTerminalError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(1)})
+	store, err := session.Open("budget-storage", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c.Session = store
+	c.OnEvent = func(e Event) {
+		if e.Kind == EventTextDelta {
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// First fail while saving the budget outcome; then fail saving an ordinary
+	// assistant response on the same Config, to verify per-turn publication reset.
+	for _, tokens := range []int{2, 0} {
+		events, _, err := runVerification(t, c, budgetSSE("done", nil, newInt(tokens), true))
+		if !errors.Is(err, os.ErrClosed) || c.LastTerminalReason != TerminalError || c.LastTaskOutcome != OutcomeIncomplete || countKind(events, EventError) != 1 || countKind(events, EventDone) != 0 {
+			t.Fatalf("storage failure settlement: reason=%s outcome=%s events=%+v err=%v", c.LastTerminalReason, c.LastTaskOutcome, events, err)
+		}
+		terminal := events[len(events)-1]
+		if !errors.Is(terminal.Err, os.ErrClosed) {
+			t.Fatalf("storage failure lost priority: %+v", terminal)
+		}
+	}
+}
+
+func TestBudgetDeadlineAndToolStorageFailurePreferOneStorageError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c := budgetConfig(t, &turnbudget.Policy{MaxDurationSeconds: capInt(1)})
+	store, err := session.Open("budget-tool-storage", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c.Session = store
+	c.OnEvent = func(e Event) {
+		if e.Kind == EventToolEnd {
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			deadline, _ := c.resources.tracker.Deadline()
+			time.Sleep(time.Until(deadline) + 10*time.Millisecond)
+		}
+	}
+	calls := []llm.ToolCall{budgetCall("write", "write", `{"path":"changed","content":"x"}`)}
+	events, _, err := runVerification(t, c, budgetSSE("working", calls, nil, true))
+	if !errors.Is(err, os.ErrClosed) || c.LastTerminalReason != TerminalError || countKind(events, EventError) != 1 || countKind(events, EventDone) != 0 {
+		t.Fatalf("conflicting storage/deadline settlement: reason=%s events=%+v err=%v", c.LastTerminalReason, events, err)
+	}
+	if !errors.Is(events[len(events)-1].Err, os.ErrClosed) {
+		t.Fatal("terminal event lost storage priority")
 	}
 }
 

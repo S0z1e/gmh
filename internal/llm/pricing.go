@@ -155,6 +155,7 @@ func (r Rates) BudgetReady() bool {
 // Unknown cache counts matter only when the active input/cache prices differ.
 // The caller must separately establish that input/output counters are present.
 func (r Rates) BudgetCost(u Usage, t time.Time) (*big.Rat, bool) {
+	u.normalize()
 	if !r.BudgetReady() || u.PromptTokens < 0 || u.CompletionTokens < 0 || u.CachedTokens < 0 || u.CachedTokens > u.PromptTokens {
 		return nil, false
 	}

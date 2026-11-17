@@ -93,8 +93,9 @@ type Config struct {
 
 	// doomLoop is the per-Config guard: its streak and session
 	// allowlist outlive one turn, like Qwen's agent-context guard.
-	doomLoop   *DoomLoopGuard
-	persistErr error
+	doomLoop          *DoomLoopGuard
+	persistErr        error
+	persistErrEmitted bool
 }
 
 // DoomLoop returns the Config's guard, creating it on first use.
@@ -108,6 +109,13 @@ func (c *Config) DoomLoop() *DoomLoopGuard {
 func (c *Config) emit(e Event) {
 	if e.Kind == EventDone || e.Kind == EventError {
 		e = c.budgetTerminal(e)
+		if c.persistErr != nil {
+			// A storage failure takes priority and is published once, even when
+			// it occurred while the budget adapter was saving its outcome.
+			e.Kind, e.Err, e.TerminalReason, e.TaskOutcome = EventError, c.persistErr, TerminalError, OutcomeIncomplete
+			c.LastTerminalReason = TerminalError
+			c.persistErrEmitted = true
+		}
 	}
 	if e.Kind == EventDone || e.Kind == EventError {
 		if e.TaskOutcome == "" {
@@ -698,6 +706,7 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 // and returns the assistant's final text, total tokens used, and error.
 func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, runUsage llm.Usage, runErr error) {
 	c.persistErr = nil
+	c.persistErrEmitted = false
 	c.LastTerminalReason = ""
 	c.LastTaskOutcome = ""
 	c.LastTurnBudget = nil
@@ -714,7 +723,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		if c.persistErr != nil {
 			runErr = c.persistErr
 			c.LastTerminalReason = TerminalError
-			c.emit(Event{Kind: EventError, Err: runErr, Text: text, TerminalReason: TerminalError})
+			if !c.persistErrEmitted {
+				c.emit(Event{Kind: EventError, Err: runErr, Text: text, TerminalReason: TerminalError})
+			}
 		}
 	}()
 	budgetCtx, cancelBudget, budgetErr := c.startBudget(ctx)
