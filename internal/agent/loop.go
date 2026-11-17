@@ -182,8 +182,8 @@ func (c *Config) checkRepeatedCall(ctx context.Context, toolName, argsJSON strin
 	key := det.InputKey
 	useArgs := argsJSON
 	if dec.UpdatedArgs != "" {
-		key = CanonicalToolKey(toolName, dec.UpdatedArgs)
-		useArgs = dec.UpdatedArgs
+		useArgs = c.verificationArguments(toolName, dec.UpdatedArgs)
+		key = CanonicalToolKey(toolName, useArgs)
 	}
 	switch dec.Outcome {
 	case ContinuationSession:
@@ -868,6 +868,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					}
 				}
 				outcome, missing := c.verificationGate(ctx)
+				if err := ctx.Err(); err != nil {
+					c.LastTerminalReason = TerminalAbort
+					c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+					return lastText, total, err
+				}
 				if missing != "" {
 					if c.verifier.feedback >= maxVerificationFeedback {
 						err := fmt.Errorf("required verification failed: %s", missing)
@@ -1000,6 +1005,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				stepHadExecution = true
 				recordLastError(&lastErrors, err.Error())
 				continue
+			}
+			if bound := c.verificationArguments(tc.Function.Name, argsJSON); bound != argsJSON {
+				inv.Rewrites = append(inv.Rewrites, llm.ArgumentRewrite{Source: "verification_cwd", Arguments: bound})
+				argsJSON = bound
+				tc.Function.Arguments = bound
+				msgs[assistantIdx].ToolCalls[i].Function.Arguments = bound
 			}
 			// Doom-loop guard: an identical call for the fifth
 			// consecutive time asks the user (once / session /

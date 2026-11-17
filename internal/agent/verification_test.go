@@ -38,6 +38,10 @@ func verificationBash(command string) string {
 }
 func runVerification(t *testing.T, cfg *Config, steps ...string) ([]Event, []string, error) {
 	t.Helper()
+	return runVerificationContext(t, cfg, context.Background(), steps...)
+}
+func runVerificationContext(t *testing.T, cfg *Config, ctx context.Context, steps ...string) ([]Event, []string, error) {
+	t.Helper()
 	var calls atomic.Int32
 	var bodies []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -61,7 +65,7 @@ func runVerification(t *testing.T, cfg *Config, steps ...string) ([]Event, []str
 			prev(e)
 		}
 	}
-	_, _, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "work"}})
+	_, _, err := cfg.Run(ctx, []llm.Message{{Role: "user", Content: "work"}})
 	return events, bodies, err
 }
 func requireVerificationFailure(t *testing.T, cfg *Config, err error) {
@@ -262,7 +266,7 @@ func TestRequiredVerificationWaitsForRunningJobs(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cfg.Exec.Root, "input"), []byte("changed"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	attempt := cfg.verificationStart(context.Background(), "bash", `{"command":"true"}`)
+	attempt := cfg.verificationStart(context.Background(), "bash", cfg.verificationArguments("bash", `{"command":"true"}`))
 	zero := 0
 	cfg.verificationFinish(context.Background(), attempt, tools.ToolResult{ExitCode: &zero}, nil)
 	job, err := cfg.Exec.BashBackground(context.Background(), tools.BashArgs{Command: "sleep 30"})
@@ -414,7 +418,7 @@ func TestRequiredVerificationJobFinishingAfterSnapshotCannotCertifyStaleFiles(t 
 	if err := os.WriteFile(filepath.Join(cfg.Exec.Root, "input"), []byte("before"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	attempt := cfg.verificationStart(ctx, "bash", `{"command":"true"}`)
+	attempt := cfg.verificationStart(ctx, "bash", cfg.verificationArguments("bash", `{"command":"true"}`))
 	result, err := cfg.Exec.Dispatch(ctx, "bash", `{"command":"true"}`)
 	if err != nil {
 		t.Fatal(err)
@@ -480,5 +484,119 @@ func TestRequiredVerificationUsesBashLexicalCwdNormalization(t *testing.T) {
 				requireVerificationFailure(t, cfg, err)
 			}
 		})
+	}
+}
+
+type verificationMutatingStop struct {
+	fakePluginRunner
+	root string
+}
+
+func (h *verificationMutatingStop) RunStopHooks(context.Context, string, string) string {
+	_ = os.WriteFile(filepath.Join(h.root, "input"), []byte("changed by hook"), 0600)
+	_ = os.Symlink("input", filepath.Join(h.root, "alias"))
+	return ""
+}
+func TestRequiredVerificationHookMakesSupportedWorkspaceUnverifiable(t *testing.T) {
+	cfg := verificationConfig(t, "true")
+	cfg.Exec.Plugins = &verificationMutatingStop{root: cfg.Exec.Root}
+	_, _, err := runVerification(t, cfg, textSSE("answer"))
+	requireVerificationFailure(t, cfg, err)
+}
+
+func TestRequiredVerificationBindsCwdBeforeApprovalAndSnapshot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cfg := verificationConfig(t, "test -f pass")
+	store, err := session.Open("cwd-binding", session.OpenOptions{Workspace: cfg.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg.Session = store
+	for _, dir := range []string{"first", "second"} {
+		if err := os.Mkdir(filepath.Join(cfg.Exec.Root, dir), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(cfg.Exec.Root, "second", "pass"), []byte("wrong cwd passes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(cfg.Exec.Root, "link")
+	if err := os.Symlink("first", link); err != nil {
+		t.Skip(err)
+	}
+	cfg.Verification.Required[0].Cwd = "first"
+	cfg.Verification.Exclude = []string{"link"}
+	armed := false
+	var approved string
+	cfg.Mode = "suggest"
+	cfg.Ask = func(req ApprovalRequest) (bool, error) {
+		if req.ToolName == "bash" {
+			history, err := session.Load(store.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var last llm.Message
+			for _, message := range history {
+				if message.Role == "assistant" && len(message.ToolCalls) > 0 && message.ToolCalls[0].Function.Name == "bash" {
+					last = message
+				}
+			}
+			if len(last.ToolInvocations) != 1 || last.ToolInvocations[0].Arguments != req.Arguments {
+				t.Fatal("canonical cwd not durable before approval")
+			}
+			var original tools.BashArgs
+			if err := json.Unmarshal([]byte(last.ToolInvocations[0].OriginalArguments), &original); err != nil || original.Cwd != "link" {
+				t.Fatal("original alias was lost")
+			}
+			armed = true
+			approved = req.Arguments
+		}
+		return true, nil
+	}
+	ctx := verificationCaptureContext{Context: context.Background(), onErr: func() {
+		if !armed {
+			return
+		}
+		armed = false
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("second", link); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	_, _, err = runVerificationContext(t, cfg, ctx, verificationWrite("input", "work"), verificationTool("bash", map[string]any{"command": "test -f pass", "cwd": "link"}))
+	requireVerificationFailure(t, cfg, err)
+	var actual tools.BashArgs
+	if err := json.Unmarshal([]byte(approved), &actual); err != nil {
+		t.Fatal(err)
+	}
+	wanted, err := (verification.Check{Name: "check", Command: "true", Cwd: "first"}).Directory(cfg.Exec.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual.Cwd != wanted {
+		t.Fatalf("approved unbound cwd: %s", approved)
+	}
+}
+
+func TestRequiredVerificationCancellationAtTerminalGateIsAborted(t *testing.T) {
+	cfg := verificationConfig(t, "true")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg.OnEvent = func(e Event) {
+		if e.Kind == EventStepUsage {
+			cancel()
+		}
+	}
+	events, _, err := runVerificationContext(t, cfg, ctx, textSSE("answer"))
+	if err == nil || cfg.LastTaskOutcome != OutcomeAborted {
+		t.Fatalf("outcome=%s err=%v", cfg.LastTaskOutcome, err)
+	}
+	for _, event := range events {
+		if event.Kind == EventDone {
+			t.Fatal("cancelled gate ended successfully")
+		}
 	}
 }

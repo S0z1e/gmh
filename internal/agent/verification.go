@@ -32,6 +32,7 @@ type verificationAttempt struct {
 	captureErr               error
 	started                  time.Time
 	foreground               bool
+	cwdBound                 bool
 }
 
 // Capture before hooks/approval: even a read tool's plugin hooks can mutate files.
@@ -43,6 +44,43 @@ func (c *Config) verificationTouch(ctx context.Context) {
 	v.touched = true
 	state, err := verification.Capture(ctx, c.Exec.Root, v.policy.Exclude)
 	v.baseline, v.baselineErr = &state, err
+}
+
+// verificationArguments makes the checked cwd an explicit canonical argument
+// before approval and durable invocation recording. A symlink alias can then
+// change during capture without redirecting the approved execution.
+func (c *Config) verificationArguments(name, args string) string {
+	if c.verifier == nil || c.Exec == nil || name != "bash" {
+		return args
+	}
+	var a tools.BashArgs
+	if json.Unmarshal([]byte(args), &a) != nil || a.KillJobID != "" {
+		return args
+	}
+	actual, err := (verification.Check{Name: "cwd", Command: a.Command, Cwd: a.Cwd}).Directory(c.Exec.Root)
+	if err != nil {
+		return args
+	}
+	for _, check := range c.verifier.policy.Required {
+		if check.Command != a.Command {
+			continue
+		}
+		wanted, err := check.Directory(c.Exec.Root)
+		if err != nil || wanted != actual {
+			continue
+		}
+		if a.Cwd == actual {
+			return args
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal([]byte(args), &fields) != nil {
+			return args
+		}
+		fields["cwd"], _ = json.Marshal(actual)
+		data, _ := json.Marshal(fields)
+		return string(data)
+	}
+	return args
 }
 
 func (c *Config) verificationStart(ctx context.Context, name, args string) *verificationAttempt {
@@ -84,7 +122,7 @@ func (c *Config) verificationStart(ctx context.Context, name, args string) *veri
 		return nil
 	}
 	state, err := verification.Capture(ctx, c.Exec.Root, v.policy.Exclude)
-	return &verificationAttempt{checks: checks, cwd: cwd, before: state, captureErr: err, started: time.Now().UTC(), foreground: !a.Background}
+	return &verificationAttempt{checks: checks, cwd: cwd, before: state, captureErr: err, started: time.Now().UTC(), foreground: !a.Background, cwdBound: a.Cwd == cwd}
 }
 
 func (c *Config) verificationFinish(ctx context.Context, a *verificationAttempt, res tools.ToolResult, runErr error) []llm.Message {
@@ -98,6 +136,8 @@ func (c *Config) verificationFinish(ctx context.Context, a *verificationAttempt,
 		record.Error = runErr.Error()
 	case !a.foreground || res.Status == tools.ResultBackground:
 		record.Error = "required verification must run in the foreground"
+	case !a.cwdBound:
+		record.Error = "verification cwd was not bound in the approved invocation"
 	case a.captureErr != nil:
 		record.Error = "cannot capture verification inputs: " + a.captureErr.Error()
 	case err != nil:
@@ -137,7 +177,7 @@ func (c *Config) verificationGate(ctx context.Context) (TaskOutcome, string) {
 	if err != nil {
 		// Pure questions/reads make no completion claim. Unsupported inputs must
 		// still fail closed after any potentially mutating dispatch or check.
-		if !v.mutationAttempted && len(v.latest) == 0 {
+		if !v.mutationAttempted && len(v.latest) == 0 && v.baselineErr != nil {
 			return "", ""
 		}
 		return "", "Cannot verify workspace version: " + err.Error()

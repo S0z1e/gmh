@@ -42,7 +42,10 @@
 
   The model runs these exact commands with the normal Bash tool after its final
   edits, in the foreground and subject to approval, denylist, timeout, sandbox
-  and environment rules. These commands are never launched automatically.
+  and environment rules. A matching check's cwd is made canonical and recorded
+  in the final arguments before approval, so an alias changing during snapshot
+  capture cannot redirect the approved command. These commands are never
+  launched automatically.
   Each result records its invocation, canonical cwd, exit code, start/end times
   and workspace content version in the transcript. A later failed attempt replaces
   an earlier pass; edits after a pass invalidate it. Checks that modify included
