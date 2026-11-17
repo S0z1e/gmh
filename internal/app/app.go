@@ -749,15 +749,23 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	if _, err := os.Stat(filepath.Join(session.Dir(), id+".jsonl")); os.IsNotExist(err) {
 		return nil, fmt.Errorf("unknown session %q (see /sessions)", id)
 	}
+	old := a.Store
+	store := old
+	reuse := old != nil && old.Owns(id)
+	if !reuse {
+		var err error
+		store, err = session.New(id)
+		if err != nil {
+			return nil, err
+		}
+	}
 	history, err := session.Load(id)
 	if err != nil {
+		if !reuse {
+			store.Close()
+		}
 		return nil, err
 	}
-	store, err := session.New(id)
-	if err != nil {
-		return nil, err
-	}
-	old := a.Store
 	oldID := ""
 	if old != nil {
 		oldID = old.ID
@@ -782,7 +790,7 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 			a.Cfg.Exec.SwitchSession(store.ID)
 		}
 	}
-	if old != nil {
+	if old != nil && !reuse {
 		_ = old.Close()
 	}
 	a.fireSessionEvents(oldID, store.ID)

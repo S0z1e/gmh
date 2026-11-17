@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
 	"minimalharness/internal/rpc"
+	"minimalharness/internal/session"
 	"minimalharness/internal/uimode"
 )
 
@@ -30,6 +32,7 @@ func main() {
 		provider       = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
 		config         = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
 		maxSteps       = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
+		viewSessionID  = flag.String("view-session", "", "read a session as JSONL without opening a writer or loading providers")
 		resume         = flag.String("resume", "", "resume session id")
 		sessionID      = flag.String("session", "", "session id (default: timestamp)")
 		ctxLimit       = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
@@ -43,6 +46,15 @@ func main() {
 	)
 	flag.Var(&images, "image", "attach an image file to the first turn (repeatable; png, jpg, gif, webp; the model must declare image input)")
 	flag.Parse()
+	if *viewSessionID != "" {
+		if *rpcMode || *printMode != "" || *resume != "" || *sessionID != "" {
+			fatal(fmt.Errorf("--view-session conflicts with --rpc, -p, --resume and --session"))
+		}
+		if err := viewSession(os.Stdout, *viewSessionID); err != nil {
+			fatal(err)
+		}
+		return
+	}
 
 	if *rpcMode && *printMode != "" {
 		fatal(fmt.Errorf("--rpc conflicts with -p"))
@@ -334,4 +346,19 @@ func (s *stringList) Set(v string) error {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "harness:", err)
 	os.Exit(1)
+}
+
+// viewSession has no writable Store, provider configuration or tool executor.
+func viewSession(w io.Writer, id string) error {
+	msgs, err := session.Load(id)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(w)
+	for _, m := range msgs {
+		if err := enc.Encode(m); err != nil {
+			return err
+		}
+	}
+	return nil
 }

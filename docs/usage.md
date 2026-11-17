@@ -61,7 +61,15 @@
   system prompt, each capped at 8 KiB, with a git snapshot (branch,
   working-tree status, recent commits) added the same way. Editing a
   context file mid-session needs a restart.
-- Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`.
+- Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`. A session has
+  one transcript writer across processes; opening, renaming or deleting another
+  process's active session fails immediately. Closing or crashing releases the
+  lease, including after rollback and rename. Lock files in the `.writers/`
+  subdirectory remain in place; do not remove them while harness processes run.
+  Writable transcripts must be regular files with one hard link.
+  `harness --view-session <id>` reads the replayed history as JSONL without
+  provider credentials or a writer lease, including while a writer is active.
+  A view is a snapshot of completed records at read time.
 - REPL commands: `/usage` shows session token totals, `/clear` drops
   the conversation context (a marker is written to the session file;
   `--resume` starts from the clear point, older messages stay in the

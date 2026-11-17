@@ -4,6 +4,7 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"syscall"
 )
@@ -22,4 +23,28 @@ func lockTranscript(f *os.File) (func(), error) {
 		}
 		return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }, nil
 	}
+}
+
+func tryLockWriter(f *os.File) error {
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return ErrSessionBusy
+		}
+		return err
+	}
+}
+
+func checkTranscriptLinks(f *os.File) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); !ok || st.Nlink != 1 {
+		return fmt.Errorf("session transcript must have exactly one hard link")
+	}
+	return nil
 }

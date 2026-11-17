@@ -174,6 +174,16 @@ func renameSessionFiles(oldID, newID string) error {
 // RenameSession renames a session that is not currently open. For the
 // open store, use Store.Rename, which also re-points the handles.
 func RenameSession(oldID, newID string) error {
+	old, err := acquireWriter(oldID)
+	if err != nil {
+		return err
+	}
+	defer old.Close()
+	target, err := acquireWriter(newID)
+	if err != nil {
+		return err
+	}
+	defer target.Close()
 	return renameSessionFiles(oldID, newID)
 }
 
@@ -186,6 +196,11 @@ func DeleteSession(id string) error {
 	if err := ValidateSessionID(id); err != nil {
 		return err
 	}
+	writer, err := acquireWriter(id)
+	if err != nil {
+		return err
+	}
+	defer writer.Close()
 	dir := Dir()
 	path := filepath.Join(dir, id+".jsonl")
 	if _, err := os.Stat(path); os.IsNotExist(err) {
@@ -224,7 +239,30 @@ func DeleteSession(id string) error {
 func (s *Store) Rename(newID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed || s.file == nil {
+		return os.ErrClosed
+	}
 	oldID := s.ID
+	// Validate/existence checks before taking the destination lease also avoid
+	// treating a case-only rename of the active file as a competing writer.
+	if err := ValidateSessionID(newID); err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(Dir(), newID+".jsonl")); err == nil {
+		return fmt.Errorf("session %q already exists", newID)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	target, err := acquireWriter(newID)
+	if err != nil {
+		return err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			target.Close()
+		}
+	}()
 	if s.auditFile != nil {
 		s.auditFile.Close()
 		s.auditFile = nil
@@ -238,8 +276,13 @@ func (s *Store) Rename(newID string) error {
 		}
 		return err
 	}
+	// The rename has committed: retain the new lease even if reopening fails.
+	s.writer.Close()
+	s.writer = target
+	keep = true
 	newPath := filepath.Join(Dir(), newID+".jsonl")
-	f, err := privatefile.Open(newPath, os.O_CREATE|os.O_APPEND|os.O_RDWR)
+	s.ID, s.Path = newID, newPath
+	f, err := privatefile.Open(newPath, os.O_APPEND|os.O_RDWR)
 	if err != nil {
 		return err
 	}

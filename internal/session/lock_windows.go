@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"syscall"
 	"unsafe"
@@ -24,4 +25,27 @@ func lockTranscript(f *os.File) (func(), error) {
 		return nil, err
 	}
 	return func() { _, _, _ = sessionUnlockFile.Call(f.Fd(), 0, 1, 0, uintptr(unsafe.Pointer(&overlapped))) }, nil
+}
+
+func tryLockWriter(f *os.File) error {
+	overlapped := syscall.Overlapped{}
+	ok, _, err := sessionLockFile.Call(f.Fd(), 3, 0, 1, 0, uintptr(unsafe.Pointer(&overlapped)))
+	if ok == 0 {
+		if err == syscall.Errno(33) {
+			return ErrSessionBusy
+		} // ERROR_LOCK_VIOLATION
+		return err
+	}
+	return nil
+}
+
+func checkTranscriptLinks(f *os.File) error {
+	var info syscall.ByHandleFileInformation
+	if err := syscall.GetFileInformationByHandle(syscall.Handle(f.Fd()), &info); err != nil {
+		return err
+	}
+	if info.NumberOfLinks != 1 {
+		return fmt.Errorf("session transcript must have exactly one hard link")
+	}
+	return nil
 }

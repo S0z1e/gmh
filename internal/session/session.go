@@ -4,6 +4,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"minimalharness/internal/privatefile"
 	"os"
@@ -19,6 +20,7 @@ type Store struct {
 	ID        string
 	Path      string
 	file      *os.File
+	writer    *os.File // lifetime lease, independent of rewritten transcript inode
 	auditFile *os.File // lazily opened sidecar for audit records
 	// mu guards Append and Audit: a background job's completion audit
 	// can land on its own goroutine while the loop appends or audits
@@ -96,21 +98,43 @@ func New(id string) (*Store, error) {
 		// until the path is free. An explicit id is never suffixed:
 		// --resume needs the exact file.
 		for i := 1; ; i++ {
-			f, err := privatefile.Open(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_RDWR)
+			writer, err := acquireWriter(id)
 			if err == nil {
-				return &Store{ID: id, Path: path, file: f}, nil
+				f, openErr := privatefile.Open(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_RDWR)
+				if openErr == nil {
+					return &Store{ID: id, Path: path, file: f, writer: writer}, nil
+				}
+				writer.Close()
+				err = openErr
 			}
-			if !os.IsExist(err) {
+			if !os.IsExist(err) && !errors.Is(err, ErrSessionBusy) {
 				return nil, err
 			}
 			id = fmt.Sprintf("%s-%d", time.Now().Format("20060102-150405"), i)
 			path = filepath.Join(dir, id+".jsonl")
 		}
 	}
+	writer, err := acquireWriter(id)
+	if err != nil {
+		return nil, err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			writer.Close()
+		}
+	}()
 	// Windows append handles cannot truncate, even with O_RDWR. Repair
 	// through a separate read/write handle, then reopen for append-only use.
+	if err := checkTranscriptPath(path); err != nil {
+		return nil, err
+	}
 	f, err := privatefile.Open(path, os.O_CREATE|os.O_RDWR)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkTranscriptLinks(f); err != nil {
+		f.Close()
 		return nil, err
 	}
 	if err := recoverTail(f); err != nil {
@@ -124,7 +148,8 @@ func New(id string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{ID: id, Path: path, file: f}, nil
+	keep = true
+	return &Store{ID: id, Path: path, file: f, writer: writer}, nil
 }
 
 func (s *Store) Append(m llm.Message) error {
@@ -230,12 +255,26 @@ func marshalCheckpoint(msgs []llm.Message) ([]byte, error) {
 // directory and returns its path. Used before compaction so the original
 // transcript is kept separately.
 func (s *Store) ArchiveCopy(name string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	writer, err := acquireWriter(name)
+	if err != nil {
+		return "", err
+	}
+	defer writer.Close()
 	data, err := os.ReadFile(s.Path)
 	if err != nil {
 		return "", err
 	}
 	dst := filepath.Join(Dir(), name+".jsonl")
-	if err := privatefile.Write(dst, data); err != nil {
+	f, err := privatefile.Open(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
+	if err != nil {
+		return "", err
+	}
+	_, writeErr := f.Write(data)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
 		return "", err
 	}
 	return dst, nil
@@ -359,7 +398,12 @@ func (s *Store) Close() error {
 		s.auditFile.Close()
 		s.auditFile = nil
 	}
-	return s.file.Close()
+	err := s.file.Close()
+	if s.writer != nil {
+		err = errors.Join(err, s.writer.Close())
+		s.writer = nil
+	}
+	return err
 }
 
 // Load replays the active checkpoint and repairs incomplete tool batches
