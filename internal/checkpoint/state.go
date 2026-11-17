@@ -143,8 +143,8 @@ type Delta struct {
 // Merge owns its result and leaves both inputs unchanged, including on errors.
 // Bounds fail closed instead of evicting old instructions or unresolved work.
 func Merge(previous State, d Delta) (State, error) {
-	if len(d.Constraints)+len(d.Decisions)+len(d.Verification)+len(d.Failures)+len(d.Pending)+len(d.Jobs)+len(d.Artifacts) > MaxEntries || len(d.ResolvedCalls)+len(d.ResolvedFailures) > MaxEntries {
-		return State{}, fmt.Errorf("checkpoint delta exceeds %d entries", MaxEntries)
+	if err := d.validate(); err != nil {
+		return State{}, err
 	}
 	if previous.Version == 0 {
 		if previous.ActiveTask != nil || len(previous.Constraints)+len(previous.Decisions)+len(previous.Verification)+len(previous.Failures)+len(previous.Pending)+len(previous.Jobs)+len(previous.Artifacts) != 0 {
@@ -206,6 +206,64 @@ func Merge(previous State, d Delta) (State, error) {
 		return State{}, err
 	}
 	return Decode(encoded) // Detach incoming slices and pointer fields too.
+}
+
+// Check incoming facts before upsert/removal can hide an invalid record behind
+// a later observation. The limit covers all inputs, including resolutions.
+func (d Delta) validate() error {
+	entries := len(d.Constraints) + len(d.Decisions) + len(d.Verification) + len(d.Failures) + len(d.Pending) + len(d.Jobs) + len(d.Artifacts) + len(d.ResolvedCalls) + len(d.ResolvedFailures)
+	if d.ActiveTask != nil {
+		entries++
+	}
+	if entries > MaxEntries {
+		return fmt.Errorf("checkpoint delta exceeds %d entries", MaxEntries)
+	}
+	check := func(s State) error { s.Version = Version; _, err := Encode(s); return err }
+	if d.ActiveTask != nil {
+		if err := check(State{ActiveTask: d.ActiveTask, Constraints: []Text{*d.ActiveTask}}); err != nil {
+			return err
+		}
+	}
+	for _, list := range [][]Text{d.Constraints, d.Decisions} {
+		for _, record := range list {
+			if err := check(State{Constraints: []Text{record}}); err != nil {
+				return err
+			}
+		}
+	}
+	for _, record := range d.Verification {
+		if err := check(State{Verification: []verification.Evidence{record}}); err != nil {
+			return err
+		}
+	}
+	for _, record := range d.Failures {
+		if err := check(State{Failures: []Failure{record}}); err != nil {
+			return err
+		}
+	}
+	for _, record := range d.Pending {
+		if err := check(State{Pending: []PendingCall{record}}); err != nil {
+			return err
+		}
+	}
+	for _, record := range d.Jobs {
+		if err := check(State{Jobs: []Job{record}}); err != nil {
+			return err
+		}
+	}
+	for _, record := range d.Artifacts {
+		if err := check(State{Artifacts: []Artifact{record}}); err != nil {
+			return err
+		}
+	}
+	for _, keys := range [][]string{d.ResolvedCalls, d.ResolvedFailures} {
+		for _, key := range keys {
+			if key == "" || len(key) > MaxTextBytes || !utf8.ValidString(key) {
+				return fmt.Errorf("invalid checkpoint resolution key")
+			}
+		}
+	}
+	return nil
 }
 
 func mergeText(old, added []Text) ([]Text, error) {
@@ -280,6 +338,12 @@ func Decode(data []byte) (State, error) {
 	if !utf8.Valid(data) {
 		return State{}, fmt.Errorf("checkpoint is not valid UTF-8")
 	}
+	if err := validateUnicodeEscapes(data); err != nil {
+		return State{}, err
+	}
+	if err := validateJSONFields(json.NewDecoder(bytes.NewReader(data)), 0); err != nil {
+		return State{}, err
+	}
 	var out State
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
@@ -289,10 +353,120 @@ func Decode(data []byte) (State, error) {
 	if err := d.Decode(new(any)); err != io.EOF {
 		return State{}, fmt.Errorf("trailing checkpoint data")
 	}
-	if err := out.validate(); err != nil {
+	// A compact input may expand under the canonical encoder (for example
+	// literal HTML characters). Every decoded state must remain re-encodable.
+	if _, err := Encode(out); err != nil {
 		return State{}, err
 	}
 	return out, nil
+}
+
+func validateJSONFields(d *json.Decoder, depth int) error {
+	if depth > 32 {
+		return fmt.Errorf("checkpoint JSON nesting exceeds limit")
+	}
+	token, err := d.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]bool)
+		for d.More() {
+			key, err := d.Token()
+			if err != nil {
+				return err
+			}
+			name, ok := key.(string)
+			if !ok {
+				return fmt.Errorf("invalid checkpoint JSON field")
+			}
+			// encoding/json matches struct fields without case sensitivity.
+			name = strings.ToLower(name)
+			if seen[name] {
+				return fmt.Errorf("duplicate checkpoint JSON field %q", name)
+			}
+			seen[name] = true
+			if err := validateJSONFields(d, depth+1); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for d.More() {
+			if err := validateJSONFields(d, depth+1); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("invalid checkpoint JSON delimiter")
+	}
+	_, err = d.Token()
+	return err
+}
+
+// encoding/json repairs unpaired UTF-16 escapes with U+FFFD. Reject those
+// escapes before decoding so a source statement can never change silently.
+func validateUnicodeEscapes(data []byte) error {
+	hex4 := func(p []byte) (uint16, error) {
+		var n uint16
+		for _, c := range p {
+			var digit byte
+			switch {
+			case c >= '0' && c <= '9':
+				digit = c - '0'
+			case c >= 'a' && c <= 'f':
+				digit = c - 'a' + 10
+			case c >= 'A' && c <= 'F':
+				digit = c - 'A' + 10
+			default:
+				return 0, fmt.Errorf("invalid checkpoint Unicode escape")
+			}
+			n = n*16 + uint16(digit)
+		}
+		return n, nil
+	}
+	for i := 0; i < len(data); i++ {
+		if data[i] != '"' {
+			continue
+		}
+		for i++; i < len(data) && data[i] != '"'; i++ {
+			if data[i] != '\\' {
+				continue
+			}
+			i++
+			if i >= len(data) || data[i] != 'u' {
+				continue
+			}
+			if i+4 >= len(data) {
+				return fmt.Errorf("incomplete checkpoint Unicode escape")
+			}
+			n, err := hex4(data[i+1 : i+5])
+			if err != nil {
+				return err
+			}
+			i += 4
+			if n >= 0xd800 && n <= 0xdbff {
+				if i+6 >= len(data) || data[i+1] != '\\' || data[i+2] != 'u' {
+					return fmt.Errorf("unpaired checkpoint Unicode surrogate")
+				}
+				low, err := hex4(data[i+3 : i+7])
+				if err != nil {
+					return err
+				}
+				if low < 0xdc00 || low > 0xdfff {
+					return fmt.Errorf("unpaired checkpoint Unicode surrogate")
+				}
+				i += 6
+			} else if n >= 0xdc00 && n <= 0xdfff {
+				return fmt.Errorf("unpaired checkpoint Unicode surrogate")
+			}
+		}
+	}
+	return nil
 }
 
 func digest(s string) bool {

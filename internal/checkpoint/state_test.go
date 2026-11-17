@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -219,7 +220,7 @@ func TestCheckpointRejectsInvalidOrOversizedState(t *testing.T) {
 }
 
 func TestDecodeRejectsUnsupportedAndMalformedRecords(t *testing.T) {
-	for _, input := range []string{`null`, `{}`, `{"version":2}`, `{"version":1,"new_field":1}`, `{"version":1} {"version":1}`, strings.Repeat(" ", MaxBytes+1)} {
+	for _, input := range []string{`null`, `{}`, `{"version":2}`, `{"version":1,"new_field":1}`, `{"version":1,"version":1}`, `{"version":1,"Version":1}`, `{"version":1,"constraints":[{"source":"s","content":"keep","content":"discard"}]}`, `{"version":1} {"version":1}`, strings.Repeat(" ", MaxBytes+1)} {
 		if _, err := Decode([]byte(input)); err == nil {
 			t.Fatalf("accepted malformed/unknown checkpoint: %.100s", input)
 		}
@@ -237,5 +238,48 @@ func TestDecodeRejectsUnsupportedAndMalformedRecords(t *testing.T) {
 	}
 	if _, err := Decode(b); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDeltaValidatesEveryEntryBeforeReplacement(t *testing.T) {
+	for name, d := range map[string]Delta{
+		"superseded oversized evidence": {Verification: []verification.Evidence{testEvidence(1, strings.Repeat("x", MaxTextBytes+1)), testEvidence(0, "")}},
+		"invalid resolution":            {ResolvedCalls: []string{string([]byte{0xff})}},
+		"large resolution":              {ResolvedFailures: []string{strings.Repeat("x", MaxTextBytes+1)}},
+		"empty resolution":              {ResolvedCalls: []string{""}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Merge(State{}, d); err == nil {
+				t.Fatal("invalid discarded delta data accepted")
+			}
+		})
+	}
+	d := Delta{ResolvedCalls: []string{"resolved"}}
+	for i := 0; i < MaxEntries; i++ {
+		d.Constraints = append(d.Constraints, Text{Source: fmt.Sprint(i), Content: "x"})
+	}
+	if _, err := Merge(State{}, d); err == nil {
+		t.Fatal("combined delta entry budget bypassed")
+	}
+}
+
+func TestDecodeKeepsSourceUnicodeAndEncoderBounds(t *testing.T) {
+	for _, text := range []string{`\ud800`, `\udfff`, `\ud800x`, `\ud800\ud800`, `\udfff\ud800`} {
+		input := `{"version":1,"constraints":[{"source":"task","content":"` + text + `"}]}`
+		if _, err := Decode([]byte(input)); err == nil {
+			t.Errorf("unpaired surrogate accepted: %s", text)
+		}
+	}
+	for _, text := range []string{`\ud83d\ude00`, `literal \\ud800`, `replacement �`} {
+		input := `{"version":1,"constraints":[{"source":"task","content":"` + text + `"}]}`
+		if _, err := Decode([]byte(input)); err != nil {
+			t.Fatalf("valid Unicode/escape rejected: %s %v", text, err)
+		}
+	}
+	input := `{"version":1,"constraints":[{"source":"task","content":"` + strings.Repeat("<", 50000) + `"}]}`
+	if decoded, err := Decode([]byte(input)); err == nil {
+		if _, err := Encode(decoded); err != nil {
+			t.Fatalf("decoded state is not re-encodable: %v", err)
+		}
 	}
 }
