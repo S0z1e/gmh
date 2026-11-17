@@ -214,7 +214,7 @@ func (s *Store) replaceHeader(h *Header, skip int64) error {
 func repositoryIdentity(root string) *workspace.Identity {
 	for dir := root; ; dir = filepath.Dir(dir) {
 		marker := filepath.Join(dir, ".git")
-		info, err := os.Lstat(marker)
+		info, err := os.Stat(marker)
 		if err == nil {
 			target := marker
 			if info.Mode().IsRegular() {
@@ -232,11 +232,15 @@ func repositoryIdentity(root string) *workspace.Identity {
 				if err != nil || len(data) > maxHeaderBytes {
 					return nil
 				}
-				text := strings.TrimSpace(string(data))
+				// Git removes trailing CR/LF, but spaces are part of the path.
+				text := strings.TrimRight(string(data), "\r\n")
 				if !strings.HasPrefix(text, "gitdir: ") {
 					return nil
 				}
-				target = strings.TrimSpace(strings.TrimPrefix(text, "gitdir: "))
+				target = strings.TrimPrefix(text, "gitdir: ")
+				if target == "" {
+					return nil
+				}
 				if !filepath.IsAbs(target) {
 					target = filepath.Join(dir, target)
 				}

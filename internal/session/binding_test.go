@@ -286,3 +286,89 @@ func TestBindingCanExplicitlyImportAnotherOSPath(t *testing.T) {
 	}
 	rebound.Close()
 }
+
+func TestRepositoryGitdirWhitespaceChangesIdentity(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	parent := t.TempDir()
+	first := filepath.Join(parent, "meta")
+	second := first + " "
+	for _, path := range []string{first, second} {
+		if err := os.Mkdir(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	marker := filepath.Join(root, ".git")
+	if err := os.WriteFile(marker, []byte("gitdir: "+first+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open("bound", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if err := os.WriteFile(marker, []byte("gitdir: "+second+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	repo := repositoryIdentity(root)
+	want, err := workspace.Identify(second)
+	if err != nil || repo == nil || !repo.Matches(want) {
+		t.Fatalf("gitdir whitespace lost: repo=%v err=%v", repo, err)
+	}
+	if other, err := Open("bound", OpenOptions{Workspace: root}); err == nil {
+		other.Close()
+		t.Fatal("changed repository accepted without explicit rebind")
+	}
+	if err := os.WriteFile(marker, []byte(" gitdir: "+first+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if repositoryIdentity(root) != nil {
+		t.Fatal("invalid gitfile prefix accepted")
+	}
+}
+
+func TestRepositorySymlinkChangeRequiresRebind(t *testing.T) {
+	for _, kind := range []string{"directory", "gitfile"} {
+		t.Run(kind, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			root := t.TempDir()
+			first, second := t.TempDir(), t.TempDir()
+			marker := filepath.Join(root, ".git")
+			target := first
+			if kind == "gitfile" {
+				target = filepath.Join(t.TempDir(), "gitfile")
+				if err := os.WriteFile(target, []byte("gitdir: "+first+"\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(target, marker); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+			s, err := Open("linked", OpenOptions{Workspace: root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.header.Repository == nil {
+				s.Close()
+				t.Fatal("symlinked repository identity missing")
+			}
+			s.Close()
+			if kind == "gitfile" {
+				if err := os.WriteFile(target, []byte("gitdir: "+second+"\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Remove(marker); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(second, marker); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if next, err := Open("linked", OpenOptions{Workspace: root}); err == nil {
+				next.Close()
+				t.Fatal("changed symlinked repository accepted")
+			}
+		})
+	}
+}
