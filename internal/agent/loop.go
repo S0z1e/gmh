@@ -1176,6 +1176,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					_ = c.Session.Audit(entry)
 				}
 				if err != nil {
+					if c.budgetError() != nil {
+						c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
+					}
 					c.LastTerminalReason = TerminalError
 					if ctx.Err() != nil {
 						c.LastTerminalReason = TerminalAbort
@@ -1199,7 +1202,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			if err := ctx.Err(); err != nil {
 				closeMutation()
-				c.rejectBudgetTools(assistant.ToolCalls[i:], err)
+				c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
 				return lastText, total, err
 			}
 			toolCtx := tools.WithInvocation(ctx, inv.ID, tc.ID)
@@ -1212,7 +1215,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			if err := ctx.Err(); err != nil {
 				closeMutation()
-				c.rejectBudgetTools(assistant.ToolCalls[i:], err)
+				c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
 				return lastText, total, err
 			}
 			var obs string

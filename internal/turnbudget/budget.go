@@ -110,11 +110,14 @@ func (e *Unavailable) Error() string {
 }
 
 // Usage distinguishes reported token counts and cost priced from configured
-// rates from absent data. CostUSD must be nil when usage or required rates are
-// unknown; a local token estimate is not reported usage.
+// rates from absent data. Both cost fields must be nil when usage or required
+// rates are unknown; a local token estimate is not reported usage.
 type Usage struct {
 	Tokens  *int64
 	CostUSD *float64
+	// ExactCostUSD accepts a decimal-priced amount without a float conversion.
+	// Supply at most one cost representation. RecordUsage copies the value.
+	ExactCostUSD *big.Rat
 	// TokensPartial retains a reported subtotal without claiming the entire
 	// attempt was measured (for example, a stream lost its output counter).
 	TokensPartial bool
@@ -229,13 +232,26 @@ func (b *Tracker) RecordUsage(u Usage) error {
 	if u.TokensPartial {
 		b.state.TokensComplete = false
 	}
-	if u.CostUSD == nil {
+	var cost *big.Rat
+	invalidCost := false
+	if u.ExactCostUSD != nil {
+		invalidCost = u.CostUSD != nil || u.ExactCostUSD.Sign() < 0
+		if !invalidCost {
+			cost = u.ExactCostUSD
+		}
+	} else if u.CostUSD != nil {
+		invalidCost = !finiteNonnegative(*u.CostUSD)
+		if !invalidCost {
+			cost = decimal(*u.CostUSD)
+		}
+	}
+	if invalidCost {
 		b.state.CostComplete = false
-	} else if !finiteNonnegative(*u.CostUSD) {
+		b.unmetered("cost_usd", "invalid or ambiguous usage")
+	} else if cost == nil {
 		b.state.CostComplete = false
-		b.unmetered("cost_usd", "invalid or overflowing usage")
 	} else {
-		next := new(big.Rat).Add(&b.cost, decimal(*u.CostUSD))
+		next := new(big.Rat).Add(&b.cost, cost)
 		amount, _ := next.Float64()
 		if !finiteNonnegative(amount) {
 			b.state.CostComplete = false

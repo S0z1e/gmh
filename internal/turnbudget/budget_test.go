@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"math/big"
 	"testing"
 	"time"
 )
@@ -240,5 +241,27 @@ func TestDecimalCostBoundaries(t *testing.T) {
 			exhausted(t, b.CheckRequest(b.State().Started), "cost_usd")
 			exhausted(t, b.RecordUsage(Usage{CostUSD: dollars(math.SmallestNonzeroFloat64)}), "cost_usd")
 		})
+	}
+}
+
+func TestExactPriceAmountsAreCopiedAndNeverRoundedForEnforcement(t *testing.T) {
+	b := tracker(t, &Policy{MaxCostUSD: dollars(.11)})
+	cost := big.NewRat(11, 100)
+	if err := b.RecordUsage(Usage{ExactCostUSD: cost}); err != nil {
+		t.Fatal(err)
+	}
+	cost.SetInt64(100)
+	if b.State().RecordedCostUSD != .11 {
+		t.Fatal("caller mutation changed recorded cost")
+	}
+	exhausted(t, b.CheckRequest(b.State().Started), "cost_usd")
+	tiny, _ := new(big.Rat).SetString("1e-300")
+	exhausted(t, b.RecordUsage(Usage{ExactCostUSD: tiny}), "cost_usd")
+	for _, u := range []Usage{{ExactCostUSD: big.NewRat(-1, 10)}, {CostUSD: dollars(1), ExactCostUSD: big.NewRat(1, 1)}} {
+		c := tracker(t, nil)
+		unavailable(t, c.RecordUsage(u), "cost_usd")
+		if c.State().CostComplete || c.State().RecordedCostUSD != 0 {
+			t.Fatal("invalid cost accepted")
+		}
 	}
 }

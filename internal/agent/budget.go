@@ -31,7 +31,7 @@ func (c *Config) startBudget(parent context.Context) (context.Context, context.C
 		api = c.Client.Mode()
 	}
 	c.resources = &turnResources{parent: parent, rates: c.UsageRates, api: api}
-	b, err := turnbudget.New(c.TurnBudget, time.Now(), c.UsageRates.Complete && api != "anthropic")
+	b, err := turnbudget.New(c.TurnBudget, time.Now(), c.UsageRates.BudgetReady() && api != "anthropic")
 	if err != nil {
 		c.resources.failure = err
 		return parent, func() {}, err
@@ -89,9 +89,10 @@ func (c *Config) recordBudgetUsage(usage *llm.Usage, started time.Time, tokensCo
 		}
 		measured.Tokens = &tokens
 		measured.TokensPartial = !tokensComplete
-		if u.CachedTokens >= 0 && u.CachedTokens <= u.PromptTokens && r.rates.Complete && priceCountsComplete && r.api != "anthropic" && tokens >= 0 && (u.CacheUsageReported || r.rates.InputPerMTok == r.rates.CachedPerMTok && r.rates.PeakInputPerMTok == r.rates.PeakCachedPerMTok) {
-			cost := r.rates.Cost(u, started)
-			measured.CostUSD = &cost
+		if priceCountsComplete && r.api != "anthropic" && tokens >= 0 {
+			if cost, known := r.rates.BudgetCost(u, started); known {
+				measured.ExactCostUSD = cost
+			}
 		}
 	}
 	if err := r.tracker.RecordUsage(measured); err != nil && r.failure == nil {
@@ -176,11 +177,16 @@ func (c *Config) reserveBudgetTools(calls []llm.ToolCall) error {
 
 // Calls rejected before dispatch have no committed invocation ID. Store a real
 // tool result for each so resume never treats them as interrupted side effects.
-func (c *Config) rejectBudgetTools(calls []llm.ToolCall, err error) {
-	for _, tc := range calls {
+func (c *Config) rejectBudgetTools(calls []llm.ToolCall, err error, startedInvocation ...string) {
+	for i, tc := range calls {
 		obs := fmt.Sprintf("Not executed: %v", err)
-		c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments, ToolCallID: tc.ID})
-		c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, ToolOutput: obs, ToolErr: err})
-		c.persist(llm.Message{Role: "tool", ToolCallID: tc.ID, ToolError: true, Content: obs})
+		invocation := ""
+		if i == 0 && len(startedInvocation) > 0 {
+			invocation = startedInvocation[0]
+		} else {
+			c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments, ToolCallID: tc.ID})
+		}
+		c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: invocation, ToolOutput: obs, ToolErr: err})
+		c.persist(llm.Message{Role: "tool", ToolCallID: tc.ID, InvocationID: invocation, ToolError: true, Content: obs})
 	}
 }

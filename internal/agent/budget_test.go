@@ -155,6 +155,81 @@ func TestBudgetReportedTotalDoesNotNeedPriceBreakdown(t *testing.T) {
 		t.Fatalf("known total erased by missing price breakdown: %+v %v", c.LastTurnBudget, err)
 	}
 }
+
+func TestBudgetPriceCalculationUsesDecimalRates(t *testing.T) {
+	c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(.11)})
+	c.UsageRates = llm.Rates{InputPerMTok: 1.1, OutputPerMTok: 1.1, CachedPerMTok: 1.1, Configured: true, Complete: true}
+	_, cancel, err := c.startBudget(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	u := llm.Usage{PromptTokens: 100000, TotalTokens: 100000}
+	c.recordBudgetUsage(&u, time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC), true, true)
+	if err := c.budgetError(); err != nil {
+		t.Fatal("exact-cap charge rejected:", err)
+	}
+	if c.resources.tracker.State().RecordedCostUSD != .11 {
+		t.Fatal("wrong cost")
+	}
+}
+
+func TestBudgetCacheSplitOnlyRequiredByActivePrices(t *testing.T) {
+	for _, peak := range []bool{false, true} {
+		t.Run(fmt.Sprint(peak), func(t *testing.T) {
+			c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(1)})
+			c.UsageRates = llm.Rates{InputPerMTok: 1, OutputPerMTok: 1, CachedPerMTok: 1, PeakInputPerMTok: 3, PeakCachedPerMTok: 2, Configured: true, Complete: true}
+			when := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+			if peak {
+				c.UsageRates.CachedPerMTok = 2
+				c.UsageRates.PeakCachedPerMTok = 3
+				when = time.Date(2026, 11, 16, 1, 0, 0, 0, time.UTC)
+			}
+			_, cancel, err := c.startBudget(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cancel()
+			u := llm.Usage{PromptTokens: 100, TotalTokens: 100}
+			c.recordBudgetUsage(&u, when, true, true)
+			if err := c.budgetError(); err != nil {
+				t.Fatal("inactive prices forced cache split:", err)
+			}
+		})
+	}
+}
+
+func TestBudgetApprovalExpiryPersistsKnownUnexecutedBatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c := budgetConfig(t, &turnbudget.Policy{MaxDurationSeconds: capInt(1)})
+	c.Mode = "suggest"
+	c.Ask = func(req ApprovalRequest) (bool, error) { <-req.Context.Done(); return false, req.Context.Err() }
+	store, err := session.Open("expired-approval", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c.Session = store
+	calls := []llm.ToolCall{budgetCall("a", "write", `{"path":"a","content":"x"}`), budgetCall("b", "write", `{"path":"b","content":"x"}`)}
+	events, _, err := runVerification(t, c, budgetSSE("", calls, nil, true))
+	requireBudgetStop(t, c, events, err, TerminalBudgetExceeded)
+	history, err := session.Load(store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := 0
+	for _, m := range history {
+		if m.Role == "tool" {
+			results++
+			if !strings.Contains(m.Content, "Not executed:") || !m.ToolError {
+				t.Fatalf("invented unknown outcome for unexecuted call: %+v", m)
+			}
+		}
+	}
+	if results != 2 {
+		t.Fatalf("results=%d", results)
+	}
+}
 func newInt(n int) *int { return &n }
 
 func TestBudgetMetersFailedAttemptsAndStopsRetryAtCap(t *testing.T) {
@@ -379,5 +454,23 @@ func TestBudgetWireCountsPreserveUnknownFieldsAcrossAPIs(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestBudgetResponsesNonterminalUsageRemainsPartial(t *testing.T) {
+	response := "data: {\"type\":\"response.created\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":0,\"total_tokens\":2}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, response)
+	}))
+	defer srv.Close()
+	c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(10)})
+	c.Client = &llm.Client{BaseURL: srv.URL, API: "responses", Model: "fake", APIKey: "fake"}
+	var events []Event
+	c.OnEvent = func(e Event) { events = append(events, e) }
+	_, _, err := c.Run(context.Background(), []llm.Message{{Role: "user", Content: "work"}})
+	requireBudgetStop(t, c, events, err, TerminalBudgetUnavailable)
+	if c.LastTurnBudget.ReportedTokens != 2 || c.LastTurnBudget.TokensComplete {
+		t.Fatal("nonterminal counters treated as final")
 	}
 }

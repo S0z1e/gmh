@@ -173,6 +173,7 @@ func traceWireUsage(ctx context.Context, usage Usage, data string, responses boo
 		return
 	}
 	var envelope struct {
+		Type     string          `json:"type"`
 		Usage    json.RawMessage `json:"usage"`
 		Response struct {
 			Usage json.RawMessage `json:"usage"`
@@ -196,5 +197,6 @@ func traceWireUsage(ctx context.Context, usage Usage, data string, responses boo
 		input, output = counts.Input, counts.Output
 	}
 	complete := input != nil && output != nil
-	traceUsage(ctx, usage, counts.Total != nil || complete, complete)
+	final := !responses || envelope.Type == "response.completed" || envelope.Type == "response.incomplete"
+	traceUsage(ctx, usage, final && (counts.Total != nil || complete), final && complete)
 }

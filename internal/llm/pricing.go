@@ -3,6 +3,7 @@ package llm
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"os"
 	"strconv"
 	"time"
@@ -112,7 +113,16 @@ func (r Rates) Cost(u Usage, t time.Time) float64 {
 	if !r.Configured {
 		return 0
 	}
-	in, out, cached := r.InputPerMTok, r.OutputPerMTok, r.CachedPerMTok
+	in, out, cached := r.at(t)
+	nonCached := u.PromptTokens - u.CachedTokens
+	if nonCached < 0 {
+		nonCached = 0
+	}
+	return (float64(nonCached)*in + float64(u.CachedTokens)*cached + float64(u.CompletionTokens)*out) / 1e6
+}
+
+func (r Rates) at(t time.Time) (in, out, cached float64) {
+	in, out, cached = r.InputPerMTok, r.OutputPerMTok, r.CachedPerMTok
 	if IsPeak(t) {
 		if r.PeakInputPerMTok > 0 {
 			in = r.PeakInputPerMTok
@@ -124,9 +134,41 @@ func (r Rates) Cost(u Usage, t time.Time) float64 {
 			cached = r.PeakCachedPerMTok
 		}
 	}
-	nonCached := u.PromptTokens - u.CachedTokens
-	if nonCached < 0 {
-		nonCached = 0
+	return
+}
+
+// BudgetReady requires a complete finite rate schedule; UI estimates may use
+// partial schedules, but enforcement cannot treat omitted rates as zero.
+func (r Rates) BudgetReady() bool {
+	if !r.Complete {
+		return false
 	}
-	return (float64(nonCached)*in + float64(u.CachedTokens)*cached + float64(u.CompletionTokens)*out) / 1e6
+	for _, v := range []float64{r.InputPerMTok, r.OutputPerMTok, r.CachedPerMTok, r.PeakInputPerMTok, r.PeakOutputPerMTok, r.PeakCachedPerMTok} {
+		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// BudgetCost applies the active schedule using exact decimal rate arithmetic.
+// Unknown cache counts matter only when the active input/cache prices differ.
+// The caller must separately establish that input/output counters are present.
+func (r Rates) BudgetCost(u Usage, t time.Time) (*big.Rat, bool) {
+	if !r.BudgetReady() || u.PromptTokens < 0 || u.CompletionTokens < 0 || u.CachedTokens < 0 || u.CachedTokens > u.PromptTokens {
+		return nil, false
+	}
+	in, out, cached := r.at(t)
+	if !u.CacheUsageReported && in != cached {
+		return nil, false
+	}
+	amount := new(big.Rat)
+	for _, part := range []struct {
+		tokens int
+		rate   float64
+	}{{u.PromptTokens - u.CachedTokens, in}, {u.CachedTokens, cached}, {u.CompletionTokens, out}} {
+		rate, _ := new(big.Rat).SetString(strconv.FormatFloat(part.rate, 'g', -1, 64))
+		amount.Add(amount, new(big.Rat).Mul(rate, new(big.Rat).SetInt64(int64(part.tokens))))
+	}
+	return amount.Quo(amount, big.NewRat(1000000, 1)), true
 }
