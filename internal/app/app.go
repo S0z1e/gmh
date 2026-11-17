@@ -36,6 +36,7 @@ type Params struct {
 	MaxSteps       int
 	ContextLimit   int
 	Resume         string
+	RebindSession  bool // direct startup consent, only valid with Resume
 	SessionID      string
 	// Provider selects a provider entry from the config file
 	// (defaultProvider when empty).
@@ -117,6 +118,9 @@ type App struct {
 // Setup builds the client, session and agent config. The caller sets
 // Cfg.OnEvent (the event renderer) before running anything.
 func Setup(p Params) (*App, error) {
+	if p.RebindSession && p.Resume == "" {
+		return nil, fmt.Errorf("--rebind-session requires --resume")
+	}
 	identity, err := workspace.Identify(p.Root)
 	if err != nil {
 		return nil, err
@@ -222,11 +226,25 @@ func Setup(p Params) (*App, error) {
 	if p.Resume != "" {
 		id = p.Resume
 	}
-	store, err := session.New(id)
+	if p.Resume != "" {
+		if err := session.ValidateSessionID(p.Resume); err != nil {
+			return nil, err
+		}
+		if _, err := os.Stat(filepath.Join(session.Dir(), p.Resume+".jsonl")); err != nil {
+			return nil, fmt.Errorf("cannot resume session %q: %w", p.Resume, err)
+		}
+	}
+	store, err := session.Open(id, session.OpenOptions{Workspace: absRoot, Rebind: p.RebindSession})
 	if err != nil {
 		return nil, err
 	}
 
+	setupComplete := false
+	defer func() {
+		if !setupComplete {
+			_ = store.Close()
+		}
+	}()
 	a := &App{Store: store, Root: absRoot, WorkspaceTrusted: trusted}
 	if p.Resume != "" {
 		history, err := session.Load(p.Resume)
@@ -423,6 +441,7 @@ func Setup(p Params) (*App, error) {
 			return nil, fmt.Errorf("-image %s: %w", p, err)
 		}
 	}
+	setupComplete = true
 	return a, nil
 }
 
@@ -705,7 +724,7 @@ func (a *App) NewSession() (*session.Store, error) {
 // ResetSession (/clear) creates a fresh session too, but the design
 // says it does NOT fire the session events, so it passes false.
 func (a *App) newSession(fire bool) (*session.Store, error) {
-	store, err := session.New("")
+	store, err := session.Open("", session.OpenOptions{Workspace: a.Root})
 	if err != nil {
 		return nil, err
 	}
@@ -752,9 +771,14 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	old := a.Store
 	store := old
 	reuse := old != nil && old.Owns(id)
+	if reuse {
+		if err := old.CheckWorkspace(a.Root); err != nil {
+			return nil, err
+		}
+	}
 	if !reuse {
 		var err error
-		store, err = session.New(id)
+		store, err = session.Open(id, session.OpenOptions{Workspace: a.Root})
 		if err != nil {
 			return nil, err
 		}

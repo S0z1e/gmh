@@ -48,3 +48,5 @@ func checkTranscriptLinks(f *os.File) error {
 	}
 	return nil
 }
+
+const metadataReadFlags = syscall.O_NONBLOCK

@@ -869,7 +869,7 @@ func TestListRenameResumeSessions(t *testing.T) {
 	d.waitFor("ready", 5*time.Second)
 
 	// A second session on disk, with one message.
-	other, err := session.New("second")
+	other, err := session.Open("second", session.OpenOptions{Workspace: a.Root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1258,7 +1258,7 @@ func TestSetToolModeAndDeleteSession(t *testing.T) {
 	d.waitFor("ready", 5*time.Second)
 
 	// A second session on disk, with one message.
-	other, err := session.New("second")
+	other, err := session.Open("second", session.OpenOptions{Workspace: a.Root})
 	if err != nil {
 		t.Fatal(err)
 	}

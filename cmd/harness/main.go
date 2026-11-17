@@ -34,6 +34,7 @@ func main() {
 		maxSteps       = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
 		viewSessionID  = flag.String("view-session", "", "read a session as JSONL without opening a writer or loading providers")
 		resume         = flag.String("resume", "", "resume session id")
+		rebindSession  = flag.Bool("rebind-session", false, "explicitly bind resumed or legacy history to this workspace")
 		sessionID      = flag.String("session", "", "session id (default: timestamp)")
 		ctxLimit       = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
 		ui             = flag.String("ui", "auto", "ui: auto, plain or tui (ignored by -p, which is always plain)")
@@ -47,7 +48,7 @@ func main() {
 	flag.Var(&images, "image", "attach an image file to the first turn (repeatable; png, jpg, gif, webp; the model must declare image input)")
 	flag.Parse()
 	if *viewSessionID != "" {
-		if *rpcMode || *printMode != "" || *resume != "" || *sessionID != "" {
+		if *rpcMode || *printMode != "" || *resume != "" || *sessionID != "" || *rebindSession {
 			fatal(fmt.Errorf("--view-session conflicts with --rpc, -p, --resume and --session"))
 		}
 		if err := viewSession(os.Stdout, *viewSessionID); err != nil {
@@ -70,7 +71,7 @@ func main() {
 			fatal(err)
 		}
 		if uiMode == "tui" {
-			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *sandbox, images, *workspaceTrust); err != nil {
+			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *sandbox, images, *workspaceTrust, *rebindSession); err != nil {
 				fmt.Fprintf(os.Stderr, "harness: TUI unavailable (%v); continuing in plain mode.\n", err)
 			}
 			// execTUI replaces this process on success; reaching here
@@ -91,6 +92,7 @@ func main() {
 		MaxSteps:                   *maxSteps,
 		ContextLimit:               *ctxLimit,
 		Resume:                     *resume,
+		RebindSession:              *rebindSession,
 		SessionID:                  *sessionID,
 		DenyInsteadOfPrompt:        *deny || *printMode != "",
 		Sandbox:                    *sandbox,
@@ -301,7 +303,7 @@ func askQuestionFromScanner(scanner *bufio.Scanner) func(agent.QuestionRequest) 
 // execTUI replaces this process with the sibling harness-tui binary,
 // passing the same flags through. It returns only if the sibling cannot
 // be started (then the caller falls back to plain mode).
-func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images []string, workspaceTrust string) error {
+func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images []string, workspaceTrust string, rebindSession bool) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -310,10 +312,15 @@ func execTUI(root, mode, model, api, provider, config string, maxSteps int, resu
 	if _, err := os.Stat(sibling); err != nil {
 		return fmt.Errorf("no harness-tui next to %s (build it with: go build -o <dir>/harness-tui ./cmd/harness-tui)", self)
 	}
+	return runTUIProcess(sibling, tuiArgs(sibling, root, mode, model, api, provider, config, maxSteps, resume, sessionID, ctxLimit, deny, bashTO, bgThresh, sandbox, images, workspaceTrust, rebindSession))
+}
+
+func tuiArgs(sibling, root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images []string, workspaceTrust string, rebindSession bool) []string {
 	args := []string{
 		sibling,
 		"-root", root,
 		"-workspace-trust", workspaceTrust,
+		"-rebind-session=" + strconv.FormatBool(rebindSession),
 		"-mode", mode,
 		"-model", model,
 		"-api", api,
@@ -323,15 +330,15 @@ func execTUI(root, mode, model, api, provider, config string, maxSteps int, resu
 		"-resume", resume,
 		"-session", sessionID,
 		"-context-limit", strconv.Itoa(ctxLimit),
-		"-deny-instead-of-prompt", strconv.FormatBool(deny),
+		"-deny-instead-of-prompt=" + strconv.FormatBool(deny),
 		"-bash-timeout", strconv.Itoa(bashTO),
 		"-bg-threshold", strconv.Itoa(bgThresh),
-		"-sandbox", strconv.FormatBool(sandbox),
+		"-sandbox=" + strconv.FormatBool(sandbox),
 	}
 	for _, img := range images {
 		args = append(args, "-image", img)
 	}
-	return runTUIProcess(sibling, args)
+	return args
 }
 
 // stringList is a repeatable -image flag: each occurrence appends one path.

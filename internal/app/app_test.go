@@ -923,7 +923,7 @@ func TestSessionsCommand(t *testing.T) {
 	defer a.Store.Close()
 	current := a.Store.ID
 
-	other, err := session.New("other")
+	other, err := session.Open("other", session.OpenOptions{Workspace: a.Root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -964,7 +964,7 @@ func TestSessionsCommand(t *testing.T) {
 		t.Fatalf("rename confirmation = %v", printed)
 	}
 	// Rename a session that is not current.
-	third, err := session.New("third")
+	third, err := session.Open("third", session.OpenOptions{Workspace: a.Root})
 	if err != nil {
 		t.Fatal(err)
 	}

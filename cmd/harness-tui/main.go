@@ -29,6 +29,7 @@ func main() {
 		config         = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
 		maxSteps       = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
 		resume         = flag.String("resume", "", "resume session id")
+		rebindSession  = flag.Bool("rebind-session", false, "explicitly bind resumed or legacy history to this workspace")
 		sessionID      = flag.String("session", "", "session id (default: timestamp)")
 		ctxLimit       = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
 		deny           = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1)")
@@ -57,6 +58,7 @@ func main() {
 		MaxSteps:                   *maxSteps,
 		ContextLimit:               *ctxLimit,
 		Resume:                     *resume,
+		RebindSession:              *rebindSession,
 		SessionID:                  *sessionID,
 		DenyInsteadOfPrompt:        *deny,
 		Sandbox:                    *sandbox,

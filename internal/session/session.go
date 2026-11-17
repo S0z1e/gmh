@@ -21,6 +21,7 @@ type Store struct {
 	Path      string
 	file      *os.File
 	writer    *os.File // lifetime lease, independent of rewritten transcript inode
+	header    *Header
 	auditFile *os.File // lazily opened sidecar for audit records
 	// mu guards Append and Audit: a background job's completion audit
 	// can land on its own goroutine while the loop appends or audits
@@ -77,7 +78,7 @@ func Dir() string {
 	return filepath.Join(home, ".minimal-harness", "sessions")
 }
 
-func New(id string) (*Store, error) {
+func newStore(id string, preflight func(*os.File, bool) error) (*Store, error) {
 	auto := id == ""
 	if !auto {
 		if err := ValidateSessionID(id); err != nil {
@@ -102,6 +103,13 @@ func New(id string) (*Store, error) {
 			if err == nil {
 				f, openErr := privatefile.Open(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_RDWR)
 				if openErr == nil {
+					if preflight != nil {
+						if err := preflight(f, true); err != nil {
+							f.Close()
+							writer.Close()
+							return nil, err
+						}
+					}
 					return &Store{ID: id, Path: path, file: f, writer: writer}, nil
 				}
 				writer.Close()
@@ -129,6 +137,8 @@ func New(id string) (*Store, error) {
 	if err := checkTranscriptPath(path); err != nil {
 		return nil, err
 	}
+	_, statErr := os.Stat(path)
+	created := os.IsNotExist(statErr)
 	f, err := privatefile.Open(path, os.O_CREATE|os.O_RDWR)
 	if err != nil {
 		return nil, err
@@ -136,6 +146,16 @@ func New(id string) (*Store, error) {
 	if err := checkTranscriptLinks(f); err != nil {
 		f.Close()
 		return nil, err
+	}
+	if preflight != nil {
+		if err := preflight(f, created); err != nil {
+			f.Close()
+			return nil, err
+		}
+		if _, err := f.Seek(0, 0); err != nil {
+			f.Close()
+			return nil, err
+		}
 	}
 	if err := recoverTail(f); err != nil {
 		f.Close()
@@ -352,6 +372,14 @@ func (s *Store) Rewrite(msgs []llm.Message) error {
 		return err
 	}
 	var b strings.Builder
+	if s.header != nil {
+		line, err := json.Marshal(s.header)
+		if err != nil {
+			return err
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+	}
 	for _, m := range msgs {
 		line, err := json.Marshal(m)
 		if err != nil {
@@ -402,7 +430,10 @@ func (s *Store) Close() error {
 		s.auditFile.Close()
 		s.auditFile = nil
 	}
-	err := s.file.Close()
+	var err error
+	if s.file != nil {
+		err = s.file.Close()
+	}
 	if s.writer != nil {
 		err = errors.Join(err, s.writer.Close())
 		s.writer = nil
@@ -424,8 +455,19 @@ func Load(id string) ([]llm.Message, error) {
 	defer f.Close()
 	var msgs []llm.Message
 	var replayErr error
+	seenRecord := false
 	_, _, _, err = scanRecords(f, func(line []byte, m llm.Message) {
 		if replayErr != nil {
+			return
+		}
+		first := !seenRecord
+		seenRecord = true
+		if m.Role == headerRole {
+			if !first {
+				replayErr = fmt.Errorf("session header must be the first record")
+				return
+			}
+			_, replayErr = decodeHeader(line)
 			return
 		}
 		if m.Role == invocationMarkerRole {

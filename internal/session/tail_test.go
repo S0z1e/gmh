@@ -53,7 +53,7 @@ func TestResumeRepairsTornRecordAtEveryByte(t *testing.T) {
 			if _, err := Load(id); err != nil {
 				t.Fatal(err)
 			}
-			s, err := New(id)
+			s, err := newLegacyFixture(id)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -114,7 +114,7 @@ func TestCorruptCompleteRecordIsNeverSilentlyDropped(t *testing.T) {
 	if _, err := Load("corrupt"); err == nil {
 		t.Fatal("Load silently skipped corruption")
 	}
-	if s, err := New("corrupt"); err == nil {
+	if s, err := newLegacyFixture("corrupt"); err == nil {
 		s.Close()
 		t.Fatal("opened corrupt session for writing")
 	}
@@ -142,7 +142,7 @@ func TestConcurrentRecoveryKeepsSuccessfulAppends(t *testing.T) {
 		for n := 0; n < 2; n++ {
 			wg.Go(func() {
 				<-start
-				s, err := New(id)
+				s, err := newLegacyFixture(id)
 				if err != nil {
 					errs <- err
 					return
@@ -183,7 +183,7 @@ func TestDeleteRemovesTornBackup(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{\"role\":\"assistant\",\"content\":\"private"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	s, err := New("deleted")
+	s, err := newLegacyFixture("deleted")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestRenameMovesTornBackups(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"role":"user","content":"private`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	s, err := New("old")
+	s, err := newLegacyFixture("old")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ func TestBackupLifecycleWithLiteralGlobCharacters(t *testing.T) {
 			if err := os.WriteFile(path, []byte(`{"role":"user","content":"private`), 0600); err != nil {
 				t.Fatal(err)
 			}
-			s, err := New("old")
+			s, err := newLegacyFixture("old")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -268,12 +268,12 @@ func TestBackupLifecycleWithLiteralGlobCharacters(t *testing.T) {
 
 func TestBackupCleanupPreservesSimilarlyNamedSession(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	s, err := New("old")
+	s, err := newLegacyFixture("old")
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
-	other, err := New("old.jsonl-torn-keep")
+	other, err := newLegacyFixture("old.jsonl-torn-keep")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +302,7 @@ func TestBackupLifecyclePreservesOtherSessionsBackups(t *testing.T) {
 				if err := os.WriteFile(path, []byte(`{"role":"user","content":"private`), 0600); err != nil {
 					t.Fatal(err)
 				}
-				s, err := New(id)
+				s, err := newLegacyFixture(id)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -347,7 +347,7 @@ func TestBackupLifecycleRecognizesCaseAliases(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(Dir(), "LOWER.jsonl")); os.IsNotExist(err) {
 				t.Skip("case-sensitive filesystem")
 			}
-			s, err := New("LOWER")
+			s, err := newLegacyFixture("LOWER")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -391,7 +391,7 @@ func TestBackupLifecyclePreservesCaseDistinctSession(t *testing.T) {
 			t.Fatal(err)
 		}
 		f.Close()
-		s, err := New(id)
+		s, err := newLegacyFixture(id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -408,3 +408,5 @@ func TestBackupLifecyclePreservesCaseDistinctSession(t *testing.T) {
 		t.Fatalf("other backup removed: %v", err)
 	}
 }
+
+func newLegacyFixture(id string) (*Store, error) { return newStore(id, nil) }

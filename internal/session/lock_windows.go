@@ -49,3 +49,5 @@ func checkTranscriptLinks(f *os.File) error {
 	}
 	return nil
 }
+
+const metadataReadFlags = 0

@@ -44,6 +44,10 @@ func pathKey(path string) string {
 	return norm.NFC.String(cases.Fold().String(norm.NFC.String(filepath.ToSlash(path))))
 }
 
+// Matches requires the same canonical location and directory incarnation.
+// Without a creation identity, callers must ask for an explicit new binding.
+func (a Identity) Matches(b Identity) bool { return sameIdentity(a, b) }
+
 func sameIdentity(a, b Identity) bool {
 	return a.FileID != "" && a.FileID == b.FileID && pathKey(a.Path) == pathKey(b.Path)
 }

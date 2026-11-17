@@ -70,6 +70,19 @@
   `harness --view-session <id>` reads the replayed history as JSONL without
   provider credentials or a writer lease, including while a writer is active.
   A view is a snapshot of completed records at read time.
+  New transcripts start with a versioned metadata record containing the canonical
+  workspace, directory creation identity, optional Git metadata directory identity,
+  and creation time. This record is excluded from model history and preserved by
+  clear, compaction, rollback and rename. Resume and `/resume` require the same
+  workspace and repository; replacing a directory or changing repositories also
+  requires a new binding. Symlink aliases of the same directory are accepted.
+  To adopt an older transcript without metadata or move one deliberately, run
+  `harness --root <project> --resume <id> --rebind-session`. This preserves history
+  and creation time when available; it does not grant workspace trust. Unsupported
+  schema versions are rejected even with this flag. On filesystems without a
+  directory creation identity, each reopen requires explicit rebind; new sessions
+  and the read-only viewer remain available. Repository metadata is discovered
+  from `.git` directories/files without running Git or loading its configuration.
 - REPL commands: `/usage` shows session token totals, `/clear` drops
   the conversation context (a marker is written to the session file;
   `--resume` starts from the clear point, older messages stay in the

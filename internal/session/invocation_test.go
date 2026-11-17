@@ -111,7 +111,7 @@ func TestInvocationMarkerKeepsOriginalRecordOnDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	var raw llm.Message
-	if err := json.Unmarshal([]byte(strings.SplitN(string(data), "\n", 2)[0]), &raw); err != nil {
+	if err := json.Unmarshal([]byte(strings.SplitN(string(data), "\n", 3)[1]), &raw); err != nil {
 		t.Fatal(err)
 	}
 	if raw.ToolCalls[0].Function.Arguments != original || len(raw.ToolInvocations) != 0 {
