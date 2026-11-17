@@ -31,8 +31,9 @@ type Snapshot struct {
 }
 
 type fingerprint struct {
-	path string
-	info os.FileInfo
+	path   string
+	info   os.FileInfo
+	change int64
 }
 type contentRecord struct {
 	path string
@@ -101,7 +102,11 @@ func Capture(ctx context.Context, root string, exclude []string) (Snapshot, erro
 		if !before.IsDir() {
 			return fmt.Errorf("verification directory changed during capture")
 		}
-		fingerprints = append(fingerprints, fingerprint{dir, before})
+		change, err := changeTime(f, before)
+		if err != nil {
+			return err
+		}
+		fingerprints = append(fingerprints, fingerprint{dir, before, change})
 		records = append(records, contentRecord{path: dir, mode: before.Mode()})
 		for {
 			batch, readErr := f.ReadDir(256)
@@ -154,9 +159,18 @@ func Capture(ctx context.Context, root string, exclude []string) (Snapshot, erro
 					input.Close()
 					return fmt.Errorf("verification input exceeds byte limits; exclude large dependencies/artifacts explicitly")
 				}
+				change, err := changeTime(input, before)
+				if err != nil {
+					input.Close()
+					return err
+				}
 				hash := sha256.New()
 				n, readErr := io.Copy(hash, io.LimitReader(input, MaxFileBytes+1))
 				after, statErr := input.Stat()
+				var afterChange int64
+				if statErr == nil {
+					afterChange, statErr = changeTime(input, after)
+				}
 				closeErr := input.Close()
 				if readErr != nil {
 					return readErr
@@ -170,13 +184,13 @@ func Capture(ctx context.Context, root string, exclude []string) (Snapshot, erro
 				if n > MaxFileBytes || result.Bytes+n > MaxBytes {
 					return fmt.Errorf("verification input exceeds byte limits")
 				}
-				if n != before.Size() || !sameFingerprint(before, after) {
+				if n != before.Size() || change != afterChange || !sameFingerprint(before, after) {
 					return fmt.Errorf("verification input %q changed during capture", path)
 				}
 				var sum [32]byte
 				copy(sum[:], hash.Sum(nil))
 				records = append(records, contentRecord{path, before.Mode(), sum})
-				fingerprints = append(fingerprints, fingerprint{path, before})
+				fingerprints = append(fingerprints, fingerprint{path, before, change})
 				result.Files++
 				result.Bytes += n
 			}
@@ -205,6 +219,26 @@ func Capture(ctx context.Context, root string, exclude []string) (Snapshot, erro
 		if !sameFingerprint(entry.info, now) {
 			return Snapshot{}, fmt.Errorf("verification workspace changed during capture")
 		}
+		current, err := handle.OpenFile(filepath.FromSlash(entry.path), os.O_RDONLY|nonblock, 0)
+		if err != nil {
+			return Snapshot{}, err
+		}
+		currentInfo, err := current.Stat()
+		if err != nil {
+			current.Close()
+			return Snapshot{}, err
+		}
+		changed, err := changeTime(current, currentInfo)
+		closeErr := current.Close()
+		if err != nil {
+			return Snapshot{}, err
+		}
+		if closeErr != nil {
+			return Snapshot{}, closeErr
+		}
+		if changed != entry.change || !sameFingerprint(entry.info, currentInfo) {
+			return Snapshot{}, fmt.Errorf("verification workspace changed during capture")
+		}
 	}
 	current, err := workspace.Identify(identity.Path)
 	if err != nil {
@@ -215,22 +249,29 @@ func Capture(ctx context.Context, root string, exclude []string) (Snapshot, erro
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].path < records[j].path })
 	hash := sha256.New()
-	// JSON encoding is length-delimited and unambiguous for arbitrary filenames.
+	// JSON byte slices use base64, preserving arbitrary filename bytes losslessly.
 	encoder := json.NewEncoder(hash)
 	if err := encoder.Encode(struct {
-		Root    workspace.Identity
-		Exclude []string
-	}{identity, excludes}); err != nil {
+		RootPath []byte
+		RootID   string
+		Exclude  [][]byte
+	}{[]byte(identity.Path), identity.FileID, bytePaths(excludes)}); err != nil {
 		return Snapshot{}, err
 	}
 	for _, record := range records {
-		if err := encoder.Encode(struct {
-			Path string
-			Mode os.FileMode
-			Sum  string
-		}{record.path, record.mode, hex.EncodeToString(record.sum[:])}); err != nil {
+		if err := ctx.Err(); err != nil {
 			return Snapshot{}, err
 		}
+		if err := encoder.Encode(struct {
+			Path []byte
+			Mode os.FileMode
+			Sum  string
+		}{[]byte(record.path), record.mode, hex.EncodeToString(record.sum[:])}); err != nil {
+			return Snapshot{}, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
 	}
 	result.Version = hex.EncodeToString(hash.Sum(nil))
 	return result, nil
@@ -238,4 +279,12 @@ func Capture(ctx context.Context, root string, exclude []string) (Snapshot, erro
 
 func sameFingerprint(a, b os.FileInfo) bool {
 	return os.SameFile(a, b) && a.Mode() == b.Mode() && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
+}
+
+func bytePaths(paths []string) [][]byte {
+	result := make([][]byte, len(paths))
+	for i, path := range paths {
+		result[i] = []byte(path)
+	}
+	return result
 }

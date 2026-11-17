@@ -174,3 +174,83 @@ func TestEvidenceRequiresExactSuccessfulCurrentAttempt(t *testing.T) {
 		t.Fatalf("nonexistent relative exclusion: %v", err)
 	}
 }
+
+type cancelAtFinalMetadata struct {
+	context.Context
+	cancel context.CancelFunc
+	calls  int
+}
+
+func (c *cancelAtFinalMetadata) Err() error {
+	err := c.Context.Err()
+	c.calls++
+	// With one regular file, this is the final metadata recheck. Model a
+	// cancellation immediately after that check, before version serialization.
+	if c.calls == 4 {
+		c.cancel()
+	}
+	return err
+}
+func TestCaptureCancellationAfterMetadataNeverReturnsVersion(t *testing.T) {
+	root := t.TempDir()
+	writeInput(t, root, "code", "source")
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &cancelAtFinalMetadata{Context: base, cancel: cancel}
+	state, err := Capture(ctx, root, nil)
+	if err == nil || state.Version != "" {
+		t.Fatalf("cancelled capture produced version: state=%+v err=%v", state, err)
+	}
+}
+
+func TestCheckDirectoryAcceptsRelativeAndAliasedRoots(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	check := Check{Name: "check", Command: "true"}
+	expected, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := check.Directory("."); err != nil || got != expected {
+		t.Fatalf("relative root cwd=%q err=%v", got, err)
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(root, alias); err == nil {
+		if got, err := check.Directory(alias); err != nil || got != expected {
+			t.Fatalf("aliased root cwd=%q err=%v", got, err)
+		}
+	}
+}
+
+type editAtFinalMetadata struct {
+	context.Context
+	calls int
+	edit  func()
+}
+
+func (c *editAtFinalMetadata) Err() error {
+	c.calls++
+	if c.calls == 3 {
+		c.edit()
+	}
+	return c.Context.Err()
+}
+func TestCaptureDetectsConcurrentEditWithRestoredMtime(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "code")
+	writeInput(t, root, "code", "before")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := &editAtFinalMetadata{Context: context.Background(), edit: func() {
+		writeInput(t, root, "code", "after!")
+		if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	state, err := Capture(ctx, root, nil)
+	if err == nil || state.Version != "" {
+		t.Fatalf("timestamp-restored edit produced stale version: %+v %v", state, err)
+	}
+}
