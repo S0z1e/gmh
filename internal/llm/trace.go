@@ -41,6 +41,8 @@ type RequestTrace struct {
 	DurationMS          int64  `json:"duration_ms"`
 	Outcome             string `json:"outcome"`
 	Usage               *Usage `json:"usage,omitempty"`
+	TokensComplete      bool   `json:"tokens_complete"`
+	PriceCountsComplete bool   `json:"price_counts_complete"`
 }
 
 type observerKey struct{}
@@ -176,8 +178,10 @@ func traceResponseHeaders(ctx context.Context, response *http.Response) {
 	}
 }
 
-func traceUsage(ctx context.Context, usage Usage) {
+func traceUsage(ctx context.Context, usage Usage, tokensComplete, priceCountsComplete bool) {
 	if o, _ := ctx.Value(traceKey{}).(*requestObservation); o != nil {
 		o.trace.Usage = &usage
+		o.trace.TokensComplete = tokensComplete
+		o.trace.PriceCountsComplete = priceCountsComplete
 	}
 }

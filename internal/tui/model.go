@@ -486,6 +486,7 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.working = false
 		m.workingSince = time.Time{}
 	case agent.EventError:
+		m.approval = nil
 		m.liveTool = ""
 		m.liveToolArgs = ""
 		m.liveThinking = ""

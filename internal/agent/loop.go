@@ -4,7 +4,6 @@
 package agent
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -16,12 +15,16 @@ import (
 	"strings"
 	"time"
 
+	"minimalharness/internal/input"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
 	"minimalharness/internal/toolargs"
 	"minimalharness/internal/tools"
+	"minimalharness/internal/turnbudget"
 	"minimalharness/internal/verification"
 )
+
+var defaultPromptInput = input.New(os.Stdin)
 
 type Config struct {
 	Client         *llm.Client
@@ -36,6 +39,10 @@ type Config struct {
 	Session        *session.Store
 	Verification   *verification.Policy
 	verifier       *verificationRun
+	TurnBudget     *turnbudget.Policy
+	UsageRates     llm.Rates
+	LastTurnBudget *turnbudget.State
+	resources      *turnResources
 	// OnEvent receives every loop event; the caller renders them.
 	// (There is no OnText: streamed text arrives as TextDelta events.)
 	OnEvent func(Event)
@@ -100,6 +107,9 @@ func (c *Config) DoomLoop() *DoomLoopGuard {
 
 func (c *Config) emit(e Event) {
 	if e.Kind == EventDone || e.Kind == EventError {
+		e = c.budgetTerminal(e)
+	}
+	if e.Kind == EventDone || e.Kind == EventError {
 		if e.TaskOutcome == "" {
 			e.TaskOutcome = TaskOutcomeForReason(e.TerminalReason)
 		}
@@ -139,7 +149,11 @@ func (c *Config) invalidArgs(msgs []llm.Message, tc llm.ToolCall, err error) []l
 	return append(msgs, m)
 }
 
-func (c *Config) ask(req ApprovalRequest) (bool, error) {
+func (c *Config) ask(ctx context.Context, req ApprovalRequest) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	req.Context = ctx
 	if c.DenyInsteadOfPrompt {
 		return false, nil
 	}
@@ -147,8 +161,7 @@ func (c *Config) ask(req ApprovalRequest) (bool, error) {
 		return c.Ask(req)
 	}
 	fmt.Printf("%s [y/N] ", req.Prompt())
-	reader := bufio.NewReader(os.Stdin)
-	line, err := reader.ReadString('\n')
+	line, err := defaultPromptInput.Read(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -173,6 +186,7 @@ func (c *Config) checkRepeatedCall(ctx context.Context, toolName, argsJSON strin
 		return argsJSON, false
 	}
 	dec, err := c.ConfirmContinuation(ContinuationRequest{
+		Context:  ctx,
 		ToolName: det.ToolName, RepeatCount: det.RepeatCount,
 		Threshold: det.Threshold, InputPreview: det.InputPreview,
 	})
@@ -209,6 +223,7 @@ func (c *Config) askUser(ctx context.Context, argsJSON string) (string, error) {
 	if c.AskQuestion == nil || ctx.Err() != nil {
 		return "No one is available to answer questions right now. Proceed with your best judgement and state the assumptions you made.", nil
 	}
+	req.Context = ctx
 	ans, err := c.AskQuestion(req)
 	if err != nil {
 		return "The questions were cancelled. Proceed with your best judgement and state the assumptions you made.", nil
@@ -271,6 +286,12 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (tools.ToolResul
 	if strings.TrimSpace(args.KillJobID) != "" {
 		res, err := c.Exec.Dispatch(ctx, "bash", tc.Function.Arguments)
 		return res, nil, err
+	}
+	if (args.Background || c.Exec.BackgroundThreshold > 0) && c.resources != nil {
+		if err := c.resources.tracker.CheckJobLaunch(c.Exec.RunningWorkspaceJobs()); err != nil {
+			c.resources.failure = err
+			return tools.ToolResult{}, nil, err
+		}
 	}
 	if args.Background {
 		job, err := c.Exec.BashBackground(ctx, args)
@@ -590,9 +611,16 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 	attempts := c.maxLLMAttempts()
 	var err error
 	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := c.budgetRequest(); err != nil {
+			return attempt - 1, err
+		}
 		requestCtx := ctx
-		if c.TraceRequests {
+		if c.TraceRequests || c.resources != nil {
 			requestCtx = llm.WithRequestObserver(ctx, func(trace llm.RequestTrace) {
+				c.recordBudgetUsage(trace.Usage, trace.StartedAt, trace.TokensComplete, trace.PriceCountsComplete)
+				if !c.TraceRequests {
+					return
+				}
 				c.emit(Event{Kind: EventLLMRequest, Request: &trace, Operation: operation, Attempt: attempt})
 				if c.Session != nil {
 					_ = c.Session.Audit(struct {
@@ -626,6 +654,9 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 			}
 		}
 		err = c.Client.Stream(requestCtx, apiMsgs, tools, wrappedText, wrappedDone, wrappedThinking)
+		if budgetErr := c.budgetError(); budgetErr != nil {
+			return attempt, budgetErr
+		}
 		if err == nil {
 			return attempt, nil
 		}
@@ -651,6 +682,9 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 		if !retry {
 			return attempt, err
 		}
+		if budgetErr := c.budgetRequest(); budgetErr != nil {
+			return attempt, budgetErr
+		}
 		delay := retryDelay(attempt, llm.RetryAfter(err))
 		c.emit(Event{Kind: EventStepRetry, Text: fmt.Sprintf("%s failed (attempt %d/%d): %v; retrying in %s", operation, attempt, attempts, err, delay), RetryAttempt: attempt + 1})
 		if !sleepCtx(ctx, delay) {
@@ -666,6 +700,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	c.persistErr = nil
 	c.LastTerminalReason = ""
 	c.LastTaskOutcome = ""
+	c.LastTurnBudget = nil
 	c.verifier = nil
 	if c.Verification != nil && len(c.Verification.Required) > 0 {
 		if err := c.Verification.Validate(); err != nil {
@@ -682,11 +717,21 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			c.emit(Event{Kind: EventError, Err: runErr, Text: text, TerminalReason: TerminalError})
 		}
 	}()
+	budgetCtx, cancelBudget, budgetErr := c.startBudget(ctx)
+	defer cancelBudget()
+	defer c.finishBudget(&text, &runErr)
+	ctx = budgetCtx
+	if budgetErr != nil {
+		c.LastTerminalReason = TerminalError
+		c.emit(Event{Kind: EventError, Err: budgetErr, TerminalReason: TerminalError})
+		return "", llm.Usage{}, budgetErr
+	}
 	steps := c.MaxSteps
 	// MaxSteps <= 0 means unlimited (the mainstream default): the turn
 	// runs until the model stops calling tools, an error ends it, or
 	// the task is blocked. The bounds are then auto-compaction at 70%
-	// of the context window plus the doom-loop / blocked guards. A
+	// of the context window, finite turn resource budgets, and the
+	// doom-loop / blocked guards. A
 	// positive MaxSteps opts into a hard cap with the grace summary.
 	hasCap := steps > 0
 	msgs := append([]llm.Message{{Role: "system", Content: c.System + verificationInstructions(c.Verification)}}, history...)
@@ -788,7 +833,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// The turn is over, but a running job's result is still
 			// the user's data: deliver it before reporting the error
 			// so it is not silently lost.
-			if len(pending) > 0 {
+			if len(pending) > 0 && c.budgetError() == nil {
 				_, _ = c.drainPending(ctx, msgs, pending)
 			}
 			// A cancelled context is an abort, not a provider error:
@@ -903,6 +948,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			continue
 		}
+		if err := c.reserveBudgetTools(assistant.ToolCalls); err != nil {
+			c.rejectBudgetTools(assistant.ToolCalls, err)
+			return lastText, total, err
+		}
 		// Execute tool calls in order. (Parallel batches are v0.2; serial
 		// avoids two tools writing the same file at once.)
 		// stepHadExecution / stepAllFailed track this step for the
@@ -915,6 +964,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				return lastText, total, c.persistErr
 			}
 			if err := ctx.Err(); err != nil {
+				if c.budgetError() != nil {
+					c.rejectBudgetTools(assistant.ToolCalls[i:], err)
+				}
 				c.LastTerminalReason = TerminalAbort
 				c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: TerminalAbort})
 				return lastText, total, err
@@ -1109,7 +1161,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if mutation != nil && mutation.Protected || c.needsApproval(tc.Function.Name, tc.Function.Arguments) {
 				req := ApprovalRequest{ToolName: tc.Function.Name, Arguments: tc.Function.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID, TargetPath: inv.TargetPath}
 				c.emit(Event{Kind: EventApproval, Text: req.Prompt(), ToolName: req.ToolName, ToolArgs: req.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID})
-				ok, err := c.ask(req)
+				ok, err := c.ask(ctx, req)
 				// Audit every decision (approved, denied, or errored)
 				// to the session sidecar, for later review.
 				if c.Session != nil {
@@ -1145,6 +1197,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					continue
 				}
 			}
+			if err := ctx.Err(); err != nil {
+				closeMutation()
+				c.rejectBudgetTools(assistant.ToolCalls[i:], err)
+				return lastText, total, err
+			}
 			toolCtx := tools.WithInvocation(ctx, inv.ID, tc.ID)
 			if mutation != nil {
 				toolCtx = tools.WithMutation(toolCtx, mutation)
@@ -1152,6 +1209,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			attempt := c.verificationStart(toolCtx, tc.Function.Name, argsJSON)
 			if attempt != nil {
 				attempt.invocationID, attempt.toolCallID = inv.ID, tc.ID
+			}
+			if err := ctx.Err(); err != nil {
+				closeMutation()
+				c.rejectBudgetTools(assistant.ToolCalls[i:], err)
+				return lastText, total, err
 			}
 			var obs string
 			var err error
@@ -1227,6 +1289,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				if c.Session != nil {
 					c.persist(imgMsg)
 				}
+			}
+			if budgetErr := c.budgetError(); budgetErr != nil {
+				c.rejectBudgetTools(assistant.ToolCalls[i+1:], budgetErr)
+				return lastText, total, budgetErr
 			}
 		}
 		// Three consecutive steps whose tool calls all failed mark
@@ -1406,6 +1472,7 @@ func (c *Config) ResetSessionState() {
 	c.LastTerminalReason = ""
 	c.LastTaskOutcome = ""
 	c.verifier = nil
+	c.LastTurnBudget = nil
 }
 
 // persist latches a storage failure. The loop stops before its next action;

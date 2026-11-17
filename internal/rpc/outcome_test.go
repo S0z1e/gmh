@@ -1,10 +1,41 @@
 package rpc
 
 import (
+	"minimalharness/internal/turnbudget"
 	"minimalharness/internal/verification"
 	"testing"
 	"time"
 )
+
+func TestSettledBudgetStopsWithIncompleteOutcome(t *testing.T) {
+	for _, approval := range []bool{false, true} {
+		t.Run(map[bool]string{false: "tokens", true: "approval_deadline"}[approval], func(t *testing.T) {
+			mode := "auto"
+			if approval {
+				mode = "suggest"
+			}
+			a, runner, _ := setupTestApp(t, mode, []fakeStep{{kind: "tool", tool: "write", args: map[string]any{"path": "never", "content": "x"}}})
+			n := int64(1)
+			if approval {
+				a.Cfg.TurnBudget = &turnbudget.Policy{MaxDurationSeconds: &n}
+			} else {
+				a.Cfg.TurnBudget = &turnbudget.Policy{MaxTokens: &n}
+			}
+			d := startDriver(t, a, runner)
+			d.waitFor("ready", 5*time.Second)
+			d.send(map[string]any{"id": "p", "type": "prompt", "message": "work"})
+			d.waitFor("response", 5*time.Second)
+			if approval {
+				d.waitFor("approval_request", 5*time.Second)
+			}
+			settled := d.waitFor("agent_settled", 5*time.Second)
+			if settled["reason"] != "budget_exceeded" || settled["outcome"] != "incomplete" || settled["error"] == nil || settled["aborted"] == true {
+				t.Fatalf("settled=%v", settled)
+			}
+			d.quit(t)
+		})
+	}
+}
 
 func TestSettledStepCapCarriesIncompleteOutcome(t *testing.T) {
 	a, runner, _ := setupTestApp(t, "auto", []fakeStep{

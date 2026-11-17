@@ -77,6 +77,8 @@ const (
 	// TerminalEndTurn: the model finished with no more tool calls.
 	TerminalEndTurn            TerminalReason = "end_turn"
 	TerminalOutputLimit        TerminalReason = "output_limit"
+	TerminalBudgetExceeded     TerminalReason = "budget_exceeded"
+	TerminalBudgetUnavailable  TerminalReason = "budget_unavailable"
 	TerminalStopCap            TerminalReason = "stop_cap"
 	TerminalVerificationFailed TerminalReason = "verification_failed"
 	// TerminalMaxTurns: the step cap was hit.

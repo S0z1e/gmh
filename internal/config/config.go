@@ -60,6 +60,7 @@ import (
 	"regexp"
 	"strings"
 
+	"minimalharness/internal/turnbudget"
 	"minimalharness/internal/verification"
 	"minimalharness/internal/workspace"
 )
@@ -180,6 +181,7 @@ type Provider struct {
 // (inherit from the other file, the environment, or the default)
 // from an explicitly set value, including 0 and false.
 type File struct {
+	TurnBudget           *turnbudget.Policy `json:"turnBudget"`
 	shorthandCredentials credentialBindings
 	// Schema is accepted and ignored: config files may carry
 	// "$schema": "https://example.com/schemas/models.schema.json"
@@ -341,6 +343,9 @@ func Merge(dst, src *File) {
 	}
 	if src.BashEnv != nil {
 		dst.BashEnv = append([]string{}, src.BashEnv...)
+	}
+	if src.TurnBudget != nil {
+		dst.TurnBudget = src.TurnBudget.Clone()
 	}
 	if src.Verification != nil {
 		policy := *src.Verification
@@ -615,6 +620,9 @@ func Validate(f *File) error {
 	}
 	if f.BashTimeoutSeconds != nil && *f.BashTimeoutSeconds <= 0 {
 		return fmt.Errorf("bashTimeoutSeconds must be > 0")
+	}
+	if _, err := f.TurnBudget.Resolve(); err != nil {
+		return fmt.Errorf("turnBudget: %w", err)
 	}
 	if err := f.Verification.Validate(); err != nil {
 		return err

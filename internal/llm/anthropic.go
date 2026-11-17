@@ -398,15 +398,18 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 	msg.Role = "assistant"
 	var usage Usage
 	var inputUsage anthropicUsage
+	var finalOutputUsage bool
 	recordUsage := func(delta *anthropicUsage) {
 		if delta == nil {
 			return
 		}
 		if delta.hasInput {
 			inputUsage.InputTokens = delta.InputTokens
+			inputUsage.hasInput = true
 		}
 		if delta.hasCreation {
 			inputUsage.CacheCreationInputTokens = delta.CacheCreationInputTokens
+			inputUsage.hasCreation = true
 		}
 		if delta.CacheUsageReported {
 			inputUsage.CacheReadInputTokens = delta.CacheReadInputTokens
@@ -414,6 +417,7 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 		}
 		if delta.hasOutput {
 			inputUsage.OutputTokens = delta.OutputTokens
+			inputUsage.hasOutput = true
 		}
 		usage.PromptTokens = inputUsage.InputTokens + inputUsage.CacheReadInputTokens + inputUsage.CacheCreationInputTokens
 		usage.CachedTokens = inputUsage.CacheReadInputTokens
@@ -424,7 +428,7 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			usage.CacheUsageSource = "cache_read_input_tokens"
 		}
 		usage.normalize()
-		traceUsage(ctx, usage)
+		traceUsage(ctx, usage, finalOutputUsage && inputUsage.hasInput && inputUsage.hasOutput && inputUsage.hasCreation && inputUsage.CacheUsageReported, false)
 	}
 	type acc struct {
 		id    string
@@ -562,6 +566,9 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			a.done = true
 		case "message_delta":
 			msg.FinishReason = ev.Delta.StopReason
+			if ev.Usage != nil && ev.Usage.hasOutput {
+				finalOutputUsage = true
+			}
 			recordUsage(ev.Usage)
 		case "message_stop":
 			sawStop = true

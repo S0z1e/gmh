@@ -21,7 +21,7 @@ func TaskOutcomeForReason(reason TerminalReason) TaskOutcome {
 		return OutcomeAborted
 	case TerminalBlocked, TerminalRepeatedToolCallDenied:
 		return OutcomeBlocked
-	case TerminalError, TerminalOutputLimit, TerminalMaxTurns, TerminalStopCap:
+	case TerminalError, TerminalOutputLimit, TerminalMaxTurns, TerminalStopCap, TerminalBudgetExceeded, TerminalBudgetUnavailable:
 		return OutcomeIncomplete
 	default:
 		return ""

@@ -507,7 +507,11 @@ func (e *Executor) Jobs() []*Job { return e.registry().List() }
 
 // HasRunningWorkspaceJobs includes retained sessions sharing this Executor's
 // workspace, without exposing another session's job IDs or output.
-func (e *Executor) HasRunningWorkspaceJobs() bool {
+func (e *Executor) HasRunningWorkspaceJobs() bool { return e.RunningWorkspaceJobs() > 0 }
+
+// RunningWorkspaceJobs counts active jobs across current and retained sessions.
+// Launches and session switches are serialized by the agent loop.
+func (e *Executor) RunningWorkspaceJobs() int64 {
 	e.jobsMu.Lock()
 	registries := map[*JobRegistry]bool{}
 	if e.jobs != nil {
@@ -519,14 +523,15 @@ func (e *Executor) HasRunningWorkspaceJobs() bool {
 		}
 	}
 	e.jobsMu.Unlock()
+	var running int64
 	for registry := range registries {
 		for _, job := range registry.List() {
 			if _, done := job.Result(); !done {
-				return true
+				running++
 			}
 		}
 	}
-	return false
+	return running
 }
 
 func (e *Executor) registry() *JobRegistry {

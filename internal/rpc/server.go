@@ -647,10 +647,17 @@ func (s *Server) ask(req agent.ApprovalRequest) (bool, error) {
 	ch := make(chan approvalAnswer, 1)
 	s.approvals[id] = ch
 	s.approvalsMu.Unlock()
+	defer func() { s.approvalsMu.Lock(); delete(s.approvals, id); s.approvalsMu.Unlock() }()
+	ctx := req.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.writeEvent(Event{Type: "approval_request", ID: id, Tool: req.ToolName, ToolCallID: req.ToolCallID, InvocationID: req.InvocationID, TargetPath: req.TargetPath, Args: parseToolArgs(req.Arguments), Prompt: req.Prompt()})
 	select {
 	case ans := <-ch:
 		return ans.approved, ans.err
+	case <-ctx.Done():
+		return false, ctx.Err()
 	case <-s.done:
 		return false, errShutdown
 	}
@@ -665,6 +672,9 @@ func (s *Server) confirmContinuation(req agent.ContinuationRequest) (agent.Conti
 	s.turnMu.Lock()
 	ctx := s.turnCtx
 	s.turnMu.Unlock()
+	if req.Context != nil {
+		ctx = req.Context
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -738,10 +748,17 @@ func (s *Server) askQuestion(req agent.QuestionRequest) (agent.QuestionAnswers, 
 	ch := make(chan questionAnswer, 1)
 	s.questions[id] = ch
 	s.questionsMu.Unlock()
+	defer func() { s.questionsMu.Lock(); delete(s.questions, id); s.questionsMu.Unlock() }()
+	ctx := req.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.writeEvent(Event{Type: "question_request", ID: id, Questions: req.Questions})
 	select {
 	case qa := <-ch:
 		return qa.ans, qa.err
+	case <-ctx.Done():
+		return agent.QuestionAnswers{}, ctx.Err()
 	case <-s.done:
 		return agent.QuestionAnswers{}, errShutdown
 	}

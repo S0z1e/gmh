@@ -115,6 +115,9 @@ func (e *Unavailable) Error() string {
 type Usage struct {
 	Tokens  *int64
 	CostUSD *float64
+	// TokensPartial retains a reported subtotal without claiming the entire
+	// attempt was measured (for example, a stream lost its output counter).
+	TokensPartial bool
 }
 
 type State struct {
@@ -222,6 +225,9 @@ func (b *Tracker) RecordUsage(u Usage) error {
 		b.unmetered("tokens", "invalid or overflowing usage")
 	} else {
 		b.state.ReportedTokens += *u.Tokens
+	}
+	if u.TokensPartial {
+		b.state.TokensComplete = false
 	}
 	if u.CostUSD == nil {
 		b.state.CostComplete = false

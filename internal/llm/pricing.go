@@ -2,6 +2,7 @@ package llm
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"time"
@@ -9,9 +10,10 @@ import (
 
 // Rates are USD per 1M tokens. They are NEVER hardcoded: they come from
 // the environment (the user's own OpenConsole bill or the provider's
-// published price), and every estimate names its source. All zero means
+// published price), and every estimate names its source. Unset rates mean
 // "no rates configured" — then no estimate is shown at all, only the
-// "real price unverified" label.
+// "real price unverified" label. Explicitly supplying all three zero base rates
+// configures free pricing.
 //
 // The harness never estimates tokens locally: the only token counts it
 // trusts are the ones the API returns in usage. (A local tokenizer
@@ -26,6 +28,9 @@ type Rates struct {
 	PeakCachedPerMTok float64
 	Source            string // human-readable rate source, shown with estimates
 	Configured        bool   // true when any rate is set
+	// Complete means every base rate (including explicit zero) was supplied;
+	// optional dollar budgets must never treat an omitted component as free.
+	Complete bool
 }
 
 // RatesFromEnv reads rates from the environment:
@@ -46,8 +51,8 @@ func RatesFromEnv() (Rates, error) {
 		if err != nil {
 			return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
 		}
-		if f < 0 {
-			return 0, fmt.Errorf("invalid %s %q: rates cannot be negative", key, v)
+		if f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+			return 0, fmt.Errorf("invalid %s %q: rates must be finite and nonnegative", key, v)
 		}
 		return f, nil
 	}
@@ -70,8 +75,14 @@ func RatesFromEnv() (Rates, error) {
 	if r.PeakCachedPerMTok, err = get("OPENAI_PRICE_PEAK_CACHED_PER_MTOK"); err != nil {
 		return r, err
 	}
+	r.Complete = true
+	for _, key := range []string{"OPENAI_PRICE_INPUT_PER_MTOK", "OPENAI_PRICE_OUTPUT_PER_MTOK", "OPENAI_PRICE_CACHED_PER_MTOK"} {
+		if os.Getenv(key) == "" {
+			r.Complete = false
+		}
+	}
 	r.Source = os.Getenv("OPENAI_PRICE_SOURCE")
-	r.Configured = r.InputPerMTok > 0 || r.OutputPerMTok > 0 || r.CachedPerMTok > 0 ||
+	r.Configured = r.Complete || r.InputPerMTok > 0 || r.OutputPerMTok > 0 || r.CachedPerMTok > 0 ||
 		r.PeakInputPerMTok > 0 || r.PeakOutputPerMTok > 0 || r.PeakCachedPerMTok > 0
 	if r.Configured && r.Source == "" {
 		r.Source = "env OPENAI_PRICE_*"

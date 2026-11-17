@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 )
@@ -163,4 +164,37 @@ func (u Usage) String() string {
 		s += fmt.Sprintf(" reasoning=%d", u.ReasoningTokens)
 	}
 	return s
+}
+
+// traceWireUsage preserves missing/null scalar counters separately from zero.
+// A reported total can establish tokens even when the price breakdown is absent.
+func traceWireUsage(ctx context.Context, usage Usage, data string, responses bool) {
+	if observer, _ := ctx.Value(traceKey{}).(*requestObservation); observer == nil {
+		return
+	}
+	var envelope struct {
+		Usage    json.RawMessage `json:"usage"`
+		Response struct {
+			Usage json.RawMessage `json:"usage"`
+		} `json:"response"`
+	}
+	_ = json.Unmarshal([]byte(data), &envelope)
+	raw := envelope.Usage
+	if responses {
+		raw = envelope.Response.Usage
+	}
+	var counts struct {
+		Prompt     *int `json:"prompt_tokens"`
+		Completion *int `json:"completion_tokens"`
+		Input      *int `json:"input_tokens"`
+		Output     *int `json:"output_tokens"`
+		Total      *int `json:"total_tokens"`
+	}
+	_ = json.Unmarshal(raw, &counts)
+	input, output := counts.Prompt, counts.Completion
+	if responses {
+		input, output = counts.Input, counts.Output
+	}
+	complete := input != nil && output != nil
+	traceUsage(ctx, usage, counts.Total != nil || complete, complete)
 }

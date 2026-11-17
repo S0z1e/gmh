@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 
 	tea "charm.land/bubbletea/v2"
@@ -37,12 +38,27 @@ func NewApprover(p *tea.Program) *Approver {
 // unread and the process exits anyway — Ask never returns an error.
 func (a *Approver) Ask(input agent.ApprovalRequest) (bool, error) {
 	req := &ApprovalRequest{ToolName: input.ToolName, Arguments: input.Arguments, Prompt: input.Prompt(), Reply: make(chan bool, 1)}
-	return a.ask(req)
+	return a.askContext(input.Context, req)
 }
 
 func (a *Approver) ask(req *ApprovalRequest) (bool, error) {
+	return a.askContext(context.Background(), req)
+}
+
+func (a *Approver) askContext(ctx context.Context, req *ApprovalRequest) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	a.program.Send(ApprovalMsg{Request: req})
-	return <-req.Reply, nil
+	select {
+	case answer := <-req.Reply:
+		return answer, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
 }
 
 // ConfirmContinuation is the TUI's doom-loop prompt, reusing the
@@ -51,7 +67,7 @@ func (a *Approver) ask(req *ApprovalRequest) (bool, error) {
 // the RPC GUI offer all three decisions.
 func (a *Approver) ConfirmContinuation(req agent.ContinuationRequest) (agent.ContinuationDecision, error) {
 	prompt := fmt.Sprintf("Repeated tool call: %s %s was requested %d times with identical input. Continue once?", req.ToolName, req.InputPreview, req.RepeatCount)
-	ok, err := a.ask(&ApprovalRequest{Prompt: prompt, Reply: make(chan bool, 1)})
+	ok, err := a.askContext(req.Context, &ApprovalRequest{Prompt: prompt, Reply: make(chan bool, 1)})
 	if err != nil {
 		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
 	}

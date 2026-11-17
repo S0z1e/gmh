@@ -171,3 +171,35 @@ func TestWorkspaceTrustGatesRequiredVerificationPolicy(t *testing.T) {
 		t.Fatal("trusted project override not applied")
 	}
 }
+
+func TestWorkspaceTrustGatesTurnBudget(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_BASE_URL", "")
+	global, _ := config.GlobalPath()
+	if err := os.MkdirAll(filepath.Dir(global), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(global, []byte(`{"providers":{"mock":{"baseUrl":"https://global.invalid","api":"chat","model":"mock","apiKey":"fake"}},"turnBudget":{"maxToolCalls":5}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(config.ProjectPath(root), []byte(`{"turnBudget":{"maxToolCalls":0}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a, err := Setup(Params{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Store.Close()
+	if a.Cfg.TurnBudget == nil || *a.Cfg.TurnBudget.MaxToolCalls != 5 {
+		t.Fatal("untrusted workspace disabled global limit")
+	}
+	b, err := Setup(Params{Root: root, WorkspaceTrust: "trust"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Store.Close()
+	if b.Cfg.TurnBudget == nil || *b.Cfg.TurnBudget.MaxToolCalls != 0 {
+		t.Fatal("trusted override not applied")
+	}
+}

@@ -217,3 +217,8 @@ available. `exit_code: 0` is preserved. `agent_settled.reason: output_limit`
 means the provider stopped with incomplete output; unfinished tool arguments
 are never executed. History messages may carry `kind`, `tool_error` and
 `finish_reason` metadata; these fields are not forwarded as provider inputs.
+
+Turn budgets also settle with `reason: "budget_exceeded"` or
+`reason: "budget_unavailable"`, `outcome: "incomplete"`, and an error. A resource
+deadline is not a user abort. Expired approval/question/continuation requests no
+longer accept replies; the client should dismiss pending prompts on settlement.

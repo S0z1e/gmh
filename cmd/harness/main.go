@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -16,6 +15,7 @@ import (
 
 	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
+	"minimalharness/internal/input"
 	"minimalharness/internal/rpc"
 	"minimalharness/internal/session"
 	"minimalharness/internal/uimode"
@@ -179,8 +179,8 @@ func main() {
 
 	// REPL
 	fmt.Println("Type a task, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /clear to drop context, /compact to summarise context, /rollback [N] to drop the last N turns, or /quit to exit.")
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	scanner := input.New(os.Stdin)
+	defer scanner.Close()
 	// The approval prompt shares the REPL's scanner: the scanner
 	// buffers piped stdin ahead, so a fresh reader on os.Stdin in
 	// the loop's default ask would see EOF after the first task
@@ -197,10 +197,11 @@ func main() {
 	a.Cfg.AskQuestion = askQuestionFromScanner(scanner)
 	for {
 		fmt.Print("> ")
-		if !scanner.Scan() {
+		line, err := scanner.Read(ctx)
+		if err != nil {
 			break
 		}
-		if runner.Handle(ctx, strings.TrimSpace(scanner.Text())) {
+		if runner.Handle(ctx, strings.TrimSpace(line)) {
 			break
 		}
 	}
@@ -214,16 +215,14 @@ func main() {
 // terminal only delivers a line once it is typed — and type-ahead
 // ("y" typed before the prompt appears) now works too, instead of
 // being swallowed by the scanner's read-ahead.
-func askFromScanner(scanner *bufio.Scanner) func(agent.ApprovalRequest) (bool, error) {
+func askFromScanner(scanner *input.Lines) func(agent.ApprovalRequest) (bool, error) {
 	return func(req agent.ApprovalRequest) (bool, error) {
 		fmt.Printf("%s [y/N] ", req.Prompt())
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				return false, err
-			}
-			return false, io.EOF
+		line, err := scanner.Read(req.Context)
+		if err != nil {
+			return false, err
 		}
-		ans := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		ans := strings.ToLower(strings.TrimSpace(line))
 		return ans == "y" || ans == "yes", nil
 	}
 }
@@ -231,16 +230,14 @@ func askFromScanner(scanner *bufio.Scanner) func(agent.ApprovalRequest) (bool, e
 // confirmContinuationFromScanner is the plain CLI's doom-loop
 // prompt. It shares the REPL scanner with askFromScanner, for the
 // same buffered-stdin reason.
-func confirmContinuationFromScanner(scanner *bufio.Scanner) func(agent.ContinuationRequest) (agent.ContinuationDecision, error) {
+func confirmContinuationFromScanner(scanner *input.Lines) func(agent.ContinuationRequest) (agent.ContinuationDecision, error) {
 	return func(req agent.ContinuationRequest) (agent.ContinuationDecision, error) {
 		fmt.Printf("Repeated tool call: %s %s was requested %d times with identical input. Continue once (o), always this session (s), or stop (d)? [o/s/d] ", req.ToolName, req.InputPreview, req.RepeatCount)
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
-			}
-			return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, io.EOF
+		line, err := scanner.Read(req.Context)
+		if err != nil {
+			return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
 		}
-		switch strings.ToLower(strings.TrimSpace(scanner.Text())) {
+		switch strings.ToLower(strings.TrimSpace(line)) {
 		case "o", "once", "y", "yes":
 			return agent.ContinuationDecision{Outcome: agent.ContinuationOnce}, nil
 		case "s", "session", "always":
@@ -252,7 +249,7 @@ func confirmContinuationFromScanner(scanner *bufio.Scanner) func(agent.Continuat
 }
 
 // askQuestionFromScanner is the plain CLI's ask_user prompt.
-func askQuestionFromScanner(scanner *bufio.Scanner) func(agent.QuestionRequest) (agent.QuestionAnswers, error) {
+func askQuestionFromScanner(scanner *input.Lines) func(agent.QuestionRequest) (agent.QuestionAnswers, error) {
 	return func(req agent.QuestionRequest) (agent.QuestionAnswers, error) {
 		var answers []agent.QuestionAnswer
 		for i, q := range req.Questions {
@@ -268,13 +265,11 @@ func askQuestionFromScanner(scanner *bufio.Scanner) func(agent.QuestionRequest) 
 				}
 			}
 			fmt.Printf("  (pick %s, or type your own answer) > ", map[bool]string{true: "numbers, comma-separated", false: "a number"}[q.MultiSelect])
-			if !scanner.Scan() {
-				if err := scanner.Err(); err != nil {
-					return agent.QuestionAnswers{}, err
-				}
-				return agent.QuestionAnswers{}, io.EOF
+			line, err := scanner.Read(req.Context)
+			if err != nil {
+				return agent.QuestionAnswers{}, err
 			}
-			line := strings.TrimSpace(scanner.Text())
+			line = strings.TrimSpace(line)
 			ans := agent.QuestionAnswer{Question: i}
 			// Numbers select options; anything else is free text.
 			parts := strings.Split(line, ",")

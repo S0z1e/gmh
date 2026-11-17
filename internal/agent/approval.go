@@ -1,10 +1,15 @@
 package agent
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // ApprovalRequest carries the exact invocation the user is approving. Renderers
 // may paginate it, but must not recover arguments from a truncated preview.
 type ApprovalRequest struct {
+	// Context bounds the prompt; implementations must stop waiting when it ends.
+	Context      context.Context `json:"-"`
 	ToolCallID   string
 	TargetPath   string
 	InvocationID string

@@ -34,6 +34,36 @@
   is complete. A stop hook that keeps vetoing after three feedback rounds stops
   with an explicit incomplete error, preserved for resume. `-p` returns a
   nonzero exit status when the turn fails, including a cap or blocked task.
+- Each agent turn defaults to a 1-hour wall deadline, 1,000 requested tool calls,
+  and 8 concurrent background-capable Bash executions across current and retained
+  sessions on the executor. Required foreground verification checks do not consume
+  a background-job slot. Configure global, explicit or trusted project settings:
+
+  ```json
+  {"turnBudget":{"maxDurationSeconds":3600,"maxToolCalls":1000,"maxConcurrentJobs":8,"maxTokens":0,"maxCostUSD":0}}
+  ```
+
+  Omitted fields use these defaults; an explicit zero disables that cap. An omitted
+  policy inherits the global policy; a supplied policy replaces it as a whole.
+  Untrusted projects cannot override global budgets. Requested calls count even
+  when invalid or refused. A batch that exceeds the remaining tool allowance is
+  rejected in full, with durable unexecuted results. A fresh turn gets fresh counters.
+  The deadline includes provider requests, tools, retries, background-result waits
+  and approval/question waits. Custom prompt callbacks must observe the request's
+  `Context`. Detached background jobs retain their existing lifecycle after a stop.
+- Token and dollar caps are opt-in. They use reported usage from every provider
+  attempt, including failed retries, automatic compaction and grace calls. An
+  exact-cap final response is allowed; another provider attempt is blocked. Usage
+  arrives after execution, so an in-flight request can overshoot; actual reported
+  consumption is retained. A dollar cap uses configured-rate estimates, requires
+  all three base `OPENAI_PRICE_*_PER_MTOK` rates (including explicit zeros), and
+  requires cache usage when input/cache rates differ. It supports chat/responses
+  pricing; Anthropic cache-write pricing is currently unavailable. It does not use
+  the model metadata's `cost` fields. Missing required usage/pricing stops with
+  `budget_unavailable`; exhaustion stops with `budget_exceeded`. Both save an
+  `incomplete` task outcome with the budget snapshot and send no extra grace call.
+  Unreported usage is recorded as unknown rather than zero. Ordinary UI usage
+  totals remain separate from this per-attempt budget evidence.
 - Required verification is opt-in in global, explicit or trusted project config:
 
   ```json

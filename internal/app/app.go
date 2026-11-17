@@ -399,6 +399,7 @@ func Setup(p Params) (*App, error) {
 		MaxSteps:            p.MaxSteps,
 		Session:             store,
 		Verification:        cfg.Verification,
+		TurnBudget:          cfg.TurnBudget,
 		DenyInsteadOfPrompt: deny,
 	}
 
@@ -431,6 +432,7 @@ func Setup(p Params) (*App, error) {
 		return nil, err
 	}
 	a.Rates = rates
+	a.Cfg.UsageRates = rates
 
 	// Images stored in a resumed session carry only paths; re-read
 	// their bytes now, while the executor exists.

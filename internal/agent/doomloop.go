@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,6 +57,8 @@ var ErrRepeatedToolCallDenied = errors.New("repeated tool call denied")
 
 // ContinuationRequest is what the guard asks the user to confirm.
 type ContinuationRequest struct {
+	// Context bounds the prompt; implementations must stop waiting when it ends.
+	Context     context.Context `json:"-"`
 	ToolName    string
 	RepeatCount int
 	Threshold   int

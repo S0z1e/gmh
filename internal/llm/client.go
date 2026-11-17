@@ -686,7 +686,7 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 			}
 			usage.normalize()
-			traceUsage(ctx, usage)
+			traceWireUsage(ctx, usage, data, false)
 		}
 		for _, ch := range chunk.Choices {
 			if ch.Index != 0 {
@@ -935,7 +935,7 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 		}
 		if u := ev.Response.Usage; u != nil {
 			usage = u.sharedUsage()
-			traceUsage(ctx, usage)
+			traceWireUsage(ctx, usage, data, true)
 		}
 		switch ev.Type {
 		case "response.refusal.delta":

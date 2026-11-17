@@ -254,7 +254,27 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 	var usage llm.Usage
 	var err error
 	if c.CompactHistory != nil {
+		if err := c.budgetRequest(); err != nil {
+			return nil, llm.Usage{}, err
+		}
+		started := time.Now()
+		var before int64
+		if c.resources != nil {
+			before = c.resources.attempts
+		}
 		summary, usage, err = c.CompactHistory(ctx, history)
+		// This legacy callback cannot distinguish omitted usage from explicit zero.
+		// Treat an all-zero report as unknown rather than invent evidence.
+		var measured *llm.Usage
+		if usage != (llm.Usage{}) {
+			measured = &usage
+		}
+		if c.resources == nil || c.resources.attempts == before {
+			c.recordBudgetUsage(measured, started, measured != nil, measured != nil)
+		}
+		if budgetErr := c.budgetError(); budgetErr != nil {
+			err = budgetErr
+		}
 	} else {
 		summary, usage, err = c.Summarize(ctx, history, nil)
 	}
