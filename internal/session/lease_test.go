@@ -224,3 +224,15 @@ func TestArchiveCannotOverwriteAnotherWriter(t *testing.T) {
 		t.Fatalf("archive damaged transcript: %v %v", got, err)
 	}
 }
+
+func TestArchiveSupportsMaximumSessionID(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s, err := New(strings.Repeat("s", 128))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.ArchiveCopy(s.ID + "-pre-compact-1234567890123456789"); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -94,15 +94,17 @@ func truncateRunes(s string, n int) string {
 // sessions directory: empty, dot names, separators, and anything
 // outside letters, digits, "-" and "_". (Dots are allowed inside an
 // id, just not as the whole id.)
-func ValidateSessionID(id string) error {
+func ValidateSessionID(id string) error { return validateSessionName(id, 128) }
+
+func validateSessionName(id string, maxBytes int) error {
 	if id == "" {
 		return fmt.Errorf("session id is empty")
 	}
 	if id == "." || id == ".." || strings.HasPrefix(id, ".") {
 		return fmt.Errorf("invalid session id %q", id)
 	}
-	if len(id) > 128 {
-		return fmt.Errorf("session id too long (max 128): %q", id)
+	if len(id) > maxBytes {
+		return fmt.Errorf("session id too long (max %d): %q", maxBytes, id)
 	}
 	for _, r := range id {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||

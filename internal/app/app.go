@@ -1328,7 +1328,7 @@ func (r *Runner) Rollback(n int) (dropped int, archive string, err error) {
 	if dropped == 0 {
 		return 0, "", fmt.Errorf("nothing to roll back: no turns in this session")
 	}
-	archive, err = r.App.Store.ArchiveCopy(fmt.Sprintf("%s-pre-rollback-%s", r.App.Store.ID, time.Now().Format("150405")))
+	archive, err = r.App.Store.ArchiveCopy(fmt.Sprintf("%s-pre-rollback-%d", r.App.Store.ID, time.Now().UnixNano()))
 	if err != nil {
 		return 0, "", err
 	}

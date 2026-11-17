@@ -18,6 +18,10 @@ func acquireWriter(id string) (*os.File, error) {
 	if err := ValidateSessionID(id); err != nil {
 		return nil, err
 	}
+	return acquireWriterFile(id)
+}
+
+func acquireWriterFile(id string) (*os.File, error) {
 	dir := filepath.Join(Dir(), ".writers")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err

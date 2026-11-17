@@ -257,7 +257,11 @@ func marshalCheckpoint(msgs []llm.Message) ([]byte, error) {
 func (s *Store) ArchiveCopy(name string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	writer, err := acquireWriter(name)
+	// Archives add a suffix to a valid (up to 128-byte) session ID.
+	if err := validateSessionName(name, 240); err != nil {
+		return "", err
+	}
+	writer, err := acquireWriterFile(name)
 	if err != nil {
 		return "", err
 	}
