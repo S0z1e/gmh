@@ -404,3 +404,51 @@ func TestFailureProgressWorkspaceWithinBookkeepingHasUnknownProof(t *testing.T) 
 		})
 	}
 }
+
+func TestFailureProgressOutputParentCreationCannotReopenCall(t *testing.T) {
+	c := budgetConfig(t, nil)
+	c.Exec.OutputDir = filepath.Join(c.Exec.Root, "logs", "bash")
+	var calls []llm.ToolCall
+	for _, id := range []string{"a", "b", "c"} {
+		calls = append(calls, budgetCall(id, "read", `{"path":"missing"}`))
+	}
+	calls = append(calls, budgetCall("output", "bash", `{"command":"true"}`), budgetCall("fourth", "read", `{"path":"missing"}`))
+	events, _, err := runVerification(t, c, budgetSSE("", calls, nil, true), textSSE("blocked report"))
+	denied := false
+	for _, e := range events {
+		if e.Kind == EventToolEnd && e.ToolCallID == "fourth" && strings.Contains(e.ToolOutput, RepeatedToolFailureReason) {
+			denied = true
+		}
+	}
+	if err == nil || c.LastTerminalReason != TerminalBlocked || !denied {
+		t.Fatalf("output parent creation reopened a failed call: reason=%s denied=%v err=%v", c.LastTerminalReason, denied, err)
+	}
+}
+
+func TestFailureProgressNestedOutputProofWaitsForParents(t *testing.T) {
+	c := budgetConfig(t, nil)
+	c.Exec.OutputDir = filepath.Join(c.Exec.Root, "logs", "nested", "bash")
+	c.progress = &turnProgress{ctx: context.Background(), jobs: make(map[string]bool)}
+	if got := c.progressRevision(); got != "" {
+		t.Fatal("missing bookkeeping parents provided usable proof")
+	}
+	if err := os.MkdirAll(filepath.Dir(c.Exec.OutputDir), 0700); err != nil {
+		t.Fatal(err)
+	}
+	before := c.progressRevision()
+	if before == "" {
+		t.Fatal("initialized parents did not restore proof")
+	}
+	if err := os.MkdirAll(c.Exec.OutputDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.progressRevision(); got != before {
+		t.Fatal("excluded leaf creation changed proof")
+	}
+	if err := os.WriteFile(filepath.Join(c.Exec.Root, "logs", "product"), []byte("changed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.progressRevision(); got == "" || got == before {
+		t.Fatal("product file in output ancestor was hidden")
+	}
+}

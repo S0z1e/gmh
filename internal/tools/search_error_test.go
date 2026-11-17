@@ -53,7 +53,7 @@ func TestMalformedNativeGrepSyntaxIsInputError(t *testing.T) {
 	}
 	t.Setenv("LC_ALL", "C")
 	e := setupGrepRoot(t)
-	for _, pattern := range []string{`[z-a]`, `[[:bogus:]]`, `\1`} {
+	for _, pattern := range []string{`[z-a]`, `[[:bogus:]]`, `\1`, `\(`, `a\{`, `a\{2,1\}`, `[[.bogus.]]`} {
 		t.Run(pattern, func(t *testing.T) {
 			_, err := e.grepFallback(context.Background(), e.Root, GrepArgs{Pattern: pattern}, 10, 0)
 			var input *InputError

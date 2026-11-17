@@ -130,7 +130,20 @@ func (c *Config) progressBookkeepingExclusions() ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := add(root, filepath.Join(canonical, suffix)); err != nil {
+		resolved := filepath.Join(canonical, suffix)
+		// A missing excluded leaf is harmless. Missing parents inside the
+		// workspace are not: MkdirAll would add directory records outside
+		// the exclusion. Keep proof unknown until those parents exist.
+		if filepath.Dir(suffix) != "." && strings.EqualFold(filepath.VolumeName(root), filepath.VolumeName(resolved)) {
+			parent, err := filepath.Rel(root, filepath.Dir(resolved))
+			if err != nil {
+				return nil, err
+			}
+			if parent != ".." && !strings.HasPrefix(parent, ".."+string(filepath.Separator)) && !filepath.IsAbs(parent) {
+				return nil, fmt.Errorf("harness bookkeeping parents are not initialized")
+			}
+		}
+		if err := add(root, resolved); err != nil {
 			return nil, err
 		}
 	}

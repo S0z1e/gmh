@@ -24,7 +24,14 @@ func searchError(binary string, err error, diagnostics searchDiagnostics) error 
 	if binary == "grep" && strings.HasPrefix(text, "grep:") {
 		// BSD and GNU grep report their own BRE parser diagnostics.
 		message := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(text, "grep:")))
-		for _, marker := range []string{"brackets ([ ]) not balanced", "invalid regular expression", "unmatched [", "unmatched (", "trailing backslash", "repetition-operator operand invalid", "invalid character range", "invalid character class", "invalid backreference number", "invalid range end", "invalid back reference", "invalid back-reference"} {
+		for _, marker := range []string{
+			"brackets ([ ]) not balanced", "parentheses not balanced", "braces not balanced",
+			"invalid regular expression", "unmatched [", "unmatched (", `unmatched \{`,
+			"trailing backslash", "repetition-operator operand invalid", "invalid repetition count(s)",
+			"invalid character range", "invalid character class", "invalid collating element",
+			"invalid backreference number", "invalid range end", "invalid back reference", "invalid back-reference",
+			`invalid content of \{\}`, "invalid collation character",
+		} {
 			invalid = invalid || strings.HasPrefix(message, marker)
 		}
 	}
