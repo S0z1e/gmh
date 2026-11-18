@@ -12,7 +12,6 @@ package tools
 
 import (
 	"fmt"
-	"io"
 	"minimalharness/internal/privatefile"
 	"minimalharness/internal/textutil"
 	"os"
@@ -40,9 +39,12 @@ const (
 	OutputFileMaxBytes = 64 << 20
 )
 
-// BashOutputPreview contains only captured output, without paths or notices.
+// BashOutputPreview keeps captured output and its capture notice separate from paths.
 // A missing tail means Head contains the whole (short) output.
-type BashOutputPreview struct{ Head, Tail string }
+type BashOutputPreview struct {
+	Head, Tail string
+	Notice     string
+}
 
 func bashPreview(head, tail []string, whole bool) BashOutputPreview {
 	// Cuts must see valid UTF-8: a raw continuation byte at the cut can
@@ -61,17 +63,10 @@ func bashPreview(head, tail []string, whole bool) BashOutputPreview {
 	return BashOutputPreview{Head: textutil.Prefix(first, headLimit), Tail: textutil.Suffix(last, tailLimit)}
 }
 
-// bashOutputSink keeps the first BashOutputHeadLines lines, the
-// last BashOutputTailLines lines, and the line/byte totals for one
-// bash output, so the inline result can be formatted without
-// re-reading the file. It is fed bytes (usually by scanOutputFile,
-// which streams the output file through it) — it is NOT the child's
-// stdout: a custom Writer there would force os/exec to build a pipe,
-// and cmd.Wait() would block until every grandchild holding that
-// pipe closed it (the café deadlock: a dev server started with `&`
-// blocked turn end forever). The child writes straight to the file
-// (an *os.File), and the accounting is re-derived from the file
-// after the child exits. It is safe for concurrent use.
+// bashOutputSink retains bounded prefixes of the first and last lines while
+// counting all captured bytes. runBashCmd feeds it as output is written, so a
+// giant unterminated line never requires re-reading or buffering the whole file.
+// It is safe for concurrent use.
 type bashOutputSink struct {
 	mu      sync.Mutex
 	pending []byte // bytes of the current, unterminated line
@@ -100,16 +95,23 @@ func (s *bashOutputSink) Write(p []byte) (int, error) {
 		s.capped = true
 	}
 	s.bytes += int64(len(p))
-	s.pending = append(s.pending, p...)
-	for {
-		i := indexByte(s.pending, '\n')
+	written := len(p)
+	for len(p) > 0 {
+		i := indexByte(p, '\n')
+		part := p
+		if i >= 0 {
+			part = p[:i]
+		}
+		keep := min(len(part), bashOutputMaxLineChars+4-len(s.pending))
+		s.pending = append(s.pending, part[:keep]...)
 		if i < 0 {
 			break
 		}
-		s.addLine(string(s.pending[:i]))
-		s.pending = s.pending[i+1:]
+		s.addLine(string(s.pending))
+		s.pending = s.pending[:0]
+		p = p[i+1:]
 	}
-	return len(p), nil
+	return written, nil
 }
 
 func indexByte(b []byte, c byte) int {
@@ -165,30 +167,6 @@ func (s *bashOutputSink) snapshot() (lines int, bytes int64, capped bool, head, 
 	head = append([]string(nil), s.head...)
 	tail = append([]string(nil), s.tail...)
 	return s.lines, s.bytes, s.capped, head, tail
-}
-
-// scanOutputFile re-derives a finished output file's accounting by
-// streaming it through a fresh sink: line/byte totals plus head and
-// tail. The child writes straight to the file, so the scan runs
-// after Wait returns; a grandchild may still be appending (a dev
-// server's logs), which is fine — the scan is a point-in-time view
-// and the file keeps growing for later reads.
-func scanOutputFile(path string) (lines int, bytes int64, capped bool, head, tail []string, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, 0, false, nil, nil, err
-	}
-	defer f.Close()
-	sink := newBashOutputSink()
-	buf := make([]byte, 32*1024)
-	if _, err := io.CopyBuffer(sink, f, buf); err != nil {
-		return 0, 0, false, nil, nil, err
-	}
-	if err := sink.Close(); err != nil {
-		return 0, 0, false, nil, nil, err
-	}
-	lines, bytes, capped, head, tail = sink.snapshot()
-	return lines, bytes, capped, head, tail, nil
 }
 
 // FormatBashOutput renders the inline result for a finished (or

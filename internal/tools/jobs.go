@@ -15,7 +15,6 @@ import (
 	"os/exec"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"minimalharness/internal/privatefile"
@@ -275,60 +274,57 @@ func IsTimeout(err error) bool {
 	return errors.As(err, &te)
 }
 
-// passed OutputFileMaxBytes. The old sink stopped recording at the
-// cap but let the command run to its timeout; with the child
-// writing straight to the file there is nothing to stop the writes
-// except killing the runaway, so the cap is now a kill: the file
-// keeps the first ~64 MiB and the call fails instead of filling
-// the disk.
+// outputCapError marks a command stopped at the hard capture byte limit.
 type outputCapError struct{ bytes int64 }
 
 func (e *outputCapError) Error() string {
 	return fmt.Sprintf("bash output exceeded %d bytes", OutputFileMaxBytes)
 }
 
-// runBashCmd runs one bash -c command with the given timeout and
-// returns the inline (head+tail) result, exit code and error. A
-// timeout is reported as a *timeoutError; a non-zero exit as an
-// error wrapped with "exit: ". Shared by Bash and BashBackground so
-// both audit the same outcomes. With Sandbox on, the command runs
-// under bwrap (see sandbox.go); killing the bwrap process kills the
-// sandbox too (--die-with-parent).
-//
-// The child's stdout+stderr go STRAIGHT to the output file (an
-// *os.File, no pipe): giving exec a custom Writer would make it
-// build an os.Pipe, and cmd.Wait() would block until every
-// grandchild holding that pipe closed it — a dev server started
-// with `&` blocked turn end forever (the café deadlock). The
-// accounting (lines, bytes, head/tail) is re-derived from the file
-// after Wait returns (scanOutputFile); a grandchild may still be
-// appending then, which is fine — the scan is a point-in-time view
-// and the file keeps growing for later reads.
-//
-// The child runs in its own process group (Setpgid), and the Cancel
-// hook kills the whole group: a timeout (or an abort) terminates
-// grandchildren too, instead of leaving a vite server orphaned and
-// holding the output open. The group kill applies to the bwrap path
-// as well — the sandbox shares the host pid namespace, so the group
-// is reachable from here.
-//
-// A timeout <= 0 means no deadline (explicit background jobs
-// without a per-call timeout): a dev server must outlive any cap.
-//
-// The output file is watched while the command runs: past
-// OutputFileMaxBytes the process group is killed and the call fails
-// with an *outputCapError, so a spewing command cannot fill the
-// disk. When outPath is "" (no OutputDir), the same file mechanism
-// runs against a temporary file that is deleted afterwards, and the
-// result is the old in-memory behaviour: whole output capped at
-// MaxOutBytes, no path.
-func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration, outPath, dir string, preview *BashOutputPreview) (string, int, error) {
-	runCtx := ctx
-	if timeout > 0 {
-		var cancel context.CancelFunc
-		runCtx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
+// bashOutputCapture owns output writes so the disk limit also applies to a
+// child that outlives its shell. Both streams share one owned pipe copier;
+// the shell exit starts a bounded drain independently of its exit status.
+type bashOutputCapture struct {
+	file    *os.File
+	summary *bashOutputSink
+	stop    func()
+	bytes   int64
+	capped  bool
+	err     error
+}
+
+func (c *bashOutputCapture) Write(p []byte) (int, error) {
+	keep := min(int64(len(p)), OutputFileMaxBytes-c.bytes)
+	n, err := c.file.Write(p[:keep])
+	if n > 0 {
+		c.bytes += int64(n)
+		_, _ = c.summary.Write(p[:n])
 	}
+	if err != nil {
+		c.err = err
+		c.stop()
+		return n, err
+	}
+	if n < len(p) {
+		c.capped = true
+		c.stop()
+		return n, &outputCapError{bytes: c.bytes}
+	}
+	return n, nil
+}
+
+// The shell and its captured stdout/stderr have separate lifetimes. A short
+// bounded drain captures buffered output without waiting indefinitely for inherited
+// handles; only background:true with a live shell retains captured output.
+func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration, outPath, dir string, preview *BashOutputPreview) (string, int, error) {
+	var runCtx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		runCtx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
 	var cmd *exec.Cmd
 	if e.Sandbox {
 		bwrap := e.BwrapPath
@@ -346,7 +342,12 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	// Cancel below). Without this, only the direct bash child died
 	// and grandchildren lingered as orphans.
 	configureProcess(cmd)
-	cmd.Cancel = func() error { return killProcessTree(cmd) }
+	var stopOnce sync.Once
+	var stopErr error
+	cmd.Cancel = func() error {
+		stopOnce.Do(func() { stopErr = killProcessTree(cmd) })
+		return stopErr
+	}
 
 	legacy := outPath == ""
 	filePath := outPath
@@ -362,36 +363,59 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	if err != nil {
 		return "", -1, fmt.Errorf("open bash output: %w", err)
 	}
-	cmd.Stdout = f
-	cmd.Stderr = f
+	capture := &bashOutputCapture{file: f, summary: newBashOutputSink(), stop: func() {
+		// cmd.Wait may already have retired its context watcher. A cap
+		// still owns the inherited process group during output drain.
+		_ = cmd.Cancel()
+		cancel()
+	}}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		_ = f.Close()
+		return "", -1, fmt.Errorf("create bash output pipe: %w", err)
+	}
+	cmd.Stdout, cmd.Stderr = writer, writer
 	if err := cmd.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
 		_ = f.Close()
 		return "", -1, err
 	}
-	// Watch the output file: past the cap, kill the whole group.
-	// A spewing command must not fill the disk while it runs out
-	// its timeout.
-	var capHit atomicBool
-	stopWatch := make(chan struct{})
+	_ = writer.Close()
+	copied := make(chan error, 1)
 	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopWatch:
-				return
-			case <-ticker.C:
-				if st, err := f.Stat(); err == nil && st.Size() > OutputFileMaxBytes {
-					capHit.set(true)
-					_ = killProcessTree(cmd)
-					return
-				}
-			}
-		}
+		_, err := io.Copy(capture, reader)
+		copied <- err
 	}()
 	runErr := cmd.Wait()
-	close(stopWatch)
-	_ = f.Close()
+	timer := time.NewTimer(200 * time.Millisecond)
+	var copyErr error
+	captureClosed := false
+	select {
+	case copyErr = <-copied:
+	case <-timer.C:
+		select {
+		case copyErr = <-copied:
+		default:
+			captureClosed = true
+			_ = reader.Close()
+			copyErr = <-copied
+			if errors.Is(copyErr, os.ErrClosed) {
+				copyErr = nil
+			}
+		}
+	}
+	timer.Stop()
+	_ = reader.Close()
+	_ = capture.summary.Close()
+	closeErr := f.Close()
+	if capture.err != nil {
+		runErr = capture.err
+	} else if copyErr != nil {
+		runErr = copyErr
+	} else if runErr == nil {
+		runErr = closeErr
+	}
 	exitCode := -1
 	if cmd.ProcessState != nil {
 		exitCode = cmd.ProcessState.ExitCode()
@@ -401,9 +425,18 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		s := truncate(string(data), MaxOutBytes)
 		if preview != nil {
 			*preview = bashPreview([]string{s}, []string{s}, true)
+			if captureClosed {
+				preview.Notice = "\n[Output capture closed after the shell exited.]"
+			}
 		}
-		if capHit.get() {
+		if captureClosed {
+			s += "\n[Output capture closed after the shell exited.]"
+		}
+		if capture.capped {
 			return s, -1, &outputCapError{bytes: int64(len(data))}
+		}
+		if capture.err != nil {
+			return s, exitCode, fmt.Errorf("capture bash output: %w", capture.err)
 		}
 		if runCtx.Err() == context.DeadlineExceeded {
 			return s, -1, &timeoutError{timeout}
@@ -416,16 +449,22 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		}
 		return s, exitCode, nil
 	}
-	lines, bytes, fileCapped, head, tail, scanErr := scanOutputFile(filePath)
-	if scanErr != nil {
-		return "", exitCode, scanErr
-	}
+	lines, bytes, fileCapped, head, tail := capture.summary.snapshot()
 	if preview != nil {
 		*preview = bashPreview(head, tail, lines <= len(head))
+		if captureClosed {
+			preview.Notice = "\n[Output capture closed after the shell exited.]"
+		}
 	}
-	s := FormatBashOutput(lines, bytes, fileCapped, head, tail, outPath, dir)
-	if capHit.get() {
+	s := FormatBashOutput(lines, bytes, fileCapped || capture.capped, head, tail, outPath, dir)
+	if captureClosed {
+		s += "\n[Output capture closed after the shell exited. Use background:true with a foreground server command to keep capturing its output.]"
+	}
+	if capture.capped {
 		return s, -1, &outputCapError{bytes: bytes}
+	}
+	if capture.err != nil {
+		return s, exitCode, fmt.Errorf("capture bash output: %w", capture.err)
 	}
 	if runCtx.Err() == context.DeadlineExceeded {
 		return s, -1, &timeoutError{timeout}
@@ -438,19 +477,6 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	}
 	return s, exitCode, nil
 }
-
-// atomicBool is a mutex-free boolean for the cap watcher goroutine.
-type atomicBool struct{ v int32 }
-
-func (b *atomicBool) set(v bool) {
-	if v {
-		atomic.StoreInt32(&b.v, 1)
-	} else {
-		atomic.StoreInt32(&b.v, 0)
-	}
-}
-
-func (b *atomicBool) get() bool { return atomic.LoadInt32(&b.v) != 0 }
 
 // readFileHead returns up to max bytes from the start of the file.
 func readFileHead(path string, max int) ([]byte, error) {
