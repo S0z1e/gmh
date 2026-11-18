@@ -61,8 +61,8 @@ func TestStoppedJobLargeBatchKeepsVisibleResults(t *testing.T) {
 			}
 		}
 	}
-	if groups != 2 {
-		t.Fatalf("256 outcomes rendered as %d groups, want 2 bounded displays", groups)
+	if groups != 8 {
+		t.Fatalf("256 outcomes rendered as %d groups, want 8 bounded displays", groups)
 	}
 }
 
@@ -116,53 +116,45 @@ func TestStoppedJobRecordedCompletionDoesNotRepeat(t *testing.T) {
 			name = "legacy-batch"
 		}
 		t.Run(name, func(t *testing.T) {
-			c, s := stoppedJobSession(t)
-			c.OnEvent = func(e Event) {
-				if e.Kind != EventToolEnd || e.ToolCallID != "stop" {
-					return
-				}
-				job := c.Exec.Jobs()[0]
-				res, ok := job.Result()
-				if !ok {
-					t.Fatal("stopped target is not ready")
-				}
-				output, _ := jobResultMessage(job, res)
-				// Model a complete write followed by a Sync error: the result
-				// is readable, but the caller has not acknowledged delivery.
-				result := llm.Message{Role: "tool", ToolCallID: e.ToolCallID, InvocationID: e.InvocationID}
-				if legacy {
-					result.Content = output
-					result.Observation = &llm.ToolObservation{CompletedJobs: []llm.JobCompletion{jobCompletion(job, res)}}
-				}
-				if err := s.Append(result); err != nil {
-					t.Fatal(err)
-				}
-				if !legacy {
-					result := completedJobMessage(job, res, output)
-					result.Observation.BeforeInvocationID = e.InvocationID
-					if err := s.Append(result); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if err := s.Close(); err != nil {
+			c, store := stoppedJobSession(t)
+			job, err := c.Exec.BashBackground(context.Background(), tools.BashArgs{Command: `printf '%s-%s' target visible`})
+			if err != nil {
+				t.Fatal(err)
+			}
+			<-job.Done()
+			res, _ := job.Result()
+			output, _ := jobResultMessage(job, res)
+			// Model a complete append followed by a Sync error: the record is
+			// readable, while the live job has not acknowledged the write.
+			if err := store.Append(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{budgetCall("stop", "bash", stoppedJobStop)}, ToolInvocations: []llm.ToolInvocation{{ID: "stop-inv", ToolCallID: "stop", CallIndex: 0, ToolName: "bash", OriginalArguments: stoppedJobStop, Arguments: stoppedJobStop}}}); err != nil {
+				t.Fatal(err)
+			}
+			result := llm.Message{Role: "tool", ToolCallID: "stop", InvocationID: "stop-inv"}
+			if legacy {
+				result.Content = output
+				result.Observation = &llm.ToolObservation{CompletedJobs: []llm.JobCompletion{jobCompletion(job, res)}}
+			} else {
+				record := completedJobMessage(job, res, output)
+				record.Observation.BeforeInvocationID = "stop-inv"
+				if err := store.Append(record); err != nil {
 					t.Fatal(err)
 				}
 			}
-			_, err := runStoppedJobSteps(t, c, func() string {
-				return toolCallSSE("launch", "bash", stoppedJobLaunch(`printf '%s-%s' target visible; : > ready; exec sleep 30`))
-			}, func() string {
-				waitStoppedJobFile(t, c, "ready")
-				return toolCallSSE("stop", "bash", stoppedJobStop)
-			})
-			if err == nil || c.Exec.Jobs()[0].Delivered() {
-				t.Fatalf("expected append failure with job unacknowledged: %v", err)
+			if err := store.Append(result); err != nil {
+				t.Fatal(err)
 			}
-			c.Session, err = session.Open(s.ID, session.OpenOptions{Workspace: c.Exec.Root})
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if job.Delivered() {
+				t.Fatal("fixture acknowledged the ambiguous write")
+			}
+			c.Session, err = session.Open(store.ID, session.OpenOptions{Workspace: c.Exec.Root})
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer c.Session.Close()
-			h, err := session.Load(s.ID)
+			h, err := session.Load(store.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -172,17 +164,17 @@ func TestStoppedJobRecordedCompletionDoesNotRepeat(t *testing.T) {
 					events++
 				}
 			}
-			c.Client.HTTP.Transport = stoppedJobTransport(func(r *http.Request) (*http.Response, error) {
+			c.Client = &llm.Client{API: "chat", Model: "fake", APIKey: "fake", BaseURL: "https://example.invalid", HTTP: &http.Client{Transport: stoppedJobTransport(func(r *http.Request) (*http.Response, error) {
 				b, err := io.ReadAll(r.Body)
 				if err != nil {
 					return nil, err
 				}
 				requests++
 				if n := strings.Count(string(b), "target-visible"); n != 1 {
-					t.Errorf("job output repeated %d times in first provider request", n)
+					t.Errorf("output repeated %d times", n)
 				}
 				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(textSSE("done")))}, nil
-			})
+			})}}
 			if _, _, err := c.Run(context.Background(), h); err != nil {
 				t.Fatal(err)
 			}

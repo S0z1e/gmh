@@ -104,7 +104,7 @@ func TestStoppedJobSaveFailureStopsBeforeGrace(t *testing.T) {
 	c.MaxSteps = 2
 	args := stoppedJobLaunch(`printf 'stopped-%s' original; : > ready; exec sleep 30`)
 	c.OnEvent = func(e Event) {
-		if e.Kind == EventToolEnd && e.ToolCallID == "stop" {
+		if e.Kind == EventToolStart && e.ToolCallID == "stop" {
 			s.Close()
 		}
 	}

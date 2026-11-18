@@ -41,6 +41,7 @@ type JobResult struct {
 	Output   string
 	Err      error
 	ExitCode int
+	Preview  *BashOutputPreview
 }
 
 // Job is one background bash execution.
@@ -318,7 +319,7 @@ func (e *outputCapError) Error() string {
 // runs against a temporary file that is deleted afterwards, and the
 // result is the old in-memory behaviour: whole output capped at
 // MaxOutBytes, no path.
-func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration, outPath, dir string) (string, int, error) {
+func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration, outPath, dir string, preview *BashOutputPreview) (string, int, error) {
 	runCtx := ctx
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -395,6 +396,9 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	if legacy {
 		data, _ := readFileHead(filePath, MaxOutBytes)
 		s := truncate(string(data), MaxOutBytes)
+		if preview != nil {
+			*preview = bashPreview([]string{s}, []string{s}, true)
+		}
 		if capHit.get() {
 			return s, -1, &outputCapError{bytes: int64(len(data))}
 		}
@@ -412,6 +416,9 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	lines, bytes, fileCapped, head, tail, scanErr := scanOutputFile(filePath)
 	if scanErr != nil {
 		return "", exitCode, scanErr
+	}
+	if preview != nil {
+		*preview = bashPreview(head, tail, lines <= len(head))
 	}
 	s := FormatBashOutput(lines, bytes, fileCapped, head, tail, outPath, dir)
 	if capHit.get() {
@@ -499,7 +506,8 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	}
 	go func() {
 		defer cancel()
-		out, code, err := e.runBashCmd(runCtx, a.Command, timeout, outPath, dir)
+		preview := &BashOutputPreview{}
+		out, code, err := e.runBashCmd(runCtx, a.Command, timeout, outPath, dir, preview)
 		if audit != nil {
 			entry := AuditEntry{InvocationID: job.InvocationID, ToolCallID: job.ToolCallID, TS: time.Now(), Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
 			if err != nil {
@@ -507,7 +515,7 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 			}
 			audit(entry)
 		}
-		job.finish(JobResult{Output: out, Err: err, ExitCode: code})
+		job.finish(JobResult{Output: out, Err: err, ExitCode: code, Preview: preview})
 	}()
 	return job, nil
 }

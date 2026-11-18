@@ -67,6 +67,19 @@ func completedJobMessage(job *tools.Job, res tools.JobResult, display string) ll
 	completed := jobCompletion(job, res)
 	obs := &llm.ToolObservation{Tool: "bash", Fingerprint: completed.Fingerprint, Command: job.Command, Cwd: completed.Cwd,
 		OutputFile: job.OutputFile, Failure: completed.Failure, Jobs: []checkpoint.Job{completed.Job}}
+	if preview := res.Preview; preview != nil {
+		header := fmt.Sprintf("Background job %s finished (exit %d).", job.ID, res.ExitCode)
+		if res.Err != nil {
+			header = fmt.Sprintf("Background job %s finished with error: %v (exit %d).", job.ID, res.Err, res.ExitCode)
+		}
+		original, _ := jobResultMessage(job, res)
+		note := strings.TrimPrefix(display, original)
+		if note == display {
+			note = ""
+		}
+		obs.JobDisplay = &llm.JobDisplay{Header: header,
+			Head: strings.ToValidUTF8(preview.Head, "\uFFFD"), Tail: strings.ToValidUTF8(preview.Tail, "\uFFFD"), Note: note}
+	}
 	return llm.Message{Role: "user", Kind: "job", InvocationID: job.InvocationID, Content: display, ToolError: res.Err != nil, Observation: obs}
 }
 
@@ -274,7 +287,7 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 			if info.id != "" {
 				d.ResolvedCalls = append(d.ResolvedCalls, info.id)
 			}
-			if m.Kind == guidanceDeferredKind {
+			if m.Kind == guidanceDeferredKind || m.Kind == notExecutedKind {
 				// The call settled without dispatch; it supplies neither
 				// failure evidence nor proof that an earlier failure cleared.
 			} else if m.ToolError {

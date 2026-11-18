@@ -184,3 +184,26 @@ func TestStoppedJobProviderShowsFailureBeforeRetry(t *testing.T) {
 		t.Fatalf("provider sees stopped failure after successful retry: failure offset %d, retry offset %d", stop, retry)
 	}
 }
+
+func TestStoppedJobRepeatedStopCapsHook(t *testing.T) {
+	c, _ := stoppedJobSession(t)
+	hooks := &fakePluginRunner{result: map[string]string{}}
+	c.Exec.Plugins = hooks
+	c.OnEvent = func(e Event) {
+		if e.Kind == EventToolStart && (e.ToolCallID == "stop" || e.ToolCallID == "repeat") {
+			hooks.result["bash"] = strings.Repeat("x", 4<<20)
+		}
+		if e.Kind == EventToolStart && e.ToolCallID == "later" {
+			hooks.result["bash"] = "later command completed"
+		}
+	}
+	req, err := runStoppedJobSteps(t, c, func() string {
+		return toolCallSSE("launch", "bash", stoppedJobLaunch(`printf '%s-%s' stopped payload; : > ready; exec sleep 30`))
+	}, func() string {
+		waitStoppedJobFile(t, c, "ready")
+		return budgetSSE("", []llm.ToolCall{budgetCall("stop", "bash", stoppedJobStop), budgetCall("repeat", "bash", stoppedJobStop), budgetCall("later", "bash", `{"command":":"}`)}, nil, true)
+	})
+	if err != nil {
+		t.Fatalf("duplicate successful stop aborts batch after %d provider calls: %v", len(req), err)
+	}
+}

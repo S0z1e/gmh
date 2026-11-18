@@ -128,7 +128,7 @@ func (c *Config) emit(e Event) {
 		c.LastTaskOutcome = e.TaskOutcome
 	}
 	if e.Kind == EventToolEnd || e.Kind == EventToolBackgroundDone {
-		if e.ToolErr != nil {
+		if e.ToolErr != nil && e.ToolStatus != tools.ResultDeferred {
 			e.ToolStatus = tools.ResultError
 		} else if e.ToolStatus == "" {
 			e.ToolStatus = tools.ResultSuccess
@@ -369,6 +369,7 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (tools.ToolResul
 // It is a user message, never a second tool message for the same
 // call id — the API rejects that with 400.
 func jobResultMessage(job *tools.Job, res tools.JobResult) (string, error) {
+	res.Output = strings.ToValidUTF8(res.Output, "\uFFFD")
 	if res.Err != nil {
 		// A timeout kill is not a failure of the command itself:
 		// say so, and point at the output file (a killed dev
@@ -1377,6 +1378,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				res, err = c.Exec.Dispatch(toolCtx, tc.Function.Name, argsJSON)
 			}
 			closeMutation()
+			var bashArgs tools.BashArgs
+			isStop := tc.Function.Name == "bash" && json.Unmarshal([]byte(argsJSON), &bashArgs) == nil && bashArgs.KillJobID != ""
 			var stopped *tools.Job
 			if target := res.StoppedJob; target != nil && !target.Delivered() {
 				stopped = target
@@ -1386,9 +1389,15 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				} else if !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == target }) {
 					pending = append(pending, pendingJob{callID: target.ToolCallID, job: target})
 				}
+				if _, done := target.Result(); !done {
+					err = fmt.Errorf("stop requested for %s; completion is not confirmed yet", target.ID)
+					res.Status = tools.ResultDeferred
+				}
 			}
 			if err != nil {
-				res.Status = tools.ResultError
+				if res.Status != tools.ResultDeferred {
+					res.Status = tools.ResultError
+				}
 				obs = fmt.Sprintf("Error: %v\nOutput:\n%s", err, res.Text)
 			} else {
 				obs = res.Text
@@ -1399,7 +1408,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if tc.Function.Name != tools.GuidanceTool && c.Exec != nil && c.Exec.Plugins != nil {
 				obs = c.Exec.Plugins.RunToolResultHooks(ctx, tc.Function.Name, argsJSON, obs, err)
 			}
-			if res.StoppedJob != nil {
+			if isStop {
 				// Decorations cannot block the original result's persistence.
 				obs = capText(obs, 1024)
 			}
@@ -1421,7 +1430,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 
 			observation := executionObservation(tc.Function.Name, argsJSON, callKey, res.Text, res.OutputFile, err, job)
 			observation.Answer = humanAnswer
-			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolTruncated: res.Truncated, ToolCountLowerBound: res.CountLowerBound, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
+			endEvent := Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolTruncated: res.Truncated, ToolCountLowerBound: res.CountLowerBound, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile}
+			if !isStop {
+				c.emit(endEvent)
+			}
 			var deliveries []jobDelivery
 			if stopped != nil {
 				// Persist each ready outcome before the next tool. Its facts
@@ -1436,26 +1448,39 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				}
 			}
 			msgs = append(msgs, result)
-			for _, d := range deliveries {
-				delivery := completedJobMessage(d.job, d.result, d.output)
-				delivery.Observation.BeforeInvocationID = inv.ID
-				msgs = append(msgs, delivery)
-				c.persist(delivery)
-				if c.persistErr != nil {
-					return lastText, total, c.persistErr
+			deliver := func(deliveries []jobDelivery) {
+				for _, d := range deliveries {
+					delivery := completedJobMessage(d.job, d.result, d.output)
+					delivery.Observation.BeforeInvocationID = inv.ID
+					msgs = append(msgs, delivery)
+					c.persist(delivery)
+					if c.persistErr != nil {
+						return
+					}
+					d.job.MarkDelivered()
+					pending = slices.DeleteFunc(pending, func(p pendingJob) bool { return p.job == d.job })
+					c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: d.output, ToolErr: d.result.Err,
+						JobID: d.job.ID, ToolCallID: d.job.ToolCallID, InvocationID: d.job.InvocationID,
+						ToolExitCode: &d.result.ExitCode, ToolOutputFile: d.job.OutputFile})
 				}
-				d.job.MarkDelivered()
-				pending = slices.DeleteFunc(pending, func(p pendingJob) bool { return p.job == d.job })
-				c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: d.output, ToolErr: d.result.Err,
-					JobID: d.job.ID, ToolCallID: d.job.ToolCallID, InvocationID: d.job.InvocationID,
-					ToolExitCode: &d.result.ExitCode, ToolOutputFile: d.job.OutputFile})
 			}
+			deliver(deliveries)
 			// A recorded stop acknowledgement must never outlive a missing
 			// target outcome after a partial batch write or crash. Provider
 			// replay groups tool replies first regardless of disk ordering.
 			c.persist(result)
 			if c.persistErr != nil {
 				return lastText, total, c.persistErr
+			}
+			if isStop {
+				c.emit(endEvent)
+			}
+			if stopped != nil && !stopped.Delivered() {
+				// A completion can arrive while the stop event is consumed.
+				deliver(c.stoppedJobDeliveries())
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
+				}
 			}
 			for _, evidence := range c.verificationFinish(ctx, attempt, res, err) {
 				msgs = append(msgs, evidence)
@@ -1476,6 +1501,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if budgetErr := c.budgetError(); budgetErr != nil {
 				c.rejectBudgetTools(assistant.ToolCalls[i+1:], budgetErr)
 				return lastText, total, budgetErr
+			}
+			if stopped != nil && !stopped.Delivered() {
+				msgs = append(msgs, c.rejectBudgetTools(assistant.ToolCalls[i+1:], fmt.Errorf("background job %s is still finalizing; reconsider these calls after its outcome is recorded", stopped.ID))...)
+				break
 			}
 		}
 		if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {

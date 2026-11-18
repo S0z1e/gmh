@@ -411,7 +411,7 @@ func (c *Config) pruneCheckpoint(msgs []llm.Message, defs []llm.ToolDef) ([]llm.
 		}
 		view[i].Content = prunedToolResultPlaceholder
 		out[i].Content = prunedToolResultPlaceholder
-		if c.contextTokens(view, defs) <= target {
+		if c.contextTokens(c.promptView(out), defs) <= target {
 			if c.Session != nil && !session.CheckpointFits(out) {
 				return nil, false
 			}

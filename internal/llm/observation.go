@@ -20,7 +20,16 @@ type ToolObservation struct {
 	CompletedJobs []JobCompletion  `json:"completed_jobs,omitempty"`
 	// BeforeInvocationID anchors a stopped completion's historical facts to
 	// the stop call, even when provider replay moves its display after a batch.
-	BeforeInvocationID string `json:"before_invocation_id,omitempty"`
+	BeforeInvocationID string      `json:"before_invocation_id,omitempty"`
+	JobDisplay         *JobDisplay `json:"job_display,omitempty"`
+}
+
+// JobDisplay separates actual captured output from harness decorations.
+type JobDisplay struct {
+	Header string `json:"header"`
+	Head   string `json:"head"`
+	Tail   string `json:"tail,omitempty"`
+	Note   string `json:"note,omitempty"`
 }
 
 // JobCompletions includes the older single-job record when replaying it.

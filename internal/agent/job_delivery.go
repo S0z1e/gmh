@@ -46,15 +46,15 @@ func stoppedResultsView(history []llm.Message) []llm.Message {
 			notice := fmt.Sprintf("\n[Background outcomes from stop call %s, completed before subsequent tools in that batch.]\n", textutil.Prefix(m.ToolCallID, 80))
 			first := true
 			for len(jobs) > 0 {
-				// At most 128 outcomes share a 32 KiB display. Each keeps
+				// At most 32 outcomes share a 32 KiB display. Each keeps
 				// its own header and actual head/tail, including the marker.
-				count := min(len(jobs), 128)
+				count := min(len(jobs), 32)
 				share := (toolResultMaxChars - len(prefix) - len(notice) - count) / count
 				var body strings.Builder
 				body.WriteString(prefix)
 				body.WriteString(notice)
 				for _, job := range jobs[:count] {
-					body.WriteString(boundedJobDisplay(job.Content, share))
+					body.WriteString(completedJobDisplay(job, share))
 					body.WriteByte('\n')
 				}
 				if first {
@@ -73,6 +73,7 @@ func stoppedResultsView(history []llm.Message) []llm.Message {
 }
 
 func boundedJobDisplay(s string, limit int) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
 	if len(s) <= limit {
 		return s
 	}
@@ -80,6 +81,29 @@ func boundedJobDisplay(s string, limit int) string {
 	remaining := max(0, limit-len(marker))
 	head := remaining * 2 / 3
 	return textutil.Prefix(s, head) + marker + textutil.Suffix(s, remaining-head)
+}
+
+func completedJobDisplay(m llm.Message, limit int) string {
+	if m.Observation == nil || m.Observation.JobDisplay == nil {
+		return boundedJobDisplay(m.Content, limit)
+	}
+	preview := m.Observation.JobDisplay
+	header := textutil.Prefix(strings.ToValidUTF8(preview.Header, "\uFFFD"), min(128, limit/4)) + "\n"
+	path := "Output file: " + m.Observation.OutputFile + "\n"
+	if m.Observation.OutputFile != "" && len(path) <= limit/4 {
+		header += path
+	} else if m.Observation.OutputFile != "" {
+		header += "[Output file path retained in session]\n"
+	}
+	note := strings.ToValidUTF8(preview.Note, "\uFFFD")
+	if len(note) > limit/5 {
+		note = ""
+	}
+	output := preview.Head
+	if preview.Tail != "" {
+		output += "\n... [captured output excerpt] ...\n" + preview.Tail
+	}
+	return header + boundedJobDisplay(output, limit-len(header)-len(note)) + note
 }
 
 // An append may write a complete result before Sync reports an error. Reconcile

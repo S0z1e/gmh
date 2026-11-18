@@ -40,6 +40,18 @@ const (
 	OutputFileMaxBytes = 64 << 20
 )
 
+// BashOutputPreview contains only captured output, without paths or notices.
+// A missing tail means Head contains the whole (short) output.
+type BashOutputPreview struct{ Head, Tail string }
+
+func bashPreview(head, tail []string, whole bool) BashOutputPreview {
+	first, last := strings.Join(head, "\n"), strings.Join(tail, "\n")
+	if whole && len(first) <= 4096 {
+		return BashOutputPreview{Head: first}
+	}
+	return BashOutputPreview{Head: textutil.Prefix(first, 2048), Tail: textutil.Suffix(last, 2048)}
+}
+
 // bashOutputSink keeps the first BashOutputHeadLines lines, the
 // last BashOutputTailLines lines, and the line/byte totals for one
 // bash output, so the inline result can be formatted without

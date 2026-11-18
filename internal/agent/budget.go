@@ -183,9 +183,12 @@ func (c *Config) reserveBudgetTools(calls []llm.ToolCall) error {
 	return c.budgetError()
 }
 
+const notExecutedKind = "not_executed"
+
 // Calls rejected before dispatch have no committed invocation ID. Store a real
 // tool result for each so resume never treats them as interrupted side effects.
-func (c *Config) rejectBudgetTools(calls []llm.ToolCall, err error, startedInvocation ...string) {
+func (c *Config) rejectBudgetTools(calls []llm.ToolCall, err error, startedInvocation ...string) []llm.Message {
+	var results []llm.Message
 	for i, tc := range calls {
 		obs := fmt.Sprintf("Not executed: %v", err)
 		invocation := ""
@@ -195,6 +198,9 @@ func (c *Config) rejectBudgetTools(calls []llm.ToolCall, err error, startedInvoc
 			c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments, ToolCallID: tc.ID})
 		}
 		c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: invocation, ToolOutput: obs, ToolErr: err})
-		c.persist(llm.Message{Role: "tool", ToolCallID: tc.ID, InvocationID: invocation, ToolError: true, Content: obs})
+		result := llm.Message{Role: "tool", Kind: notExecutedKind, ToolCallID: tc.ID, InvocationID: invocation, ToolError: true, Content: obs}
+		results = append(results, result)
+		c.persist(result)
 	}
+	return results
 }
