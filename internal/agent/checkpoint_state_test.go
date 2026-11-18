@@ -270,6 +270,25 @@ func TestPruneCheckpointRetainsFailedOutput(t *testing.T) {
 	}
 }
 
+func TestPruneCheckpointRetainsStoppedJobFailure(t *testing.T) {
+	history := []llm.Message{{Role: "user", Kind: "task", Content: "task"}}
+	for i := 0; i < 8; i++ {
+		history = appendFixtureBatch(history, i, 16000)
+	}
+	history[1].ToolCalls[0].Function.Name = "bash"
+	history[1].ToolCalls[0].Function.Arguments = `{"killJobId":"bg-1"}`
+	failure, err := checkpoint.Observe("original command failed", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history[2].Observation = &llm.ToolObservation{Tool: "bash", CompletedJob: &llm.JobCompletion{Failure: &failure}}
+	cfg := &Config{ContextLimit: 40000}
+	out, ok := cfg.pruneCheckpoint(history, cfg.Tools)
+	if !ok || out[2].Content != history[2].Content || out[2].ToolError {
+		t.Fatal("pruning discarded the command failure carried by a successful stop")
+	}
+}
+
 func TestCompletedJobCheckpointCapturesActualFailureBeforeDisplayHooks(t *testing.T) {
 	exec := &tools.Executor{Root: t.TempDir(), OutputDir: t.TempDir()}
 	args := `{"command":"printf 'HEAD'; printf 'TAIL'; exit 7","background":true}`

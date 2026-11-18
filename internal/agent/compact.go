@@ -402,7 +402,9 @@ func (c *Config) pruneCheckpoint(msgs []llm.Message, defs []llm.ToolDef) ([]llm.
 		for _, call := range view[i].ToolCalls {
 			callNames[call.ID] = call.Function.Name
 		}
-		if view[i].Role != "tool" || view[i].ToolError || callNames[view[i].ToolCallID] == "ask_user" || len(view[i].Content) <= len(prunedToolResultPlaceholder) {
+		stoppedFailure := view[i].Observation != nil && view[i].Observation.CompletedJob != nil &&
+			(view[i].Observation.CompletedJob.Failure != nil || view[i].Observation.CompletedJob.Job.Error != "")
+		if view[i].Role != "tool" || view[i].ToolError || stoppedFailure || callNames[view[i].ToolCallID] == "ask_user" || len(view[i].Content) <= len(prunedToolResultPlaceholder) {
 			continue
 		}
 		view[i].Content = prunedToolResultPlaceholder
