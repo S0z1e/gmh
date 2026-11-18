@@ -391,15 +391,28 @@ func jobResultMessage(job *tools.Job, res tools.JobResult) (string, error) {
 // pending for a later step or the turn-end drain.
 func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) ([]llm.Message, []pendingJob) {
 	var done, rest []pendingJob
+	cutoff := time.Now()
+	if c.Exec != nil {
+		for _, job := range c.Exec.Jobs() {
+			if !job.Delivered() && !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == job }) {
+				pending = append(pending, pendingJob{callID: job.ToolCallID, job: job})
+			}
+		}
+	}
 	for _, p := range pending {
-		if _, ok := p.job.Result(); ok {
+		if p.job.Delivered() {
+			continue
+		}
+		if finished, ok := p.job.FinishedAt(); ok && !finished.After(cutoff) {
 			done = append(done, p)
-		} else {
+		} else if !p.job.Reported() {
+			// Already-reported running jobs remain only in the registry:
+			// they must not force another drain or discard a final answer.
 			rest = append(rest, p)
 		}
 	}
 	if len(done) == 0 {
-		return msgs, pending
+		return msgs, rest
 	}
 	sort.Slice(done, func(i, j int) bool {
 		ti, _ := done[i].job.FinishedAt()
@@ -878,6 +891,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		if c.persistErr != nil {
 			return lastText, total, c.persistErr
 		}
+		if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {
+			return finishBlocked()
+		}
 		if guidanceState != nil {
 			msgs = guidanceState.refreshRoot(ctx, c, msgs)
 		}
@@ -973,14 +989,6 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		// A job can finish during any provider response, including a final
 		// answer. Save the outcome before the newer batch; a final answer
 		// that has not seen it needs another model step to account for it.
-		if c.Exec != nil {
-			for _, job := range c.Exec.Jobs() {
-				_, done := job.Result()
-				if !job.Delivered() && (done || !job.Reported()) && !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == job }) {
-					pending = append(pending, pendingJob{callID: job.ToolCallID, job: job})
-				}
-			}
-		}
 		beforeCollection := len(msgs)
 		msgs, pending = c.collectFinishedJobs(msgs, pending)
 		collectedAfterResponse := len(msgs) > beforeCollection
@@ -1003,6 +1011,15 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		}
 		if len(assistant.ToolCalls) == 0 {
 			if collectedAfterResponse {
+				if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {
+					return finishBlocked()
+				}
+				followup := llm.Message{Role: "user", Kind: "job", Content: "A background job completed while the preceding answer was generated. Reconsider that answer using the saved outcome above."}
+				msgs = append(msgs, followup)
+				c.persist(followup)
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
+				}
 				continue
 			}
 			if len(pending) == 0 {
@@ -1115,6 +1132,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				}
 				timer.Stop()
 				if waitErr != nil {
+					msgs, pending = c.collectFinishedJobs(msgs, pending)
+					if c.persistErr != nil {
+						return lastText, total, c.persistErr
+					}
+					if target.Delivered() && ctx.Err() == nil {
+						continue
+					}
 					c.LastTerminalReason = TerminalError
 					if ctx.Err() != nil {
 						c.LastTerminalReason = TerminalAbort
@@ -1123,9 +1147,6 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					c.persist(llm.Message{Role: "user", Kind: "task_outcome", Content: lastText})
 					c.emit(Event{Kind: EventError, Err: waitErr, Text: lastText, Usage: total, TerminalReason: c.LastTerminalReason})
 					return lastText, total, waitErr
-				}
-				if !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == target }) {
-					pending = append(pending, pendingJob{callID: target.ToolCallID, job: target})
 				}
 				continue
 			}
