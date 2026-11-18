@@ -522,12 +522,24 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 			freshJobs = append(freshJobs, job)
 		}
 	}
-	msgs, _ = c.collectFinishedJobs(msgs, pending)
+	// Completion callbacks may release another job after a collector's
+	// cutoff. Rescan after each delivery batch before classifying unfinished
+	// work or returning to a provider request. Each pass delivers new jobs.
+	collectReady := func() {
+		for {
+			before := len(msgs)
+			msgs, _ = c.collectFinishedJobs(msgs, pending)
+			if c.persistErr != nil || len(msgs) == before {
+				return
+			}
+		}
+	}
+	collectReady()
 	if c.persistErr != nil {
 		return msgs, c.persistErr
 	}
 	freshJobs = slices.DeleteFunc(freshJobs, func(job *tools.Job) bool { return job.Delivered() })
-	if len(freshJobs) == 0 {
+	if len(freshJobs) == 0 || ctx.Err() != nil {
 		// Nothing new to wait for: the only unfinished jobs are
 		// ones the model was already told about.
 		return msgs, ctx.Err()
@@ -556,13 +568,13 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 	for remaining > 0 {
 		select {
 		case <-done:
-			msgs, _ = c.collectFinishedJobs(msgs, pending)
+			collectReady()
 			if c.persistErr != nil {
 				return msgs, c.persistErr
 			}
 			remaining--
 		case <-timer.C:
-			msgs, _ = c.collectFinishedJobs(msgs, pending)
+			collectReady()
 			if c.persistErr != nil {
 				return msgs, c.persistErr
 			}
@@ -573,7 +585,7 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 			// next turn's drain does not wait on them again.
 			var still []*tools.Job
 			for _, job := range freshJobs {
-				if _, ok := job.Result(); !ok {
+				if !job.Delivered() {
 					still = append(still, job)
 				}
 			}
@@ -599,7 +611,7 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 			}
 			return msgs, ctx.Err()
 		case <-ctx.Done():
-			msgs, _ = c.collectFinishedJobs(msgs, pending)
+			collectReady()
 			if c.persistErr != nil {
 				return msgs, c.persistErr
 			}
@@ -1095,7 +1107,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			var err error
 			msgs, err = c.drainPending(ctx, msgs, pending)
 			pending = nil
+			if c.persistErr != nil {
+				return lastText, total, c.persistErr
+			}
 			if err != nil {
+				c.LastTerminalReason = TerminalAbort
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
 				return lastText, total, err
 			}
 			if c.progress.failures >= MaxFailedFixAttempts {
@@ -1648,6 +1665,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	}
 	if c.persistErr != nil {
 		return lastText, total, c.persistErr
+	}
+	if err := ctx.Err(); err != nil {
+		c.LastTerminalReason = TerminalAbort
+		c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+		return lastText, total, err
 	}
 	// Step-cap grace period, after Gemini CLI: a hard cut throws
 	// away the turn, so the model gets one final, tool-less call —
