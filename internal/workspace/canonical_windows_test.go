@@ -151,21 +151,33 @@ func TestFallbackBindingPathKeepsOnlyDirectNamespace(t *testing.T) {
 }
 
 func TestWindowsCaseOnlyJunctionIsNotADirectBinding(t *testing.T) {
-	parent := t.TempDir()
-	if out, err := exec.Command("fsutil.exe", "file", "setCaseSensitiveInfo", parent, "enable").CombinedOutput(); err != nil {
-		t.Skipf("cannot create case-sensitive NTFS fixture: %v (%s)", err, out)
-	}
-	physical := filepath.Join(parent, "repo")
-	if err := os.Mkdir(physical, 0700); err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command("cmd.exe", "/d", "/c", "mklink", "/J", "Repo", "repo")
-	cmd.Dir = parent
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Skipf("cannot create case-only junction: %v (%s)", err, out)
-	}
-	alias := filepath.Join(parent, "Repo")
-	if sameDirectBindingName(bindingNamespace(alias), bindingNamespace(physical)) {
-		t.Fatal("case-only junction treated as direct open")
+	for _, tc := range []struct {
+		alias, target string
+	}{
+		{"Repo", "repo"},
+		{`A\repo`, `a\repo`}, // the junction itself has the same name as the target leaf
+	} {
+		t.Run(tc.alias, func(t *testing.T) {
+			parent := t.TempDir()
+			if out, err := exec.Command("fsutil.exe", "file", "setCaseSensitiveInfo", parent, "enable").CombinedOutput(); err != nil {
+				t.Skipf("cannot create case-sensitive NTFS fixture: %v (%s)", err, out)
+			}
+			physical := filepath.Join(parent, tc.target)
+			if err := os.MkdirAll(physical, 0700); err != nil {
+				t.Fatal(err)
+			}
+			alias := filepath.Join(parent, tc.alias)
+			if err := os.MkdirAll(filepath.Dir(alias), 0700); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("cmd.exe", "/d", "/c", "mklink", "/J", tc.alias, tc.target)
+			cmd.Dir = parent
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Skipf("cannot create case-only junction: %v (%s)", err, out)
+			}
+			if sameDirectBindingName(bindingNamespace(alias), bindingNamespace(physical)) {
+				t.Fatal("case-only junction treated as direct open")
+			}
+		})
 	}
 }

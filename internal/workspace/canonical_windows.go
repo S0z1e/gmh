@@ -89,7 +89,7 @@ func identify(path string) (Identity, error) {
 	return Identity{Path: fallbackBindingPath(abs, physical, func(path string) bool {
 		// Open the ordinary spelling as-is: the metadata helper adds a
 		// device prefix, so it cannot tell if Win32 accepts the plain name.
-		check, err := openDirectoryPath(path, windows.FILE_READ_ATTRIBUTES, 0)
+		check, err := openDirectoryPath(path)
 		if err != nil {
 			return false
 		}
@@ -115,25 +115,20 @@ func fallbackBindingPath(requested, physical string, ordinaryUsable func(string)
 	return canonical
 }
 
-// Case-folded path strings can compare equal even when one of their components
-// is a link in a case-sensitive directory. For each case mismatch, inspect the
-// requested component without following its final reparse point.
+// Case-folded names can compare equal when a component is a junction in a
+// case-sensitive directory. Inspect the requested suffix through their common
+// exact prefix: the redirection need not be at the component whose case differs.
 func sameDirectBindingName(requested, physical string) bool {
 	if !strings.EqualFold(requested, physical) {
 		return false
 	}
 	for requested != physical && requested != filepath.Dir(requested) {
-		if filepath.Base(requested) != filepath.Base(physical) {
-			h, err := openDirectoryPath(requested, 0, windows.FILE_FLAG_OPEN_REPARSE_POINT)
-			if err != nil {
-				return false
-			}
-			var info windows.ByHandleFileInformation
-			err = windows.GetFileInformationByHandle(h, &info)
-			windows.CloseHandle(h)
-			if err != nil || info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-				return false
-			}
+		// On Windows Lstat reports name-surrogate reparse points (including
+		// directory junctions) as non-directories. Other reparse points,
+		// such as cloud directory placeholders, still report directory mode.
+		info, err := os.Lstat(requested)
+		if err != nil || !info.IsDir() {
+			return false
 		}
 		requested, physical = filepath.Dir(requested), filepath.Dir(physical)
 	}
