@@ -516,39 +516,21 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 	// Jobs already reported still-running in an earlier turn are
 	// never waited on again: the model already knows about them,
 	// so they must not make the next turn pay the bound too.
-	var doneJobs, freshJobs, oldJobs []*tools.Job
+	var freshJobs []*tools.Job
 	for _, job := range jobs {
-		if _, ok := job.Result(); ok {
-			doneJobs = append(doneJobs, job)
-		} else if job.Reported() {
-			oldJobs = append(oldJobs, job)
-		} else {
+		if _, done := job.Result(); !done && !job.Reported() {
 			freshJobs = append(freshJobs, job)
 		}
 	}
-	sort.Slice(doneJobs, func(i, j int) bool {
-		ti, _ := doneJobs[i].FinishedAt()
-		tj, _ := doneJobs[j].FinishedAt()
-		return ti.Before(tj)
-	})
-	for _, job := range doneJobs {
-		res, _ := job.Result()
-		obs, toolErr := jobResultMessage(job, res)
-		obs = c.progressJob(job, res, obs)
-		msgs = append(msgs, pendingStopCompletion(msgs, job, res, obs))
-		if c.Session != nil {
-			c.persist(msgs[len(msgs)-1])
-		}
-		if c.persistErr != nil {
-			return msgs, c.persistErr
-		}
-		job.MarkDelivered()
-		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
+	msgs, _ = c.collectFinishedJobs(msgs, pending)
+	if c.persistErr != nil {
+		return msgs, c.persistErr
 	}
+	freshJobs = slices.DeleteFunc(freshJobs, func(job *tools.Job) bool { return job.Delivered() })
 	if len(freshJobs) == 0 {
 		// Nothing new to wait for: the only unfinished jobs are
 		// ones the model was already told about.
-		return msgs, nil
+		return msgs, ctx.Err()
 	}
 	c.emit(Event{Kind: EventBackgroundWait, Text: strings.Join(jobIDs, ", ")})
 	// Deliver in completion order, not submission order: a slow
@@ -573,21 +555,17 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 	remaining := len(freshJobs)
 	for remaining > 0 {
 		select {
-		case job := <-done:
-			res, _ := job.Result()
-			obs, toolErr := jobResultMessage(job, res)
-			obs = c.progressJob(job, res, obs)
-			msgs = append(msgs, pendingStopCompletion(msgs, job, res, obs))
-			if c.Session != nil {
-				c.persist(msgs[len(msgs)-1])
-			}
+		case <-done:
+			msgs, _ = c.collectFinishedJobs(msgs, pending)
 			if c.persistErr != nil {
 				return msgs, c.persistErr
 			}
-			job.MarkDelivered()
-			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
 			remaining--
 		case <-timer.C:
+			msgs, _ = c.collectFinishedJobs(msgs, pending)
+			if c.persistErr != nil {
+				return msgs, c.persistErr
+			}
 			// Bound reached: end the turn with the jobs still
 			// running instead of waiting forever. Report each
 			// one with its output file path so the model can
@@ -619,12 +597,16 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 					c.persist(msgs[len(msgs)-1])
 				}
 			}
-			return msgs, nil
+			return msgs, ctx.Err()
 		case <-ctx.Done():
+			msgs, _ = c.collectFinishedJobs(msgs, pending)
+			if c.persistErr != nil {
+				return msgs, c.persistErr
+			}
 			return msgs, ctx.Err()
 		}
 	}
-	return msgs, nil
+	return msgs, ctx.Err()
 }
 
 // MaxStopBlocks caps consecutive turn-end vetoes by stop hooks,
@@ -1011,7 +993,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				if c.progress.failures >= MaxFailedFixAttempts && len(pending) > 0 {
 					var err error
 					msgs, err = c.drainPending(ctx, msgs, pending)
-					pending = nil
+					msgs, pending = c.collectFinishedJobs(msgs, nil)
+					if c.persistErr != nil {
+						return lastText, total, c.persistErr
+					}
+					if err == nil {
+						err = ctx.Err()
+					}
 					if err != nil {
 						c.LastTerminalReason = TerminalAbort
 						c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
@@ -1142,7 +1130,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				if c.persistErr != nil {
 					return lastText, total, c.persistErr
 				}
-				if target.Delivered() && ctx.Err() == nil {
+				if ctx.Err() != nil {
+					waitErr = ctx.Err()
+				} else if target.Delivered() {
 					waitErr = nil
 				}
 				if waitErr != nil {
@@ -1158,7 +1148,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				if c.progress.failures >= MaxFailedFixAttempts && len(pending) > 0 {
 					var err error
 					msgs, err = c.drainPending(ctx, msgs, pending)
-					pending = nil
+					msgs, pending = c.collectFinishedJobs(msgs, nil)
+					if c.persistErr != nil {
+						return lastText, total, c.persistErr
+					}
+					if err == nil {
+						err = ctx.Err()
+					}
 					if err != nil {
 						c.LastTerminalReason = TerminalAbort
 						c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
