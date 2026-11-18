@@ -117,4 +117,28 @@ func TestWindowsBindingDoesNotLoseSignificantTrailingDot(t *testing.T) {
 	if err != nil || reopened != want {
 		t.Fatalf("identity pathname %q does not reopen the expected directory: %q, %v", got.Path, reopened, err)
 	}
+	if err := os.Remove(sibling); err != nil {
+		t.Fatal(err)
+	}
+	direct, err := Identify(dotted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	viaAlias, err := Identify(alias)
+	if err != nil || !direct.Matches(viaAlias) {
+		t.Fatalf("alias without plain-named sibling lost its canonical binding: direct=%+v alias=%+v err=%v", direct, viaAlias, err)
+	}
+}
+
+func TestFallbackBindingPathKeepsOnlyDirectNamespace(t *testing.T) {
+	for _, tc := range []struct{ request, physical, want string }{
+		{`\\?\C:\Work\repo`, `\\?\C:\work\repo`, `\\?\C:\Work\repo`},
+		{`\\.\C:\Work\repo`, `\\?\C:\work\repo`, `\\.\C:\Work\repo`},
+		{`C:\work\alias`, `\\?\C:\work\repo.`, `\\?\C:\work\repo.`},
+		{`\\?\C:\work\alias`, `\\?\D:\repos\repo`, `D:\repos\repo`},
+	} {
+		if got := fallbackBindingPath(tc.request, tc.physical); got != tc.want {
+			t.Errorf("request %q, physical %q: got %q, want %q", tc.request, tc.physical, got, tc.want)
+		}
+	}
 }

@@ -55,23 +55,39 @@ func identify(path string) (Identity, error) {
 		return Identity{}, err
 	}
 	legacy, err := filepath.EvalSymlinks(abs)
-	switch {
-	case err != nil:
-		// The known path can still be opened after a parent stops allowing
-		// enumeration. Keep its namespace (including any extended prefix).
-		return Identity{Path: abs, FileID: id}, nil
-	case legacy == abs:
-		return Identity{Path: abs, FileID: id}, nil
-	default:
+	if err == nil {
+		if legacy == abs {
+			return Identity{Path: abs, FileID: id}, nil
+		}
 		if legacyID, err := directoryID(legacy); err == nil && legacyID == id {
 			return Identity{Path: legacy, FileID: id}, nil
 		}
 	}
-	actual, err := resolvedDirectoryName(h)
-	if err != nil {
-		return Identity{}, &os.PathError{Op: "resolve directory", Path: abs, Err: err}
+	physical, nameErr := resolvedDirectoryName(h)
+	if nameErr != nil {
+		if err != nil {
+			// The filesystem cannot supply a canonical name; the caller's
+			// exact path still identifies the directory we opened.
+			return Identity{Path: abs, FileID: id}, nil
+		}
+		return Identity{}, &os.PathError{Op: "resolve directory", Path: abs, Err: nameErr}
 	}
-	return Identity{Path: windowsCanonicalSpelling(actual), FileID: id}, nil
+	return Identity{Path: fallbackBindingPath(abs, physical), FileID: id}, nil
+}
+
+func fallbackBindingPath(requested, physical string) string {
+	canonical := windowsCanonicalSpelling(physical)
+	// Preserve the requested namespace only if the name already spells the
+	// physical location. When legacy resolution fails on a symlink alias,
+	// the handle's physical name must instead match opening its target.
+	comparable := windowsMetadataPath(requested)
+	if strings.HasPrefix(comparable, `\\.\`) {
+		comparable = `\\?\` + comparable[4:]
+	}
+	if strings.EqualFold(windowsCanonicalSpelling(comparable), canonical) {
+		return requested
+	}
+	return canonical
 }
 
 func resolvedDirectoryName(h windows.Handle) (string, error) {
