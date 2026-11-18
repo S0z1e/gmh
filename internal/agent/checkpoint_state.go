@@ -43,7 +43,7 @@ func executionObservation(name, args, key, output, outputFile string, runErr err
 	}
 	if runErr != nil {
 		// Preserve the unmodified failure before display hooks can replace it.
-		excerpt, err := checkpoint.Observe(runErr.Error()+"\n"+output, 4096)
+		excerpt, err := checkpoint.Observe(strings.ToValidUTF8(runErr.Error()+"\n"+output, "\uFFFD"), 4096)
 		if err == nil {
 			out.Failure = &excerpt
 		}
@@ -216,17 +216,24 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 					d.Artifacts = append(d.Artifacts, checkpoint.Artifact{Kind: "tool_output", Path: job.OutputFile, Source: source})
 				}
 			}
-			if completed := o.CompletedJob; completed != nil {
+			for _, completed := range o.JobCompletions() {
+				var outcome checkpoint.Delta
 				job := completed.Job
-				d.Jobs = append(d.Jobs, job)
+				outcome.Jobs = append(outcome.Jobs, job)
 				if job.OutputFile != "" && job.OutputFile != o.OutputFile {
-					d.Artifacts = append(d.Artifacts, checkpoint.Artifact{Kind: "tool_output", Path: job.OutputFile, Source: source})
+					outcome.Artifacts = append(outcome.Artifacts, checkpoint.Artifact{Kind: "tool_output", Path: job.OutputFile, Source: source})
 				}
 				if completed.Failure != nil {
-					d.Failures = append(d.Failures, checkpoint.Failure{Fingerprint: completed.Fingerprint, Source: source,
+					outcome.Failures = append(outcome.Failures, checkpoint.Failure{Fingerprint: completed.Fingerprint, Source: source,
 						Tool: "bash", Command: job.Command, Cwd: completed.Cwd, Output: *completed.Failure})
 				} else if job.Error == "" && completed.Fingerprint != "" {
-					d.ResolvedFailures = append(d.ResolvedFailures, completed.Fingerprint)
+					outcome.ResolvedFailures = append(outcome.ResolvedFailures, completed.Fingerprint)
+				}
+				// Fold completion order before the stop acknowledgement. A
+				// prior success must not resolve a later job's failure.
+				state, err = checkpoint.Merge(state, outcome)
+				if err != nil {
+					return
 				}
 			}
 		}
