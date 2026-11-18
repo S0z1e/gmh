@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"minimalharness/internal/textutil"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -804,9 +805,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if !job.Delivered() {
 				pending = append(pending, pendingJob{callID: "", job: job})
 			} else {
-				// Already delivered before this turn: its outcome belongs to
-				// earlier history. A job stopped during this turn must still
-				// be accounted even if killJob delivered its output directly.
+				// This outcome already belongs to an earlier turn.
 				c.progress.jobs[job.ID] = true
 			}
 		}
@@ -1355,6 +1354,14 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				obs = c.Exec.Plugins.RunToolResultHooks(ctx, tc.Function.Name, argsJSON, obs, err)
 			}
 
+			stopped := res.StoppedJob
+			if stopped != nil {
+				// Count the original bash outcome before acknowledging delivery.
+				// A later call in this batch can depend on that failure count.
+				c.progressReadyJobs()
+				outcome, _ := stopped.Result() // A stop result only carries a finished job.
+				obs = c.progressJob(stopped, outcome, obs)
+			}
 			if job == nil {
 				c.DoomLoop().Observe(callKey, obs)
 				if ctx.Err() == nil && c.budgetError() == nil {
@@ -1372,6 +1379,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 
 			observation := executionObservation(tc.Function.Name, argsJSON, callKey, res.Text, res.OutputFile, err, job)
 			observation.Answer = humanAnswer
+			if stopped != nil {
+				observation.Jobs = []checkpoint.Job{snapshotJob(stopped, true)}
+			}
 			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolTruncated: res.Truncated, ToolCountLowerBound: res.CountLowerBound, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
 			result := llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil, Observation: observation}
 			if res.Guidance != nil && err == nil {
@@ -1383,6 +1393,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			msgs = append(msgs, result)
 			if c.Session != nil {
 				c.persist(msgs[len(msgs)-1])
+			}
+			if stopped != nil && c.persistErr == nil {
+				stopped.MarkDelivered()
+				pending = slices.DeleteFunc(pending, func(p pendingJob) bool { return p.job == stopped })
 			}
 			for _, evidence := range c.verificationFinish(ctx, attempt, res, err) {
 				msgs = append(msgs, evidence)

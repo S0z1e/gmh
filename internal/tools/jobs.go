@@ -65,9 +65,8 @@ type Job struct {
 	result     JobResult
 	finished   bool
 	finishedAt time.Time
-	// delivered is set once the result was fed back to the model
-	// (collectFinishedJobs or drainPending): a job re-attached by a
-	// later turn must not deliver its result twice.
+	registry   *JobRegistry
+	// A later turn must not deliver a recorded result twice.
 	delivered bool
 	// reported is set once a bounded drain told the model the job is
 	// still running: the next turn's drain must not wait on it again
@@ -125,7 +124,11 @@ func (j *Job) finish(r JobResult) {
 	j.result = r
 	j.finished = true
 	j.finishedAt = time.Now()
+	registry, delivered := j.registry, j.delivered
 	j.mu.Unlock()
+	if delivered && registry != nil {
+		registry.trimDelivered()
+	}
 	close(j.done)
 }
 
@@ -140,8 +143,18 @@ func (j *Job) Delivered() bool {
 // MarkDelivered records that the result was fed back to the model.
 func (j *Job) MarkDelivered() {
 	j.mu.Lock()
+	if j.delivered {
+		j.mu.Unlock()
+		return
+	}
 	j.delivered = true
+	registry, finished := j.registry, j.finished
 	j.mu.Unlock()
+	// Registry operations lock jobs while holding the registry lock.
+	// Notify the registry only after releasing the job lock.
+	if finished && registry != nil {
+		registry.trimDelivered()
+	}
 }
 
 // Reported reports whether a bounded drain already told the model
@@ -172,11 +185,20 @@ func (r *JobRegistry) add(j *Job) {
 	defer r.mu.Unlock()
 	r.next++
 	j.ID = fmt.Sprintf("bg-%d", r.next)
+	j.mu.Lock()
+	j.registry = r
+	j.mu.Unlock()
 	r.jobs = append(r.jobs, j)
 	r.evictDelivered()
 }
 
 const recentJobsLimit = 50
+
+func (r *JobRegistry) trimDelivered() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evictDelivered()
+}
 
 // evictDelivered runs with the registry locked. A result can be finished
 // without being delivered when the turn ended or another session was selected.
@@ -194,6 +216,7 @@ func (r *JobRegistry) evictDelivered() {
 		if !job.finished || !job.delivered {
 			return false
 		}
+		job.registry = nil
 		remaining--
 		return true
 	})
@@ -203,7 +226,6 @@ func (r *JobRegistry) evictDelivered() {
 func (r *JobRegistry) List() []*Job {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.evictDelivered()
 	out := make([]*Job, len(r.jobs))
 	copy(out, r.jobs)
 	return out
@@ -213,7 +235,6 @@ func (r *JobRegistry) List() []*Job {
 func (r *JobRegistry) Get(id string) *Job {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.evictDelivered()
 	for _, j := range r.jobs {
 		if j.ID == id {
 			return j
@@ -230,7 +251,10 @@ func (r *JobRegistry) forget(j *Job) {
 	defer r.mu.Unlock()
 	for i, old := range r.jobs {
 		if old == j {
-			r.jobs = append(r.jobs[:i], r.jobs[i+1:]...)
+			j.mu.Lock()
+			j.registry = nil
+			j.mu.Unlock()
+			r.jobs = slices.Delete(r.jobs, i, i+1)
 			return
 		}
 	}

@@ -41,7 +41,8 @@ func TestJobRegistryTrimsOverflowAfterDelivery(t *testing.T) {
 	for _, job := range pending[:3] {
 		job.MarkDelivered()
 	}
-	kept := registry.List()
+	// Avoid a registry read: the delivery itself must have freed memory.
+	kept := registry.jobs
 	if len(kept) != 50 || kept[0] != pending[3] {
 		t.Fatalf("retained %d results after delivery; want the last 50", len(kept))
 	}

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -349,6 +350,100 @@ func TestFailureProgressStoppedJobOutputCannotProveRepair(t *testing.T) {
 	c.progressReadyJobs()
 	if c.progress.failures != 3 {
 		t.Fatal("stopped job counted more than once")
+	}
+}
+
+func TestFailureProgressAccountsForStoppedJobBeforeSameBatchRetry(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash is not available")
+	}
+	t.Setenv("HOME", t.TempDir())
+	c := budgetConfig(t, nil)
+	store, err := session.Open("stop-before-retry", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c.Session = store
+	defer c.Exec.CancelJobs()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	const command = `if test -f fail-mode; then printf x >> attempts; exit 1; fi; printf ready > running; exec sleep 30`
+	args, err := json.Marshal(map[string]string{"command": command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := CanonicalToolKey("bash", string(args))
+	job, err := c.Exec.BashBackground(tools.WithFailureKey(ctx, key), tools.BashArgs{Command: command, Background: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job.MarkReported()
+	for {
+		if _, err := os.Stat(filepath.Join(c.Exec.Root, "running")); err == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("initial background job did not start")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if err := os.WriteFile(filepath.Join(c.Exec.Root, "fail-mode"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	c.OnEvent = func(e Event) {
+		if e.Kind != EventToolStart || e.ToolCallID != "stop" {
+			return
+		}
+		// Fill the registry after the turn has attached its pending jobs.
+		for range 50 {
+			extra, err := c.Exec.BashBackground(ctx, tools.BashArgs{Command: ":"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-extra.Done():
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+		}
+	}
+	batch := []llm.ToolCall{
+		budgetCall("stop", "bash", fmt.Sprintf(`{"killJobId":%q}`, job.ID)),
+		budgetCall("retry", "bash", string(args)),
+	}
+	_, _, runErr := runVerificationContext(t, c, ctx, toolCallSSE("first", "bash", string(args)),
+		toolCallSSE("second", "bash", string(args)), budgetSSE("", batch, nil, true), textSSE("done"))
+	if res, done := job.Result(); !done || res.Err == nil || !job.Delivered() {
+		t.Fatalf("stopped result was not delivered: %+v (done=%v, delivered=%v)", res, done, job.Delivered())
+	}
+	if output, err := os.ReadFile(filepath.Join(c.Exec.Root, "attempts")); err != nil || string(output) != "xx" {
+		t.Fatalf("same-batch retry ran despite three observed failures: attempts=%q err=%v run=%v", output, err, runErr)
+	}
+	if c.LastTerminalReason != TerminalBlocked {
+		t.Fatalf("reason=%s, want blocked; run=%v", c.LastTerminalReason, runErr)
+	}
+	history, err := session.Load(store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveries := 0
+	for _, msg := range history {
+		if msg.Observation == nil {
+			continue
+		}
+		for _, saved := range msg.Observation.Jobs {
+			if saved.ID == job.ID && saved.Delivered {
+				if msg.ToolCallID != "stop" || saved.Error == "" {
+					t.Fatalf("unexpected stopped job observation: call=%q job=%+v", msg.ToolCallID, saved)
+				}
+				deliveries++
+			}
+		}
+	}
+	if deliveries != 1 {
+		t.Fatalf("stopped job was recorded as delivered %d times, want 1", deliveries)
 	}
 }
 

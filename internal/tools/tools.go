@@ -673,6 +673,7 @@ const (
 
 type ToolResult struct {
 	Guidance        *GuidanceDelivery
+	StoppedJob      *Job // Finished job whose stop result the agent can acknowledge.
 	Status          ResultStatus
 	ExitCode        *int
 	OutputFile      string
@@ -941,8 +942,7 @@ func (e *Executor) killJob(id string) (ToolResult, error) {
 	}
 	res, ok := job.Result()
 	if ok {
-		job.MarkDelivered()
-		return ToolResult{Text: fmt.Sprintf("Stopped background job %s (exit %d).\nOutput:\n%s", job.ID, res.ExitCode, truncate(res.Output, 32*1024)), ExitCode: &res.ExitCode, OutputFile: job.OutputFile}, nil
+		return ToolResult{Text: fmt.Sprintf("Stopped background job %s (exit %d).\nOutput:\n%s", job.ID, res.ExitCode, truncate(res.Output, 32*1024)), ExitCode: &res.ExitCode, OutputFile: job.OutputFile, StoppedJob: job}, nil
 	}
 	return ToolResult{Text: fmt.Sprintf("Signalled background job %s to stop.", job.ID), OutputFile: job.OutputFile}, nil
 }
