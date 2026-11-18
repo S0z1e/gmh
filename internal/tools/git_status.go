@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,6 +55,10 @@ func (e *Executor) gitStatus(ctx context.Context) (ToolResult, error) {
 			"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_ATTR_NOSYSTEM=1",
 			"GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1", "GIT_ALLOW_PROTOCOL=", "LC_ALL=C"),
 	}
+	version, err := base.value("version")
+	if err != nil {
+		return ToolResult{}, fmt.Errorf("determine Git version: %w", err)
+	}
 	// Override configured worktree selection during discovery. The discovered
 	// Git directory, matched to an ancestor's actual .git marker, sets the root.
 	discovery := base.withEnv("GIT_WORK_TREE=" + selected)
@@ -68,22 +73,9 @@ func (e *Executor) gitStatus(ctx context.Context) (ToolResult, error) {
 	if err != nil {
 		return ToolResult{}, err
 	}
-	repo := base.withEnv("GIT_WORK_TREE="+root, "GIT_DIR="+gitDir)
-	repo.dir = root
-	// These plumbing commands inspect metadata without comparing worktree
-	// files. Each path uses its own response because it may contain newlines.
-	objects, err := repo.gitPath("objects")
-	if err != nil {
-		return ToolResult{}, err
-	}
-	index, err := repo.gitPath("index")
-	if err != nil {
-		return ToolResult{}, err
-	}
-	excludes, err := repo.gitPath("info/exclude")
-	if err != nil {
-		return ToolResult{}, err
-	}
+	checkout := base.withEnv("GIT_WORK_TREE=" + root)
+	checkout.dir = root
+	repo := checkout.withEnv("GIT_DIR=" + gitDir)
 	format, err := repo.value("rev-parse", "--show-object-format")
 	if err != nil {
 		return ToolResult{}, fmt.Errorf("determine Git object format: %w", err)
@@ -111,7 +103,38 @@ func (e *Executor) gitStatus(ctx context.Context) (ToolResult, error) {
 			return ToolResult{}, fmt.Errorf("invalid Git commit identity")
 		}
 	}
-	settings, err := repo.safeSettings()
+	if !gitCanScanWorkTree(version) {
+		// Git before 2.32 follows symlinked worktree .gitignore and
+		// .gitattributes files. Retain HEAD lookup without opening the tree.
+		var head string
+		switch {
+		case ref == "":
+			head = "HEAD (detached at " + oid + ")"
+		case oid == "":
+			head = "No commits yet on " + strings.TrimPrefix(ref, "refs/heads/")
+		default:
+			head = strings.TrimPrefix(ref, "refs/heads/")
+		}
+		return ToolResult{Text: "## " + head + "\n\n[Git working tree status omitted; requires a recognized Git version 2.32 or later.]"}, nil
+	}
+	// These plumbing commands inspect metadata without comparing worktree
+	// files. Each path uses its own response because it may contain newlines.
+	objects, err := repo.gitPath("objects")
+	if err != nil {
+		return ToolResult{}, err
+	}
+	index, err := repo.gitPath("index")
+	if err != nil {
+		return ToolResult{}, err
+	}
+	excludes, err := repo.gitPath("info/exclude")
+	if err != nil {
+		return ToolResult{}, err
+	}
+	// Let Git use the original discovery path for includeIf.gitdir rules;
+	// an explicit canonical GIT_DIR would hide an alias such as .git.
+	// Only the validated built-in settings are used by isolated status.
+	settings, err := checkout.safeSettings()
 	if err != nil {
 		return ToolResult{}, err
 	}
@@ -157,6 +180,30 @@ func (e *Executor) gitStatus(ctx context.Context) (ToolResult, error) {
 	}
 	text += "\n[Status does not inspect submodule working trees or run Git filters; upstream tracking is omitted.]"
 	return ToolResult{Text: text, Truncated: out.truncated}, nil
+}
+
+// Git 2.32 started ignoring symlinked worktree ignore and attribute files.
+// Accept released upstream/Apple and Git for Windows version formats. Fall
+// back to HEAD-only state for older or unrecognized versions.
+func gitCanScanWorkTree(version string) bool {
+	fields := strings.Fields(version)
+	if len(fields) < 3 || fields[0] != "git" || fields[1] != "version" {
+		return false
+	}
+	parts := strings.Split(fields[2], ".")
+	if len(parts) == 5 && parts[3] == "windows" {
+		if _, err := strconv.ParseUint(parts[4], 10, 32); err != nil {
+			return false
+		}
+		parts = parts[:3]
+	}
+	if len(parts) != 3 {
+		return false
+	}
+	major, majorErr := strconv.ParseUint(parts[0], 10, 32)
+	minor, minorErr := strconv.ParseUint(parts[1], 10, 32)
+	_, patchErr := strconv.ParseUint(parts[2], 10, 32)
+	return majorErr == nil && minorErr == nil && patchErr == nil && (major > 2 || major == 2 && minor >= 32)
 }
 
 type gitStatusCommand struct {

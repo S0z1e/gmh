@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -35,6 +36,9 @@ func TestGitStatusDisablesRepositoryPrograms(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "monitor-ran")); !os.IsNotExist(err) {
 		t.Fatalf("status executed repository fsmonitor: %v", err)
+	}
+	if strings.Contains(res.Text, "working tree status omitted") {
+		t.Skip("installed Git does not support worktree scans")
 	}
 	if err := os.WriteFile(filepath.Join(root, ".gitattributes"), []byte("tracked filter=fixture\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -82,7 +86,8 @@ func TestGitStatusIgnoresConfiguredWorkTree(t *testing.T) {
 		}
 	}
 	res, err := (&Executor{Root: root}).Dispatch(context.Background(), GitStatusTool, `{}`)
-	if err != nil || !strings.Contains(res.Text, "?? inside-marker") || strings.Contains(res.Text, "outside-marker") {
+	if err != nil || !strings.Contains(res.Text, "fixture-branch") || strings.Contains(res.Text, "outside-marker") ||
+		!strings.Contains(res.Text, "?? inside-marker") && !strings.Contains(res.Text, "working tree status omitted") {
 		t.Fatalf("scoped status = %q, %v", res.Text, err)
 	}
 }
@@ -100,6 +105,9 @@ func TestGitStatusOutputCapAppliesToReaderCopy(t *testing.T) {
 
 func TestGitStatusPreservesBuiltInNormalization(t *testing.T) {
 	root, git := gitStatusTestRepo(t)
+	if !gitCanScanWorkTree(git("version")) {
+		t.Skip("installed Git does not support worktree scans")
+	}
 	git("config", "core.autocrlf", "true")
 	tracked := filepath.Join(root, "windows-lines.txt")
 	if err := os.WriteFile(tracked, []byte("line\r\n"), 0600); err != nil {
@@ -127,6 +135,9 @@ func TestGitStatusPreservesMacOSFilenameNormalization(t *testing.T) {
 		t.Skip("precomposeUnicode applies to macOS")
 	}
 	root, git := gitStatusTestRepo(t)
+	if !gitCanScanWorkTree(git("version")) {
+		t.Skip("installed Git does not support worktree scans")
+	}
 	git("config", "core.precomposeunicode", "true")
 	const name = "cafe\u0301.txt"
 	if err := os.WriteFile(filepath.Join(root, name), []byte("before"), 0600); err != nil {
@@ -185,6 +196,38 @@ func TestGitStatusUsesRepositoryDiscoveredByGit(t *testing.T) {
 		res, err := (&Executor{Root: root}).Dispatch(context.Background(), GitStatusTool, `{}`)
 		if err != nil || !strings.Contains(res.Text, "fixture-branch") {
 			t.Fatalf("status rejected a Git directory accepted by Git: %q, %v", res.Text, err)
+		}
+		if !gitCanScanWorkTree(git("version")) {
+			return // The legacy path only reads the branch, checked above.
+		}
+		canonical, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(metadata, "normalization"), []byte("[core]\n autocrlf = true\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		git("config", "--add", "includeIf.gitdir:**/repo/.git.path", "normalization")
+		const file = "aliased-lines.txt"
+		tracked := filepath.Join(root, file)
+		if err := os.WriteFile(tracked, []byte("line\r\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		git("add", file)
+		git("commit", "-m", "fixture")
+		if blob := git("show", "HEAD:"+file); blob != "line\n" {
+			t.Fatalf("fixture does not apply the conditional normalization: %q", blob)
+		}
+		mtime := time.Now().Add(-time.Hour)
+		if err := os.Chtimes(tracked, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		if out := git("--no-optional-locks", "status", "--porcelain=v1"); out != "" {
+			t.Fatalf("fixture is not clean according to Git: %q", out)
+		}
+		res, err = (&Executor{Root: canonical}).Dispatch(context.Background(), GitStatusTool, `{}`)
+		if err != nil || strings.Contains(res.Text, file) {
+			t.Fatalf("status ignored normalization selected by the Git directory alias: %q, %v", res.Text, err)
 		}
 	})
 }
@@ -250,4 +293,61 @@ func gitStatusTestRepo(t *testing.T) (string, func(...string) string) {
 	}
 	git("init", "-b", "fixture-branch")
 	return root, git
+}
+
+func TestGitStatusDoesNotScanLegacyWorkTree(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX wrapper for Git")
+	}
+	root, git := gitStatusTestRepo(t)
+	git("commit", "--allow-empty", "-m", "fixture")
+	oid := strings.TrimSpace(git("rev-parse", "HEAD"))
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	const wrapper = `#!/bin/sh
+for arg do
+  case "$arg" in
+    version) printf 'git version 2.30.9\n'; exit 0 ;;
+    status) printf 'legacy worktree scan was attempted\n' >&2; exit 97 ;;
+  esac
+done
+exec %s "$@"
+`
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(fmt.Sprintf(wrapper, "'"+strings.ReplaceAll(realGit, "'", "'\\''")+"'")), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ex := &Executor{Root: root}
+	check := func(head string) {
+		t.Helper()
+		res, err := ex.Dispatch(context.Background(), GitStatusTool, `{}`)
+		if err != nil || !strings.Contains(res.Text, head) || !strings.Contains(res.Text, "working tree status omitted") {
+			t.Fatalf("safe status fallback = %q, %v", res.Text, err)
+		}
+	}
+	check("## fixture-branch")
+	git("checkout", "--detach", oid)
+	check(oid)
+}
+
+func TestGitWorkTreeScanVersionGate(t *testing.T) {
+	for _, tc := range []struct {
+		version string
+		allowed bool
+	}{
+		{"git version 2.30.9", false},
+		{"git version 2.31.8", false},
+		{"git version 2.32.0.rc1", false},
+		{"git version 2.32.0", true},
+		{"git version 2.50.1 (Apple Git-155)", true},
+		{"git version 2.49.0.windows.1", true},
+		{"unknown version", false},
+	} {
+		if got := gitCanScanWorkTree(tc.version); got != tc.allowed {
+			t.Errorf("can scan with %q = %t, want %t", tc.version, got, tc.allowed)
+		}
+	}
 }

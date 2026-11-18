@@ -44,7 +44,7 @@ func TestProjectGitStatusIsObservedOnDemand(t *testing.T) {
 		t.Fatal("system prompt contains snapshot data for this checkout")
 	}
 	result, err := a.Cfg.Exec.Dispatch(context.Background(), tools.GitStatusTool, `{}`)
-	if err != nil || !strings.Contains(result.Text, "fixture-current-branch") || !strings.Contains(result.Text, path) || strings.Contains(result.Text, "fixture-start-branch") {
+	if err != nil || !strings.Contains(result.Text, "fixture-current-branch") || strings.Contains(result.Text, "fixture-start-branch") || !hasGitStatusPathOrOmission(result.Text, path) {
 		t.Fatalf("on-demand status = %q, %v", result.Text, err)
 	}
 }
@@ -81,7 +81,11 @@ func TestProjectGitStatusReadsExternalLinkedWorktreeMetadata(t *testing.T) {
 	a.Cfg.Exec.Sandbox = true
 	a.Cfg.Exec.BwrapPath = filepath.Join(t.TempDir(), "missing-bwrap")
 	result, err := a.Cfg.Exec.Dispatch(context.Background(), tools.GitStatusTool, `{}`)
-	if err != nil || !strings.Contains(result.Text, "linked-branch") || !strings.Contains(result.Text, "?? .harness.json") {
+	if err != nil || !strings.Contains(result.Text, "linked-branch") || !hasGitStatusPathOrOmission(result.Text, "?? .harness.json") {
 		t.Fatalf("linked worktree status = %q, %v", result.Text, err)
 	}
+}
+
+func hasGitStatusPathOrOmission(status, path string) bool {
+	return strings.Contains(status, path) || strings.Contains(status, "working tree status omitted")
 }

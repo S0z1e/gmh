@@ -132,6 +132,8 @@
   linked worktree may keep its Git metadata outside that sandbox.
   The result covers the selected working tree, without running Git filters,
   inspecting submodule working trees or reporting upstream tracking status.
+  The working tree scan requires Git 2.32 or later. With older or unrecognized
+  versions the tool reports only the branch or detached commit.
 - Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`. A session has
   one transcript writer across processes; opening, renaming or deleting another
   process's active session fails immediately. Closing or crashing releases the
