@@ -20,17 +20,7 @@ type Identity struct {
 	FileID string `json:"file_id"`
 }
 
-func Identify(path string) (Identity, error) {
-	canonical, err := workspaceBindingPath(path)
-	if err != nil {
-		return Identity{}, err
-	}
-	id, err := directoryID(canonical)
-	if err != nil {
-		return Identity{}, err
-	}
-	return Identity{Path: canonical, FileID: id}, nil
-}
+func Identify(path string) (Identity, error) { return identify(path) }
 
 // Workspace binding paths can preserve some case/Unicode aliases, including UNC volumes.
 // Fold only the lookup key, and always pair it with the directory incarnation:

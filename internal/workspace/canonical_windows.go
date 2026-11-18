@@ -37,18 +37,41 @@ func CanonicalDirectory(path string) (string, error) {
 	return windowsCanonicalSpelling(resolved), nil
 }
 
-// Preserve the pathname used in existing trust and session records whenever
-// the legacy lookup succeeds. The physical path used for reading guidance can
-// differ (notably when a workspace is opened through a junction).
-func workspaceBindingPath(path string) (string, error) {
+// Keep the established binding spelling only when it resolves to the same
+// directory as the requested path. Go may lose significant Windows namespace
+// information while following a link, even when the rewritten name exists.
+func identify(path string) (Identity, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return "", err
+		return Identity{}, err
 	}
-	if old, err := filepath.EvalSymlinks(abs); err == nil {
-		return old, nil
+	h, err := openDirectoryMetadata(abs)
+	if err != nil {
+		return Identity{}, &os.PathError{Op: "open directory metadata", Path: abs, Err: err}
 	}
-	return CanonicalDirectory(abs)
+	defer windows.CloseHandle(h)
+	id, err := directoryHandleID(h, abs)
+	if err != nil {
+		return Identity{}, err
+	}
+	legacy, err := filepath.EvalSymlinks(abs)
+	switch {
+	case err != nil:
+		// The known path can still be opened after a parent stops allowing
+		// enumeration. Keep its namespace (including any extended prefix).
+		return Identity{Path: abs, FileID: id}, nil
+	case legacy == abs:
+		return Identity{Path: abs, FileID: id}, nil
+	default:
+		if legacyID, err := directoryID(legacy); err == nil && legacyID == id {
+			return Identity{Path: legacy, FileID: id}, nil
+		}
+	}
+	actual, err := resolvedDirectoryName(h)
+	if err != nil {
+		return Identity{}, &os.PathError{Op: "resolve directory", Path: abs, Err: err}
+	}
+	return Identity{Path: windowsCanonicalSpelling(actual), FileID: id}, nil
 }
 
 func resolvedDirectoryName(h windows.Handle) (string, error) {

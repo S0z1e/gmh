@@ -87,3 +87,34 @@ func TestWindowsCanonicalDirectoryAcceptsVolumeGUID(t *testing.T) {
 		t.Fatalf("volume GUID %q resolved to %q (%v); want directory %q", guid, canonical, err, root)
 	}
 }
+
+func TestWindowsBindingDoesNotLoseSignificantTrailingDot(t *testing.T) {
+	base := t.TempDir()
+	if strings.HasPrefix(base, `\\`) {
+		t.Skip("fixture requires a local drive")
+	}
+	sibling := filepath.Join(base, "workspace")
+	dotted := `\\?\` + sibling + "."
+	if err := os.Mkdir(sibling, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(dotted, 0700); err != nil {
+		t.Skipf("filesystem does not accept extended directory names: %v", err)
+	}
+	alias := filepath.Join(base, "alias")
+	if err := os.Symlink(dotted, alias); err != nil {
+		t.Skipf("cannot create Windows symlink: %v", err)
+	}
+	want, err := directoryID(dotted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Identify(alias)
+	if err != nil || got.FileID != want {
+		t.Fatalf("alias rebound to a sibling: %+v, %v; expected ID %q", got, err, want)
+	}
+	reopened, err := directoryID(got.Path)
+	if err != nil || reopened != want {
+		t.Fatalf("identity pathname %q does not reopen the expected directory: %q, %v", got.Path, reopened, err)
+	}
+}

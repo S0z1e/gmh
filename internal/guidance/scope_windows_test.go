@@ -58,7 +58,25 @@ func TestWindowsGuidanceWithRestrictedACL(t *testing.T) {
 			if tc.ancestor {
 				protected = parent
 			}
+			extended := root
+			if !strings.HasPrefix(root, `\\`) {
+				extended = `\\?\` + root
+			}
+			prior, err := workspace.Identify(extended)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := workspace.Decide(prior, "trust"); err != nil {
+				t.Fatal(err)
+			}
 			denyWindowsDirectoryAccess(t, protected, tc.mask, tc.access)
+			after, err := workspace.Identify(extended)
+			if err != nil || !prior.Matches(after) {
+				t.Fatalf("ACL change lost the same workspace binding: was %+v, now %+v, %v", prior, after, err)
+			}
+			if trusted, err := workspace.Trusted(after); err != nil || !trusted {
+				t.Fatalf("saved trust decision lost after ACL change: %t, %v", trusted, err)
+			}
 			snap, err := Resolve(context.Background(), root, "new.go")
 			if err != nil || len(snap.Files) != 1 || snap.Files[0].Prefix != "restricted ACL guidance" {
 				t.Fatalf("resolve restricted workspace: %+v, %v", snap, err)
@@ -133,5 +151,28 @@ func denyWindowsDirectoryAccess(t *testing.T, path, mask string, access uint32) 
 	}
 	if !errors.Is(err, os.ErrPermission) {
 		t.Fatalf("test directory access should be denied: %v", err)
+	}
+}
+
+func TestWindowsExtendedOnlyWorkspaceContinuesHomeGuidance(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home)
+	if strings.HasPrefix(home, `\\`) {
+		t.Skip("fixture requires a local drive")
+	}
+	root := `\\?\` + filepath.Join(home, "extended-only.")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Skipf("filesystem does not accept extended directory names: %v", err)
+	}
+	text := strings.Repeat("a", PrefixBytes) + "actual end"
+	put(t, filepath.Join(home, "AGENTS.md"), text)
+	s, err := Resolve(context.Background(), root, "new.go")
+	if err != nil || len(s.Files) != 1 || !s.Files[0].More {
+		t.Fatalf("home guidance not available: %+v, %v", s, err)
+	}
+	f := s.Files[0]
+	chunk, err := Read(context.Background(), root, s.Target, f.Path, f.SHA256, len(f.Prefix), 128)
+	if err != nil || chunk.Text != "actual end" || chunk.More {
+		t.Fatalf("cannot continue advertised home guidance: %+v, %v", chunk, err)
 	}
 }

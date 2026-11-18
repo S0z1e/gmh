@@ -415,42 +415,46 @@ func Read(ctx context.Context, root, target, path, expectedHash string, offset, 
 	if err != nil {
 		return Chunk{}, err
 	}
-	parent, err := canonicalRoot(filepath.Dir(path))
+	index := slices.IndexFunc(snapshot.Files, func(f File) bool { return f.Path == path })
+	if index < 0 {
+		// The published pathname is authoritative, including an extended
+		// namespace. For other spellings, also accept a canonical alias.
+		parent, err := canonicalRoot(filepath.Dir(path))
+		if err != nil {
+			return Chunk{}, err
+		}
+		canonical := ancestrySpelling(filepath.Join(parent, filepath.Base(path)))
+		index = slices.IndexFunc(snapshot.Files, func(f File) bool { return ancestrySpelling(f.Path) == canonical })
+	}
+	if index < 0 {
+		return Chunk{}, fmt.Errorf("instruction source does not apply to target")
+	}
+	source := snapshot.Files[index]
+	if source.SHA256 != expectedHash {
+		return Chunk{}, fmt.Errorf("instruction source changed; refresh guidance before continuing")
+	}
+	roots, err := openSourceRoots(snapshot.Root)
 	if err != nil {
 		return Chunk{}, err
 	}
-	path = filepath.Join(parent, filepath.Base(path))
-	for _, source := range snapshot.Files {
-		if source.Path != path {
-			continue
-		}
-		if source.SHA256 != expectedHash {
-			return Chunk{}, fmt.Errorf("instruction source changed; refresh guidance before continuing")
-		}
-		roots, err := openSourceRoots(snapshot.Root)
-		if err != nil {
-			return Chunk{}, err
-		}
-		data, err := roots.read(ctx, source.Scope, filepath.Base(source.Path))
-		if err == nil {
-			err = roots.check()
-		}
-		roots.close()
-		if err != nil {
-			return Chunk{}, err
-		}
-		if digest(data) != expectedHash {
-			return Chunk{}, fmt.Errorf("instruction source changed; refresh guidance before continuing")
-		}
-		if offset > len(data) || offset < len(data) && !utf8.RuneStart(data[offset]) {
-			return Chunk{}, fmt.Errorf("invalid guidance offset")
-		}
-		text := textutil.Prefix(string(data[offset:]), limit)
-		next := offset + len(text)
-		if err := ctx.Err(); err != nil {
-			return Chunk{}, err
-		}
-		return Chunk{Path: source.Path, SHA256: expectedHash, Offset: offset, Next: next, Bytes: len(data), Text: text, More: next < len(data)}, nil
+	data, err := roots.read(ctx, source.Scope, filepath.Base(source.Path))
+	if err == nil {
+		err = roots.check()
 	}
-	return Chunk{}, fmt.Errorf("instruction source does not apply to target")
+	roots.close()
+	if err != nil {
+		return Chunk{}, err
+	}
+	if digest(data) != expectedHash {
+		return Chunk{}, fmt.Errorf("instruction source changed; refresh guidance before continuing")
+	}
+	if offset > len(data) || offset < len(data) && !utf8.RuneStart(data[offset]) {
+		return Chunk{}, fmt.Errorf("invalid guidance offset")
+	}
+	text := textutil.Prefix(string(data[offset:]), limit)
+	next := offset + len(text)
+	if err := ctx.Err(); err != nil {
+		return Chunk{}, err
+	}
+	return Chunk{Path: source.Path, SHA256: expectedHash, Offset: offset, Next: next, Bytes: len(data), Text: text, More: next < len(data)}, nil
 }
