@@ -73,7 +73,7 @@ func ancestorDirectories(root string) []string {
 	for at := root; len(dirs) < MaxAncestorLevels; at = filepath.Dir(at) {
 		dirs = append(dirs, at)
 		parent := filepath.Dir(at)
-		if parent == at || home == "" || !contained(home, parent) {
+		if parent == at || home == "" || !contained(ancestrySpelling(home), ancestrySpelling(parent)) {
 			break
 		}
 	}

@@ -30,17 +30,40 @@ func CanonicalDirectory(path string) (string, error) {
 	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
 		return "", fmt.Errorf("not a directory: %s", abs)
 	}
-	const volumeNameDOS, fileNameOpened = 0, 8
-	resolved, err := finalDirectoryPath(h, volumeNameDOS)
-	if errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_NOT_SUPPORTED) || errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
-		// Some SMB servers cannot normalize a handle without checking
-		// access to each component. Ask for the opened name instead.
-		resolved, err = finalDirectoryPath(h, volumeNameDOS|fileNameOpened)
-	}
+	resolved, err := resolvedDirectoryName(h)
 	if err != nil {
 		return "", &os.PathError{Op: "resolve directory", Path: abs, Err: err}
 	}
-	return windowsCanonicalSpelling(resolved, abs), nil
+	return windowsCanonicalSpelling(resolved), nil
+}
+
+// Preserve the pathname used in existing trust and session records whenever
+// the legacy lookup succeeds. The physical path used for reading guidance can
+// differ (notably when a workspace is opened through a junction).
+func workspaceBindingPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if old, err := filepath.EvalSymlinks(abs); err == nil {
+		return old, nil
+	}
+	return CanonicalDirectory(abs)
+}
+
+func resolvedDirectoryName(h windows.Handle) (string, error) {
+	const volumeNameDOS, volumeNameGUID, fileNameOpened = 0, 1, 8
+	path, err := finalDirectoryPath(h, volumeNameDOS)
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_NOT_SUPPORTED) || errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		// Some SMB servers require permission to list every component in
+		// order to normalize the name. The opened name does not need that.
+		path, err = finalDirectoryPath(h, volumeNameDOS|fileNameOpened)
+	}
+	if errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+		// A local volume can be mounted without any DOS drive letter.
+		path, err = finalDirectoryPath(h, volumeNameGUID)
+	}
+	return path, err
 }
 
 func finalDirectoryPath(h windows.Handle, flags uint32) (string, error) {
@@ -57,18 +80,11 @@ func finalDirectoryPath(h windows.Handle, flags uint32) (string, error) {
 	}
 }
 
-// Preserve the input namespace for saved workspace bindings. For ordinary
-// DOS/UNC inputs remove Win32's handle prefix only when reopening the name
-// through the ordinary namespace would still refer to the same path.
-func windowsCanonicalSpelling(path, input string) string {
+// Use ordinary DOS/UNC path spellings when doing so cannot change which
+// directory the name denotes. Volume GUIDs and extended-only names retain
+// Win32's prefix.
+func windowsCanonicalSpelling(path string) string {
 	const extended = `\\?\`
-	const device = `\\.\`
-	if strings.HasPrefix(input, extended) {
-		return path
-	}
-	if strings.HasPrefix(input, device) && strings.HasPrefix(path, extended) {
-		return device + path[len(extended):]
-	}
 	if !strings.HasPrefix(path, extended) {
 		return path
 	}

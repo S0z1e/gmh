@@ -20,7 +20,7 @@ func openCanonicalScope(path string) (*os.Root, error) {
 		return nil, err
 	}
 	const metadata = windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE
-	const traverse = metadata | windows.FILE_TRAVERSE
+	const traverse = windows.FILE_TRAVERSE | windows.SYNCHRONIZE
 	const share = windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE
 	access := uint32(metadata)
 	if rel != "." {
@@ -65,4 +65,20 @@ func openCanonicalScope(path string) (*os.Root, error) {
 		}
 	}
 	return openVerifiedScope(path, os.NewFile(uintptr(handle), path))
+}
+
+// ancestrySpelling compares DOS/UNC volumes across equivalent namespace names.
+// Keep the individual components unmodified; a trailing dot or space can be
+// significant in an extended path. This is only a containment comparison.
+func ancestrySpelling(path string) string {
+	if strings.HasPrefix(path, `\\?\`) || strings.HasPrefix(path, `\\.\`) {
+		name := path[4:]
+		if len(name) >= 4 && strings.EqualFold(name[:4], `UNC\`) {
+			return `\\` + name[4:]
+		}
+		if len(name) >= 3 && name[1] == ':' && name[2] == '\\' {
+			return name
+		}
+	}
+	return path
 }

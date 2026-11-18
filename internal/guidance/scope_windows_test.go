@@ -15,12 +15,13 @@ import (
 )
 
 func TestWindowsExtendedScopePath(t *testing.T) {
-	t.Setenv("USERPROFILE", t.TempDir())
 	base := t.TempDir()
+	t.Setenv("USERPROFILE", base)
 	if strings.HasPrefix(base, `\\`) {
 		t.Skip("fixture requires a local drive")
 	}
 	root := filepath.Join(base, strings.Repeat("one", 40), strings.Repeat("two", 40))
+	put(t, filepath.Join(base, "AGENTS.md"), "home guidance")
 	put(t, filepath.Join(root, "AGENTS.md"), "extended path guidance")
 	extended := `\\?\` + root
 	bound, err := openCanonicalScope(extended)
@@ -29,10 +30,10 @@ func TestWindowsExtendedScopePath(t *testing.T) {
 	}
 	bound.Close()
 	snap, err := Resolve(context.Background(), extended, filepath.Join(extended, "new.go"))
-	if err != nil || !strings.HasPrefix(snap.Root, `\\?\`) || len(snap.Files) != 1 || snap.Files[0].Prefix != "extended path guidance" {
+	if err != nil || len(snap.Files) != 2 || snap.Files[0].Prefix != "home guidance" || snap.Files[1].Prefix != "extended path guidance" {
 		t.Fatalf("extended workspace: %+v, %v", snap, err)
 	}
-	f := snap.Files[0]
+	f := snap.Files[1]
 	chunk, err := Read(context.Background(), extended, snap.Target, f.Path, f.SHA256, 0, 128)
 	if err != nil || chunk.Text != f.Prefix {
 		t.Fatalf("extended continuation: %+v, %v", chunk, err)
@@ -46,7 +47,7 @@ func TestWindowsGuidanceWithRestrictedACL(t *testing.T) {
 		access     uint32
 	}{
 		{"readable scope without explicit traverse", "0x20", false, windows.FILE_TRAVERSE},
-		{"searchable ancestor without directory listing", "0x01", true, windows.FILE_LIST_DIRECTORY},
+		{"searchable ancestor without listing or metadata", "0x81", true, windows.FILE_LIST_DIRECTORY | windows.FILE_READ_ATTRIBUTES},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("USERPROFILE", t.TempDir())
@@ -97,7 +98,7 @@ func denyWindowsDirectoryAccess(t *testing.T, path, mask string, access uint32) 
 		t.Fatal(err)
 	}
 	sid := owner.User.Sid.String()
-	sd, err := windows.SecurityDescriptorFromString(fmt.Sprintf("D:P(D;;%s;;;%s)(A;;FA;;;%s)(A;;FA;;;SY)", mask, sid, sid))
+	sd, err := windows.SecurityDescriptorFromString(fmt.Sprintf("D:P(D;;%s;;;%s)(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)", mask, sid, sid))
 	if err != nil {
 		t.Fatal(err)
 	}

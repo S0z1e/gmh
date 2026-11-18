@@ -12,3 +12,7 @@ func CanonicalDirectory(path string) (string, error) {
 	}
 	return filepath.EvalSymlinks(abs)
 }
+
+func workspaceBindingPath(path string) (string, error) {
+	return CanonicalDirectory(path)
+}

@@ -21,7 +21,7 @@ type Identity struct {
 }
 
 func Identify(path string) (Identity, error) {
-	canonical, err := CanonicalDirectory(path)
+	canonical, err := workspaceBindingPath(path)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -32,7 +32,7 @@ func Identify(path string) (Identity, error) {
 	return Identity{Path: canonical, FileID: id}, nil
 }
 
-// CanonicalDirectory can preserve some case/Unicode aliases, including UNC volumes.
+// Workspace binding paths can preserve some case/Unicode aliases, including UNC volumes.
 // Fold only the lookup key, and always pair it with the directory incarnation:
 // distinct directories on case-sensitive filesystems retain distinct records.
 // This does not require read permission on otherwise searchable ancestors.
