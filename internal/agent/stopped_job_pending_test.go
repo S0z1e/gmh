@@ -62,7 +62,7 @@ func TestStoppedJobPendingAnchorSurvivesLaterStop(t *testing.T) {
 		if e.Kind == EventToolEnd && e.ToolCallID == "stop-a" && e.ToolStatus != tools.ResultDeferred {
 			t.Errorf("first stop not pending: %s", e.ToolStatus)
 		}
-		if e.Kind == EventToolEnd && e.ToolCallID == "stop-b" {
+		if e.Kind == EventToolEnd && e.ToolCallID == "retry" {
 			release()
 			<-c.Exec.Jobs()[0].Done()
 		}

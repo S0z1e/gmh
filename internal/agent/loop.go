@@ -970,20 +970,22 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		total.Add(usage)
 		c.emit(Event{Kind: EventStepUsage, Usage: usage})
 		lastText = assistant.Content
-		if len(assistant.ToolCalls) > 0 {
-			// A job may finish while the provider chooses its next calls.
-			// Save that earlier evidence before appending the newer batch.
-			if c.Exec != nil {
-				for _, job := range c.Exec.Jobs() {
-					if !job.Delivered() && !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == job }) {
-						pending = append(pending, pendingJob{callID: job.ToolCallID, job: job})
-					}
+		// A job can finish during any provider response, including a final
+		// answer. Save the outcome before the newer batch; a final answer
+		// that has not seen it needs another model step to account for it.
+		if c.Exec != nil {
+			for _, job := range c.Exec.Jobs() {
+				_, done := job.Result()
+				if !job.Delivered() && (done || !job.Reported()) && !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == job }) {
+					pending = append(pending, pendingJob{callID: job.ToolCallID, job: job})
 				}
 			}
-			msgs, pending = c.collectFinishedJobs(msgs, pending)
-			if c.persistErr != nil {
-				return lastText, total, c.persistErr
-			}
+		}
+		beforeCollection := len(msgs)
+		msgs, pending = c.collectFinishedJobs(msgs, pending)
+		collectedAfterResponse := len(msgs) > beforeCollection
+		if c.persistErr != nil {
+			return lastText, total, c.persistErr
 		}
 		assistantIdx := len(msgs)
 		msgs = append(msgs, assistant)
@@ -1000,6 +1002,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			return lastText, total, err
 		}
 		if len(assistant.ToolCalls) == 0 {
+			if collectedAfterResponse {
+				continue
+			}
 			if len(pending) == 0 {
 				if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {
 					return finishBlocked()
@@ -1095,6 +1100,32 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				msgs = append(msgs, c.rejectBudgetTools(assistant.ToolCalls, fmt.Errorf("background job %s is still finalizing; reconsider these calls after its outcome is recorded", target.ID))...)
 				if c.persistErr != nil {
 					return lastText, total, c.persistErr
+				}
+				// The batch is settled without execution. Wait once for its
+				// prerequisite instead of spending model steps in a busy loop.
+				c.emit(Event{Kind: EventBackgroundWait, Text: target.ID})
+				timer := time.NewTimer(c.drainTimeout())
+				var waitErr error
+				select {
+				case <-target.Done():
+				case <-timer.C:
+					waitErr = fmt.Errorf("background job %s is still finalizing after %s; resume after its outcome is available", target.ID, c.drainTimeout())
+				case <-ctx.Done():
+					waitErr = ctx.Err()
+				}
+				timer.Stop()
+				if waitErr != nil {
+					c.LastTerminalReason = TerminalError
+					if ctx.Err() != nil {
+						c.LastTerminalReason = TerminalAbort
+					}
+					lastText = "Task incomplete: " + waitErr.Error()
+					c.persist(llm.Message{Role: "user", Kind: "task_outcome", Content: lastText})
+					c.emit(Event{Kind: EventError, Err: waitErr, Text: lastText, Usage: total, TerminalReason: c.LastTerminalReason})
+					return lastText, total, waitErr
+				}
+				if !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == target }) {
+					pending = append(pending, pendingJob{callID: target.ToolCallID, job: target})
 				}
 				continue
 			}

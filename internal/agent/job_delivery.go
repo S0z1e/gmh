@@ -151,13 +151,7 @@ func completedJobDisplay(m llm.Message, limit int) string {
 		return boundedJobDisplay(m.Content, limit)
 	}
 	preview := m.Observation.JobDisplay
-	header := textutil.Prefix(strings.ToValidUTF8(preview.Header, "\uFFFD"), min(128, limit/4)) + "\n"
-	path := "Output file: " + strings.ToValidUTF8(m.Observation.OutputFile, "\uFFFD") + "\n"
-	if m.Observation.OutputFile != "" && len(path) <= limit/4 {
-		header += path
-	} else if m.Observation.OutputFile != "" {
-		header += "[Output file path retained in session]\n"
-	}
+	header := textutil.Prefix(strings.ToValidUTF8(preview.Header, "\uFFFD"), min(128, max(0, limit-1))) + "\n"
 	note := strings.ToValidUTF8(preview.Note, "\uFFFD")
 	if len(note) > limit/5 {
 		note = ""
@@ -165,6 +159,15 @@ func completedJobDisplay(m llm.Message, limit int) string {
 	output := preview.Head
 	if preview.Tail != "" {
 		output += "\n... [captured output excerpt] ...\n" + preview.Tail
+	}
+	path := "Output file: " + strings.ToValidUTF8(m.Observation.OutputFile, "\uFFFD") + "\n"
+	// A small result's share includes its full header and path. Do not
+	// shrink those again as fractions of that already-sized share.
+	wholeFits := len(header)+len(path)+len(output)+len(note) <= limit
+	if m.Observation.OutputFile != "" && (len(path) <= limit/4 || wholeFits) {
+		header += path
+	} else if m.Observation.OutputFile != "" {
+		header += "[Output file path retained in session]\n"
 	}
 	return header + boundedJobDisplay(output, limit-len(header)-len(note)) + note
 }
