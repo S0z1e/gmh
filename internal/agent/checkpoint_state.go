@@ -287,8 +287,8 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 			if info.id != "" {
 				d.ResolvedCalls = append(d.ResolvedCalls, info.id)
 			}
-			if m.Kind == guidanceDeferredKind || m.Kind == notExecutedKind {
-				// The call settled without dispatch; it supplies neither
+			if m.Kind == guidanceDeferredKind || m.Kind == notExecutedKind || m.Kind == stopPendingKind {
+				// The call settled without a confirmed execution outcome; it supplies neither
 				// failure evidence nor proof that an earlier failure cleared.
 			} else if m.ToolError {
 				var excerpt checkpoint.Excerpt

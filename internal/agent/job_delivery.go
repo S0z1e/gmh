@@ -9,7 +9,29 @@ import (
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
 	"minimalharness/internal/textutil"
+	"minimalharness/internal/tools"
 )
+
+// The signal was sent, but the original outcome is not available yet.
+// This settlement supplies neither command-failure nor command-success evidence.
+const stopPendingKind = "stop_pending"
+
+// A stop may settle before its target finishes. Keep the later outcome at that
+// stop when the history still contains its anchor, including after cold resume.
+func pendingStopCompletion(history []llm.Message, job *tools.Job, res tools.JobResult, output string) llm.Message {
+	m := completedJobMessage(job, res, output)
+	for i := len(history) - 1; i >= 0; i-- {
+		stop := history[i]
+		if stop.Kind != stopPendingKind || stop.Observation == nil || stop.InvocationID == "" {
+			continue
+		}
+		if target := stop.Observation.PendingStop; target != nil && target.ID == job.ID && target.Started.Equal(job.Started) {
+			m.Observation.BeforeInvocationID = stop.InvocationID
+			break
+		}
+	}
+	return m
+}
 
 // Keep durable results separate, but show them at their stop call. Provider
 // protocols group tool replies before user messages, so a plain job message

@@ -1,6 +1,10 @@
 package llm
 
-import "minimalharness/internal/checkpoint"
+import (
+	"time"
+
+	"minimalharness/internal/checkpoint"
+)
 
 // ToolObservation is durable harness metadata, omitted by every provider wire
 // adapter. It records actual execution, independently of display hooks or clips.
@@ -20,8 +24,15 @@ type ToolObservation struct {
 	CompletedJobs []JobCompletion  `json:"completed_jobs,omitempty"`
 	// BeforeInvocationID anchors a stopped completion's historical facts to
 	// the stop call, even when provider replay moves its display after a batch.
-	BeforeInvocationID string      `json:"before_invocation_id,omitempty"`
-	JobDisplay         *JobDisplay `json:"job_display,omitempty"`
+	BeforeInvocationID string       `json:"before_invocation_id,omitempty"`
+	JobDisplay         *JobDisplay  `json:"job_display,omitempty"`
+	PendingStop        *JobIdentity `json:"pending_stop,omitempty"`
+}
+
+// JobIdentity distinguishes a retained job from an ID reused by a later process.
+type JobIdentity struct {
+	ID      string    `json:"id"`
+	Started time.Time `json:"started"`
 }
 
 // JobDisplay separates actual captured output from harness decorations.

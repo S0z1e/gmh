@@ -154,7 +154,7 @@ func (c *Config) invalidArgs(msgs []llm.Message, tc llm.ToolCall, err error) []l
 	obs := fmt.Sprintf("Error: invalid %s arguments: %v", tc.Function.Name, err)
 	c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments, ToolCallID: tc.ID})
 	c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, ToolOutput: obs, ToolErr: err})
-	m := llm.Message{Role: "tool", ToolCallID: tc.ID, ToolError: true, Content: obs}
+	m := llm.Message{Role: "tool", Kind: notExecutedKind, ToolCallID: tc.ID, ToolError: true, Content: obs}
 	if c.Session != nil {
 		c.persist(m)
 	}
@@ -411,7 +411,7 @@ func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) (
 		obs, toolErr := jobResultMessage(p.job, res)
 		obs = c.progressJob(p.job, res, obs)
 		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID, ToolCallID: p.job.ToolCallID, InvocationID: p.job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: p.job.OutputFile})
-		msgs = append(msgs, completedJobMessage(p.job, res, obs))
+		msgs = append(msgs, pendingStopCompletion(msgs, p.job, res, obs))
 		if c.Session != nil {
 			c.persist(msgs[len(msgs)-1])
 		}
@@ -522,7 +522,7 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 		obs, toolErr := jobResultMessage(job, res)
 		obs = c.progressJob(job, res, obs)
 		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
-		msgs = append(msgs, completedJobMessage(job, res, obs))
+		msgs = append(msgs, pendingStopCompletion(msgs, job, res, obs))
 		if c.Session != nil {
 			c.persist(msgs[len(msgs)-1])
 		}
@@ -563,7 +563,7 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 			obs, toolErr := jobResultMessage(job, res)
 			obs = c.progressJob(job, res, obs)
 			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
-			msgs = append(msgs, completedJobMessage(job, res, obs))
+			msgs = append(msgs, pendingStopCompletion(msgs, job, res, obs))
 			if c.Session != nil {
 				c.persist(msgs[len(msgs)-1])
 			}
@@ -964,6 +964,14 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		total.Add(usage)
 		c.emit(Event{Kind: EventStepUsage, Usage: usage})
 		lastText = assistant.Content
+		if len(assistant.ToolCalls) > 0 {
+			// A job may finish while the provider chooses its next calls.
+			// Save that earlier evidence before appending the newer batch.
+			msgs, pending = c.collectFinishedJobs(msgs, pending)
+			if c.persistErr != nil {
+				return lastText, total, c.persistErr
+			}
+		}
 		assistantIdx := len(msgs)
 		msgs = append(msgs, assistant)
 		if c.Session != nil {
@@ -1127,7 +1135,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				}
 				startTool(argsJSON)
 				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: fmt.Errorf("tool %s not offered in this turn", tc.Function.Name)})
-				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
+				msgs = append(msgs, llm.Message{Role: "tool", Kind: notExecutedKind, Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
@@ -1152,7 +1160,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					}
 					startTool(argsJSON)
 					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: fmt.Errorf("denied by plugin %s", deny)})
-					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
+					msgs = append(msgs, llm.Message{Role: "tool", Kind: notExecutedKind, Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 					if c.Session != nil {
 						c.persist(msgs[len(msgs)-1])
 					}
@@ -1199,7 +1207,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				}
 				startTool(argsJSON)
 				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: ErrRepeatedToolCallDenied})
-				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
+				msgs = append(msgs, llm.Message{Role: "tool", Kind: notExecutedKind, Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
@@ -1274,7 +1282,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool failure denied"})
 				}
 				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: ErrRepeatedToolFailureDenied})
-				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
+				msgs = append(msgs, llm.Message{Role: "tool", Kind: notExecutedKind, Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
@@ -1317,7 +1325,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					obs := "User denied this tool call. Do not retry it; explain and propose an alternative."
 					recordLastError(&c.progress.lastErrors, obs)
 					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: fmt.Errorf("tool call denied by user")})
-					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
+					msgs = append(msgs, llm.Message{Role: "tool", Kind: notExecutedKind, Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 					if c.Session != nil {
 						c.persist(msgs[len(msgs)-1])
 					}
@@ -1416,13 +1424,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if job == nil {
 				c.DoomLoop().Observe(callKey, obs)
 				if ctx.Err() == nil && c.budgetError() == nil {
-					if err != nil {
+					if err != nil && res.Status != tools.ResultDeferred {
 						failures := c.progressFailure(callKey, failureKind(err, attempt != nil))
 						if failures >= FailureWarnAfter {
 							obs += "\n" + FailureNote(tc.Function.Name, failures)
 						}
 						recordLastError(&c.progress.lastErrors, obs)
-					} else {
+					} else if err == nil {
 						c.progressSuccess(callKey, tc.Function.Name)
 					}
 				}
@@ -1441,6 +1449,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				deliveries = c.stoppedJobDeliveries()
 			}
 			result := llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil, Observation: observation}
+			if isStop && res.Status == tools.ResultDeferred {
+				result.Kind = stopPendingKind
+				observation.Failure = nil
+				observation.PendingStop = &llm.JobIdentity{ID: stopped.ID, Started: stopped.Started}
+			}
 			if res.Guidance != nil && err == nil {
 				attachGuidanceDelivery(&result, *res.Guidance)
 				if guidanceState != nil {
@@ -1475,8 +1488,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if isStop {
 				c.emit(endEvent)
 			}
-			if stopped != nil && !stopped.Delivered() {
-				// A completion can arrive while the stop event is consumed.
+			if isStop {
+				// The target or a sibling can finish while the stop event is
+				// consumed, even if the first snapshot delivered the target.
 				deliver(c.stoppedJobDeliveries())
 				if c.persistErr != nil {
 					return lastText, total, c.persistErr
@@ -1504,6 +1518,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			if stopped != nil && !stopped.Delivered() {
 				msgs = append(msgs, c.rejectBudgetTools(assistant.ToolCalls[i+1:], fmt.Errorf("background job %s is still finalizing; reconsider these calls after its outcome is recorded", stopped.ID))...)
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
+				}
 				break
 			}
 		}

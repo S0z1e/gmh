@@ -45,11 +45,14 @@ const (
 type BashOutputPreview struct{ Head, Tail string }
 
 func bashPreview(head, tail []string, whole bool) BashOutputPreview {
-	first, last := strings.Join(head, "\n"), strings.Join(tail, "\n")
-	if whole && len(first) <= 4096 {
+	// Cuts must see valid UTF-8: a raw continuation byte at the cut can
+	// otherwise move it past valid output at the beginning of the buffer.
+	first := strings.ToValidUTF8(strings.Join(head, "\n"), "\uFFFD")
+	last := strings.ToValidUTF8(strings.Join(tail, "\n"), "\uFFFD")
+	if whole && len(first) <= bashOutputInlineMaxChars {
 		return BashOutputPreview{Head: first}
 	}
-	return BashOutputPreview{Head: textutil.Prefix(first, 2048), Tail: textutil.Suffix(last, 2048)}
+	return BashOutputPreview{Head: textutil.Prefix(first, bashOutputInlineMaxChars/2), Tail: textutil.Suffix(last, bashOutputInlineMaxChars/2)}
 }
 
 // bashOutputSink keeps the first BashOutputHeadLines lines, the
