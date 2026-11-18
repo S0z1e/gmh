@@ -263,7 +263,7 @@ func estimatePromptTokens(msgs []llm.Message, defs []llm.ToolDef) int {
 }
 
 func (c *Config) promptView(msgs []llm.Message) []llm.Message {
-	out := truncateToolResults(session.RepairToolBatches(msgs), toolResultMaxChars)
+	out := truncateToolResults(stoppedResultsView(session.RepairToolBatches(msgs)), toolResultMaxChars)
 	for i := range out {
 		switch out[i].Kind {
 		case "checkpoint":

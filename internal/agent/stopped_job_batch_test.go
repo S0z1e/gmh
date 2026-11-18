@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"slices"
@@ -42,8 +43,26 @@ func TestStoppedJobLargeBatchKeepsVisibleResults(t *testing.T) {
 	if job := c.Exec.Jobs()[len(c.Exec.Jobs())-1]; !job.Delivered() {
 		t.Fatal("test expected acknowledged job")
 	}
-	if !strings.Contains(requests[2], "target-visible") || !strings.Contains(requests[2], "sibling-visible") {
+	if strings.Count(requests[2], "target-visible") != 1 || strings.Count(requests[2], "sibling-visible") != 255 {
 		t.Fatalf("zero-byte result markers: %d, target visible: %t, sibling visible: %t", strings.Count(requests[2], "0 chars shown"), strings.Contains(requests[2], "target-visible"), strings.Contains(requests[2], "sibling-visible"))
+	}
+	var request struct {
+		Messages []llm.Message `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(requests[2]), &request); err != nil {
+		t.Fatal(err)
+	}
+	groups := 0
+	for _, m := range request.Messages {
+		if strings.Contains(m.Content, "[Background outcomes from stop call") {
+			groups++
+			if len(m.Content) > toolResultMaxChars {
+				t.Fatalf("provider display has %d bytes, cap is %d", len(m.Content), toolResultMaxChars)
+			}
+		}
+	}
+	if groups != 2 {
+		t.Fatalf("256 outcomes rendered as %d groups, want 2 bounded displays", groups)
 	}
 }
 

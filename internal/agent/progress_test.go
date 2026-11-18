@@ -578,6 +578,11 @@ func TestStoppedBackgroundJobSurvivesAbortAndResolvesBeforeRetry(t *testing.T) {
 			if haveFailure := slices.ContainsFunc(state.Failures, func(f checkpoint.Failure) bool { return f.Fingerprint == key }); haveFailure != abort {
 				t.Errorf("checkpoint has original failure=%t, want %t", haveFailure, abort)
 			}
+			if abort && !slices.ContainsFunc(state.Failures, func(f checkpoint.Failure) bool {
+				return f.Fingerprint == key && strings.Contains(f.Output.Head, "initial-output")
+			}) {
+				t.Fatalf("unknown retry replaced the original stopped output: %+v", state.Failures)
+			}
 		})
 	}
 }

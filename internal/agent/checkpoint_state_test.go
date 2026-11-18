@@ -464,3 +464,27 @@ func TestCheckpointHumanReplyKeepsOriginalWhitespaceAndProvenance(t *testing.T) 
 		}
 	}
 }
+
+func TestInterruptedRetryKeepsExecutionFailureUntilSuccessfulRerun(t *testing.T) {
+	args := `{"command":"printf original; exit 2"}`
+	h := checkpointBatch("original", args, "original execution failed", true)
+	interrupted := checkpointBatch("interrupted", args, "unknown retry outcome", true)
+	interrupted[1].Kind = "interrupted"
+	interrupted[1].Observation = nil
+	h = append(h, interrupted...)
+	state, _, _, err := (&Config{}).compactState(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Failures) != 2 {
+		t.Fatalf("failures=%+v, want actual execution and unknown retry", state.Failures)
+	}
+	h = append(h, checkpointBatch("success", args, "actual successful rerun", false)...)
+	state, _, _, err = (&Config{}).compactState(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Failures) != 0 {
+		t.Fatalf("successful rerun left stale failures: %+v", state.Failures)
+	}
+}

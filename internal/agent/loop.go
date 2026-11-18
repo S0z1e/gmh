@@ -1378,12 +1378,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			closeMutation()
 			var stopped *tools.Job
-			var stoppedResult tools.JobResult
 			if target := res.StoppedJob; target != nil && !target.Delivered() {
+				stopped = target
 				if outcome, done := target.Result(); done {
-					stopped, stoppedResult = target, outcome
 					res.Text = fmt.Sprintf("Stopped background job %s (exit %d).", target.ID, outcome.ExitCode)
-					res.ExitCode = &stoppedResult.ExitCode
+					res.ExitCode = &outcome.ExitCode
 				} else if !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == target }) {
 					pending = append(pending, pendingJob{callID: target.ToolCallID, job: target})
 				}
@@ -1399,6 +1398,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			if tc.Function.Name != tools.GuidanceTool && c.Exec != nil && c.Exec.Plugins != nil {
 				obs = c.Exec.Plugins.RunToolResultHooks(ctx, tc.Function.Name, argsJSON, obs, err)
+			}
+			if res.StoppedJob != nil {
+				// Decorations cannot block the original result's persistence.
+				obs = capText(obs, 1024)
 			}
 
 			if job == nil {
@@ -1433,12 +1436,6 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				}
 			}
 			msgs = append(msgs, result)
-			if c.Session != nil {
-				c.persist(msgs[len(msgs)-1])
-			}
-			if c.persistErr != nil {
-				return lastText, total, c.persistErr
-			}
 			for _, d := range deliveries {
 				delivery := completedJobMessage(d.job, d.result, d.output)
 				delivery.Observation.BeforeInvocationID = inv.ID
@@ -1452,6 +1449,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: d.output, ToolErr: d.result.Err,
 					JobID: d.job.ID, ToolCallID: d.job.ToolCallID, InvocationID: d.job.InvocationID,
 					ToolExitCode: &d.result.ExitCode, ToolOutputFile: d.job.OutputFile})
+			}
+			// A recorded stop acknowledgement must never outlive a missing
+			// target outcome after a partial batch write or crash. Provider
+			// replay groups tool replies first regardless of disk ordering.
+			c.persist(result)
+			if c.persistErr != nil {
+				return lastText, total, c.persistErr
 			}
 			for _, evidence := range c.verificationFinish(ctx, attempt, res, err) {
 				msgs = append(msgs, evidence)

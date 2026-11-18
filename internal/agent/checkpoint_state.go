@@ -260,7 +260,7 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 					outcome.Failures = append(outcome.Failures, checkpoint.Failure{Fingerprint: completed.Fingerprint, Source: source,
 						Tool: "bash", Command: job.Command, Cwd: completed.Cwd, Output: *completed.Failure})
 				} else if job.Error == "" && completed.Fingerprint != "" {
-					outcome.ResolvedFailures = append(outcome.ResolvedFailures, completed.Fingerprint)
+					outcome.ResolvedFailures = append(outcome.ResolvedFailures, completed.Fingerprint, factDigest("unknown:"+completed.Fingerprint))
 				}
 				// Fold completion order before the stop acknowledgement. A
 				// prior success must not resolve a later job's failure.
@@ -278,13 +278,16 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 				// The call settled without dispatch; it supplies neither
 				// failure evidence nor proof that an earlier failure cleared.
 			} else if m.ToolError {
-				excerpt, observeErr := checkpoint.Observe(m.Content, 4096)
-				if observeErr != nil {
-					err = observeErr
-					return
-				}
+				var excerpt checkpoint.Excerpt
 				if m.Observation != nil && m.Observation.Failure != nil {
 					excerpt = *m.Observation.Failure
+				} else {
+					var observeErr error
+					excerpt, observeErr = checkpoint.Observe(strings.ToValidUTF8(m.Content, "\uFFFD"), 4096)
+					if observeErr != nil {
+						err = observeErr
+						return
+					}
 				}
 				if info.name == "" {
 					info.name = "unknown"
@@ -292,11 +295,18 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 				if info.fingerprint == "" {
 					info.fingerprint = factDigest("unidentified:" + source)
 				}
-				d.Failures = append(d.Failures, checkpoint.Failure{Fingerprint: info.fingerprint, Source: source, Tool: info.name, Command: info.command, Cwd: info.cwd, Output: excerpt})
+				// An interrupted retry grants no new execution evidence.
+				// Keep its unknown outcome as a distinct unresolved fact so
+				// it cannot overwrite the original command's actual failure.
+				fingerprint := info.fingerprint
+				if m.Kind == "interrupted" {
+					fingerprint = factDigest("unknown:" + info.fingerprint)
+				}
+				d.Failures = append(d.Failures, checkpoint.Failure{Fingerprint: fingerprint, Source: source, Tool: info.name, Command: info.command, Cwd: info.cwd, Output: excerpt})
 			} else {
 				backgroundLaunch := m.Role == "tool" && m.Observation != nil && len(m.Observation.Jobs) > 0
 				if info.fingerprint != "" && !backgroundLaunch {
-					d.ResolvedFailures = append(d.ResolvedFailures, info.fingerprint)
+					d.ResolvedFailures = append(d.ResolvedFailures, info.fingerprint, factDigest("unknown:"+info.fingerprint))
 				}
 				if info.name == "ask_user" {
 					answer := m.Content
