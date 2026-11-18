@@ -78,7 +78,7 @@ func completedJobMessage(job *tools.Job, res tools.JobResult, display string) ll
 			note = ""
 		}
 		obs.JobDisplay = &llm.JobDisplay{Header: header,
-			Head: strings.ToValidUTF8(preview.Head, "\uFFFD"), Tail: strings.ToValidUTF8(preview.Tail, "\uFFFD"), Note: preview.Notice + note}
+			Head: strings.ToValidUTF8(preview.Head, "\uFFFD"), Tail: strings.ToValidUTF8(preview.Tail, "\uFFFD"), Notice: preview.Notice, Note: note}
 	}
 	return llm.Message{Role: "user", Kind: "job", InvocationID: job.InvocationID, Content: display, ToolError: res.Err != nil, Observation: obs}
 }

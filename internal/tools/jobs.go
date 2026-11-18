@@ -344,8 +344,12 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	configureProcess(cmd)
 	var stopOnce sync.Once
 	var stopErr error
+	var processContextErr error
 	cmd.Cancel = func() error {
-		stopOnce.Do(func() { stopErr = killProcessTree(cmd) })
+		stopOnce.Do(func() {
+			processContextErr = runCtx.Err()
+			stopErr = killProcessTree(cmd)
+		})
 		return stopErr
 	}
 
@@ -388,6 +392,10 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		copied <- err
 	}()
 	runErr := cmd.Wait()
+	// The command deadline governs the shell, not the subsequent pipe drain.
+	// Cancel only after Wait retired its context watcher; capture cap errors
+	// still stop the process group directly.
+	cancel()
 	timer := time.NewTimer(200 * time.Millisecond)
 	var copyErr error
 	captureClosed := false
@@ -438,11 +446,11 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		if capture.err != nil {
 			return s, exitCode, fmt.Errorf("capture bash output: %w", capture.err)
 		}
-		if runCtx.Err() == context.DeadlineExceeded {
+		if processContextErr == context.DeadlineExceeded {
 			return s, -1, &timeoutError{timeout}
 		}
-		if runCtx.Err() != nil {
-			return s, -1, runCtx.Err()
+		if ctx.Err() != nil {
+			return s, -1, ctx.Err()
 		}
 		if runErr != nil {
 			return s, exitCode, fmt.Errorf("exit: %w", runErr)
@@ -466,11 +474,11 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	if capture.err != nil {
 		return s, exitCode, fmt.Errorf("capture bash output: %w", capture.err)
 	}
-	if runCtx.Err() == context.DeadlineExceeded {
+	if processContextErr == context.DeadlineExceeded {
 		return s, -1, &timeoutError{timeout}
 	}
-	if runCtx.Err() != nil {
-		return s, -1, runCtx.Err()
+	if ctx.Err() != nil {
+		return s, -1, ctx.Err()
 	}
 	if runErr != nil {
 		return s, exitCode, fmt.Errorf("exit: %w", runErr)

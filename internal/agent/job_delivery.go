@@ -152,24 +152,28 @@ func completedJobDisplay(m llm.Message, limit int) string {
 	}
 	preview := m.Observation.JobDisplay
 	header := textutil.Prefix(strings.ToValidUTF8(preview.Header, "\uFFFD"), min(128, max(0, limit-1))) + "\n"
+	notice := textutil.Prefix(strings.ToValidUTF8(preview.Notice, "\uFFFD"), 128)
 	note := strings.ToValidUTF8(preview.Note, "\uFFFD")
-	if len(note) > limit/5 {
-		note = ""
-	}
 	output := preview.Head
 	if preview.Tail != "" {
 		output += "\n... [captured output excerpt] ...\n" + preview.Tail
 	}
-	path := "Output file: " + strings.ToValidUTF8(m.Observation.OutputFile, "\uFFFD") + "\n"
+	path := ""
+	if m.Observation.OutputFile != "" {
+		path = "Output file: " + strings.ToValidUTF8(m.Observation.OutputFile, "\uFFFD") + "\n"
+	}
 	// A small result's share includes its full header and path. Do not
 	// shrink those again as fractions of that already-sized share.
-	wholeFits := len(header)+len(path)+len(output)+len(note) <= limit
+	wholeFits := len(header)+len(path)+len(output)+len(note)+len(notice) <= limit
+	if !wholeFits && len(note) > limit/5 {
+		note = ""
+	}
 	if m.Observation.OutputFile != "" && (len(path) <= limit/4 || wholeFits) {
 		header += path
 	} else if m.Observation.OutputFile != "" {
 		header += "[Output file path retained in session]\n"
 	}
-	return header + boundedJobDisplay(output, limit-len(header)-len(note)) + note
+	return header + boundedJobDisplay(output, limit-len(header)-len(note)-len(notice)) + notice + note
 }
 
 // An append may write a complete result before Sync reports an error. Reconcile

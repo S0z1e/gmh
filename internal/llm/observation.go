@@ -41,6 +41,7 @@ type JobDisplay struct {
 	Head   string `json:"head"`
 	Tail   string `json:"tail,omitempty"`
 	Note   string `json:"note,omitempty"`
+	Notice string `json:"notice,omitempty"`
 }
 
 // JobCompletions includes the older single-job record when replaying it.
