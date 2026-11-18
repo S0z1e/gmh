@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -19,15 +20,9 @@ func TestBashOutputCapAfterShellExit(t *testing.T) {
 	if !strings.Contains(out, "Output capture closed") {
 		t.Fatalf("inherited output closure was not reported: %s", out)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, err := os.Stat(filepath.Join(e.Root, "complete")); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("finite child did not finish")
-		}
-		time.Sleep(time.Millisecond)
+	time.Sleep(600 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(e.Root, "complete")); (runtime.GOOS == "linux" || runtime.GOOS == "darwin") && !os.IsNotExist(err) {
+		t.Fatalf("child continued after shell completion: %v", err)
 	}
 	entries, err := os.ReadDir(e.OutputDir)
 	if err != nil {

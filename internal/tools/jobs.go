@@ -345,12 +345,22 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	var stopOnce sync.Once
 	var stopErr error
 	var processContextErr error
-	cmd.Cancel = func() error {
+	var processMu sync.Mutex
+	shellExited := false
+	stopProcess := func(cause error) error {
 		stopOnce.Do(func() {
-			processContextErr = runCtx.Err()
-			stopErr = killProcessTree(cmd)
+			processContextErr = cause
+			stopErr = stopBashProcessGroup(cmd)
 		})
 		return stopErr
+	}
+	cmd.Cancel = func() error {
+		processMu.Lock()
+		defer processMu.Unlock()
+		if shellExited {
+			return os.ErrProcessDone
+		}
+		return stopProcess(runCtx.Err())
 	}
 
 	legacy := outPath == ""
@@ -368,9 +378,9 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		return "", -1, fmt.Errorf("open bash output: %w", err)
 	}
 	capture := &bashOutputCapture{file: f, summary: newBashOutputSink(), stop: func() {
-		// cmd.Wait may already have retired its context watcher. A cap
-		// still owns the inherited process group during output drain.
-		_ = cmd.Cancel()
+		// Capture errors still stop the inherited process group during
+		// output drain, after the command deadline has been retired.
+		_ = stopProcess(nil)
 		cancel()
 	}}
 	reader, writer, err := os.Pipe()
@@ -391,10 +401,24 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		_, err := io.Copy(capture, reader)
 		copied <- err
 	}()
-	runErr := cmd.Wait()
-	// The command deadline governs the shell, not the subsequent pipe drain.
-	// Cancel only after Wait retired its context watcher; capture cap errors
-	// still stop the process group directly.
+	// On supported platforms, observe shell exit without reaping it. Keeping
+	// its PID reserved lets us stop the owned group before it can be reused.
+	ownedGroup, observeErr := waitBashExit(cmd)
+	var runErr error
+	if observeErr != nil {
+		// No Wait has run yet, so the PID is still ours. Fail closed if
+		// exit observation is unavailable rather than abandoning children.
+		_ = stopProcess(nil)
+		ownedGroup = false
+	}
+	if !ownedGroup {
+		runErr = cmd.Wait()
+	}
+	processMu.Lock()
+	shellExited = true
+	processMu.Unlock()
+	// The deadline governs the shell, not the subsequent pipe drain. Its
+	// watcher now returns ErrProcessDone without changing the shell outcome.
 	cancel()
 	timer := time.NewTimer(200 * time.Millisecond)
 	var copyErr error
@@ -414,6 +438,17 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		}
 	}
 	timer.Stop()
+	var cleanupErr error
+	if ownedGroup {
+		cleanupErr = stopProcess(nil)
+		runErr = cmd.Wait()
+		if cleanupErr != nil && !errors.Is(cleanupErr, os.ErrProcessDone) {
+			runErr = errors.Join(runErr, fmt.Errorf("stop remaining bash processes: %w", cleanupErr))
+		}
+	}
+	if observeErr != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("observe bash exit: %w", observeErr))
+	}
 	_ = reader.Close()
 	_ = capture.summary.Close()
 	closeErr := f.Close()
@@ -428,17 +463,21 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	if cmd.ProcessState != nil {
 		exitCode = cmd.ProcessState.ExitCode()
 	}
+	closureNotice := "\n[Output capture closed after the shell exited.]"
+	if ownedGroup && (cleanupErr == nil || errors.Is(cleanupErr, os.ErrProcessDone)) {
+		closureNotice = "\n[Output capture closed; remaining processes in the command group were stopped.]"
+	}
 	if legacy {
 		data, _ := readFileHead(filePath, MaxOutBytes)
 		s := truncate(string(data), MaxOutBytes)
 		if preview != nil {
 			*preview = bashPreview([]string{s}, []string{s}, true)
 			if captureClosed {
-				preview.Notice = "\n[Output capture closed after the shell exited.]"
+				preview.Notice = closureNotice
 			}
 		}
 		if captureClosed {
-			s += "\n[Output capture closed after the shell exited.]"
+			s += closureNotice
 		}
 		if capture.capped {
 			return s, -1, &outputCapError{bytes: int64(len(data))}
@@ -461,12 +500,12 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	if preview != nil {
 		*preview = bashPreview(head, tail, lines <= len(head))
 		if captureClosed {
-			preview.Notice = "\n[Output capture closed after the shell exited.]"
+			preview.Notice = closureNotice
 		}
 	}
 	s := FormatBashOutput(lines, bytes, fileCapped || capture.capped, head, tail, outPath, dir)
 	if captureClosed {
-		s += "\n[Output capture closed after the shell exited. Use background:true with a foreground server command to keep capturing its output.]"
+		s += closureNotice + "\n[Use background:true with a foreground server command for a long-lived service.]"
 	}
 	if capture.capped {
 		return s, -1, &outputCapError{bytes: bytes}
