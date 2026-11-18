@@ -111,6 +111,10 @@ func directories(handle *os.Root, root, target string, ancestors []string) ([]st
 // symlinks, and never loads instructions from sibling directories. Missing
 // sources are absent; unreadable, special or oversized sources fail explicitly.
 func Resolve(ctx context.Context, root, target string) (Snapshot, error) {
+	return resolve(ctx, root, target, "")
+}
+
+func resolve(ctx context.Context, root, target, expectedRootID string) (Snapshot, error) {
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
 	}
@@ -141,7 +145,7 @@ func Resolve(ctx context.Context, root, target string) (Snapshot, error) {
 			return Snapshot{}, err
 		}
 	}
-	roots, err := openSourceRoots(root)
+	roots, err := openSourceRoots(root, expectedRootID)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -205,12 +209,18 @@ type sourceRoots struct {
 	ancestors                []string
 }
 
-func openSourceRoots(root string) (*sourceRoots, error) {
+func openSourceRoots(root, expectedRootID string) (*sourceRoots, error) {
 	out := &sourceRoots{workspacePath: root}
 	var err error
 	out.workspace, err = openCanonicalScope(root)
 	if err != nil {
 		return nil, err
+	}
+	if expectedRootID != "" {
+		if err := workspace.CheckRootFileID(out.workspace, expectedRootID); err != nil {
+			out.close()
+			return nil, err
+		}
 	}
 	out.workspaceInfo, err = out.workspace.Stat(".")
 	if err != nil {
@@ -401,13 +411,17 @@ type Chunk struct {
 // hash. It cannot become a general read exception for unrelated ancestor files.
 // Offset and Next are byte offsets and must lie on UTF8 boundaries.
 func Read(ctx context.Context, root, target, path, expectedHash string, offset, limit int) (Chunk, error) {
+	return read(ctx, root, target, path, expectedHash, "", offset, limit)
+}
+
+func read(ctx context.Context, root, target, path, expectedHash, expectedRootID string, offset, limit int) (Chunk, error) {
 	if !utf8.ValidString(path) {
 		return Chunk{}, fmt.Errorf("guidance source path must be valid UTF-8")
 	}
 	if offset < 0 || limit < 4 || limit > PrefixBytes {
 		return Chunk{}, fmt.Errorf("invalid guidance byte range")
 	}
-	snapshot, err := Resolve(ctx, root, target)
+	snapshot, err := resolve(ctx, root, target, expectedRootID)
 	if err != nil {
 		return Chunk{}, err
 	}
@@ -433,7 +447,7 @@ func Read(ctx context.Context, root, target, path, expectedHash string, offset, 
 	if source.SHA256 != expectedHash {
 		return Chunk{}, fmt.Errorf("instruction source changed; refresh guidance before continuing")
 	}
-	roots, err := openSourceRoots(snapshot.Root)
+	roots, err := openSourceRoots(snapshot.Root, expectedRootID)
 	if err != nil {
 		return Chunk{}, err
 	}

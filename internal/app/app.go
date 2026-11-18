@@ -17,6 +17,7 @@ import (
 
 	"minimalharness/internal/agent"
 	"minimalharness/internal/config"
+	"minimalharness/internal/guidance"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/plugins"
 	"minimalharness/internal/session"
@@ -260,7 +261,7 @@ func Setup(p Params) (*App, error) {
 	a.Skills = skillList
 	system := agent.SystemPrompt
 	if trusted {
-		system += agent.ProjectContext(absRoot)
+		system += agent.ProjectGitContext(absRoot)
 	}
 	system += skills.Listing(skillList)
 
@@ -290,6 +291,9 @@ func Setup(p Params) (*App, error) {
 	pluginReg.SessionGetter = a.sessionID
 
 	executor := &tools.Executor{Root: absRoot, UntrustedWorkspace: !trusted, ImageInput: slices.Contains(mdl.Input, "image"), Plugins: pluginReg}
+	if trusted {
+		executor.Guidance = guidance.ForWorkspace(identity)
+	}
 	executor.BashEnv = cfg.BashEnv
 	// Bash output files live in this session's directory (never in
 	// the project tree): the loop's read tool can pull them, and a
@@ -388,6 +392,9 @@ func Setup(p Params) (*App, error) {
 	// The tool mode starts at default, with the full tool list.
 	a.toolMode = agent.ToolModeDefault
 	a.allTools = append(agent.ToolDefs(), pluginTools...)
+	if !trusted {
+		a.allTools = slices.DeleteFunc(a.allTools, func(d llm.ToolDef) bool { return d.Function.Name == tools.GuidanceTool })
+	}
 	timeout, idle := clientTimeouts(mdl)
 	a.Cfg = &agent.Config{
 		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort, Thinking: mdl.Thinking, PromptCacheKey: a.sessionID(), Timeout: timeout, IdleTimeout: idle},

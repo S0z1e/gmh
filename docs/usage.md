@@ -119,11 +119,15 @@
   them in a footer, and the model loads one with
   `load_skill {name, reference}` (paths are jailed to that skill's
   `references/`).
-- Project context: `AGENTS.md` and `CLAUDE.md` in the workspace root
-  (and ancestors up to `$HOME`) are loaded once at startup into the
-  system prompt, each capped at 8 KiB, with a git snapshot (branch,
-  working-tree status, recent commits) added the same way. Editing a
-  context file mid-session needs a restart.
+- Project guidance: in a trusted workspace, applicable `AGENTS.md` and
+  `CLAUDE.md` files are read from the allowed ancestors up to home, the
+  workspace root, and directories containing the file being edited. Nearer
+  directories refine earlier instructions; `CLAUDE.md` follows `AGENTS.md`
+  in the same directory. The model sees each source's path, SHA-256 and
+  up to 8 KiB of text (also subject to an overall preview limit). It can
+  request the rest with `read_guidance`. If the applicable instructions
+  change before a write or edit, the harness asks the model to reconsider
+  the operation before executing it. The startup Git snapshot is separate.
 - Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`. A session has
   one transcript writer across processes; opening, renaming or deleting another
   process's active session fails immediately. Closing or crashing releases the

@@ -776,8 +776,8 @@ func TestModelCommand(t *testing.T) {
 	}
 }
 
-// Setup loads AGENTS.md from the root into the system prompt.
-func TestSetupLoadsProjectContext(t *testing.T) {
+// Setup wires trusted guidance without freezing it in the system prompt.
+func TestSetupEnablesProjectGuidance(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	root := t.TempDir()
@@ -790,8 +790,12 @@ func TestSetupLoadsProjectContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Store.Close()
-	if !strings.Contains(a.Cfg.System, "ZEBRA-7") {
-		t.Fatalf("system prompt = %q, want the AGENTS.md content", a.Cfg.System)
+	if strings.Contains(a.Cfg.System, "ZEBRA-7") || !a.Cfg.Exec.GuidanceEnabled() {
+		t.Fatalf("guidance is not live: %q", a.Cfg.System)
+	}
+	snapshot, err := a.Cfg.Exec.Guidance.Resolve(context.Background(), "")
+	if err != nil || len(snapshot.Files) != 1 || !strings.Contains(snapshot.Files[0].Prefix, "ZEBRA-7") {
+		t.Fatalf("project guidance = %+v; err = %v", snapshot, err)
 	}
 }
 
@@ -1275,5 +1279,59 @@ func TestDoCompactRunsSessionBeforeCompactHooks(t *testing.T) {
 	}
 	if len(a.History) != 3 || a.History[0].Kind != "task" || a.History[1].Kind != "summary" || !strings.Contains(a.History[1].Content, "hi there") || a.History[2].Kind != "checkpoint" {
 		t.Fatalf("history after compact = %+v, want the active task, summary and source facts", a.History)
+	}
+}
+
+func TestRunnerUsesCurrentGuidanceAfterExplicitRebind(t *testing.T) {
+	var requests []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests = append(requests, string(body))
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	setupRoot := func(marker string) string {
+		t.Helper()
+		root := t.TempDir()
+		writeMockProvider(t, root)
+		if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte(marker), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return root
+	}
+	first := setupRoot("previous-workspace-guidance-marker")
+	second := setupRoot("current-workspace-guidance-marker")
+	original, err := Setup(Params{Root: first, WorkspaceTrust: "trust"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer original.Store.Close()
+	print := func(string, ...any) {}
+	r := &Runner{App: original, Print: print}
+	r.Handle(context.Background(), "start the earlier task")
+	if r.LastErr != nil || len(requests) != 1 || !strings.Contains(requests[0], "previous-workspace-guidance-marker") {
+		t.Fatalf("trusted original workspace lacked live guidance: calls=%d err=%v", len(requests), r.LastErr)
+	}
+	if err := original.Store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rebound, err := Setup(Params{Root: second, WorkspaceTrust: "trust", Resume: original.Store.ID, RebindSession: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rebound.Store.Close()
+	r = &Runner{App: rebound, Print: print}
+	r.Handle(context.Background(), "continue in the new workspace")
+	if r.LastErr != nil || len(requests) != 2 {
+		t.Fatalf("rebound turn failed: calls=%d err=%v", len(requests), r.LastErr)
+	}
+	if strings.Contains(requests[1], "previous-workspace-guidance-marker") || !strings.Contains(requests[1], "current-workspace-guidance-marker") || !strings.Contains(requests[1], "start the earlier task") {
+		t.Fatal("rebound prompt did not retain task history with only the new workspace guidance")
 	}
 }

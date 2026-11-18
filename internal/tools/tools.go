@@ -26,6 +26,7 @@ import (
 	"unicode/utf8"
 
 	"minimalharness/internal/fileguard"
+	"minimalharness/internal/guidance"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/skills"
 	"minimalharness/internal/toolargs"
@@ -46,8 +47,9 @@ const (
 )
 
 type Executor struct {
-	// UntrustedWorkspace disables discovery of project skill instructions.
+	// UntrustedWorkspace disables discovery of project guidance and skills.
 	UntrustedWorkspace bool
+	Guidance           *guidance.Resolver
 	Root               string
 	editMu             sync.Mutex
 	snapshots          map[string][32]byte
@@ -756,6 +758,8 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 		}
 	}
 	switch name {
+	case GuidanceTool:
+		return e.readGuidance(ctx, argsJSON)
 	case "read":
 		var a ReadArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {

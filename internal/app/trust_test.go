@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -41,7 +42,9 @@ func TestUntrustedWorkspaceCannotOverrideProviderOrApproval(t *testing.T) {
 }
 
 func TestWorkspaceTrustGatesPluginsAndProjectInstructions(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("OPENAI_API_KEY", "fake")
 	t.Setenv("OPENAI_BASE_URL", "")
 	root := t.TempDir()
@@ -69,7 +72,10 @@ func TestWorkspaceTrustGatesPluginsAndProjectInstructions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Store.Close()
-	if a.WorkspaceTrusted || a.Plugins.HasCommand("plan") || strings.Contains(a.Cfg.System, "UNTRUSTED-SYSTEM-MARKER") {
+	hasGuidance := func(app *App) bool {
+		return slices.ContainsFunc(app.Cfg.Tools, func(d llm.ToolDef) bool { return d.Function.Name == tools.GuidanceTool })
+	}
+	if a.WorkspaceTrusted || a.Plugins.HasCommand("plan") || a.Cfg.Exec.GuidanceEnabled() || hasGuidance(a) || strings.Contains(a.Cfg.System, "UNTRUSTED-SYSTEM-MARKER") {
 		t.Fatal("untrusted project code/instructions loaded")
 	}
 	if _, err := a.Cfg.Exec.LoadSkill(tools.LoadSkillArgs{Name: "project_only"}); err == nil {
@@ -80,7 +86,7 @@ func TestWorkspaceTrustGatesPluginsAndProjectInstructions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Store.Close()
-	if !b.WorkspaceTrusted || !b.Plugins.HasCommand("plan") || !strings.Contains(b.Cfg.System, "UNTRUSTED-SYSTEM-MARKER") {
+	if !b.WorkspaceTrusted || !b.Plugins.HasCommand("plan") || !b.Cfg.Exec.GuidanceEnabled() || !hasGuidance(b) || strings.Contains(b.Cfg.System, "UNTRUSTED-SYSTEM-MARKER") {
 		t.Fatal("explicit trust did not enable project")
 	}
 	c, err := Setup(Params{Root: root})
@@ -88,7 +94,7 @@ func TestWorkspaceTrustGatesPluginsAndProjectInstructions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Store.Close()
-	if !c.WorkspaceTrusted || !c.Plugins.HasCommand("plan") {
+	if !c.WorkspaceTrusted || !c.Plugins.HasCommand("plan") || !c.Cfg.Exec.GuidanceEnabled() || !hasGuidance(c) {
 		t.Fatal("saved decision not reused")
 	}
 	d, err := Setup(Params{Root: root, WorkspaceTrust: "untrust"})
@@ -96,7 +102,7 @@ func TestWorkspaceTrustGatesPluginsAndProjectInstructions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Store.Close()
-	if d.WorkspaceTrusted || d.Plugins.HasCommand("plan") {
+	if d.WorkspaceTrusted || d.Plugins.HasCommand("plan") || d.Cfg.Exec.GuidanceEnabled() || hasGuidance(d) {
 		t.Fatal("revoked workspace still enabled")
 	}
 }

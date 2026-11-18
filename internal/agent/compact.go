@@ -264,8 +264,13 @@ func estimatePromptTokens(msgs []llm.Message, defs []llm.ToolDef) int {
 func (c *Config) promptView(msgs []llm.Message) []llm.Message {
 	out := truncateToolResults(session.RepairToolBatches(msgs), toolResultMaxChars)
 	for i := range out {
-		if out[i].Kind == "checkpoint" {
+		switch out[i].Kind {
+		case "checkpoint":
 			out[i].Content = checkpointNotice + out[i].Content
+		case guidanceMessageKind, guidanceChunkKind:
+			if !c.Exec.GuidanceEnabled() {
+				out[i].Content = "[Earlier project guidance is unavailable in this workspace.]"
+			}
 		}
 	}
 	return out
@@ -408,9 +413,13 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 	// and all previous snapshots are already included in this validated state.
 	var summaryHistory []llm.Message
 	for _, m := range history {
-		if m.Kind != "checkpoint" {
-			summaryHistory = append(summaryHistory, m)
+		switch m.Kind {
+		case "checkpoint", guidanceMessageKind:
+			continue // project guidance is refreshed live, never promoted to historical user instructions
+		case guidanceChunkKind:
+			m.Content = "[Earlier project guidance chunk omitted; discover current guidance for the next target.]"
 		}
+		summaryHistory = append(summaryHistory, m)
 	}
 	summaryHistory = append(summaryHistory, facts)
 	var summary string

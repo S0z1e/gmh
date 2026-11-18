@@ -371,7 +371,7 @@ func TestCanonicalScopesRejectAncestorReplacement(t *testing.T) {
 			}
 			var roots *sourceRoots
 			if tc.alreadyOpen {
-				roots, err = openSourceRoots(canonical)
+				roots, err = openSourceRoots(canonical, "")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -389,7 +389,7 @@ func TestCanonicalScopesRejectAncestorReplacement(t *testing.T) {
 				t.Skipf("cannot replace ancestor with symlink: %v", err)
 			}
 			if !tc.alreadyOpen {
-				roots, err = openSourceRoots(canonical)
+				roots, err = openSourceRoots(canonical, "")
 				if err != nil {
 					return
 				}

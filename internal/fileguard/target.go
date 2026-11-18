@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
+	"minimalharness/internal/workspace"
 )
 
 // Target binds a mutation to a parent directory and leaf name, following
@@ -179,6 +180,11 @@ func (t *Target) Close() error {
 	}
 	t.parents = nil
 	return first
+}
+
+// CheckRootFileID compares the pinned mutation root to the trusted workspace.
+func (t *Target) CheckRootFileID(expected string) error {
+	return workspace.CheckRootFileID(t.root, expected)
 }
 
 // Check detects retargeting during approval. Even a swap after Check cannot

@@ -270,7 +270,7 @@ func (c *Config) needsApproval(name, argsJSON string) bool {
 	}
 	// Network and plugin tools can send data or cause side effects.
 	switch name {
-	case "read", "grep", "glob", "load_skill", "ask_user":
+	case "read", "grep", "glob", "load_skill", "ask_user", tools.GuidanceTool:
 		return false
 	}
 	return true
@@ -777,7 +777,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	// doom-loop / blocked guards. A
 	// positive MaxSteps opts into a hard cap with the grace summary.
 	hasCap := steps > 0
+	guidanceState := newGuidanceTurn(c.Exec)
 	msgs := append([]llm.Message{{Role: "system", Content: c.System + verificationInstructions(c.Verification)}}, history...)
+	msgs = retireProjectGuidance(msgs)
 	var total llm.Usage
 	var lastText string
 	// pending background bash jobs, in call order. Their results are
@@ -831,6 +833,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		// in completion order — the model sees results as soon
 		// as they are ready, not only when the turn would end.
 		msgs, pending = c.collectFinishedJobs(msgs, pending)
+		if guidanceState != nil {
+			msgs = guidanceState.refreshRoot(ctx, c, msgs)
+		}
 		if c.persistErr != nil {
 			return lastText, total, c.persistErr
 		}
@@ -858,6 +863,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				return lastText, total, err
 			}
 			msgs = compacted
+			if guidanceState != nil {
+				msgs = guidanceState.afterCompact(ctx, c, msgs)
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
+				}
+			}
 			if c.needsCompact(msgs) {
 				err := fmt.Errorf("context still exceeds the budget after compaction; reduce the task, system prompt or tool definitions, or select a larger context window")
 				c.LastTerminalReason = TerminalError
@@ -1191,6 +1202,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					_ = mutation.Close()
 				}
 			}
+			if mutation != nil && guidanceState != nil {
+				if update, err := guidanceState.forMutation(ctx, mutation); update != nil || err != nil {
+					closeMutation()
+					msgs = c.deferForGuidance(msgs, assistant.ToolCalls[i:], "", update, err)
+					break
+				}
+			}
 			if err := recordInvocation(argsJSON); err != nil {
 				closeMutation()
 				return lastText, total, err
@@ -1272,6 +1290,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
 				return lastText, total, err
 			}
+			if mutation != nil && guidanceState != nil {
+				if update, err := guidanceState.forMutation(ctx, mutation); update != nil || err != nil {
+					closeMutation()
+					msgs = c.deferForGuidance(msgs, assistant.ToolCalls[i:], inv.ID, update, err)
+					break
+				}
+			}
 			toolCtx := tools.WithFailureKey(tools.WithInvocation(ctx, inv.ID, tc.ID), callKey)
 			if mutation != nil {
 				toolCtx = tools.WithMutation(toolCtx, mutation)
@@ -1317,7 +1342,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					res.Status = tools.ResultSuccess
 				}
 			}
-			if c.Exec != nil && c.Exec.Plugins != nil {
+			if tc.Function.Name != tools.GuidanceTool && c.Exec != nil && c.Exec.Plugins != nil {
 				obs = c.Exec.Plugins.RunToolResultHooks(ctx, tc.Function.Name, argsJSON, obs, err)
 			}
 
@@ -1339,7 +1364,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			observation := executionObservation(tc.Function.Name, argsJSON, callKey, res.Text, res.OutputFile, err, job)
 			observation.Answer = humanAnswer
 			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolTruncated: res.Truncated, ToolCountLowerBound: res.CountLowerBound, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
-			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil, Observation: observation})
+			result := llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil, Observation: observation}
+			if tc.Function.Name == tools.GuidanceTool && err == nil {
+				result.Kind = guidanceChunkKind
+			}
+			msgs = append(msgs, result)
 			if c.Session != nil {
 				c.persist(msgs[len(msgs)-1])
 			}

@@ -22,6 +22,23 @@ type Identity struct {
 
 func Identify(path string) (Identity, error) { return identify(path) }
 
+// CheckRootFileID verifies the incarnation of a directory already opened by a caller.
+func CheckRootFileID(root *os.Root, expected string) error {
+	f, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	id, err := DirectoryFileID(f)
+	if err != nil {
+		return err
+	}
+	if id == "" || id != expected {
+		return fmt.Errorf("workspace directory identity changed")
+	}
+	return nil
+}
+
 // Workspace binding paths can preserve some case/Unicode aliases, including UNC volumes.
 // Fold only the lookup key, and always pair it with the directory incarnation:
 // distinct directories on case-sensitive filesystems retain distinct records.
