@@ -302,44 +302,45 @@ func (c *Config) needsCompact(msgs []llm.Message) bool {
 }
 
 type checkpointPreparation struct {
-	tools []llm.ToolDef
-	apply func([]llm.Message) ([]llm.Message, error)
+	guidance *guidanceTurn
+	// The final request is tool-less. Its closing instruction counts
+	// against the prompt budget, but is never saved in the transcript.
+	closing *llm.Message
 }
 
-// The next request may include transient text (such as the grace instruction)
-// that must count against the budget but must not enter the durable checkpoint.
-func (c *Config) prepareNextPrompt(ctx context.Context, defs []llm.ToolDef, g *guidanceTurn, transient ...llm.Message) *checkpointPreparation {
-	if g == nil && len(transient) == 0 {
+func (p *checkpointPreparation) tools(c *Config) []llm.ToolDef {
+	if p != nil && p.closing != nil {
 		return nil
 	}
-	apply := func(candidate []llm.Message) ([]llm.Message, error) {
-		fits := func(msgs []llm.Message) bool {
-			return c.checkpointContextFits(append(msgs[:len(msgs):len(msgs)], transient...), defs)
+	return c.Tools
+}
+
+func (p *checkpointPreparation) apply(ctx context.Context, c *Config, candidate []llm.Message, defs []llm.ToolDef) ([]llm.Message, error) {
+	fits := func(msgs []llm.Message) bool {
+		if p.closing != nil {
+			msgs = append(msgs[:len(msgs):len(msgs)], *p.closing)
 		}
-		if g != nil {
-			candidate = g.prepareCheckpoint(ctx, candidate, fits)
-		}
-		if !fits(candidate) {
-			return nil, fmt.Errorf("preserved checkpoint exceeds context input budget; reduce the task or select a larger context window")
-		}
-		return candidate, nil
+		return c.checkpointContextFits(msgs, defs)
 	}
-	return &checkpointPreparation{tools: defs, apply: apply}
+	if p.guidance != nil {
+		candidate = p.guidance.prepareCheckpoint(ctx, candidate, fits)
+	}
+	if !fits(candidate) {
+		return nil, fmt.Errorf("preserved checkpoint exceeds context input budget; reduce the task or select a larger context window")
+	}
+	return candidate, nil
 }
 
 func (c *Config) compactInLoop(ctx context.Context, msgs []llm.Message, prepare *checkpointPreparation) ([]llm.Message, llm.Usage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, llm.Usage{}, err
 	}
-	defs := c.Tools
-	if prepare != nil {
-		defs = prepare.tools
-	}
+	defs := prepare.tools(c)
 	if pruned, ok := c.pruneCheckpoint(msgs, defs); ok {
 		if prepare == nil {
 			return c.commitCheckpointNamed(pruned, llm.Usage{}, "", defs)
 		}
-		prepared, err := prepare.apply(pruned)
+		prepared, err := prepare.apply(ctx, c, pruned, defs)
 		if err := ctx.Err(); err != nil {
 			return nil, llm.Usage{}, err
 		}
@@ -531,10 +532,11 @@ func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message
 	// next request in this turn needs the retained task's bytes too.
 	session.HydrateImages(replacement)
 	candidate := append(system, replacement...)
-	defs := c.Tools
+	// The summary callback may update the normal request's tools, so
+	// read the definitions only after it has returned.
+	defs := prepare.tools(c)
 	if prepare != nil {
-		defs = prepare.tools
-		candidate, err = prepare.apply(candidate)
+		candidate, err = prepare.apply(ctx, c, candidate, defs)
 		if cancelled := ctx.Err(); cancelled != nil {
 			return nil, usage, cancelled
 		}

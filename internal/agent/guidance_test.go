@@ -603,7 +603,7 @@ func TestCompactionCanPruneAfterRetiringEarlierGuidance(t *testing.T) {
 	if !cfg.needsCompact(visible) {
 		t.Fatal("fixture does not reach the compaction budget")
 	}
-	out, _, err := cfg.compactInLoop(ctx, visible, cfg.prepareNextPrompt(ctx, cfg.Tools, g))
+	out, _, err := cfg.compactInLoop(ctx, visible, &checkpointPreparation{guidance: g})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -616,5 +616,42 @@ func TestCompactionCanPruneAfterRetiringEarlierGuidance(t *testing.T) {
 	}
 	if !pruned {
 		t.Fatal("expected raw checkpoint to prune earlier tool results")
+	}
+}
+
+func TestGuidanceCheckpointRechecksToolsChangedBySummary(t *testing.T) {
+	cfg := guidanceFixture(t)
+	root := cfg.Exec.Root
+	putGuidanceFixture(t, root, "AGENTS.md", "current project instructions")
+	store, err := session.Open("changed-checkpoint-tools", session.OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg.Session = store
+	cfg.ContextLimit = 8000
+	task := llm.Message{Role: "user", Kind: "task", Content: "preserve this task"}
+	if err := store.Append(task); err != nil {
+		t.Fatal(err)
+	}
+	cfg.CompactHistory = func(_ context.Context, _ []llm.Message) (string, llm.Usage, error) {
+		cfg.Tools = append(cfg.Tools, llm.Tool("new_schema", strings.Repeat("d", 16000), `{"type":"object"}`))
+		return "The tool list changed while preparing the checkpoint.", llm.Usage{}, nil
+	}
+	commits := 0
+	cfg.OnCompact = func([]llm.Message, llm.Usage, string) { commits++ }
+	ctx := context.Background()
+	g := newGuidanceTurn(cfg.Exec)
+	_, _, err = cfg.compactInLoop(ctx, []llm.Message{task}, &checkpointPreparation{guidance: g})
+	if err == nil || !strings.Contains(err.Error(), "context input budget") {
+		t.Errorf("expected expanded schemas to exceed the current prompt budget, got %v", err)
+	}
+	saved, err := session.Load(store.ID)
+	if err != nil || commits != 0 || len(saved) != 1 || saved[0].Content != task.Content {
+		t.Fatalf("budget rejection did not preserve history: commits=%d saved=%+v err=%v", commits, saved, err)
+	}
+	archives, err := filepath.Glob(filepath.Join(session.Dir(), store.ID+"-pre-compact-*.jsonl"))
+	if err != nil || len(archives) != 0 {
+		t.Fatalf("archive created before checkpoint preflight: %v, %v", archives, err)
 	}
 }
