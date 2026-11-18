@@ -130,6 +130,8 @@
   needed, `git_status` reads it on demand in trusted workspaces. It requires
   approval in suggest mode and whenever the Bash sandbox is enabled, since a
   linked worktree may keep its Git metadata outside that sandbox.
+  The result covers the selected working tree, without running Git filters,
+  inspecting submodule working trees or reporting upstream tracking status.
 - Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`. A session has
   one transcript writer across processes; opening, renaming or deleting another
   process's active session fails immediately. Closing or crashing releases the
