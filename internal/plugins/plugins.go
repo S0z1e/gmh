@@ -69,7 +69,7 @@ const (
 // register one, or the model could not tell whose tool it called.
 var builtinTools = map[string]bool{
 	"read": true, "write": true, "edit": true, "bash": true,
-	"grep": true, "glob": true, "load_skill": true, "webfetch": true, "read_guidance": true,
+	"grep": true, "glob": true, "load_skill": true, "webfetch": true, "read_guidance": true, "git_status": true,
 }
 
 var validToolName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)

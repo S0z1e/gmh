@@ -186,7 +186,7 @@ func (c *Config) progressSuccess(key, tool string) {
 		return
 	}
 	switch tool {
-	case "read", "glob", "grep", "load_skill", "webfetch", "ask_user", tools.GuidanceTool:
+	case "read", "glob", "grep", "load_skill", "webfetch", "ask_user", tools.GuidanceTool, tools.GitStatusTool:
 		return
 	}
 	observed := p.observed

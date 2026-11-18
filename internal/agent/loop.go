@@ -257,6 +257,9 @@ func (c *Config) askUser(ctx context.Context, argsJSON string) (string, *string,
 }
 
 func (c *Config) needsApproval(name, argsJSON string) bool {
+	if name == tools.GitStatusTool && c.Exec != nil && c.Exec.Sandbox {
+		return true // linked metadata may be outside the shell sandbox
+	}
 	if name == "write" || name == "edit" {
 		var target struct {
 			Path string `json:"path"`

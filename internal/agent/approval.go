@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"fmt"
+
+	"minimalharness/internal/tools"
 )
 
 // ApprovalRequest carries the exact invocation the user is approving. Renderers
@@ -19,6 +21,9 @@ type ApprovalRequest struct {
 
 func (r ApprovalRequest) Prompt() string {
 	prompt := fmt.Sprintf("Run %s %s?", r.ToolName, r.Arguments)
+	if r.ToolName == tools.GitStatusTool {
+		prompt += "\nRead Git status on the host, including linked worktree metadata if needed."
+	}
 	if r.TargetPath != "" {
 		prompt += "\nResolved file target: " + r.TargetPath
 	}

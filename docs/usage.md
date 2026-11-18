@@ -127,8 +127,9 @@
   request the rest with `read_guidance`. If the applicable instructions
   change before a write or edit, the harness asks the model to reconsider
   the operation before executing it. If branch or working tree status is
-  needed, the model requests current Git status through Bash under the
-  normal tool approval rules.
+  needed, `git_status` reads it on demand in trusted workspaces. It requires
+  approval in suggest mode and whenever the Bash sandbox is enabled, since a
+  linked worktree may keep its Git metadata outside that sandbox.
 - Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`. A session has
   one transcript writer across processes; opening, renaming or deleting another
   process's active session fails immediately. Closing or crashing releases the

@@ -760,6 +760,8 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 		}
 	}
 	switch name {
+	case GitStatusTool:
+		return e.gitStatus(ctx)
 	case GuidanceTool:
 		return e.readGuidance(ctx, argsJSON)
 	case "read":

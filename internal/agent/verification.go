@@ -90,7 +90,7 @@ func (c *Config) verificationStart(ctx context.Context, name, args string) *veri
 	}
 	c.verificationTouch(ctx)
 	switch name {
-	case "read", "grep", "glob", "load_skill", "ask_user", "webfetch", tools.GuidanceTool:
+	case "read", "grep", "glob", "load_skill", "ask_user", "webfetch", tools.GuidanceTool, tools.GitStatusTool:
 	default:
 		v.mutationAttempted = true
 	}

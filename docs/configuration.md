@@ -19,7 +19,7 @@ global and explicit configuration still work there. Older trust-record formats
 require a new explicit decision.
 
 Untrusted workspaces use global configuration; project config, plugins,
-project instructions and project skills are disabled.
+project instructions, project skills and `git_status` are disabled.
 Explicit CLI flags and `--config <path>` remain direct user choices; an
 explicit config does not enable project plugins. Trust takes effect on the
 next process start. It allows project configuration and executable plugins;

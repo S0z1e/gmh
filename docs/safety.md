@@ -44,6 +44,9 @@ What is enforced:
   cannot create a sandbox here (unprivileged user namespaces
   disabled). read/write/edit run in-process and are jailed by the
   harness itself, not by bwrap.
+  The fixed `git_status` lookup in a trusted workspace also runs on the host
+  so linked worktrees can read their Git metadata. It always asks for approval
+  when the Bash sandbox is enabled and takes no caller-supplied arguments.
 
 What is NOT promised (residual risk — run on disposable copies or in
 a container):

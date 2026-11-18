@@ -390,7 +390,9 @@ func Setup(p Params) (*App, error) {
 	a.toolMode = agent.ToolModeDefault
 	a.allTools = append(agent.ToolDefs(), pluginTools...)
 	if !trusted {
-		a.allTools = slices.DeleteFunc(a.allTools, func(d llm.ToolDef) bool { return d.Function.Name == tools.GuidanceTool })
+		a.allTools = slices.DeleteFunc(a.allTools, func(d llm.ToolDef) bool {
+			return d.Function.Name == tools.GuidanceTool || d.Function.Name == tools.GitStatusTool
+		})
 	}
 	timeout, idle := clientTimeouts(mdl)
 	a.Cfg = &agent.Config{
