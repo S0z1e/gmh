@@ -67,7 +67,24 @@ func contained(base, path string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func directories(handle *os.Root, root, target, home string) ([]string, string, error) {
+func ancestorDirectories(root string) []string {
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		home, _ = canonicalRoot(home)
+	}
+	var dirs []string
+	for at := root; len(dirs) < MaxAncestorLevels; at = filepath.Dir(at) {
+		dirs = append(dirs, at)
+		parent := filepath.Dir(at)
+		if parent == at || home == "" || !contained(home, parent) {
+			break
+		}
+	}
+	slices.Reverse(dirs)
+	return dirs
+}
+
+func directories(handle *os.Root, root, target string, ancestors []string) ([]string, string, error) {
 	dir := root
 	resolved := root
 	if target != "" && target != "." {
@@ -79,16 +96,6 @@ func directories(handle *os.Root, root, target, home string) ([]string, string, 
 		binding.Close()
 		dir = filepath.Dir(resolved)
 	}
-	var ancestors []string
-	for parent, level := root, 0; level < MaxAncestorLevels; level++ {
-		ancestors = append(ancestors, parent)
-		next := filepath.Dir(parent)
-		if next == parent || home == "" || !contained(home, next) {
-			break
-		}
-		parent = next
-	}
-	slices.Reverse(ancestors)
 	var descendants []string
 	for at := dir; at != root; at = filepath.Dir(at) {
 		if !contained(root, at) {
@@ -100,7 +107,7 @@ func directories(handle *os.Root, root, target, home string) ([]string, string, 
 		}
 	}
 	slices.Reverse(descendants)
-	return append(ancestors, descendants...), resolved, nil
+	return slices.Concat(ancestors, descendants), resolved, nil
 }
 
 // Resolve loads bounded regular files, follows the effective target's in-root
@@ -112,6 +119,11 @@ func Resolve(ctx context.Context, root, target string) (Snapshot, error) {
 	}
 	if !utf8.ValidString(root) || !utf8.ValidString(target) {
 		return Snapshot{}, fmt.Errorf("guidance paths must be valid UTF-8")
+	}
+	// Match fileguard.Root, which normalizes the requested path before
+	// expanding symlinks for write and edit.
+	if target != "" {
+		target = filepath.Clean(target)
 	}
 	requestedRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -141,7 +153,7 @@ func Resolve(ctx context.Context, root, target string) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	defer roots.close()
-	dirs, resolved, err := directories(roots.workspace, root, target, roots.homePath)
+	dirs, resolved, err := directories(roots.workspace, root, target, roots.ancestors)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -167,7 +179,7 @@ func Resolve(ctx context.Context, root, target string) (Snapshot, error) {
 	if err := roots.check(); err != nil {
 		return Snapshot{}, err
 	}
-	_, currentTarget, err := directories(roots.workspace, root, target, roots.homePath)
+	_, currentTarget, err := directories(roots.workspace, root, target, roots.ancestors)
 	if err != nil || currentTarget != resolved {
 		return Snapshot{}, fmt.Errorf("guidance target changed during discovery")
 	}
@@ -194,9 +206,10 @@ func Resolve(ctx context.Context, root, target string) (Snapshot, error) {
 var errSourceAbsent = errors.New("instruction source absent")
 
 type sourceRoots struct {
-	workspace, home         *os.Root
-	workspacePath, homePath string
-	workspaceInfo, homeInfo os.FileInfo
+	workspace, outer         *os.Root
+	workspacePath, outerPath string
+	workspaceInfo, outerInfo os.FileInfo
+	ancestors                []string
 }
 
 func openSourceRoots(root string) (*sourceRoots, error) {
@@ -211,30 +224,28 @@ func openSourceRoots(root string) (*sourceRoots, error) {
 		out.close()
 		return nil, err
 	}
-	home, _ := os.UserHomeDir()
-	if home != "" {
-		if canonical, err := canonicalRoot(home); err == nil && contained(canonical, root) {
-			out.homePath = canonical
-			if canonical != root {
-				out.home, err = os.OpenRoot(canonical)
-				if err != nil {
-					out.close()
-					return nil, err
-				}
-				out.homeInfo, err = out.home.Stat(".")
-				if err != nil {
-					out.close()
-					return nil, err
-				}
-			}
+	out.ancestors = ancestorDirectories(root)
+	out.outerPath = out.ancestors[0]
+	if out.outerPath != root {
+		// Pin the furthest applicable directory. HOME can be above the
+		// ancestor limit, in which case it only needs to be traversable.
+		out.outer, err = os.OpenRoot(out.outerPath)
+		if err != nil {
+			out.close()
+			return nil, err
+		}
+		out.outerInfo, err = out.outer.Stat(".")
+		if err != nil {
+			out.close()
+			return nil, err
 		}
 	}
 	return out, nil
 }
 
 func (r *sourceRoots) close() {
-	if r.home != nil {
-		r.home.Close()
+	if r.outer != nil {
+		r.outer.Close()
 	}
 	if r.workspace != nil {
 		r.workspace.Close()
@@ -245,7 +256,7 @@ func (r *sourceRoots) check() error {
 	for _, entry := range []struct {
 		path string
 		info os.FileInfo
-	}{{r.workspacePath, r.workspaceInfo}, {r.homePath, r.homeInfo}} {
+	}{{r.workspacePath, r.workspaceInfo}, {r.outerPath, r.outerInfo}} {
 		if entry.info == nil {
 			continue
 		}
@@ -263,7 +274,7 @@ func (r *sourceRoots) check() error {
 func (r *sourceRoots) read(ctx context.Context, dir, name string) ([]byte, error) {
 	base, handle := r.workspacePath, r.workspace
 	if !contained(base, dir) {
-		base, handle = r.homePath, r.home
+		base, handle = r.outerPath, r.outer
 		if handle == nil || !contained(base, dir) {
 			return nil, fmt.Errorf("instruction scope outside allowed roots")
 		}

@@ -11,5 +11,5 @@ func changeTime(_ *os.File, info os.FileInfo) (int64, error) {
 	if !ok {
 		return 0, fmt.Errorf("instruction source change time unavailable")
 	}
-	return st.Ctim.Sec*1e9 + st.Ctim.Nsec, nil
+	return st.Ctim.Nano(), nil
 }

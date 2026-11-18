@@ -295,3 +295,29 @@ func TestInvalidPathBytesCannotAliasManifestIdentity(t *testing.T) {
 		t.Fatal("non-UTF8 source identity accepted")
 	}
 }
+
+func TestRelativeTargetUsesMutationPathNormalization(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	put(t, filepath.Join(root, "AGENTS.md"), "root rules")
+	put(t, filepath.Join(root, "pkg", "AGENTS.md"), "nested rules")
+	if err := os.Mkdir(filepath.Join(root, "pkg", "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("pkg", "sub"), filepath.Join(root, "alias")); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+	sep := string(filepath.Separator)
+	rel := "alias" + sep + ".." + sep + "new.go"
+	relative, err := Resolve(context.Background(), root, rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	absolute, err := Resolve(context.Background(), root, root+sep+rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if relative.SHA256 != absolute.SHA256 || len(relative.Files) != 1 || relative.Files[0].Prefix != "root rules" {
+		t.Fatalf("relative target scope = %s, want %s with just root rules", relative.Target, absolute.Target)
+	}
+}

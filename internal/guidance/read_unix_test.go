@@ -68,3 +68,39 @@ func TestInstructionSymlinkReplacementDuringReadIsRejected(t *testing.T) {
 		t.Fatal("source symlink changed while descriptor stayed unchanged")
 	}
 }
+
+func TestAncestorLimitDoesNotRequireReadableHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	outer := filepath.Join(home, "outermost-scope")
+	root := outer
+	for i := 1; i < MaxAncestorLevels; i++ {
+		root = filepath.Join(root, "nested")
+	}
+	put(t, filepath.Join(root, "AGENTS.md"), "workspace rules")
+	put(t, filepath.Join(outer, "AGENTS.md"), "outermost rules")
+	put(t, filepath.Join(home, "AGENTS.md"), "outside ancestor limit")
+	if err := os.Chmod(home, 0100); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(home, 0700); err != nil {
+			t.Error(err)
+		}
+	})
+	if handle, err := os.OpenRoot(home); err == nil {
+		handle.Close()
+		t.Skip("filesystem permits opening a searchable directory without read permission")
+	} else if !os.IsPermission(err) {
+		t.Fatal(err)
+	}
+	snapshot, err := Resolve(context.Background(), root, "new.go")
+	if err != nil || len(snapshot.Files) != 2 || snapshot.Files[0].Prefix != "outermost rules" || snapshot.Files[1].Prefix != "workspace rules" {
+		t.Fatalf("resolve readable scopes under traversal-only HOME: %+v, %v", snapshot, err)
+	}
+	source := snapshot.Files[0]
+	chunk, err := Read(context.Background(), root, snapshot.Target, source.Path, source.SHA256, 0, 128)
+	if err != nil || chunk.Text != "outermost rules" {
+		t.Fatalf("read applicable source: %+v, %v", chunk, err)
+	}
+}
