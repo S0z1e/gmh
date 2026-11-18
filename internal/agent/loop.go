@@ -849,7 +849,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		// Rendering uses a fixed per-result cap. Old content changes only
 		// at a persisted checkpoint when the context budget is reached.
 		if c.ContextLimit > 0 && c.needsCompact(msgs) {
-			compacted, usage, err := c.compactInLoop(ctx, msgs, c.prepareNextPrompt(ctx, guidanceState))
+			compacted, usage, err := c.compactInLoop(ctx, msgs, c.prepareNextPrompt(ctx, c.Tools, guidanceState))
 			total.Add(usage)
 			c.emit(Event{Kind: EventStepUsage, Usage: usage})
 			if err != nil {
@@ -1462,15 +1462,15 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	instructionMsg := llm.Message{Role: "user", Content: instruction}
 	graceMsgs := append(msgs[:len(msgs):len(msgs)], instructionMsg)
 	var total llm.Usage
-	if c.ContextLimit > 0 && c.needsCompact(graceMsgs) {
-		compacted, u, err := c.compactInLoop(graceCtx, msgs, c.prepareNextPrompt(graceCtx, guidanceState, instructionMsg))
+	if c.ContextLimit > 0 && c.contextTokens(c.promptView(graceMsgs), nil) >= c.contextBudget() {
+		compacted, u, err := c.compactInLoop(graceCtx, msgs, c.prepareNextPrompt(graceCtx, nil, guidanceState, instructionMsg))
 		total.Add(u)
 		c.emit(Event{Kind: EventStepUsage, Usage: u})
 		if err != nil {
 			return "", total, false
 		}
 		graceMsgs = append(compacted, instructionMsg)
-		if c.needsCompact(graceMsgs) {
+		if !c.checkpointContextFits(graceMsgs, nil) {
 			return "", total, false
 		}
 	}

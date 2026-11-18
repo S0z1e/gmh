@@ -264,7 +264,7 @@ func TestPruneCheckpointRetainsFailedOutput(t *testing.T) {
 	}
 	history[2].ToolError = true
 	cfg := &Config{ContextLimit: 40000}
-	out, ok := cfg.pruneCheckpoint(history)
+	out, ok := cfg.pruneCheckpoint(history, cfg.Tools)
 	if !ok || out[2].Content != history[2].Content || !out[2].ToolError {
 		t.Fatal("pruning discarded unresolved failed observation")
 	}
@@ -313,7 +313,7 @@ func TestPruneCheckpointRetainsUserAnswer(t *testing.T) {
 	}
 	history[1].ToolCalls[0].Function.Name = "ask_user"
 	cfg := &Config{ContextLimit: 40000}
-	out, ok := cfg.pruneCheckpoint(history)
+	out, ok := cfg.pruneCheckpoint(history, cfg.Tools)
 	if !ok || out[2].Content != history[2].Content {
 		t.Fatal("pruning discarded a user answer")
 	}

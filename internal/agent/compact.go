@@ -288,8 +288,8 @@ func (c *Config) contextBudget() int {
 
 // contextTokens combines measured usage with estimated changes since the last
 // request. It also accounts for removed content when evaluating a checkpoint.
-func (c *Config) contextTokens(view []llm.Message) int {
-	estimated := estimatePromptTokens(view, c.Tools)
+func (c *Config) contextTokens(view []llm.Message, defs []llm.ToolDef) int {
+	estimated := estimatePromptTokens(view, defs)
 	projected := c.LastPromptTokens
 	if c.lastPromptEstimate > 0 {
 		projected += estimated - c.lastPromptEstimate
@@ -298,20 +298,23 @@ func (c *Config) contextTokens(view []llm.Message) int {
 }
 
 func (c *Config) needsCompact(msgs []llm.Message) bool {
-	return c.contextTokens(c.promptView(msgs)) >= c.contextBudget()
+	return c.contextTokens(c.promptView(msgs), c.Tools) >= c.contextBudget()
 }
 
-type checkpointPreparation func([]llm.Message) ([]llm.Message, error)
+type checkpointPreparation struct {
+	tools []llm.ToolDef
+	apply func([]llm.Message) ([]llm.Message, error)
+}
 
 // The next request may include transient text (such as the grace instruction)
 // that must count against the budget but must not enter the durable checkpoint.
-func (c *Config) prepareNextPrompt(ctx context.Context, g *guidanceTurn, transient ...llm.Message) checkpointPreparation {
+func (c *Config) prepareNextPrompt(ctx context.Context, defs []llm.ToolDef, g *guidanceTurn, transient ...llm.Message) *checkpointPreparation {
 	if g == nil && len(transient) == 0 {
 		return nil
 	}
-	return func(candidate []llm.Message) ([]llm.Message, error) {
+	apply := func(candidate []llm.Message) ([]llm.Message, error) {
 		fits := func(msgs []llm.Message) bool {
-			return c.checkpointContextFits(append(msgs[:len(msgs):len(msgs)], transient...))
+			return c.checkpointContextFits(append(msgs[:len(msgs):len(msgs)], transient...), defs)
 		}
 		if g != nil {
 			candidate = g.prepareCheckpoint(ctx, candidate, fits)
@@ -321,22 +324,27 @@ func (c *Config) prepareNextPrompt(ctx context.Context, g *guidanceTurn, transie
 		}
 		return candidate, nil
 	}
+	return &checkpointPreparation{tools: defs, apply: apply}
 }
 
-func (c *Config) compactInLoop(ctx context.Context, msgs []llm.Message, prepare checkpointPreparation) ([]llm.Message, llm.Usage, error) {
+func (c *Config) compactInLoop(ctx context.Context, msgs []llm.Message, prepare *checkpointPreparation) ([]llm.Message, llm.Usage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, llm.Usage{}, err
 	}
-	if pruned, ok := c.pruneCheckpoint(msgs); ok {
+	defs := c.Tools
+	if prepare != nil {
+		defs = prepare.tools
+	}
+	if pruned, ok := c.pruneCheckpoint(msgs, defs); ok {
 		if prepare == nil {
-			return c.commitCheckpoint(pruned, llm.Usage{})
+			return c.commitCheckpointNamed(pruned, llm.Usage{}, "", defs)
 		}
-		prepared, err := prepare(pruned)
+		prepared, err := prepare.apply(pruned)
 		if err := ctx.Err(); err != nil {
 			return nil, llm.Usage{}, err
 		}
 		if err == nil {
-			return c.commitCheckpoint(prepared, llm.Usage{})
+			return c.commitCheckpointNamed(prepared, llm.Usage{}, "", defs)
 		}
 	}
 	return c.compactMessagesPrepared(ctx, msgs, true, prepare)
@@ -346,7 +354,7 @@ func (c *Config) compactInLoop(ctx context.Context, msgs []llm.Message, prepare 
 // while rendering a normal request. Keep the latest tool batch intact and
 // reclaim enough space for a substantial append-only interval (60% of the
 // trigger budget). If old tool outputs cannot do that, generate a summary.
-func (c *Config) pruneCheckpoint(msgs []llm.Message) ([]llm.Message, bool) {
+func (c *Config) pruneCheckpoint(msgs []llm.Message, defs []llm.ToolDef) ([]llm.Message, bool) {
 	base := session.RepairToolBatches(msgs)
 	if c.Session != nil {
 		// A context hook may supply a transient rewrite. Persisting that
@@ -362,14 +370,15 @@ func (c *Config) pruneCheckpoint(msgs []llm.Message) ([]llm.Message, bool) {
 		if err != nil {
 			return nil, false
 		}
-		// Compare persisted fields: hydrated image bytes deliberately stay
-		// in memory and must not make an otherwise identical history differ.
-		history, err = session.ImageReferences(history)
+		// Ignore only the harness's own view changes. Guidance is rebuilt
+		// separately, and hydrated image bytes are not persisted. Other
+		// differences can be transient context hook edits.
+		history, err = session.ImageReferences(WithoutHistoricalGuidance(history))
 		if err != nil {
 			return nil, false
 		}
 		currentJSON, currentErr := json.Marshal(history)
-		savedJSON, savedErr := json.Marshal(saved)
+		savedJSON, savedErr := json.Marshal(WithoutHistoricalGuidance(saved))
 		if currentErr != nil || savedErr != nil || !bytes.Equal(currentJSON, savedJSON) {
 			return nil, false
 		}
@@ -397,7 +406,7 @@ func (c *Config) pruneCheckpoint(msgs []llm.Message) ([]llm.Message, bool) {
 		}
 		view[i].Content = prunedToolResultPlaceholder
 		out[i].Content = prunedToolResultPlaceholder
-		if c.contextTokens(view) <= target {
+		if c.contextTokens(view, defs) <= target {
 			if c.Session != nil && !session.CheckpointFits(out) {
 				return nil, false
 			}
@@ -417,7 +426,7 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 	return c.compactMessagesPrepared(ctx, msgs, keepTask, nil)
 }
 
-func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message, keepTask bool, prepare checkpointPreparation) ([]llm.Message, llm.Usage, error) {
+func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message, keepTask bool, prepare *checkpointPreparation) ([]llm.Message, llm.Usage, error) {
 	var system, history []llm.Message
 	for _, m := range msgs {
 		if m.Role == "system" {
@@ -522,8 +531,10 @@ func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message
 	// next request in this turn needs the retained task's bytes too.
 	session.HydrateImages(replacement)
 	candidate := append(system, replacement...)
+	defs := c.Tools
 	if prepare != nil {
-		candidate, err = prepare(candidate)
+		defs = prepare.tools
+		candidate, err = prepare.apply(candidate)
 		if cancelled := ctx.Err(); cancelled != nil {
 			return nil, usage, cancelled
 		}
@@ -531,10 +542,10 @@ func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message
 			return nil, usage, err
 		}
 	}
-	return c.commitCheckpointNamed(candidate, usage, archiveName)
+	return c.commitCheckpointNamed(candidate, usage, archiveName, defs)
 }
 
-func (c *Config) checkpointContextFits(msgs []llm.Message) bool {
+func (c *Config) checkpointContextFits(msgs []llm.Message, defs []llm.ToolDef) bool {
 	if c.ContextLimit <= 0 {
 		return true
 	}
@@ -542,16 +553,12 @@ func (c *Config) checkpointContextFits(msgs []llm.Message) bool {
 	if !slices.ContainsFunc(msgs, func(m llm.Message) bool { return m.Role == "system" }) {
 		request = append([]llm.Message{{Role: "system", Content: c.System + verificationInstructions(c.Verification)}}, msgs...)
 	}
-	return estimatePromptTokens(c.promptView(request), c.Tools) < c.contextBudget()
+	return estimatePromptTokens(c.promptView(request), defs) < c.contextBudget()
 }
 
-// commitCheckpoint persists both pruning and summaries through the same atomic
-// session marker. Resume therefore keeps exactly the view sent after a rewrite.
-func (c *Config) commitCheckpoint(msgs []llm.Message, usage llm.Usage) ([]llm.Message, llm.Usage, error) {
-	return c.commitCheckpointNamed(msgs, usage, "")
-}
-
-func (c *Config) commitCheckpointNamed(msgs []llm.Message, usage llm.Usage, archiveName string) ([]llm.Message, llm.Usage, error) {
+// commitCheckpointNamed validates before writing either the archive or the
+// durable session marker. Transient request instructions were checked separately.
+func (c *Config) commitCheckpointNamed(msgs []llm.Message, usage llm.Usage, archiveName string, defs []llm.ToolDef) ([]llm.Message, llm.Usage, error) {
 	var system, replacement []llm.Message
 	for _, m := range msgs {
 		if m.Role == "system" {
@@ -560,7 +567,7 @@ func (c *Config) commitCheckpointNamed(msgs []llm.Message, usage llm.Usage, arch
 			replacement = append(replacement, m)
 		}
 	}
-	if !c.checkpointContextFits(msgs) {
+	if !c.checkpointContextFits(msgs, defs) {
 		return nil, usage, fmt.Errorf("preserved checkpoint exceeds context input budget; reduce the task or select a larger context window")
 	}
 	if c.Session != nil && !session.CheckpointFits(replacement) {

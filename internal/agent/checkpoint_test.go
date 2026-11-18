@@ -126,7 +126,7 @@ func TestPruneCheckpointDoesNotPersistTransientContext(t *testing.T) {
 	}
 	msgs = append(msgs, llm.Message{Role: "user", Content: "transient context hook instruction"})
 	cfg := &Config{Session: store, ContextLimit: 40000}
-	if _, ok := cfg.pruneCheckpoint(msgs); ok {
+	if _, ok := cfg.pruneCheckpoint(msgs, cfg.Tools); ok {
 		t.Fatal("transient context must not be committed as raw history")
 	}
 	saved, err := session.Load(store.ID)
@@ -184,7 +184,7 @@ func TestPruneCheckpointAcceptsHydratedImages(t *testing.T) {
 		}
 	}
 	cfg := &Config{Session: store, ContextLimit: 40000}
-	out, ok := cfg.pruneCheckpoint(msgs)
+	out, ok := cfg.pruneCheckpoint(msgs, cfg.Tools)
 	if !ok || out[0].Images[0].Data != msgs[0].Images[0].Data {
 		t.Fatal("hydrated image blocked pruning or lost its data")
 	}
@@ -375,7 +375,9 @@ func TestBlockedGraceCheckpointIncludesDrainedJob(t *testing.T) {
 			b, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"tool_calls": []any{map[string]any{"index": 0, "id": msg.ToolCalls[0].ID, "function": msg.ToolCalls[0].Function}}}}}})
 			prompt := 10
 			if calls == 3 {
-				prompt = 6900
+				// Leave 100 tokens before the tool-less prompt hits its
+				// trigger; the drained job and closing instruction exceed it.
+				prompt = 6900 + estimatePromptTokens(nil, cfg.Tools) - estimatePromptTokens(nil, nil)
 			}
 			return fmt.Sprintf("data: %s\n\ndata: {\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n", b, prompt)
 		}()

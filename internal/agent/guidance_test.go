@@ -485,7 +485,7 @@ func TestCompactionFitsScopedGuidanceBeforeWritingCheckpoint(t *testing.T) {
 	commits := 0
 	cfg.OnCompact = func(history []llm.Message, _ llm.Usage, archive string) {
 		commits++
-		if archive == "" || !cfg.checkpointContextFits(history) {
+		if archive == "" || !cfg.checkpointContextFits(history, cfg.Tools) {
 			t.Error("checkpoint omitted the complete next prompt budget or archive")
 		}
 		var paths int
@@ -510,5 +510,111 @@ func TestCompactionFitsScopedGuidanceBeforeWritingCheckpoint(t *testing.T) {
 	}
 	if data, err := os.ReadFile(filepath.Join(root, "pkg/deep/new.go")); err != nil || string(data) != "after shortened preview" {
 		t.Fatalf("write after compacted guidance = %q, %v", data, err)
+	}
+}
+
+func TestGuidanceAnnouncesNestedRemovalAfterRootRefresh(t *testing.T) {
+	cfg := guidanceFixture(t)
+	root := cfg.Exec.Root
+	putGuidanceFixture(t, root, "AGENTS.md", "old-root-rule")
+	nested := putGuidanceFixture(t, root, "pkg/AGENTS.md", "nested-rule-that-must-be-cleared")
+	cfg.OnEvent = func(e Event) {
+		if e.Kind == EventToolEnd && e.ToolCallID == "first" {
+			putGuidanceFixture(t, root, "AGENTS.md", "new-root-rule")
+			if err := os.Remove(nested); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	write := func(id string) string {
+		args, _ := json.Marshal(map[string]string{"path": "pkg/new.go", "content": id})
+		return toolCallSSE(id, "write", string(args))
+	}
+	_, requests, err := runVerification(t, cfg, write("first"), write("stale"), write("updated"))
+	if err != nil || len(requests) != 4 {
+		t.Fatalf("requests=%d err=%v", len(requests), err)
+	}
+	index := strings.LastIndex(requests[2], "[harness project guidance")
+	if index < 0 || !strings.Contains(requests[2][index:], "new-root-rule") || strings.Contains(requests[2][index:], "nested-rule-that-must-be-cleared") {
+		t.Fatal("previous nested guidance was not superseded for the mutation directory")
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "pkg/new.go")); err != nil || string(got) != "updated" {
+		t.Fatalf("write reused withdrawn nested instructions: got %q, err %v", got, err)
+	}
+}
+
+func TestGuidanceGraceCheckpointUsesToollessRequestBudget(t *testing.T) {
+	cfg := guidanceFixture(t)
+	cfg.MaxSteps = 1
+	cfg.ContextLimit = 60000
+	cfg.Tools = append(cfg.Tools, llm.Tool("large_schema", strings.Repeat("d", 12000), `{"type":"object"}`))
+	const marker = "last-bytes-of-unread-chunk"
+	putGuidanceFixture(t, cfg.Exec.Root, "AGENTS.md", strings.Repeat("p", guidance.PrefixBytes)+strings.Repeat("b", guidance.PrefixBytes-len(marker))+marker)
+	cursor := guidanceCursorFixture(t, cfg)
+	cfg.CompactHistory = func(_ context.Context, _ []llm.Message) (string, llm.Usage, error) {
+		return "The model requested a project source continuation.", llm.Usage{}, nil
+	}
+	cfg.OnEvent = func(e Event) {
+		if e.Kind == EventToolEnd && e.ToolCallID == "read" && e.ToolErr == nil {
+			cfg.ContextLimit = 5800
+		}
+	}
+	read := guidanceReadCall(t, "read", cursor, guidance.PrefixBytes)
+	_, requests, err := runVerification(t, cfg, budgetSSE("", []llm.ToolCall{read}, nil, true))
+	if err == nil || cfg.LastTerminalReason != TerminalMaxTurns || len(requests) != 2 {
+		t.Fatalf("tool-less grace did not run after compaction: requests=%d reason=%q err=%v", len(requests), cfg.LastTerminalReason, err)
+	}
+	if !strings.Contains(requests[1], marker) || strings.Contains(requests[1], `"tools"`) {
+		t.Fatal("grace did not include the complete unread chunk in its tool-less request")
+	}
+}
+
+func TestCompactionCanPruneAfterRetiringEarlierGuidance(t *testing.T) {
+	cfg := guidanceFixture(t)
+	root := cfg.Exec.Root
+	putGuidanceFixture(t, root, "AGENTS.md", "current-root-instructions")
+	store, err := session.Open("prune-guidance", session.OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg.Session = store
+	cfg.ContextLimit = 40000
+	cfg.CompactHistory = func(_ context.Context, _ []llm.Message) (string, llm.Usage, error) {
+		t.Error("transcript differing only by archived guidance should not request a summary")
+		return "unnecessary summary", llm.Usage{}, nil
+	}
+	history := []llm.Message{
+		{Role: "user", Kind: "task", Content: "old task"},
+		{Role: "user", Kind: guidanceMessageKind, Content: "retired-guidance-marker"},
+	}
+	for i := 0; i < 8; i++ {
+		history = appendFixtureBatch(history, i, 16000)
+	}
+	history = append(history, llm.Message{Role: "user", Kind: "task", Content: "new task"})
+	for _, m := range history {
+		if err := store.Append(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+	g := newGuidanceTurn(cfg.Exec)
+	visible := g.refreshRoot(ctx, cfg, WithoutHistoricalGuidance(history))
+	if !cfg.needsCompact(visible) {
+		t.Fatal("fixture does not reach the compaction budget")
+	}
+	out, _, err := cfg.compactInLoop(ctx, visible, cfg.prepareNextPrompt(ctx, cfg.Tools, g))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pruned := false
+	for _, m := range out {
+		pruned = pruned || m.Content == prunedToolResultPlaceholder
+		if strings.Contains(m.Content, "retired-guidance-marker") {
+			t.Fatal("pruning reintroduced retired guidance into the prompt")
+		}
+	}
+	if !pruned {
+		t.Fatal("expected raw checkpoint to prune earlier tool results")
 	}
 }

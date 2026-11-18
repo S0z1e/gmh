@@ -31,6 +31,7 @@ type guidanceTurn struct {
 type guidanceView struct {
 	scopeKey string
 	rootKey  string
+	stale    bool
 }
 
 func newGuidanceTurn(e *tools.Executor) *guidanceTurn {
@@ -67,7 +68,10 @@ func guidanceViewFor(s guidance.Snapshot) guidanceView {
 func (g *guidanceTurn) changeRoot(status, key string) {
 	for directory, view := range g.shown {
 		if key == "" || view.rootKey != key {
-			delete(g.shown, directory)
+			// The old scoped message is still in the prompt. Remember
+			// that it must be superseded even if only root rules remain.
+			view.stale = true
+			g.shown[directory] = view
 		}
 	}
 	g.rootStatus, g.rootKey = status, key
