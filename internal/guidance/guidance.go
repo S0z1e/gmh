@@ -120,30 +120,26 @@ func Resolve(ctx context.Context, root, target string) (Snapshot, error) {
 	if !utf8.ValidString(root) || !utf8.ValidString(target) {
 		return Snapshot{}, fmt.Errorf("guidance paths must be valid UTF-8")
 	}
-	// Match fileguard.Root, which normalizes the requested path before
-	// expanding symlinks for write and edit.
-	if target != "" {
-		target = filepath.Clean(target)
-	}
 	requestedRoot, err := filepath.Abs(root)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	if filepath.IsAbs(target) && contained(requestedRoot, target) {
-		target, err = filepath.Rel(requestedRoot, target)
-		if err != nil {
-			return Snapshot{}, err
-		}
-	}
-	root, err = canonicalRoot(root)
+	root, err = canonicalRoot(requestedRoot)
 	if err != nil {
 		return Snapshot{}, err
 	}
 	if !utf8.ValidString(root) {
 		return Snapshot{}, fmt.Errorf("guidance root must be valid UTF-8")
 	}
-	if filepath.IsAbs(target) && contained(root, target) {
-		target, err = filepath.Rel(root, target)
+	if target != "" {
+		// Accept both the requested workspace spelling and the canonical
+		// absolute target returned by Resolve. Relative paths follow the
+		// same join and containment rules as write/edit.
+		base := requestedRoot
+		if filepath.IsAbs(target) && !contained(requestedRoot, target) {
+			base = root
+		}
+		target, err = fileguard.RelativePath(base, target)
 		if err != nil {
 			return Snapshot{}, err
 		}
@@ -215,7 +211,7 @@ type sourceRoots struct {
 func openSourceRoots(root string) (*sourceRoots, error) {
 	out := &sourceRoots{workspacePath: root}
 	var err error
-	out.workspace, err = os.OpenRoot(root)
+	out.workspace, err = openCanonicalScope(root)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +225,7 @@ func openSourceRoots(root string) (*sourceRoots, error) {
 	if out.outerPath != root {
 		// Pin the furthest applicable directory. HOME can be above the
 		// ancestor limit, in which case it only needs to be traversable.
-		out.outer, err = os.OpenRoot(out.outerPath)
+		out.outer, err = openCanonicalScope(out.outerPath)
 		if err != nil {
 			out.close()
 			return nil, err
@@ -260,7 +256,12 @@ func (r *sourceRoots) check() error {
 		if entry.info == nil {
 			continue
 		}
-		current, err := os.Stat(entry.path)
+		handle, err := openCanonicalScope(entry.path)
+		if err != nil {
+			return err
+		}
+		current, err := handle.Stat(".")
+		handle.Close()
 		if err != nil {
 			return err
 		}

@@ -321,3 +321,78 @@ func TestRelativeTargetUsesMutationPathNormalization(t *testing.T) {
 		t.Fatalf("relative target scope = %s, want %s with just root rules", relative.Target, absolute.Target)
 	}
 }
+
+func TestRelativeTargetCanLexicallyReturnToWorkspace(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "repo")
+	t.Setenv("HOME", t.TempDir())
+	put(t, filepath.Join(root, "AGENTS.md"), "root rules")
+	sep := string(filepath.Separator)
+	target := strings.Join([]string{"alias", "..", "..", "repo", "new.go"}, sep)
+	relative, err := Resolve(context.Background(), root, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	absolute, err := Resolve(context.Background(), root, filepath.Join(root, "new.go"))
+	if err != nil || relative.SHA256 != absolute.SHA256 {
+		t.Fatalf("normalizing %q yielded %+v; want %+v (err=%v)", target, relative, absolute, err)
+	}
+}
+
+func TestCanonicalScopesRejectAncestorReplacement(t *testing.T) {
+	cases := []struct {
+		name        string
+		parent      bool
+		alreadyOpen bool
+	}{
+		{name: "outer scope before opening"},
+		{name: "parent of outer scope before opening", parent: true},
+		{name: "ancestor after pinning", parent: true, alreadyOpen: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			outer := filepath.Join(home, "parent", "outer")
+			root := outer
+			for i := 1; i < MaxAncestorLevels; i++ {
+				root = filepath.Join(root, "nested")
+			}
+			put(t, filepath.Join(outer, "AGENTS.md"), "outer guidance")
+			put(t, filepath.Join(root, "AGENTS.md"), "workspace guidance")
+			canonical, err := canonicalRoot(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var roots *sourceRoots
+			if tc.alreadyOpen {
+				roots, err = openSourceRoots(canonical)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer roots.close()
+			}
+			replaced := outer
+			if tc.parent {
+				replaced = filepath.Dir(outer)
+			}
+			moved := filepath.Join(t.TempDir(), "moved")
+			if err := os.Rename(replaced, moved); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(moved, replaced); err != nil {
+				t.Skipf("cannot replace ancestor with symlink: %v", err)
+			}
+			if !tc.alreadyOpen {
+				roots, err = openSourceRoots(canonical)
+				if err != nil {
+					return
+				}
+				defer roots.close()
+				t.Fatal("opened a scope through a substituted ancestor symlink")
+			}
+			if err := roots.check(); err == nil {
+				t.Fatal("published pinned scopes after canonical ancestry became a symlink")
+			}
+		})
+	}
+}
