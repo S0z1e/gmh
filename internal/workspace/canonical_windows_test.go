@@ -131,11 +131,14 @@ func TestWindowsBindingDoesNotLoseSignificantTrailingDot(t *testing.T) {
 }
 
 func TestFallbackBindingPathKeepsOnlyDirectNamespace(t *testing.T) {
+	long := `\\?\C:\` + strings.Repeat(`long-directory\`, 20) + "workspace"
 	for _, tc := range []struct{ request, physical, want string }{
 		{`\\?\C:\Work\repo`, `\\?\C:\work\repo`, `\\?\C:\Work\repo`},
 		{`\\.\C:\Work\repo`, `\\?\C:\work\repo`, `\\.\C:\Work\repo`},
 		{`C:\work\alias`, `\\?\C:\work\repo.`, `\\?\C:\work\repo.`},
 		{`\\?\C:\work\alias`, `\\?\D:\repos\repo`, `D:\repos\repo`},
+		{`C:\work\alias`, long, long},
+		{long, long, long},
 	} {
 		if got := fallbackBindingPath(tc.request, tc.physical); got != tc.want {
 			t.Errorf("request %q, physical %q: got %q, want %q", tc.request, tc.physical, got, tc.want)

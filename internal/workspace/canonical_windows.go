@@ -10,6 +10,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+const (
+	volumeNameDOS  = 0
+	volumeNameGUID = 1
+	fileNameOpened = 8
+)
+
 // CanonicalDirectory resolves links through a directory handle. Unlike
 // filepath.EvalSymlinks' Windows case normalization, this does not enumerate
 // the caller's directory path one component at a time.
@@ -72,6 +78,13 @@ func identify(path string) (Identity, error) {
 		}
 		return Identity{}, &os.PathError{Op: "resolve directory", Path: abs, Err: nameErr}
 	}
+	if strings.HasPrefix(strings.ToLower(bindingNamespace(abs)), `\\?\volume{`) {
+		// A drive-letter volume can also be opened by GUID. Compare the
+		// handle in the caller's namespace before replacing that binding.
+		if guidPath, err := finalDirectoryPath(h, volumeNameGUID); err == nil && strings.EqualFold(bindingNamespace(abs), guidPath) {
+			return Identity{Path: abs, FileID: id}, nil
+		}
+	}
 	return Identity{Path: fallbackBindingPath(abs, physical), FileID: id}, nil
 }
 
@@ -80,18 +93,27 @@ func fallbackBindingPath(requested, physical string) string {
 	// Preserve the requested namespace only if the name already spells the
 	// physical location. When legacy resolution fails on a symlink alias,
 	// the handle's physical name must instead match opening its target.
-	comparable := windowsMetadataPath(requested)
-	if strings.HasPrefix(comparable, `\\.\`) {
-		comparable = `\\?\` + comparable[4:]
-	}
-	if strings.EqualFold(windowsCanonicalSpelling(comparable), canonical) {
+	if strings.EqualFold(windowsCanonicalSpelling(bindingNamespace(requested)), canonical) {
 		return requested
+	}
+	// EvalSymlinks can lose the prefix of an absolute link target. If the
+	// DOS name is too long for legacy Win32, retain the prefix as when the
+	// target was opened directly in the extended namespace.
+	if units, err := windows.UTF16FromString(canonical); err == nil && len(units) > windows.MAX_PATH {
+		return physical
 	}
 	return canonical
 }
 
+func bindingNamespace(path string) string {
+	path = windowsMetadataPath(path)
+	if strings.HasPrefix(path, `\\.\`) {
+		return `\\?\` + path[4:]
+	}
+	return path
+}
+
 func resolvedDirectoryName(h windows.Handle) (string, error) {
-	const volumeNameDOS, volumeNameGUID, fileNameOpened = 0, 1, 8
 	path, err := finalDirectoryPath(h, volumeNameDOS)
 	if errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_NOT_SUPPORTED) || errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
 		// Some SMB servers require permission to list every component in

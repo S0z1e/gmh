@@ -176,3 +176,38 @@ func TestWindowsExtendedOnlyWorkspaceContinuesHomeGuidance(t *testing.T) {
 		t.Fatalf("cannot continue advertised home guidance: %+v, %v", chunk, err)
 	}
 }
+
+func TestWindowsGUIDBindingSurvivesAncestorACLChange(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
+	parent := t.TempDir()
+	root := filepath.Join(parent, "repo")
+	put(t, filepath.Join(root, "AGENTS.md"), "guidance")
+	volume := filepath.VolumeName(root)
+	if len(volume) != 2 || volume[1] != ':' {
+		t.Skip("fixture requires a local drive")
+	}
+	mount, err := windows.UTF16PtrFromString(volume + `\`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf [64]uint16
+	if err := windows.GetVolumeNameForVolumeMountPoint(mount, &buf[0], uint32(len(buf))); err != nil {
+		t.Skipf("cannot obtain local volume GUID: %v", err)
+	}
+	guid := windows.UTF16ToString(buf[:]) + strings.TrimPrefix(root[len(volume):], `\`)
+	before, err := workspace.Identify(guid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := workspace.Decide(before, "trust"); err != nil {
+		t.Fatal(err)
+	}
+	denyWindowsDirectoryAccess(t, parent, "0x81", windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES)
+	after, err := workspace.Identify(guid)
+	if err != nil || !before.Matches(after) {
+		t.Fatalf("GUID binding changed: before=%+v after=%+v err=%v", before, after, err)
+	}
+	if ok, err := workspace.Trusted(after); err != nil || !ok {
+		t.Fatalf("saved GUID trust lost: %t, %v", ok, err)
+	}
+}
