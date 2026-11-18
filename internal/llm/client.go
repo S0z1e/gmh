@@ -43,12 +43,23 @@ type Message struct {
 	InvocationID    string           `json:"invocation_id,omitempty"`
 	Observation     *ToolObservation `json:"observation,omitempty"`
 
+	// Only harness messages in the current turn can grant a continuation.
+	GuidanceOffers []GuidanceCursor `json:"-"`
+
 	// Images are attached images (user messages only). The session
 	// file stores their path and media type, never the bytes; the
 	// bytes are re-read from disk on --resume.
 	Images []Image `json:"images,omitempty"`
 	// AnthropicContent preserves provider blocks and signatures for exact replay.
 	AnthropicContent []AnthropicContentBlock `json:"anthropic_content,omitempty"`
+}
+
+// GuidanceCursor identifies an exact continuation the harness showed to the model.
+type GuidanceCursor struct {
+	Target string `json:"target"`
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Offset int    `json:"offset"`
 }
 
 type ToolCall struct {

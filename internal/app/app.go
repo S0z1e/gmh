@@ -1287,7 +1287,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	// Context hooks retain their explicit, transient rewrite semantics.
 	// The harness snapshot is appended afterwards, so mode and plugin state
 	// no longer change the system prefix or disappear on the next turn.
-	history := r.App.History
+	history := agent.WithoutHistoricalGuidance(r.App.History)
 	if r.App.Plugins != nil {
 		history = r.App.Plugins.RunContextHooks(ctx, r.App.sessionID(), string(r.App.ToolMode()), history)
 	}

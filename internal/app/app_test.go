@@ -1307,6 +1307,13 @@ func TestRunnerUsesCurrentGuidanceAfterExplicitRebind(t *testing.T) {
 	}
 	first := setupRoot("previous-workspace-guidance-marker")
 	second := setupRoot("current-workspace-guidance-marker")
+	writePhase4Plugin(t, second, "rewrite", `
+harness.on("context", (e) => {
+  const messages = e.messages.map((m) => ({role: m.role, content: m.content}));
+  messages.push({role: "user", content: "rebind-context-hook-ran"});
+  return messages;
+});
+`)
 	original, err := Setup(Params{Root: first, WorkspaceTrust: "trust"})
 	if err != nil {
 		t.Fatal(err)
@@ -1331,7 +1338,7 @@ func TestRunnerUsesCurrentGuidanceAfterExplicitRebind(t *testing.T) {
 	if r.LastErr != nil || len(requests) != 2 {
 		t.Fatalf("rebound turn failed: calls=%d err=%v", len(requests), r.LastErr)
 	}
-	if strings.Contains(requests[1], "previous-workspace-guidance-marker") || !strings.Contains(requests[1], "current-workspace-guidance-marker") || !strings.Contains(requests[1], "start the earlier task") {
+	if strings.Contains(requests[1], "previous-workspace-guidance-marker") || !strings.Contains(requests[1], "current-workspace-guidance-marker") || !strings.Contains(requests[1], "start the earlier task") || !strings.Contains(requests[1], "rebind-context-hook-ran") {
 		t.Fatal("rebound prompt did not retain task history with only the new workspace guidance")
 	}
 }

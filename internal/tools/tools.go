@@ -667,10 +667,12 @@ type ResultStatus string
 const (
 	ResultSuccess    ResultStatus = "success"
 	ResultError      ResultStatus = "error"
+	ResultDeferred   ResultStatus = "deferred"
 	ResultBackground ResultStatus = "background"
 )
 
 type ToolResult struct {
+	Guidance        *GuidanceDelivery
 	Status          ResultStatus
 	ExitCode        *int
 	OutputFile      string

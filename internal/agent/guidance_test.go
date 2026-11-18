@@ -50,6 +50,9 @@ func TestGuidanceFollowsEffectiveTargetAndDefersBatch(t *testing.T) {
 	cfg.OnEvent = func(e Event) {
 		if e.Kind == EventToolEnd && strings.HasPrefix(e.ToolOutput, "Not executed:") {
 			deferred++
+			if e.ToolStatus != tools.ResultDeferred || e.ToolErr != nil {
+				t.Errorf("skipped call %q reported status %q with error %v", e.ToolCallID, e.ToolStatus, e.ToolErr)
+			}
 			if _, err := os.Stat(filepath.Join(root, "pkg/new.go")); !os.IsNotExist(err) {
 				t.Errorf("target existed during deferral: %v", err)
 			}
@@ -305,7 +308,7 @@ func TestGuidanceThatTriggeredCompactionIsShownBeforeRetry(t *testing.T) {
 func TestGuidanceContinuationIsReadOnlyForVerification(t *testing.T) {
 	cfg := guidanceFixture(t)
 	cfg.Verification = &verification.Policy{Required: []verification.Check{{Name: "test", Command: "true"}}}
-	path := putGuidanceFixture(t, cfg.Exec.Root, "AGENTS.md", "instructions")
+	putGuidanceFixture(t, cfg.Exec.Root, "AGENTS.md", strings.Repeat("instruction ", 800))
 	// An unsupported workspace snapshot must not block a read-only turn.
 	if err := os.Symlink("AGENTS.md", filepath.Join(cfg.Exec.Root, "snapshot-unsupported")); err != nil {
 		t.Skipf("cannot create fixture symlink: %v", err)
@@ -314,9 +317,198 @@ func TestGuidanceContinuationIsReadOnlyForVerification(t *testing.T) {
 	if err != nil || len(s.Files) != 1 {
 		t.Fatalf("snapshot files=%d err=%v", len(s.Files), err)
 	}
-	read := verificationTool(tools.GuidanceTool, map[string]any{"target": s.Target, "path": path, "sha256": s.Files[0].SHA256, "offset": 0})
+	f := s.Files[0]
+	read := verificationTool(tools.GuidanceTool, llm.GuidanceCursor{Target: s.Target, Path: f.Path, SHA256: f.SHA256, Offset: len(f.Prefix)})
 	_, requests, err := runVerification(t, cfg, read)
 	if err != nil || len(requests) != 2 || !strings.Contains(requests[1], "[project guidance") {
 		t.Fatalf("a read-only continuation activated completion verification: requests=%d err=%v", len(requests), err)
+	}
+}
+
+func TestGuidanceDoesNotReuseNestedVersionAcrossRootRefresh(t *testing.T) {
+	cfg := guidanceFixture(t)
+	root := cfg.Exec.Root
+	putGuidanceFixture(t, root, "AGENTS.md", "original-root-rule")
+	putGuidanceFixture(t, root, "pkg/AGENTS.md", "nested-rule")
+	requestsDone := 0
+	cfg.OnEvent = func(e Event) {
+		if e.Kind == EventStepUsage {
+			requestsDone++
+			if requestsDone == 2 {
+				putGuidanceFixture(t, root, "AGENTS.md", "original-root-rule")
+			}
+		}
+		if e.Kind == EventToolEnd && e.ToolCallID == "first" {
+			putGuidanceFixture(t, root, "AGENTS.md", "changed-root-rule-must-invalidate-nested")
+		}
+	}
+	write := func(id string) string {
+		args, _ := json.Marshal(map[string]string{"path": "pkg/new.go", "content": id})
+		return toolCallSSE(id, "write", string(args))
+	}
+	_, requests, err := runVerification(t, cfg, write("first"), write("stale"), write("new"))
+	if err != nil || len(requests) != 4 || !strings.Contains(requests[1], "changed-root-rule-must-invalidate-nested") {
+		t.Fatalf("root refresh fixture unsound: requests=%d err=%v", len(requests), err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "pkg/new.go")); err != nil || string(got) != "new" {
+		t.Fatalf("write reused a superseded nested snapshot: got %q, err %v", got, err)
+	}
+}
+
+func guidanceCursorFixture(t *testing.T, cfg *Config) llm.GuidanceCursor {
+	t.Helper()
+	snapshot, err := cfg.Exec.Guidance.Resolve(context.Background(), "")
+	if err != nil || len(snapshot.Files) != 1 || !snapshot.Files[0].More {
+		t.Fatalf("fixture does not advertise a continuation: %+v, %v", snapshot.Files, err)
+	}
+	f := snapshot.Files[0]
+	return llm.GuidanceCursor{Target: snapshot.Target, Path: f.Path, SHA256: f.SHA256, Offset: len(f.Prefix)}
+}
+
+func guidanceReadCall(t *testing.T, id string, cursor llm.GuidanceCursor, limit int) llm.ToolCall {
+	t.Helper()
+	args, err := json.Marshal(struct {
+		llm.GuidanceCursor
+		Limit int `json:"limit"`
+	}{cursor, limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return budgetCall(id, tools.GuidanceTool, string(args))
+}
+
+func TestGuidanceContinuationRequiresOffsetFromTheModelRequest(t *testing.T) {
+	cfg := guidanceFixture(t)
+	putGuidanceFixture(t, cfg.Exec.Root, "AGENTS.md", strings.Repeat("p", guidance.PrefixBytes)+"more"+"last")
+	first := guidanceCursorFixture(t, cfg)
+	next := first
+	next.Offset += 4
+	guess := next
+	guess.Offset++
+	step := func(calls ...llm.ToolCall) string { return budgetSSE("", calls, nil, true) }
+	events, _, err := runVerification(t, cfg,
+		step(guidanceReadCall(t, "guess", guess, 4), guidanceReadCall(t, "first", first, 4), guidanceReadCall(t, "early-next", next, 4)),
+		step(guidanceReadCall(t, "valid-next", next, 4)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(map[string]Event)
+	for _, e := range events {
+		if e.Kind == EventToolEnd {
+			results[e.ToolCallID] = e
+		}
+	}
+	for _, id := range []string{"guess", "early-next"} {
+		if e := results[id]; e.ToolErr == nil || !strings.Contains(e.ToolErr.Error(), "advertised") {
+			t.Errorf("unpublished offset %s accepted: %+v", id, e)
+		}
+	}
+	for id, suffix := range map[string]string{"first": "more", "valid-next": "last"} {
+		if e := results[id]; e.ToolErr != nil || !strings.HasSuffix(e.ToolOutput, "\n"+suffix) {
+			t.Errorf("published offset %s returned %+v, want %q", id, e, suffix)
+		}
+	}
+}
+
+func TestCompactionPreservesOnlyCurrentUnreadGuidance(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		changed bool
+		grace   bool
+	}{
+		{name: "unchanged"},
+		{name: "changed", changed: true},
+		{name: "step cap grace request", grace: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := guidanceFixture(t)
+			if tc.grace {
+				cfg.MaxSteps = 1
+			}
+			const tail = "unread-guidance-tail-marker"
+			guide := putGuidanceFixture(t, cfg.Exec.Root, "AGENTS.md", strings.Repeat("p", guidance.PrefixBytes)+tail)
+			cursor := guidanceCursorFixture(t, cfg)
+			cfg.ContextLimit = 12000
+			compactions := 0
+			cfg.CompactHistory = func(_ context.Context, history []llm.Message) (string, llm.Usage, error) {
+				compactions++
+				cfg.ContextLimit = 12000
+				for _, m := range history {
+					if strings.Contains(m.Content, tail) {
+						t.Error("unread project guidance leaked into narration summary")
+					}
+				}
+				if tc.changed {
+					if err := os.WriteFile(guide, []byte("new-guidance-after-compaction"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return "The model requested a project source continuation.", llm.Usage{}, nil
+			}
+			cfg.OnEvent = func(e Event) {
+				if e.Kind == EventToolEnd && e.ToolCallID == "read" && e.ToolErr == nil {
+					cfg.ContextLimit = 3000
+				}
+			}
+			read := guidanceReadCall(t, "read", cursor, guidance.PrefixBytes)
+			_, requests, err := runVerification(t, cfg, budgetSSE("", []llm.ToolCall{read}, nil, true))
+			settled := !tc.grace && err == nil || tc.grace && err != nil && cfg.LastTerminalReason == TerminalMaxTurns
+			if !settled || compactions != 1 || len(requests) != 2 {
+				t.Fatalf("requests=%d compactions=%d err=%v", len(requests), compactions, err)
+			}
+			if strings.Contains(requests[0], tail) || strings.Contains(requests[1], tail) == tc.changed {
+				t.Fatalf("unread chunk delivery did not match its current digest (changed=%t)", tc.changed)
+			}
+			if tc.changed && !strings.Contains(requests[1], "new-guidance-after-compaction") {
+				t.Fatal("compacted turn did not refresh the source")
+			}
+		})
+	}
+}
+
+func TestCompactionFitsScopedGuidanceBeforeWritingCheckpoint(t *testing.T) {
+	cfg := guidanceFixture(t)
+	root := cfg.Exec.Root
+	for _, name := range []string{"pkg/AGENTS.md", "pkg/CLAUDE.md", "pkg/deep/AGENTS.md", "pkg/deep/CLAUDE.md"} {
+		putGuidanceFixture(t, root, name, strings.Repeat("p", guidance.PrefixBytes)+"-tail")
+	}
+	store, err := session.Open("bounded-guidance", session.OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg.Session = store
+	cfg.ContextLimit = 12000
+	cfg.CompactHistory = func(_ context.Context, _ []llm.Message) (string, llm.Usage, error) {
+		return "The nested write is waiting on project guidance.", llm.Usage{}, nil
+	}
+	commits := 0
+	cfg.OnCompact = func(history []llm.Message, _ llm.Usage, archive string) {
+		commits++
+		if archive == "" || !cfg.checkpointContextFits(history) {
+			t.Error("checkpoint omitted the complete next prompt budget or archive")
+		}
+		var paths int
+		for _, m := range history {
+			if m.Kind == guidanceMessageKind {
+				paths += strings.Count(m.Content, "\nSource ")
+			}
+		}
+		if paths != 4 {
+			t.Errorf("checkpoint retained %d live source entries, want 4", paths)
+		}
+	}
+	write := func(id string) string {
+		return toolCallSSE(id, "write", `{"path":"pkg/deep/new.go","content":"after shortened preview"}`)
+	}
+	_, requests, err := runVerification(t, cfg, write("first"), write("retry"))
+	if err != nil || len(requests) != 3 || commits != 1 {
+		t.Fatalf("requests=%d checkpoints=%d err=%v", len(requests), commits, err)
+	}
+	if !strings.Contains(requests[1], "Source continues; use read_guidance") || !strings.Contains(requests[1], "pkg/deep/CLAUDE.md") {
+		t.Fatal("checkpoint omitted the scoped source catalogue or continuation")
+	}
+	if data, err := os.ReadFile(filepath.Join(root, "pkg/deep/new.go")); err != nil || string(data) != "after shortened preview" {
+		t.Fatalf("write after compacted guidance = %q, %v", data, err)
 	}
 }

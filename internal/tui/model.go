@@ -27,6 +27,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"minimalharness/internal/agent"
+	"minimalharness/internal/tools"
 )
 
 // Palette and styles live in theme.go: one Theme struct, rebuilt by
@@ -414,6 +415,9 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		}
 		m.liveTool = ""
 		m.liveToolArgs = ""
+		if ev.ToolStatus == tools.ResultDeferred {
+			return m, tea.Println("   " + styleMuted.Render("… "+toolSummary(name, args)+" (deferred)"))
+		}
 		// A backgrounded bash also gets a ToolEnd, with the
 		// "still running" observation — its notice was already
 		// printed by the ToolBackgrounded event, so print nothing

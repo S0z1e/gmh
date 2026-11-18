@@ -219,8 +219,9 @@ arrived, a later error ends the turn instead. A turn that still fails reports
   `agent_settled`.
 
 `tool_end` and `tool_background_done` include `status` (`success`, `error`,
-`background`), and bash results include `exit_code` and `output_file` when
-available. `exit_code: 0` is preserved. `agent_settled.reason: output_limit`
+`background`, or `deferred`). `deferred` is a `tool_end` for a call skipped
+pending updated project guidance; the call did not execute and has no `error`.
+Bash results include `exit_code` and `output_file` when available. `exit_code: 0` is preserved. `agent_settled.reason: output_limit`
 means the provider stopped with incomplete output; unfinished tool arguments
 are never executed. History messages may carry `kind`, `tool_error` and
 `finish_reason` metadata; these fields are not forwarded as provider inputs.

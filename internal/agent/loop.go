@@ -779,7 +779,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	hasCap := steps > 0
 	guidanceState := newGuidanceTurn(c.Exec)
 	msgs := append([]llm.Message{{Role: "system", Content: c.System + verificationInstructions(c.Verification)}}, history...)
-	msgs = retireProjectGuidance(msgs)
+	msgs = WithoutHistoricalGuidance(msgs)
 	var total llm.Usage
 	var lastText string
 	// pending background bash jobs, in call order. Their results are
@@ -812,7 +812,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	finishBlocked := func() (string, llm.Usage, error) {
 		blocked := fmt.Errorf("task blocked: %d tool attempts failed without proven state or result progress", MaxFailedFixAttempts)
 		if ctx.Err() == nil {
-			graceText, graceUsage, ok := c.graceCall(ctx, msgs, blockedGracePrompt(blocked, c.progress.lastErrors))
+			graceText, graceUsage, ok := c.graceCall(ctx, msgs, blockedGracePrompt(blocked, c.progress.lastErrors), guidanceState)
 			total.Add(graceUsage)
 			if ok {
 				lastText = graceText
@@ -849,7 +849,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		// Rendering uses a fixed per-result cap. Old content changes only
 		// at a persisted checkpoint when the context budget is reached.
 		if c.ContextLimit > 0 && c.needsCompact(msgs) {
-			compacted, usage, err := c.compactInLoop(ctx, msgs)
+			compacted, usage, err := c.compactInLoop(ctx, msgs, c.prepareNextPrompt(ctx, guidanceState))
 			total.Add(usage)
 			c.emit(Event{Kind: EventStepUsage, Usage: usage})
 			if err != nil {
@@ -863,12 +863,6 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				return lastText, total, err
 			}
 			msgs = compacted
-			if guidanceState != nil {
-				msgs = guidanceState.afterCompact(ctx, c, msgs)
-				if c.persistErr != nil {
-					return lastText, total, c.persistErr
-				}
-			}
 			if c.needsCompact(msgs) {
 				err := fmt.Errorf("context still exceeds the budget after compaction; reduce the task, system prompt or tool definitions, or select a larger context window")
 				c.LastTerminalReason = TerminalError
@@ -916,6 +910,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 			c.emit(Event{Kind: EventError, Err: wrapped, Text: lastText, TerminalReason: c.LastTerminalReason})
 			return lastText, total, wrapped
+		}
+		var offeredGuidance map[llm.GuidanceCursor]bool
+		if guidanceState != nil {
+			guidanceState.unread = nil // the completed request received its result
+			offeredGuidance = guidanceOffers(apiMsgs)
 		}
 		c.LastPromptTokens = usage.PromptTokens
 		c.lastPromptEstimate = estimatePromptTokens(apiMsgs, c.Tools)
@@ -1298,6 +1297,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				}
 			}
 			toolCtx := tools.WithFailureKey(tools.WithInvocation(ctx, inv.ID, tc.ID), callKey)
+			if tc.Function.Name == tools.GuidanceTool {
+				toolCtx = tools.WithGuidanceOffers(toolCtx, func(cursor llm.GuidanceCursor) bool { return offeredGuidance[cursor] })
+			}
 			if mutation != nil {
 				toolCtx = tools.WithMutation(toolCtx, mutation)
 			}
@@ -1365,8 +1367,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			observation.Answer = humanAnswer
 			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolTruncated: res.Truncated, ToolCountLowerBound: res.CountLowerBound, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
 			result := llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil, Observation: observation}
-			if tc.Function.Name == tools.GuidanceTool && err == nil {
-				result.Kind = guidanceChunkKind
+			if res.Guidance != nil && err == nil {
+				attachGuidanceDelivery(&result, *res.Guidance)
+				if guidanceState != nil {
+					guidanceState.unread = res.Guidance
+				}
 			}
 			msgs = append(msgs, result)
 			if c.Session != nil {
@@ -1433,7 +1438,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	// tool-call step's text. A failed final attempt adds no assistant
 	// message; a context checkpoint may already have been committed.
 	if ctx.Err() == nil {
-		graceText, graceUsage, ok := c.graceCall(ctx, msgs, "You have reached the step limit. Give your best final answer now, summarising what was done and what remains unfinished. Do not call any more tools.")
+		graceText, graceUsage, ok := c.graceCall(ctx, msgs, "You have reached the step limit. Give your best final answer now, summarising what was done and what remains unfinished. Do not call any more tools.", guidanceState)
 		total.Add(graceUsage)
 		if ok {
 			lastText = graceText
@@ -1451,20 +1456,20 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 // 60-second timeout. The instruction is the caller's: the cap asks
 // for a best final answer, the blocked turn for a summary of what
 // was verified, what failed and what is left.
-func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction string) (string, llm.Usage, bool) {
+func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction string, guidanceState *guidanceTurn) (string, llm.Usage, bool) {
 	graceCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	graceMsgs := append(append([]llm.Message{}, msgs...),
-		llm.Message{Role: "user", Content: instruction})
+	instructionMsg := llm.Message{Role: "user", Content: instruction}
+	graceMsgs := append(msgs[:len(msgs):len(msgs)], instructionMsg)
 	var total llm.Usage
 	if c.ContextLimit > 0 && c.needsCompact(graceMsgs) {
-		compacted, u, err := c.compactInLoop(graceCtx, msgs)
+		compacted, u, err := c.compactInLoop(graceCtx, msgs, c.prepareNextPrompt(graceCtx, guidanceState, instructionMsg))
 		total.Add(u)
 		c.emit(Event{Kind: EventStepUsage, Usage: u})
 		if err != nil {
 			return "", total, false
 		}
-		graceMsgs = append(compacted, llm.Message{Role: "user", Content: instruction})
+		graceMsgs = append(compacted, instructionMsg)
 		if c.needsCompact(graceMsgs) {
 			return "", total, false
 		}

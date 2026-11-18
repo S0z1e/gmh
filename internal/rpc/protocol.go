@@ -130,7 +130,7 @@ type Event struct {
 	TargetPath   string `json:"target_path,omitempty"`
 
 	Tool       string `json:"tool,omitempty"`
-	Status     string `json:"status,omitempty"`
+	Status     string `json:"status,omitempty"` // deferred means the tool did not execute
 	ExitCode   *int   `json:"exit_code,omitempty"`
 	OutputFile string `json:"output_file,omitempty"`
 	Args       any    `json:"args,omitempty"`

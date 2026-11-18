@@ -6,14 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"minimalharness/internal/session"
-	"minimalharness/internal/textutil"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"minimalharness/internal/checkpoint"
 	"minimalharness/internal/llm"
+	"minimalharness/internal/session"
+	"minimalharness/internal/textutil"
 )
 
 // Compaction (P0-2d). When the context used by the last LLM call reaches
@@ -270,6 +271,7 @@ func (c *Config) promptView(msgs []llm.Message) []llm.Message {
 		case guidanceMessageKind, guidanceChunkKind:
 			if !c.Exec.GuidanceEnabled() {
 				out[i].Content = "[Earlier project guidance is unavailable in this workspace.]"
+				out[i].GuidanceOffers = nil
 			}
 		}
 	}
@@ -299,14 +301,45 @@ func (c *Config) needsCompact(msgs []llm.Message) bool {
 	return c.contextTokens(c.promptView(msgs)) >= c.contextBudget()
 }
 
-func (c *Config) compactInLoop(ctx context.Context, msgs []llm.Message) ([]llm.Message, llm.Usage, error) {
+type checkpointPreparation func([]llm.Message) ([]llm.Message, error)
+
+// The next request may include transient text (such as the grace instruction)
+// that must count against the budget but must not enter the durable checkpoint.
+func (c *Config) prepareNextPrompt(ctx context.Context, g *guidanceTurn, transient ...llm.Message) checkpointPreparation {
+	if g == nil && len(transient) == 0 {
+		return nil
+	}
+	return func(candidate []llm.Message) ([]llm.Message, error) {
+		fits := func(msgs []llm.Message) bool {
+			return c.checkpointContextFits(append(msgs[:len(msgs):len(msgs)], transient...))
+		}
+		if g != nil {
+			candidate = g.prepareCheckpoint(ctx, candidate, fits)
+		}
+		if !fits(candidate) {
+			return nil, fmt.Errorf("preserved checkpoint exceeds context input budget; reduce the task or select a larger context window")
+		}
+		return candidate, nil
+	}
+}
+
+func (c *Config) compactInLoop(ctx context.Context, msgs []llm.Message, prepare checkpointPreparation) ([]llm.Message, llm.Usage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, llm.Usage{}, err
 	}
 	if pruned, ok := c.pruneCheckpoint(msgs); ok {
-		return c.commitCheckpoint(pruned, llm.Usage{})
+		if prepare == nil {
+			return c.commitCheckpoint(pruned, llm.Usage{})
+		}
+		prepared, err := prepare(pruned)
+		if err := ctx.Err(); err != nil {
+			return nil, llm.Usage{}, err
+		}
+		if err == nil {
+			return c.commitCheckpoint(prepared, llm.Usage{})
+		}
 	}
-	return c.compactMessages(ctx, msgs, true)
+	return c.compactMessagesPrepared(ctx, msgs, true, prepare)
 }
 
 // pruneCheckpoint is attempted only at the context-budget boundary, never
@@ -381,6 +414,10 @@ func (c *Config) Compact(ctx context.Context, history []llm.Message) ([]llm.Mess
 }
 
 func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTask bool) ([]llm.Message, llm.Usage, error) {
+	return c.compactMessagesPrepared(ctx, msgs, keepTask, nil)
+}
+
+func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message, keepTask bool, prepare checkpointPreparation) ([]llm.Message, llm.Usage, error) {
 	var system, history []llm.Message
 	for _, m := range msgs {
 		if m.Role == "system" {
@@ -412,14 +449,10 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 	// A single consolidated state goes to the summarizer. The rollback baseline
 	// and all previous snapshots are already included in this validated state.
 	var summaryHistory []llm.Message
-	for _, m := range history {
-		switch m.Kind {
-		case "checkpoint", guidanceMessageKind:
-			continue // project guidance is refreshed live, never promoted to historical user instructions
-		case guidanceChunkKind:
-			m.Content = "[Earlier project guidance chunk omitted; discover current guidance for the next target.]"
+	for _, m := range WithoutHistoricalGuidance(history) {
+		if m.Kind != "checkpoint" {
+			summaryHistory = append(summaryHistory, m)
 		}
-		summaryHistory = append(summaryHistory, m)
 	}
 	summaryHistory = append(summaryHistory, facts)
 	var summary string
@@ -488,7 +521,28 @@ func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTa
 	// Read immutable image blobs rather than the mutable original paths. The
 	// next request in this turn needs the retained task's bytes too.
 	session.HydrateImages(replacement)
-	return c.commitCheckpointNamed(append(system, replacement...), usage, archiveName)
+	candidate := append(system, replacement...)
+	if prepare != nil {
+		candidate, err = prepare(candidate)
+		if cancelled := ctx.Err(); cancelled != nil {
+			return nil, usage, cancelled
+		}
+		if err != nil {
+			return nil, usage, err
+		}
+	}
+	return c.commitCheckpointNamed(candidate, usage, archiveName)
+}
+
+func (c *Config) checkpointContextFits(msgs []llm.Message) bool {
+	if c.ContextLimit <= 0 {
+		return true
+	}
+	request := msgs
+	if !slices.ContainsFunc(msgs, func(m llm.Message) bool { return m.Role == "system" }) {
+		request = append([]llm.Message{{Role: "system", Content: c.System + verificationInstructions(c.Verification)}}, msgs...)
+	}
+	return estimatePromptTokens(c.promptView(request), c.Tools) < c.contextBudget()
 }
 
 // commitCheckpoint persists both pruning and summaries through the same atomic
@@ -506,11 +560,7 @@ func (c *Config) commitCheckpointNamed(msgs []llm.Message, usage llm.Usage, arch
 			replacement = append(replacement, m)
 		}
 	}
-	request := msgs
-	if len(system) == 0 {
-		request = append([]llm.Message{{Role: "system", Content: c.System + verificationInstructions(c.Verification)}}, msgs...)
-	}
-	if c.ContextLimit > 0 && estimatePromptTokens(c.promptView(request), c.Tools) >= c.contextBudget() {
+	if !c.checkpointContextFits(msgs) {
 		return nil, usage, fmt.Errorf("preserved checkpoint exceeds context input budget; reduce the task or select a larger context window")
 	}
 	if c.Session != nil && !session.CheckpointFits(replacement) {
