@@ -439,9 +439,12 @@ type jobDelivery struct {
 // completion order before the next tool can produce a newer observation.
 func (c *Config) stoppedJobDeliveries() []jobDelivery {
 	var deliveries []jobDelivery
+	cutoff := time.Now()
 	for _, job := range c.Exec.Jobs() {
 		if result, done := job.Result(); done && !job.Delivered() {
-			deliveries = append(deliveries, jobDelivery{job: job, result: result})
+			if finished, _ := job.FinishedAt(); !finished.After(cutoff) {
+				deliveries = append(deliveries, jobDelivery{job: job, result: result})
+			}
 		}
 	}
 	sort.SliceStable(deliveries, func(i, j int) bool {
@@ -820,6 +823,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	var pending []pendingJob
 	c.progress = &turnProgress{ctx: ctx, jobs: make(map[string]bool)}
 	defer func() { c.progress = nil }()
+	if err := c.reconcileJobDeliveries(); err != nil {
+		c.LastTerminalReason = TerminalError
+		c.emit(Event{Kind: EventError, Err: err, TerminalReason: TerminalError})
+		return "", total, err
+	}
 	// Re-attach jobs from earlier turns whose results were never
 	// delivered: a job that finished after its turn ended — or
 	// after a bounded drain gave up on it — still owes the model
@@ -1413,17 +1421,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolTruncated: res.Truncated, ToolCountLowerBound: res.CountLowerBound, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
 			var deliveries []jobDelivery
 			if stopped != nil {
-				// Save ready outcomes in one record before the next call can
-				// change the original command's state or the batch can abort.
+				// Persist each ready outcome before the next tool. Its facts
+				// are anchored to this stop independently of provider display.
 				deliveries = c.stoppedJobDeliveries()
-				// Display hooks can decorate the acknowledgement, but must
-				// leave room for the original failure's header and output head.
-				obs = capText(obs, 1024)
-				share := (toolResultMaxChars-len(obs))/max(1, len(deliveries)) - 128
-				for _, d := range deliveries {
-					observation.CompletedJobs = append(observation.CompletedJobs, jobCompletion(d.job, d.result))
-					obs += "\n" + capText(d.output, max(0, share))
-				}
 			}
 			result := llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil, Observation: observation}
 			if res.Guidance != nil && err == nil {
@@ -1440,6 +1440,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				return lastText, total, c.persistErr
 			}
 			for _, d := range deliveries {
+				delivery := completedJobMessage(d.job, d.result, d.output)
+				delivery.Observation.BeforeInvocationID = inv.ID
+				msgs = append(msgs, delivery)
+				c.persist(delivery)
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
+				}
 				d.job.MarkDelivered()
 				pending = slices.DeleteFunc(pending, func(p pendingJob) bool { return p.job == d.job })
 				c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: d.output, ToolErr: d.result.Err,

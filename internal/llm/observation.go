@@ -18,6 +18,9 @@ type ToolObservation struct {
 	Jobs          []checkpoint.Job `json:"jobs,omitempty"`
 	CompletedJob  *JobCompletion   `json:"completed_job,omitempty"`
 	CompletedJobs []JobCompletion  `json:"completed_jobs,omitempty"`
+	// BeforeInvocationID anchors a stopped completion's historical facts to
+	// the stop call, even when provider replay moves its display after a batch.
+	BeforeInvocationID string `json:"before_invocation_id,omitempty"`
 }
 
 // JobCompletions includes the older single-job record when replaying it.

@@ -74,6 +74,38 @@ type compactCall struct {
 	id, name, args, fingerprint, command, cwd string
 }
 
+// Provider replay groups tool replies before background displays. Restore only
+// completion facts to their stop invocation before folding checkpoint state.
+func completionFactOrder(history []llm.Message) []llm.Message {
+	anchors := make(map[string]bool)
+	for _, m := range history {
+		if m.Role == "tool" && m.InvocationID != "" {
+			anchors[m.InvocationID] = true
+		}
+	}
+	before := make(map[string][]llm.Message)
+	anchored := func(m llm.Message) bool {
+		return m.Kind == "job" && m.Observation != nil && anchors[m.Observation.BeforeInvocationID]
+	}
+	for _, m := range history {
+		if anchored(m) {
+			key := m.Observation.BeforeInvocationID
+			before[key] = append(before[key], m)
+		}
+	}
+	out := make([]llm.Message, 0, len(history))
+	for _, m := range history {
+		if anchored(m) {
+			continue
+		}
+		if m.Role == "tool" {
+			out = append(out, before[m.InvocationID]...)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
 // checkpointSources reads durable source statements, not a context hook's
 // temporary rewrite. Programmatic callers that have not persisted their initial
 // task may seed it from the view, only when no durable task exists at all.
@@ -113,6 +145,7 @@ func (c *Config) checkpointSources(view []llm.Message) ([]llm.Message, error) {
 // a full snapshot, not a model proposal. The state before the latest task is
 // kept separately so rolling that task back cannot resurrect its instructions.
 func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoint.State, task *llm.Message, err error) {
+	history = completionFactOrder(history)
 	state.Version, beforeTask.Version = checkpoint.Version, checkpoint.Version
 	calls := make(map[string]compactCall)
 	epoch := "initial"

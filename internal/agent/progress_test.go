@@ -435,13 +435,8 @@ func TestFailureProgressAccountsForStoppedJobBeforeSameBatchRetry(t *testing.T) 
 		if msg.Observation == nil {
 			continue
 		}
-		for _, completed := range msg.Observation.JobCompletions() {
-			if completed.Job.ID == job.ID {
-				if msg.ToolCallID != "stop" || msg.ToolError || !completed.Job.Delivered || completed.Failure == nil {
-					t.Fatalf("unexpected stopped outcome: call=%q outcome=%+v", msg.ToolCallID, completed)
-				}
-				deliveries++
-			}
+		if len(msg.Observation.JobCompletions()) != 0 {
+			t.Fatal("new stop results must persist each completion separately")
 		}
 		for _, saved := range msg.Observation.Jobs {
 			if saved.ID == job.ID && saved.Delivered {
