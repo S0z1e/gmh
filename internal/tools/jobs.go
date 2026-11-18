@@ -11,12 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"minimalharness/internal/privatefile"
 	"os"
 	"os/exec"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"minimalharness/internal/privatefile"
 )
 
 // timeoutError marks a bash run killed by its timeout. Its message is
@@ -171,25 +173,37 @@ func (r *JobRegistry) add(j *Job) {
 	r.next++
 	j.ID = fmt.Sprintf("bg-%d", r.next)
 	r.jobs = append(r.jobs, j)
-	// Bound memory: drop the oldest finished jobs past 50.
-	if len(r.jobs) > 50 {
-		kept := r.jobs[:0]
-		dropped := 0
-		for _, old := range r.jobs {
-			if dropped < len(r.jobs)-50 && old.Status() == JobDone {
-				dropped++
-				continue
-			}
-			kept = append(kept, old)
-		}
-		r.jobs = kept
+	r.evictDelivered()
+}
+
+const recentJobsLimit = 50
+
+// evictDelivered runs with the registry locked. A result can be finished
+// without being delivered when the turn ended or another session was selected.
+func (r *JobRegistry) evictDelivered() {
+	remaining := len(r.jobs) - recentJobsLimit
+	if remaining <= 0 {
+		return
 	}
+	r.jobs = slices.DeleteFunc(r.jobs, func(job *Job) bool {
+		if remaining == 0 {
+			return false
+		}
+		job.mu.Lock()
+		defer job.mu.Unlock()
+		if !job.finished || !job.delivered {
+			return false
+		}
+		remaining--
+		return true
+	})
 }
 
 // List returns a snapshot of all jobs, oldest first.
 func (r *JobRegistry) List() []*Job {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.evictDelivered()
 	out := make([]*Job, len(r.jobs))
 	copy(out, r.jobs)
 	return out
@@ -199,6 +213,7 @@ func (r *JobRegistry) List() []*Job {
 func (r *JobRegistry) Get(id string) *Job {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.evictDelivered()
 	for _, j := range r.jobs {
 		if j.ID == id {
 			return j
