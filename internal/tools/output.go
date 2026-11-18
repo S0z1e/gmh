@@ -52,7 +52,13 @@ func bashPreview(head, tail []string, whole bool) BashOutputPreview {
 	if whole && len(first) <= bashOutputInlineMaxChars {
 		return BashOutputPreview{Head: first}
 	}
-	return BashOutputPreview{Head: textutil.Prefix(first, bashOutputInlineMaxChars/2), Tail: textutil.Suffix(last, bashOutputInlineMaxChars/2)}
+	headLimit := min(len(first), bashOutputInlineMaxChars/2)
+	tailLimit := min(len(last), bashOutputInlineMaxChars/2)
+	remaining := bashOutputInlineMaxChars - headLimit - tailLimit
+	extra := min(remaining, len(first)-headLimit)
+	headLimit += extra
+	tailLimit += min(remaining-extra, len(last)-tailLimit)
+	return BashOutputPreview{Head: textutil.Prefix(first, headLimit), Tail: textutil.Suffix(last, tailLimit)}
 }
 
 // bashOutputSink keeps the first BashOutputHeadLines lines, the

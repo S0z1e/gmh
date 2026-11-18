@@ -69,6 +69,9 @@ type Job struct {
 	registry   *JobRegistry
 	// A later turn must not deliver a recorded result twice.
 	delivered bool
+	// A requested stop remains a delivery barrier even if context compaction
+	// no longer contains its original acknowledgement.
+	stopRequested bool
 	// reported is set once a bounded drain told the model the job is
 	// still running: the next turn's drain must not wait on it again
 	// (the turn would pay the bound on every turn while a server runs).
@@ -533,9 +536,17 @@ func (j *Job) Detach() {
 func (j *Job) Cancel() {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	j.stopRequested = true
 	if j.cancel != nil {
 		j.cancel()
 	}
+}
+
+// StopRequested reports whether this live job has been explicitly cancelled.
+func (j *Job) StopRequested() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.stopRequested
 }
 
 // CancelJobs explicitly stops the current session's jobs. Turn cancellation

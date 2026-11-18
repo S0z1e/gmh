@@ -410,14 +410,15 @@ func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) (
 		res, _ := p.job.Result()
 		obs, toolErr := jobResultMessage(p.job, res)
 		obs = c.progressJob(p.job, res, obs)
-		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID, ToolCallID: p.job.ToolCallID, InvocationID: p.job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: p.job.OutputFile})
 		msgs = append(msgs, pendingStopCompletion(msgs, p.job, res, obs))
 		if c.Session != nil {
 			c.persist(msgs[len(msgs)-1])
 		}
-		if c.persistErr == nil {
-			p.job.MarkDelivered()
+		if c.persistErr != nil {
+			return msgs, pending
 		}
+		p.job.MarkDelivered()
+		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID, ToolCallID: p.job.ToolCallID, InvocationID: p.job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: p.job.OutputFile})
 	}
 	return msgs, rest
 }
@@ -521,14 +522,15 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 		res, _ := job.Result()
 		obs, toolErr := jobResultMessage(job, res)
 		obs = c.progressJob(job, res, obs)
-		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
 		msgs = append(msgs, pendingStopCompletion(msgs, job, res, obs))
 		if c.Session != nil {
 			c.persist(msgs[len(msgs)-1])
 		}
-		if c.persistErr == nil {
-			job.MarkDelivered()
+		if c.persistErr != nil {
+			return msgs, c.persistErr
 		}
+		job.MarkDelivered()
+		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
 	}
 	if len(freshJobs) == 0 {
 		// Nothing new to wait for: the only unfinished jobs are
@@ -562,14 +564,15 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 			res, _ := job.Result()
 			obs, toolErr := jobResultMessage(job, res)
 			obs = c.progressJob(job, res, obs)
-			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
 			msgs = append(msgs, pendingStopCompletion(msgs, job, res, obs))
 			if c.Session != nil {
 				c.persist(msgs[len(msgs)-1])
 			}
-			if c.persistErr == nil {
-				job.MarkDelivered()
+			if c.persistErr != nil {
+				return msgs, c.persistErr
 			}
+			job.MarkDelivered()
+			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
 			remaining--
 		case <-timer.C:
 			// Bound reached: end the turn with the jobs still
@@ -872,6 +875,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		// in completion order — the model sees results as soon
 		// as they are ready, not only when the turn would end.
 		msgs, pending = c.collectFinishedJobs(msgs, pending)
+		if c.persistErr != nil {
+			return lastText, total, c.persistErr
+		}
 		if guidanceState != nil {
 			msgs = guidanceState.refreshRoot(ctx, c, msgs)
 		}
@@ -967,6 +973,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		if len(assistant.ToolCalls) > 0 {
 			// A job may finish while the provider chooses its next calls.
 			// Save that earlier evidence before appending the newer batch.
+			if c.Exec != nil {
+				for _, job := range c.Exec.Jobs() {
+					if !job.Delivered() && !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == job }) {
+						pending = append(pending, pendingJob{callID: job.ToolCallID, job: job})
+					}
+				}
+			}
 			msgs, pending = c.collectFinishedJobs(msgs, pending)
 			if c.persistErr != nil {
 				return lastText, total, c.persistErr
@@ -1076,6 +1089,15 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		if err := c.reserveBudgetTools(assistant.ToolCalls); err != nil {
 			c.rejectBudgetTools(assistant.ToolCalls, err)
 			return lastText, total, err
+		}
+		if c.Exec != nil {
+			if target := pendingStopTarget(c.Exec.Jobs()); target != nil {
+				msgs = append(msgs, c.rejectBudgetTools(assistant.ToolCalls, fmt.Errorf("background job %s is still finalizing; reconsider these calls after its outcome is recorded", target.ID))...)
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
+				}
+				continue
+			}
 		}
 		// Execute tool calls in order. (Parallel batches are v0.2; serial
 		// avoids two tools writing the same file at once.)
@@ -1463,8 +1485,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			msgs = append(msgs, result)
 			deliver := func(deliveries []jobDelivery) {
 				for _, d := range deliveries {
-					delivery := completedJobMessage(d.job, d.result, d.output)
-					delivery.Observation.BeforeInvocationID = inv.ID
+					delivery := pendingStopCompletion(msgs, d.job, d.result, d.output)
+					if delivery.Observation.BeforeInvocationID == "" {
+						delivery.Observation.BeforeInvocationID = inv.ID
+					}
 					msgs = append(msgs, delivery)
 					c.persist(delivery)
 					if c.persistErr != nil {
@@ -1554,6 +1578,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	if len(pending) > 0 {
 		msgs, _ = c.drainPending(ctx, msgs, pending)
 	}
+	if c.persistErr != nil {
+		return lastText, total, c.persistErr
+	}
 	// Step-cap grace period, after Gemini CLI: a hard cut throws
 	// away the turn, so the model gets one final, tool-less call —
 	// bounded by 60 seconds — to deliver its best answer from what
@@ -1583,6 +1610,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 // for a best final answer, the blocked turn for a summary of what
 // was verified, what failed and what is left.
 func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction string, guidanceState *guidanceTurn) (string, llm.Usage, bool) {
+	if c.persistErr != nil {
+		return "", llm.Usage{}, false
+	}
 	graceCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	instructionMsg := llm.Message{Role: "user", Content: instruction}

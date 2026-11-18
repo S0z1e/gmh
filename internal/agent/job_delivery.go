@@ -16,6 +16,18 @@ import (
 // This settlement supplies neither command-failure nor command-success evidence.
 const stopPendingKind = "stop_pending"
 
+// A later model batch must also wait for an unconfirmed stop. Otherwise a
+// retry can run before the old result, recreating the ordering problem that
+// deferring only the remainder of the stop's own batch was meant to prevent.
+func pendingStopTarget(jobs []*tools.Job) *tools.Job {
+	for _, job := range jobs {
+		if job.StopRequested() && !job.Delivered() {
+			return job
+		}
+	}
+	return nil
+}
+
 // A stop may settle before its target finishes. Keep the later outcome at that
 // stop when the history still contains its anchor, including after cold resume.
 func pendingStopCompletion(history []llm.Message, job *tools.Job, res tools.JobResult, output string) llm.Message {
@@ -71,12 +83,12 @@ func stoppedResultsView(history []llm.Message) []llm.Message {
 				// At most 32 outcomes share a 32 KiB display. Each keeps
 				// its own header and actual head/tail, including the marker.
 				count := min(len(jobs), 32)
-				share := (toolResultMaxChars - len(prefix) - len(notice) - count) / count
+				shares := jobDisplayShares(jobs[:count], toolResultMaxChars-len(prefix)-len(notice)-count)
 				var body strings.Builder
 				body.WriteString(prefix)
 				body.WriteString(notice)
-				for _, job := range jobs[:count] {
-					body.WriteString(completedJobDisplay(job, share))
+				for i, job := range jobs[:count] {
+					body.WriteString(completedJobDisplay(job, shares[i]))
 					body.WriteByte('\n')
 				}
 				if first {
@@ -92,6 +104,35 @@ func stoppedResultsView(history []llm.Message) []llm.Message {
 		out = append(out, m)
 	}
 	return append(out, overflow...)
+}
+
+// Short results return their unused space to the other results. If all the
+// captured previews fit together, none is clipped merely for having a sibling.
+func jobDisplayShares(jobs []llm.Message, budget int) []int {
+	wanted := make([]int, len(jobs))
+	shares := make([]int, len(jobs))
+	for i, job := range jobs {
+		wanted[i] = len(completedJobDisplay(job, budget))
+	}
+	remaining := budget
+	for remaining > 0 {
+		unsatisfied := 0
+		for i := range jobs {
+			if shares[i] < wanted[i] {
+				unsatisfied++
+			}
+		}
+		if unsatisfied == 0 {
+			break
+		}
+		grant := max(1, remaining/unsatisfied)
+		for i := range jobs {
+			more := min(grant, wanted[i]-shares[i], remaining)
+			shares[i] += more
+			remaining -= more
+		}
+	}
+	return shares
 }
 
 func boundedJobDisplay(s string, limit int) string {
@@ -111,7 +152,7 @@ func completedJobDisplay(m llm.Message, limit int) string {
 	}
 	preview := m.Observation.JobDisplay
 	header := textutil.Prefix(strings.ToValidUTF8(preview.Header, "\uFFFD"), min(128, limit/4)) + "\n"
-	path := "Output file: " + m.Observation.OutputFile + "\n"
+	path := "Output file: " + strings.ToValidUTF8(m.Observation.OutputFile, "\uFFFD") + "\n"
 	if m.Observation.OutputFile != "" && len(path) <= limit/4 {
 		header += path
 	} else if m.Observation.OutputFile != "" {
@@ -154,13 +195,11 @@ func (c *Config) reconcileJobDeliveries() error {
 		return incarnation{id, started.UTC().Format(time.RFC3339Nano)}
 	}
 	delivered := make(map[incarnation]bool)
-	notify := make(map[incarnation]bool)
-	remember := func(jobs []checkpoint.Job, stopped bool) {
+	remember := func(jobs []checkpoint.Job) {
 		for _, job := range jobs {
 			if job.Status == checkpoint.Done && job.Delivered && !job.Started.IsZero() {
 				k := key(job.ID, job.Started)
 				delivered[k] = true
-				notify[k] = notify[k] || stopped
 			}
 		}
 	}
@@ -170,12 +209,12 @@ func (c *Config) reconcileJobDeliveries() error {
 			if err != nil {
 				return fmt.Errorf("reconcile background deliveries: %w", err)
 			}
-			remember(state.Jobs, false)
+			remember(state.Jobs)
 		}
 		if m.Observation != nil {
-			remember(m.Observation.Jobs, m.Observation.BeforeInvocationID != "")
+			remember(m.Observation.Jobs)
 			for _, completed := range m.Observation.JobCompletions() {
-				remember([]checkpoint.Job{completed.Job}, true)
+				remember([]checkpoint.Job{completed.Job})
 			}
 		}
 	}
@@ -185,11 +224,8 @@ func (c *Config) reconcileJobDeliveries() error {
 		}
 		if result, done := job.Result(); done {
 			job.MarkDelivered()
-			// Stop emits completion only after a successful append. Other
-			// delivery paths already emitted it before attempting the write.
-			if !notify[key(job.ID, job.Started)] {
-				continue
-			}
+			// Every path publishes completion only after a successful append.
+			// A readable but unacknowledged write still owes its event.
 			output, toolErr := jobResultMessage(job, result)
 			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: output, ToolErr: toolErr,
 				JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID,
