@@ -18,6 +18,7 @@ import (
 
 	"minimalharness/internal/fileguard"
 	"minimalharness/internal/textutil"
+	"minimalharness/internal/workspace"
 )
 
 const (
@@ -55,11 +56,7 @@ func digest(data []byte) string {
 }
 
 func canonicalRoot(root string) (string, error) {
-	abs, err := filepath.Abs(root)
-	if err != nil {
-		return "", err
-	}
-	return filepath.EvalSymlinks(abs)
+	return workspace.CanonicalDirectory(root)
 }
 
 func contained(base, path string) bool {
@@ -418,7 +415,7 @@ func Read(ctx context.Context, root, target, path, expectedHash string, offset, 
 	if err != nil {
 		return Chunk{}, err
 	}
-	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	parent, err := canonicalRoot(filepath.Dir(path))
 	if err != nil {
 		return Chunk{}, err
 	}

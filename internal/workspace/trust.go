@@ -21,11 +21,7 @@ type Identity struct {
 }
 
 func Identify(path string) (Identity, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return Identity{}, err
-	}
-	canonical, err := filepath.EvalSymlinks(abs)
+	canonical, err := CanonicalDirectory(path)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -36,7 +32,7 @@ func Identify(path string) (Identity, error) {
 	return Identity{Path: canonical, FileID: id}, nil
 }
 
-// EvalSymlinks preserves some case/Unicode aliases, including UNC volumes.
+// CanonicalDirectory can preserve some case/Unicode aliases, including UNC volumes.
 // Fold only the lookup key, and always pair it with the directory incarnation:
 // distinct directories on case-sensitive filesystems retain distinct records.
 // This does not require read permission on otherwise searchable ancestors.

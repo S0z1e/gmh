@@ -19,8 +19,13 @@ func openCanonicalScope(path string) (*os.Root, error) {
 	if err != nil {
 		return nil, err
 	}
-	const access = windows.FILE_READ_ATTRIBUTES | windows.FILE_TRAVERSE | windows.SYNCHRONIZE
+	const metadata = windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE
+	const traverse = metadata | windows.FILE_TRAVERSE
 	const share = windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE
+	access := uint32(metadata)
+	if rel != "." {
+		access = traverse
+	}
 	handle, err := windows.CreateFile(rootName, access, share, nil, windows.OPEN_EXISTING,
 		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
@@ -29,7 +34,14 @@ func openCanonicalScope(path string) (*os.Root, error) {
 	if rel != "." {
 		// Traverse without FILE_GENERIC_READ: a parent may allow traversal
 		// but deny other rights such as reading the access control list.
-		for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		parts := strings.Split(filepath.ToSlash(rel), "/")
+		for i, part := range parts {
+			access = traverse
+			if i == len(parts)-1 {
+				// This handle is for identity only. A readable directory
+				// need not grant FILE_TRAVERSE explicitly to its caller.
+				access = metadata
+			}
 			name, err := windows.NewNTUnicodeString(part)
 			if err != nil {
 				windows.CloseHandle(handle)

@@ -19,12 +19,18 @@ func put(t *testing.T, path, text string) {
 	}
 }
 
+func setGuidanceHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+}
+
 func TestScopeOrderTargetAndRefresh(t *testing.T) {
 	home, err := canonicalRoot(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HOME", home)
+	setGuidanceHome(t, home)
 	root := filepath.Join(home, "repo")
 	paths := []string{filepath.Join(home, "AGENTS.md"), filepath.Join(root, "AGENTS.md"), filepath.Join(root, "CLAUDE.md"), filepath.Join(root, "pkg", "AGENTS.md"), filepath.Join(root, "pkg", "deep", "AGENTS.md")}
 	for _, path := range paths {
@@ -68,7 +74,7 @@ func TestScopeOrderTargetAndRefresh(t *testing.T) {
 
 func TestLongSourceCanBeReadInBoundedExactChunks(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setGuidanceHome(t, home)
 	root := filepath.Join(home, "repo")
 	if err := os.Mkdir(root, 0700); err != nil {
 		t.Fatal(err)
@@ -111,7 +117,7 @@ func TestLongSourceCanBeReadInBoundedExactChunks(t *testing.T) {
 
 func TestReadCannotAccessUnrelatedSources(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	setGuidanceHome(t, t.TempDir())
 	a := filepath.Join(root, "a", "AGENTS.md")
 	b := filepath.Join(root, "b", "AGENTS.md")
 	put(t, a, "a rules")
@@ -131,7 +137,7 @@ func TestReadCannotAccessUnrelatedSources(t *testing.T) {
 
 func TestSourceBoundsAndCancellationFailExplicitly(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	setGuidanceHome(t, t.TempDir())
 	path := filepath.Join(root, "AGENTS.md")
 	put(t, path, strings.Repeat("x", MaxSourceBytes+1))
 	if _, err := Resolve(context.Background(), root, "new.go"); err == nil {
@@ -158,7 +164,7 @@ func TestSymlinkTargetUsesEffectiveDirectoryAndRejectsEscapes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HOME", t.TempDir())
+	setGuidanceHome(t, t.TempDir())
 	put(t, filepath.Join(root, "real", "AGENTS.md"), "real rules")
 	if err := os.Symlink("real", filepath.Join(root, "alias")); err != nil {
 		t.Skip(err)
@@ -185,7 +191,7 @@ func TestSymlinkTargetUsesEffectiveDirectoryAndRejectsEscapes(t *testing.T) {
 
 func TestRootAliasAndAbsoluteTargetRetainSourceIdentity(t *testing.T) {
 	base := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	setGuidanceHome(t, t.TempDir())
 	root := filepath.Join(base, "real")
 	alias := filepath.Join(base, "alias")
 	put(t, filepath.Join(root, "pkg", "AGENTS.md"), "rules")
@@ -204,7 +210,7 @@ func TestRootAliasAndAbsoluteTargetRetainSourceIdentity(t *testing.T) {
 
 func TestAggregateSourceLimitDoesNotSilentlyDropInstructions(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	setGuidanceHome(t, t.TempDir())
 	dir := root
 	text := strings.Repeat("x", MaxSourceBytes)
 	for i := 0; i < 9; i++ {
@@ -218,7 +224,7 @@ func TestAggregateSourceLimitDoesNotSilentlyDropInstructions(t *testing.T) {
 
 func TestDanglingInstructionSourceMustNotDisappear(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	setGuidanceHome(t, t.TempDir())
 	if err := os.Symlink("missing-guide", filepath.Join(root, "AGENTS.md")); err != nil {
 		t.Skip(err)
 	}
@@ -242,7 +248,7 @@ func (c *scopeSwapContext) Err() error {
 }
 func TestInstructionParentSwapCannotEscapeWorkspace(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	setGuidanceHome(t, t.TempDir())
 	sub := filepath.Join(root, "sub")
 	if err := os.Mkdir(sub, 0700); err != nil {
 		t.Fatal(err)
@@ -265,7 +271,7 @@ func TestInstructionParentSwapCannotEscapeWorkspace(t *testing.T) {
 
 func TestCanonicalRootTargetCanBeReusedThroughAlias(t *testing.T) {
 	base := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	setGuidanceHome(t, t.TempDir())
 	root := filepath.Join(base, "real")
 	alias := filepath.Join(base, "alias")
 	put(t, filepath.Join(root, "AGENTS.md"), "rules")
@@ -287,7 +293,7 @@ func TestCanonicalRootTargetCanBeReusedThroughAlias(t *testing.T) {
 
 func TestInvalidPathBytesCannotAliasManifestIdentity(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	setGuidanceHome(t, t.TempDir())
 	if _, err := Resolve(context.Background(), root, "sub\xff/new.go"); err == nil {
 		t.Fatal("non-UTF8 target identity accepted")
 	}
@@ -298,7 +304,7 @@ func TestInvalidPathBytesCannotAliasManifestIdentity(t *testing.T) {
 
 func TestRelativeTargetUsesMutationPathNormalization(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	setGuidanceHome(t, t.TempDir())
 	put(t, filepath.Join(root, "AGENTS.md"), "root rules")
 	put(t, filepath.Join(root, "pkg", "AGENTS.md"), "nested rules")
 	if err := os.Mkdir(filepath.Join(root, "pkg", "sub"), 0700); err != nil {
@@ -324,7 +330,7 @@ func TestRelativeTargetUsesMutationPathNormalization(t *testing.T) {
 
 func TestRelativeTargetCanLexicallyReturnToWorkspace(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "repo")
-	t.Setenv("HOME", t.TempDir())
+	setGuidanceHome(t, t.TempDir())
 	put(t, filepath.Join(root, "AGENTS.md"), "root rules")
 	sep := string(filepath.Separator)
 	target := strings.Join([]string{"alias", "..", "..", "repo", "new.go"}, sep)
@@ -351,7 +357,7 @@ func TestCanonicalScopesRejectAncestorReplacement(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
-			t.Setenv("HOME", home)
+			setGuidanceHome(t, home)
 			outer := filepath.Join(home, "parent", "outer")
 			root := outer
 			for i := 1; i < MaxAncestorLevels; i++ {

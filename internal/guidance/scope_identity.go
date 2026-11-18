@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 // The caller pinned this exact directory without following links. os.Root
@@ -15,9 +16,13 @@ func openVerifiedScope(path string, pinned *os.File) (*os.Root, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Force a directory lookup even if the final component has concurrently
-	// become a special file. A bare os.OpenRoot can block opening a FIFO.
-	root, err := os.OpenRoot(path + string(filepath.Separator) + ".")
+	rootPath := path
+	if runtime.GOOS != "windows" {
+		// Force a directory lookup in case the leaf became a FIFO. Windows
+		// has no FIFO at a filesystem path and extended paths do not normalize \.
+		rootPath += string(filepath.Separator) + "."
+	}
+	root, err := os.OpenRoot(rootPath)
 	if err != nil {
 		return nil, err
 	}

@@ -10,22 +10,24 @@ import (
 const trustReadFlags = 0
 
 func directoryID(path string) (string, error) {
-	// Identify supplies an absolute path; preserve support for long paths when
-	// opening directly through Win32 rather than os.Open's internal conversion.
-	name, err := windows.UTF16PtrFromString(windowsMetadataPath(path))
-	if err != nil {
-		return "", err
-	}
-	// Query metadata without GENERIC_READ / FILE_LIST_DIRECTORY. Traversable
-	// directories may permit attributes while denying directory enumeration.
-	handle, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	handle, err := openDirectoryMetadata(path)
 	if err != nil {
 		return "", err
 	}
 	defer windows.CloseHandle(handle)
 	return directoryHandleID(handle, path)
+}
+
+func openDirectoryMetadata(path string) (windows.Handle, error) {
+	name, err := windows.UTF16PtrFromString(windowsMetadataPath(path))
+	if err != nil {
+		return 0, err
+	}
+	// Query metadata without requesting FILE_LIST_DIRECTORY. A path may
+	// be known and traversable even when its parent can't be enumerated.
+	return windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
 }
 
 // DirectoryFileID identifies a pinned directory handle without reopening its path.
