@@ -891,9 +891,6 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		if c.persistErr != nil {
 			return lastText, total, c.persistErr
 		}
-		if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {
-			return finishBlocked()
-		}
 		if guidanceState != nil {
 			msgs = guidanceState.refreshRoot(ctx, c, msgs)
 		}
@@ -1011,6 +1008,16 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		}
 		if len(assistant.ToolCalls) == 0 {
 			if collectedAfterResponse {
+				if c.progress.failures >= MaxFailedFixAttempts && len(pending) > 0 {
+					var err error
+					msgs, err = c.drainPending(ctx, msgs, pending)
+					pending = nil
+					if err != nil {
+						c.LastTerminalReason = TerminalAbort
+						c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+						return lastText, total, err
+					}
+				}
 				if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {
 					return finishBlocked()
 				}
@@ -1131,14 +1138,14 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					waitErr = ctx.Err()
 				}
 				timer.Stop()
+				msgs, pending = c.collectFinishedJobs(msgs, pending)
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
+				}
+				if target.Delivered() && ctx.Err() == nil {
+					waitErr = nil
+				}
 				if waitErr != nil {
-					msgs, pending = c.collectFinishedJobs(msgs, pending)
-					if c.persistErr != nil {
-						return lastText, total, c.persistErr
-					}
-					if target.Delivered() && ctx.Err() == nil {
-						continue
-					}
 					c.LastTerminalReason = TerminalError
 					if ctx.Err() != nil {
 						c.LastTerminalReason = TerminalAbort
@@ -1147,6 +1154,19 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					c.persist(llm.Message{Role: "user", Kind: "task_outcome", Content: lastText})
 					c.emit(Event{Kind: EventError, Err: waitErr, Text: lastText, Usage: total, TerminalReason: c.LastTerminalReason})
 					return lastText, total, waitErr
+				}
+				if c.progress.failures >= MaxFailedFixAttempts && len(pending) > 0 {
+					var err error
+					msgs, err = c.drainPending(ctx, msgs, pending)
+					pending = nil
+					if err != nil {
+						c.LastTerminalReason = TerminalAbort
+						c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+						return lastText, total, err
+					}
+				}
+				if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {
+					return finishBlocked()
 				}
 				continue
 			}
