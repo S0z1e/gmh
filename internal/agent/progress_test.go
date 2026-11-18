@@ -435,7 +435,7 @@ func TestFailureProgressAccountsForStoppedJobBeforeSameBatchRetry(t *testing.T) 
 		}
 		for _, saved := range msg.Observation.Jobs {
 			if saved.ID == job.ID && saved.Delivered {
-				if msg.ToolCallID != "stop" || saved.Error == "" {
+				if msg.Kind != "job" || !msg.ToolError || saved.Error == "" {
 					t.Fatalf("unexpected stopped job observation: call=%q job=%+v", msg.ToolCallID, saved)
 				}
 				deliveries++
@@ -444,6 +444,79 @@ func TestFailureProgressAccountsForStoppedJobBeforeSameBatchRetry(t *testing.T) 
 	}
 	if deliveries != 1 {
 		t.Fatalf("stopped job was recorded as delivered %d times, want 1", deliveries)
+	}
+}
+
+func TestStoppedBackgroundJobDeliversOriginalOutcome(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash is not available")
+	}
+	t.Setenv("HOME", t.TempDir())
+	c := budgetConfig(t, nil)
+	store, err := session.Open("stopped-job-delivery", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c.Session = store
+	defer c.Exec.CancelJobs()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	const tail = "stopped-tail-sentinel"
+	const args = `{"command":"printf '%040000d' 0; printf ` + tail + `; printf ready > running; exec sleep 30","background":true}`
+	c.OnEvent = func(e Event) {
+		if e.Kind != EventToolStart || e.ToolCallID != "stop" {
+			return
+		}
+		for {
+			if _, err := os.Stat(filepath.Join(c.Exec.Root, "running")); err == nil {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal("background command did not start")
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+	events, requests, err := runVerificationContext(t, c, ctx, toolCallSSE("launch", "bash", args),
+		toolCallSSE("stop", "bash", `{"killJobId":"bg-1"}`), textSSE("done"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 3 || strings.Count(requests[2], tail) != 2 {
+		t.Error("the request after stop should include the output tail once besides the launch arguments")
+	}
+	var launchID string
+	backgroundDone := 0
+	for _, e := range events {
+		if e.Kind == EventToolBackgrounded && e.ToolCallID == "launch" {
+			launchID = e.InvocationID
+		}
+		if e.Kind == EventToolEnd && e.ToolCallID == "stop" && strings.Contains(e.ToolOutput, "Output:\n") {
+			t.Error("the stop acknowledgement duplicated the background output")
+		}
+		if e.Kind == EventToolBackgroundDone && e.JobID == "bg-1" {
+			if e.ToolCallID != "launch" || e.InvocationID == "" || e.InvocationID != launchID || e.ToolErr == nil || !strings.Contains(e.ToolOutput, tail) {
+				t.Error("background completion event did not carry the original outcome and identity")
+			}
+			backgroundDone++
+		}
+	}
+	if backgroundDone != 1 {
+		t.Errorf("got %d background completion events, want 1", backgroundDone)
+	}
+	history, err := session.Load(store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _, _, err := c.compactState(history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := factDigest(CanonicalToolKey("bash", args))
+	if len(state.Failures) != 1 || state.Failures[0].Fingerprint != key || !strings.Contains(state.Failures[0].Output.Tail, tail) {
+		t.Errorf("checkpoint omitted the original command failure or output tail: %d failure records", len(state.Failures))
 	}
 }
 
