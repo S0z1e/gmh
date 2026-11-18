@@ -396,3 +396,15 @@ func TestCanonicalScopesRejectAncestorReplacement(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifiedScopeRejectsDifferentDirectory(t *testing.T) {
+	oldDir, newDir := t.TempDir(), t.TempDir()
+	pinned, err := os.Open(oldDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handle, err := openVerifiedScope(newDir, pinned); err == nil {
+		handle.Close()
+		t.Fatal("scope reopen accepted a different directory from the pinned identity")
+	}
+}

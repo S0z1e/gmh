@@ -2,7 +2,6 @@ package guidance
 
 import (
 	"os"
-	"strconv"
 
 	"golang.org/x/sys/unix"
 )
@@ -13,6 +12,5 @@ func openCanonicalScope(path string) (*os.Root, error) {
 	if err != nil {
 		return nil, &os.PathError{Op: "open guidance scope", Path: path, Err: err}
 	}
-	defer unix.Close(fd)
-	return os.OpenRoot("/dev/fd/" + strconv.Itoa(fd))
+	return openVerifiedScope(path, os.NewFile(uintptr(fd), path))
 }

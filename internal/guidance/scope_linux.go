@@ -2,7 +2,6 @@ package guidance
 
 import (
 	"os"
-	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -26,6 +25,5 @@ func openCanonicalScope(path string) (*os.Root, error) {
 		}
 		fd = next
 	}
-	defer unix.Close(fd)
-	return os.OpenRoot("/proc/self/fd/" + strconv.Itoa(fd))
+	return openVerifiedScope(path, os.NewFile(uintptr(fd), path))
 }
