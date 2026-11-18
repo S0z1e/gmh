@@ -1341,14 +1341,15 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				res, err = c.Exec.Dispatch(toolCtx, tc.Function.Name, argsJSON)
 			}
 			closeMutation()
-			// Keep the stop acknowledgement separate from the original job
-			// result. The normal delivery preserves its output and identity.
-			if stopped := res.StoppedJob; stopped != nil && !stopped.Delivered() {
-				if !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == stopped }) {
-					pending = append(pending, pendingJob{callID: stopped.ToolCallID, job: stopped})
-				}
-				if res.ExitCode != nil {
-					res.Text = fmt.Sprintf("Stopped background job %s (exit %d). See its background result for output.", stopped.ID, *res.ExitCode)
+			var stopped *tools.Job
+			var stoppedResult tools.JobResult
+			if target := res.StoppedJob; target != nil && !target.Delivered() {
+				if outcome, done := target.Result(); done {
+					stopped, stoppedResult = target, outcome
+					res.Text = fmt.Sprintf("Stopped background job %s (exit %d).", target.ID, outcome.ExitCode)
+					res.ExitCode = &stoppedResult.ExitCode
+				} else if !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == target }) {
+					pending = append(pending, pendingJob{callID: target.ToolCallID, job: target})
 				}
 			}
 			if err != nil {
@@ -1382,6 +1383,16 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			observation := executionObservation(tc.Function.Name, argsJSON, callKey, res.Text, res.OutputFile, err, job)
 			observation.Answer = humanAnswer
 			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolTruncated: res.Truncated, ToolCountLowerBound: res.CountLowerBound, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
+			var stoppedOutput string
+			if stopped != nil {
+				// Save both outcomes in one record before the next call can
+				// change the original command's state or the batch can abort.
+				completion := jobCompletion(stopped, stoppedResult)
+				observation.CompletedJob = &completion
+				stoppedOutput, _ = jobResultMessage(stopped, stoppedResult)
+				stoppedOutput = c.progressJob(stopped, stoppedResult, stoppedOutput)
+				obs += "\n" + stoppedOutput
+			}
 			result := llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil, Observation: observation}
 			if res.Guidance != nil && err == nil {
 				attachGuidanceDelivery(&result, *res.Guidance)
@@ -1392,6 +1403,13 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			msgs = append(msgs, result)
 			if c.Session != nil {
 				c.persist(msgs[len(msgs)-1])
+			}
+			if stopped != nil && c.persistErr == nil {
+				stopped.MarkDelivered()
+				pending = slices.DeleteFunc(pending, func(p pendingJob) bool { return p.job == stopped })
+				c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: stoppedOutput, ToolErr: stoppedResult.Err,
+					JobID: stopped.ID, ToolCallID: stopped.ToolCallID, InvocationID: stopped.InvocationID,
+					ToolExitCode: &stoppedResult.ExitCode, ToolOutputFile: stopped.OutputFile})
 			}
 			for _, evidence := range c.verificationFinish(ctx, attempt, res, err) {
 				msgs = append(msgs, evidence)

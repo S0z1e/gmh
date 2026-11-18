@@ -54,14 +54,19 @@ func executionObservation(name, args, key, output, outputFile string, runErr err
 	return out
 }
 
-func completedJobMessage(job *tools.Job, res tools.JobResult, display string) llm.Message {
+func jobCompletion(job *tools.Job, res tools.JobResult) llm.JobCompletion {
 	key := job.FailureKey()
 	if key == "" {
 		key = fmt.Sprintf("unidentified job:%s:%s", job.ID, job.Started.UTC().Format(time.RFC3339Nano))
 	}
 	obs := executionObservation("bash", "", key, res.Output, job.OutputFile, res.Err, nil)
-	obs.Command, obs.Cwd = job.Command, job.Cwd
-	obs.Jobs = []checkpoint.Job{snapshotJob(job, true)}
+	return llm.JobCompletion{Job: snapshotJob(job, true), Fingerprint: obs.Fingerprint, Cwd: job.Cwd, Failure: obs.Failure}
+}
+
+func completedJobMessage(job *tools.Job, res tools.JobResult, display string) llm.Message {
+	completed := jobCompletion(job, res)
+	obs := &llm.ToolObservation{Tool: "bash", Fingerprint: completed.Fingerprint, Command: job.Command, Cwd: completed.Cwd,
+		OutputFile: job.OutputFile, Failure: completed.Failure, Jobs: []checkpoint.Job{completed.Job}}
 	return llm.Message{Role: "user", Kind: "job", InvocationID: job.InvocationID, Content: display, ToolError: res.Err != nil, Observation: obs}
 }
 
@@ -209,6 +214,19 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 			for _, job := range o.Jobs {
 				if job.OutputFile != "" {
 					d.Artifacts = append(d.Artifacts, checkpoint.Artifact{Kind: "tool_output", Path: job.OutputFile, Source: source})
+				}
+			}
+			if completed := o.CompletedJob; completed != nil {
+				job := completed.Job
+				d.Jobs = append(d.Jobs, job)
+				if job.OutputFile != "" && job.OutputFile != o.OutputFile {
+					d.Artifacts = append(d.Artifacts, checkpoint.Artifact{Kind: "tool_output", Path: job.OutputFile, Source: source})
+				}
+				if completed.Failure != nil {
+					d.Failures = append(d.Failures, checkpoint.Failure{Fingerprint: completed.Fingerprint, Source: source,
+						Tool: "bash", Command: job.Command, Cwd: completed.Cwd, Output: *completed.Failure})
+				} else if job.Error == "" && completed.Fingerprint != "" {
+					d.ResolvedFailures = append(d.ResolvedFailures, completed.Fingerprint)
 				}
 			}
 		}

@@ -7,10 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"minimalharness/internal/checkpoint"
 	"minimalharness/internal/failureguard"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
@@ -433,6 +435,12 @@ func TestFailureProgressAccountsForStoppedJobBeforeSameBatchRetry(t *testing.T) 
 		if msg.Observation == nil {
 			continue
 		}
+		if completed := msg.Observation.CompletedJob; completed != nil && completed.Job.ID == job.ID {
+			if msg.ToolCallID != "stop" || msg.ToolError || !completed.Job.Delivered || completed.Failure == nil {
+				t.Fatalf("unexpected stopped outcome: call=%q outcome=%+v", msg.ToolCallID, completed)
+			}
+			deliveries++
+		}
 		for _, saved := range msg.Observation.Jobs {
 			if saved.ID == job.ID && saved.Delivered {
 				if msg.Kind != "job" || !msg.ToolError || saved.Error == "" {
@@ -517,6 +525,63 @@ func TestStoppedBackgroundJobDeliversOriginalOutcome(t *testing.T) {
 	key := factDigest(CanonicalToolKey("bash", args))
 	if len(state.Failures) != 1 || state.Failures[0].Fingerprint != key || !strings.Contains(state.Failures[0].Output.Tail, tail) {
 		t.Errorf("checkpoint omitted the original command failure or output tail: %d failure records", len(state.Failures))
+	}
+}
+
+func TestStoppedBackgroundJobSurvivesAbortAndResolvesBeforeRetry(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash is not available")
+	}
+	for _, abort := range []bool{false, true} {
+		t.Run(fmt.Sprintf("abort=%t", abort), func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			c := budgetConfig(t, nil)
+			c.Exec.BackgroundThreshold = 500 * time.Millisecond
+			store, err := session.Open("stopped-job-batch", session.OpenOptions{Workspace: c.Exec.Root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			c.Session = store
+			defer c.Exec.CancelJobs()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			const args = `{"command":"if test -f ready; then printf repaired; exit 0; fi; printf initial-output; : > ready; exec sleep 30"}`
+			c.OnEvent = func(e Event) {
+				if abort && e.Kind == EventToolEnd && e.ToolCallID == "stop" {
+					cancel()
+				}
+			}
+			batch := budgetSSE("", []llm.ToolCall{
+				budgetCall("stop", "bash", `{"killJobId":"bg-1"}`),
+				budgetCall("retry", "bash", args),
+			}, nil, true)
+			_, _, runErr := runVerificationContext(t, c, ctx, toolCallSSE("launch", "bash", args), batch, textSSE("done"))
+			if abort && c.LastTerminalReason != TerminalAbort || !abort && runErr != nil {
+				t.Fatalf("unexpected terminal result: %s, %v", c.LastTerminalReason, runErr)
+			}
+			history, err := session.Load(store.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stopped, repaired := false, false
+			for _, m := range history {
+				stopped = stopped || (m.Kind == "job" || m.ToolCallID == "stop") && strings.Contains(m.Content, "initial-output")
+				repaired = repaired || m.ToolCallID == "retry" && !m.ToolError && strings.Contains(m.Content, "repaired")
+			}
+			if !stopped || repaired == abort {
+				t.Errorf("saved result: stopped=%t, repaired=%t; want stopped and repaired=%t", stopped, repaired, !abort)
+			}
+			// Reopen from the transcript without an in-memory job registry.
+			state, _, _, err := (&Config{}).compactState(history)
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := factDigest(CanonicalToolKey("bash", args))
+			if haveFailure := slices.ContainsFunc(state.Failures, func(f checkpoint.Failure) bool { return f.Fingerprint == key }); haveFailure != abort {
+				t.Errorf("checkpoint has original failure=%t, want %t", haveFailure, abort)
+			}
+		})
 	}
 }
 
