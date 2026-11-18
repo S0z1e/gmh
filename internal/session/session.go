@@ -306,8 +306,8 @@ func (s *Store) ArchiveCopy(name string) (string, error) {
 
 // IsTurnStart reports whether m starts a user turn: a user message
 // with no images that is not a turn-internal message the loop
-// itself appended. Turn-internal user messages are the auto-loaded
-// skill bodies ("Skill <name>:\n..."), background-job deliveries
+// itself appended. Turn-internal user messages include loaded skill
+// bodies ("Skill <name>:\n..."), background-job deliveries
 // ("Background job ...") and the compact summary ("Previous
 // conversation summary:\n..."). Kind distinguishes new task messages
 // explicitly; prefix checks exist only for older transcripts.

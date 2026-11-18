@@ -260,9 +260,6 @@ func Setup(p Params) (*App, error) {
 	skillList := skills.DiscoverForTrust(absRoot, trusted)
 	a.Skills = skillList
 	system := agent.SystemPrompt
-	if trusted {
-		system += agent.ProjectGitContext(absRoot)
-	}
 	system += skills.Listing(skillList)
 
 	// Plugins: a bad plugin is skipped with a warning on stderr; it
@@ -1252,22 +1249,6 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		}
 		r.Print("Unknown skill: %s", name)
 		return
-	}
-	// Keyword trigger: if the task names a skill as a whole word, load
-	// its full text into the turn before the model sees the task.
-	for _, sk := range skills.MatchKeywords(task, r.App.Skills) {
-		body, err := sk.Load()
-		if err != nil {
-			continue
-		}
-		r.Print("Auto-loaded skill %s (mentioned in your task).", sk.Name)
-		skillMsg := llm.Message{Role: "user", Kind: "skill", Content: "Skill " + sk.Name + ":\n" + body}
-		r.App.History = append(r.App.History, skillMsg)
-		if err := r.App.Store.Append(skillMsg); err != nil {
-			r.LastErr = fmt.Errorf("save session: %w", err)
-			r.Print("[error] %v", r.LastErr)
-			return
-		}
 	}
 	userMsg := llm.Message{Role: "user", Content: task, Kind: "task"}
 	// Images attached for this turn (-image, /image, RPC) ride on

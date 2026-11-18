@@ -112,9 +112,8 @@
 - Skills: put `SKILL.md` files under `.agents/skills/<name>/` in the
   project, or `~/.config/minimal-harness/skills/`. Only name +
   description are loaded at startup; the full text loads on demand
-  three ways: the user types `/skill:<name>`, the task names a skill
-  as a whole word (auto-loaded before the turn), or the model calls
-  the `load_skill` tool when a task matches a skill. A skill's
+  when the user types `/skill:<name>` or the model calls the
+  `load_skill` tool when a task matches a skill. A skill's
   `references/` files are never loaded up front: `load_skill` lists
   them in a footer, and the model loads one with
   `load_skill {name, reference}` (paths are jailed to that skill's
@@ -127,7 +126,9 @@
   up to 8 KiB of text (also subject to an overall preview limit). It can
   request the rest with `read_guidance`. If the applicable instructions
   change before a write or edit, the harness asks the model to reconsider
-  the operation before executing it. The startup Git snapshot is separate.
+  the operation before executing it. If branch or working tree status is
+  needed, the model requests current Git status through Bash under the
+  normal tool approval rules.
 - Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`. A session has
   one transcript writer across processes; opening, renaming or deleting another
   process's active session fails immediately. Closing or crashing releases the

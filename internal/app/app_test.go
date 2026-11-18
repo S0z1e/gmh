@@ -313,9 +313,9 @@ func TestRunnerHandleClear(t *testing.T) {
 	}
 }
 
-// The keyword trigger: a task naming a skill loads its body into the
-// turn before the model sees the task.
-func TestRunnerKeywordTriggerLoadsSkill(t *testing.T) {
+// A plain word in the task does not load skill content. The explicit
+// slash command still loads the user-selected skill.
+func TestRunnerLoadsSkillOnExplicitRequest(t *testing.T) {
 	srv := mockServer(t)
 	defer srv.Close()
 	t.Setenv("HOME", t.TempDir())
@@ -342,26 +342,22 @@ func TestRunnerKeywordTriggerLoadsSkill(t *testing.T) {
 	r := &Runner{App: a, Print: func(format string, args ...any) {
 		printed = append(printed, fmt.Sprintf(format, args...))
 	}}
-	r.Handle(context.Background(), "use the greeter skill to say hi")
-	if len(a.History) < 3 {
-		t.Fatalf("history = %d messages, want >= 3 (skill + task + assistant)", len(a.History))
+	r.Handle(context.Background(), "Who greets the greeter at the door?")
+	if r.LastErr != nil {
+		t.Fatal(r.LastErr)
 	}
-	if !strings.Contains(a.History[0].Content, "Say hello warmly.") {
-		t.Fatalf("first history message = %q, want the skill body", a.History[0].Content)
+	for _, m := range a.History {
+		if m.Kind == "skill" || strings.Contains(m.Content, "Say hello warmly.") {
+			t.Fatalf("implicit skill injection: %+v", m)
+		}
 	}
-	if !strings.Contains(strings.Join(printed, "\n"), "Auto-loaded skill greeter") {
-		t.Fatalf("no auto-load notice printed: %v", printed)
+	r.Handle(context.Background(), "/skill:greeter")
+	skill := a.History[len(a.History)-1]
+	if skill.Kind != "skill" || !strings.Contains(skill.Content, "Say hello warmly.") {
+		t.Fatalf("explicit command did not load the skill: %+v", skill)
 	}
-	// A task that does not name the skill loads nothing.
-	a2, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 5, SessionID: "other-session"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer a2.Store.Close()
-	r2 := &Runner{App: a2, Print: func(format string, args ...any) {}}
-	r2.Handle(context.Background(), "just do something unrelated")
-	if len(a2.History) != 3 { // task + context snapshot + assistant
-		t.Fatalf("history = %d messages, want 3 (no skill loaded)", len(a2.History))
+	if !strings.Contains(strings.Join(printed, "\n"), "Loaded skill greeter") {
+		t.Fatalf("no explicit-load notice printed: %v", printed)
 	}
 }
 
