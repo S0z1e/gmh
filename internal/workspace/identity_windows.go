@@ -19,15 +19,19 @@ func directoryID(path string) (string, error) {
 }
 
 func openDirectoryMetadata(path string) (windows.Handle, error) {
-	name, err := windows.UTF16PtrFromString(windowsMetadataPath(path))
+	return openDirectoryPath(windowsMetadataPath(path), windows.FILE_READ_ATTRIBUTES, 0)
+}
+
+func openDirectoryPath(path string, access, flags uint32) (windows.Handle, error) {
+	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return 0, err
 	}
 	// Query metadata without requesting FILE_LIST_DIRECTORY. A path may
 	// be known and traversable even when its parent can't be enumerated.
-	return windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES,
+	return windows.CreateFile(name, access,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|flags, 0)
 }
 
 // DirectoryFileID identifies a pinned directory handle without reopening its path.

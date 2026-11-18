@@ -132,16 +132,40 @@ func TestWindowsBindingDoesNotLoseSignificantTrailingDot(t *testing.T) {
 
 func TestFallbackBindingPathKeepsOnlyDirectNamespace(t *testing.T) {
 	long := `\\?\C:\` + strings.Repeat(`long-directory\`, 20) + "workspace"
-	for _, tc := range []struct{ request, physical, want string }{
-		{`\\?\C:\Work\repo`, `\\?\C:\work\repo`, `\\?\C:\Work\repo`},
-		{`\\.\C:\Work\repo`, `\\?\C:\work\repo`, `\\.\C:\Work\repo`},
-		{`C:\work\alias`, `\\?\C:\work\repo.`, `\\?\C:\work\repo.`},
-		{`\\?\C:\work\alias`, `\\?\D:\repos\repo`, `D:\repos\repo`},
-		{`C:\work\alias`, long, long},
-		{long, long, long},
+	for _, tc := range []struct {
+		request, physical, want string
+		ordinaryUsable          bool
+	}{
+		{`\\?\C:\work\repo`, `\\?\C:\work\repo`, `\\?\C:\work\repo`, true},
+		{`\\.\C:\work\repo`, `\\?\C:\work\repo`, `\\.\C:\work\repo`, true},
+		{`C:\work\alias`, `\\?\C:\work\repo.`, `\\?\C:\work\repo.`, false},
+		{`\\?\C:\work\alias`, `\\?\D:\repos\repo`, `D:\repos\repo`, true},
+		{`C:\work\alias`, long, long, false},
+		{`C:\work\alias`, long, long[4:], true},
+		{long, long, long, true},
 	} {
-		if got := fallbackBindingPath(tc.request, tc.physical); got != tc.want {
+		if got := fallbackBindingPath(tc.request, tc.physical, func(string) bool { return tc.ordinaryUsable }); got != tc.want {
 			t.Errorf("request %q, physical %q: got %q, want %q", tc.request, tc.physical, got, tc.want)
 		}
+	}
+}
+
+func TestWindowsCaseOnlyJunctionIsNotADirectBinding(t *testing.T) {
+	parent := t.TempDir()
+	if out, err := exec.Command("fsutil.exe", "file", "setCaseSensitiveInfo", parent, "enable").CombinedOutput(); err != nil {
+		t.Skipf("cannot create case-sensitive NTFS fixture: %v (%s)", err, out)
+	}
+	physical := filepath.Join(parent, "repo")
+	if err := os.Mkdir(physical, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("cmd.exe", "/d", "/c", "mklink", "/J", "Repo", "repo")
+	cmd.Dir = parent
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("cannot create case-only junction: %v (%s)", err, out)
+	}
+	alias := filepath.Join(parent, "Repo")
+	if sameDirectBindingName(bindingNamespace(alias), bindingNamespace(physical)) {
+		t.Fatal("case-only junction treated as direct open")
 	}
 }

@@ -78,31 +78,66 @@ func identify(path string) (Identity, error) {
 		}
 		return Identity{}, &os.PathError{Op: "resolve directory", Path: abs, Err: nameErr}
 	}
-	if strings.HasPrefix(strings.ToLower(bindingNamespace(abs)), `\\?\volume{`) {
+	namespace := bindingNamespace(abs)
+	if strings.HasPrefix(strings.ToLower(filepath.VolumeName(namespace)), `\\?\volume{`) {
 		// A drive-letter volume can also be opened by GUID. Compare the
 		// handle in the caller's namespace before replacing that binding.
-		if guidPath, err := finalDirectoryPath(h, volumeNameGUID); err == nil && strings.EqualFold(bindingNamespace(abs), guidPath) {
+		if guidPath, err := finalDirectoryPath(h, volumeNameGUID); err == nil && sameDirectBindingName(namespace, guidPath) {
 			return Identity{Path: abs, FileID: id}, nil
 		}
 	}
-	return Identity{Path: fallbackBindingPath(abs, physical), FileID: id}, nil
+	return Identity{Path: fallbackBindingPath(abs, physical, func(path string) bool {
+		// Open the ordinary spelling as-is: the metadata helper adds a
+		// device prefix, so it cannot tell if Win32 accepts the plain name.
+		check, err := openDirectoryPath(path, windows.FILE_READ_ATTRIBUTES, 0)
+		if err != nil {
+			return false
+		}
+		defer windows.CloseHandle(check)
+		plainID, err := directoryHandleID(check, path)
+		return err == nil && plainID == id
+	}), FileID: id}, nil
 }
 
-func fallbackBindingPath(requested, physical string) string {
+func fallbackBindingPath(requested, physical string, ordinaryUsable func(string) bool) string {
 	canonical := windowsCanonicalSpelling(physical)
 	// Preserve the requested namespace only if the name already spells the
 	// physical location. When legacy resolution fails on a symlink alias,
 	// the handle's physical name must instead match opening its target.
-	if strings.EqualFold(windowsCanonicalSpelling(bindingNamespace(requested)), canonical) {
+	if sameDirectBindingName(bindingNamespace(requested), bindingNamespace(canonical)) {
 		return requested
 	}
-	// EvalSymlinks can lose the prefix of an absolute link target. If the
-	// DOS name is too long for legacy Win32, retain the prefix as when the
-	// target was opened directly in the extended namespace.
-	if units, err := windows.UTF16FromString(canonical); err == nil && len(units) > windows.MAX_PATH {
+	// A long name may be usable without a prefix when Win32 long paths are
+	// enabled. Keep the prefix only if the ordinary name cannot open it.
+	if units, err := windows.UTF16FromString(canonical); err == nil && len(units) > windows.MAX_PATH && canonical != physical && !ordinaryUsable(canonical) {
 		return physical
 	}
 	return canonical
+}
+
+// Case-folded path strings can compare equal even when one of their components
+// is a link in a case-sensitive directory. For each case mismatch, inspect the
+// requested component without following its final reparse point.
+func sameDirectBindingName(requested, physical string) bool {
+	if !strings.EqualFold(requested, physical) {
+		return false
+	}
+	for requested != physical && requested != filepath.Dir(requested) {
+		if filepath.Base(requested) != filepath.Base(physical) {
+			h, err := openDirectoryPath(requested, 0, windows.FILE_FLAG_OPEN_REPARSE_POINT)
+			if err != nil {
+				return false
+			}
+			var info windows.ByHandleFileInformation
+			err = windows.GetFileInformationByHandle(h, &info)
+			windows.CloseHandle(h)
+			if err != nil || info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+				return false
+			}
+		}
+		requested, physical = filepath.Dir(requested), filepath.Dir(physical)
+	}
+	return true
 }
 
 func bindingNamespace(path string) string {
