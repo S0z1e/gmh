@@ -711,6 +711,16 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 				}
 			}
 		})
+		requestCtx = llm.WithRequestStart(requestCtx, func(trace llm.RequestTrace) error {
+			if c.Session == nil {
+				return nil
+			}
+			if err := c.Session.BeginUsageAttempt(trace.ID); err != nil {
+				c.persistErr = fmt.Errorf("save pending provider attempt: %w", err)
+				return c.persistErr
+			}
+			return nil
+		})
 		outputSeen := false
 		doneSeen := false
 		wrappedText := func(s string) {

@@ -46,6 +46,7 @@ type RequestTrace struct {
 }
 
 type observerKey struct{}
+type requestStartKey struct{}
 type traceKey struct{}
 type requestObservation struct {
 	trace   RequestTrace
@@ -63,7 +64,8 @@ func WithRequestObserver(ctx context.Context, observe func(RequestTrace)) contex
 
 func startRequestTrace(ctx context.Context) (context.Context, func(error)) {
 	observe, _ := ctx.Value(observerKey{}).(func(RequestTrace))
-	if observe == nil {
+	start, _ := ctx.Value(requestStartKey{}).(func(RequestTrace) error)
+	if observe == nil && start == nil {
 		return ctx, func(error) {}
 	}
 	o := &requestObservation{started: time.Now()}
@@ -81,7 +83,9 @@ func startRequestTrace(ctx context.Context) (context.Context, func(error)) {
 		if ctx.Err() != nil {
 			o.trace.Outcome = "cancelled"
 		}
-		observe(o.trace)
+		if observe != nil {
+			observe(o.trace)
+		}
 	}
 }
 
@@ -90,14 +94,19 @@ func hashBytes(data []byte) string {
 	return hex.EncodeToString(s[:])
 }
 
-func (c *Client) traceRequest(ctx context.Context, body []byte) {
+// WithRequestStart installs a synchronous persistence gate before HTTP dispatch.
+// A failed gate prevents both dispatch and the completed-attempt observation.
+func WithRequestStart(ctx context.Context, start func(RequestTrace) error) context.Context {
+	return context.WithValue(ctx, requestStartKey{}, start)
+}
+func (c *Client) traceRequest(ctx context.Context, body []byte) error {
 	o, _ := ctx.Value(traceKey{}).(*requestObservation)
 	if o == nil {
-		return
+		return nil
 	}
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(body, &fields) != nil {
-		return
+		return nil
 	}
 	t := RequestTrace{ID: rand.Text(), Model: c.Model, API: c.Mode(), EndpointHash: hashBytes([]byte(c.endpoint())), RequestHash: hashBytes(body), Relation: "baseline"}
 	t.StartedAt = o.started.UTC()
@@ -135,6 +144,11 @@ func (c *Client) traceRequest(ctx context.Context, body []byte) {
 	}
 	settings, _ := json.Marshal(fields)
 	t.SettingsHash = hashBytes(settings)
+	if start, _ := ctx.Value(requestStartKey{}).(func(RequestTrace) error); start != nil {
+		if err := start(t); err != nil {
+			return err
+		}
+	}
 	c.traceMu.Lock()
 	if prev := c.previousTrace; prev != nil {
 		t.PreviousID = prev.ID
@@ -163,6 +177,7 @@ func (c *Client) traceRequest(ctx context.Context, body []byte) {
 	c.previousTrace = &previous
 	c.traceMu.Unlock()
 	o.trace = t
+	return nil
 }
 
 func traceResponseHeaders(ctx context.Context, response *http.Response) {

@@ -55,14 +55,16 @@ func TestUsageLedgerFailureStopsBeforeTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Closing the writer simulates persistence failure after a fully received reply.
+	// A closed writer must fail the pending gate before any provider dispatch.
 	store.Close()
 	cfg := &Config{Session: store, Exec: &tools.Executor{Root: root}, Tools: ToolDefs(), Mode: "auto"}
+	called := false
 	cfg.Client = &llm.Client{API: "chat", Model: "fake", APIKey: "fake", BaseURL: "https://example.invalid", HTTP: &http.Client{Transport: stoppedJobTransport(func(r *http.Request) (*http.Response, error) {
+		called = true
 		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}],\"usage\":{\"total_tokens\":7}}\n\ndata: [DONE]\n\n"))}, nil
 	})}}
 	_, u, err := cfg.Run(context.Background(), []llm.Message{{Role: "user", Content: "hello"}})
-	if err == nil || !strings.Contains(err.Error(), "usage") || u.TotalTokens != 7 {
+	if err == nil || !strings.Contains(err.Error(), "usage") || u.TotalTokens != 0 || called {
 		t.Fatalf("usage=%+v err=%v", u, err)
 	}
 }

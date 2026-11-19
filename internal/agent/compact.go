@@ -477,6 +477,12 @@ func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message
 			return nil, llm.Usage{}, err
 		}
 		started := time.Now()
+		callbackID := rand.Text()
+		if c.Session != nil {
+			if err := c.Session.BeginUsageAttempt(callbackID); err != nil {
+				return nil, llm.Usage{}, fmt.Errorf("save pending compaction: %w", err)
+			}
+		}
 		before := c.usageAttempts
 		summary, usage, err = c.CompactHistory(ctx, summaryHistory)
 		// This legacy callback cannot distinguish omitted usage from explicit zero.
@@ -490,11 +496,18 @@ func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message
 			// A total alone proves tokens, not an input/output price breakdown.
 			breakdownKnown := usage.PromptTokens != 0 || usage.CompletionTokens != 0
 			tokensKnown := breakdownKnown || usage.TotalTokens != 0
-			tr := llm.RequestTrace{ID: rand.Text(), StartedAt: started, API: "callback", Outcome: "complete", Usage: measured, TokensComplete: tokensKnown, PriceCountsComplete: breakdownKnown}
+			tr := llm.RequestTrace{ID: callbackID, StartedAt: started, API: "callback", Outcome: "complete", Usage: measured, TokensComplete: tokensKnown, PriceCountsComplete: breakdownKnown}
 			if err != nil {
 				tr.Outcome = "error"
 			}
 			c.recordAttempt("Compaction callback", 1, tr)
+		}
+		if c.Session != nil && (errors.As(err, &inputErr) || c.usageAttempts != before+1 || c.persistErr == nil) {
+			// Actual observed streams have their own pending markers. On a failed
+			// synthetic record retain this wrapper as evidence of the missing attempt.
+			if completeErr := c.Session.CompleteUsageScope(callbackID); completeErr != nil && c.persistErr == nil {
+				c.persistErr = fmt.Errorf("complete compaction scope: %w", completeErr)
+			}
 		}
 		if budgetErr := c.budgetError(); budgetErr != nil {
 			err = budgetErr

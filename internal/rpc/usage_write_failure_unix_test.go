@@ -5,6 +5,7 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"minimalharness/internal/session"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -76,5 +77,22 @@ func TestUsageRegressionAppendFailureKeepsAccountingUnavailable(t *testing.T) {
 				t.Error("lost attempt has known turn cost")
 			}
 		}
+	}
+
+	id := s.app.Store.ID
+	if err := s.app.Store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := session.Open(id, session.OpenOptions{Workspace: s.app.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	totals, err := reopened.UsageTotals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !totals.RecoveryGap || totals.TokenCountsComplete() {
+		t.Fatalf("cold reopen erased lost attempt: %+v", totals)
 	}
 }

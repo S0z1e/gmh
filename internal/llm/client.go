@@ -501,7 +501,9 @@ func (c *Client) doPost(ctx context.Context, body []byte) (*http.Response, conte
 // cancelling first releases that read so Body.Close cannot wait on it.
 // On any error the cancel is already called and nil is returned.
 func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[string]string, withBearer bool) (*http.Response, context.CancelFunc, error) {
-	c.traceRequest(ctx, body)
+	if err := c.traceRequest(ctx, body); err != nil {
+		return nil, nil, err
+	}
 	// The request runs on a derived context so the first-byte idle
 	// deadline can abort it: if the server sends no response
 	// headers within the idle timeout, the stream is stalled before

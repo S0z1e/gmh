@@ -90,6 +90,11 @@ func (s *Store) loadUsageLocked() error {
 		if err != nil {
 			return err
 		}
+		pending, err := s.pendingUsageIDsLocked()
+		if err != nil {
+			return err
+		}
+		s.usageTotals.RecoveryGap = len(pending) > 0
 		s.usageLoaded = true
 		return nil
 	}
@@ -110,6 +115,10 @@ func (s *Store) loadUsageLocked() error {
 		return err
 	}
 	backups, err := recoveryBackups(f.Name())
+	if err != nil {
+		return err
+	}
+	pending, err := s.pendingUsageIDsLocked()
 	if err != nil {
 		return err
 	}
@@ -138,6 +147,7 @@ func (s *Store) loadUsageLocked() error {
 			return fmt.Errorf("usage cost overflow")
 		}
 		totals.add(a)
+		delete(pending, a.ID)
 		first = false
 	}
 	if err := sc.Err(); err != nil {
@@ -146,6 +156,7 @@ func (s *Store) loadUsageLocked() error {
 	if first {
 		totals.LegacyHistory = true
 	}
+	totals.RecoveryGap = totals.RecoveryGap || len(pending) > 0
 	s.usageTotals = totals
 	s.usageLoaded = true
 	return nil
@@ -251,6 +262,9 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 		return err
 	}
 	if err := syncRecoveryDirectory(filepath.Dir(path)); err != nil {
+		return err
+	}
+	if err := s.clearPendingUsageLocked(a.ID); err != nil {
 		return err
 	}
 	s.usageTotals.add(a)
