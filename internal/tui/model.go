@@ -136,8 +136,9 @@ type Model struct {
 	metaBranch string
 	// sessionTokens/turnCount accumulate across turns, fed by
 	// MetaUpdateMsg from the runner; shown on the meta line's right.
-	sessionTokens int
-	turnCount     int
+	sessionTokens    int
+	usageUnavailable bool
+	turnCount        int
 
 	// OnSubmit is called with the submitted line on Enter. The caller
 	// runs the task and feeds agent events back via program.Send.
@@ -177,11 +178,12 @@ func (m Model) WithBranch(branch string) Model {
 // unchanged. ToolMode is the loop's tool mode ("default" or "plan");
 // the meta line shows a plan chip while it is "plan".
 type MetaUpdateMsg struct {
-	Tokens   int
-	Turns    int
-	Model    string
-	API      string
-	ToolMode string
+	UsageUnavailable bool
+	Tokens           int
+	Turns            int
+	Model            string
+	API              string
+	ToolMode         string
 }
 
 // markWorking starts a turn: working becomes true, and workingSince
@@ -293,6 +295,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case MetaUpdateMsg:
 		m.sessionTokens = msg.Tokens
+		m.usageUnavailable = msg.UsageUnavailable
 		m.turnCount = msg.Turns
 		if msg.Model != "" {
 			m.metaModel = msg.Model
@@ -1011,12 +1014,16 @@ func (m Model) metaLine() string {
 	if m.metaBranch != "" {
 		right = styleMuted.Render(m.metaBranch)
 	}
-	if m.turnCount > 0 || m.sessionTokens > 0 {
+	if m.turnCount > 0 || m.sessionTokens > 0 || m.usageUnavailable {
 		turnWord := "turns"
 		if m.turnCount == 1 {
 			turnWord = "turn"
 		}
-		totals := fmt.Sprintf("%d %s · %s tokens", m.turnCount, turnWord, formatInt(m.sessionTokens))
+		tokens := formatInt(m.sessionTokens)
+		if m.usageUnavailable {
+			tokens = "unavailable"
+		}
+		totals := fmt.Sprintf("%d %s · %s tokens", m.turnCount, turnWord, tokens)
 		if right != "" {
 			right += styleMuted.Render(" · ") + styleMuted.Render(totals)
 		} else {

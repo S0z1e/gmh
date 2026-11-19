@@ -468,18 +468,22 @@ func (s *Server) handleQuery(req Request) {
 	s.mu.Unlock()
 	switch req.Type {
 	case "get_state":
-		s.respond(req, map[string]any{
+		data := map[string]any{
 			"session": st.sessionID, "model": st.model, "api": st.api,
 			"mode": st.mode, "tool_mode": st.toolMode, "root": st.root, "streaming": st.streaming,
 			"workspace_trusted": st.workspaceTrusted,
 			"queued":            len(s.work), "messages": st.messages, "turns": st.turns,
-			"total_tokens": st.sessionUsage.TotalTokens,
+			"metering_available": st.meteringAvailable,
 			// The effective window and output cap for the current
 			// model (Setup/SwitchModel resolved flag/env/model/
 			// config/default), so the GUI can meter context against
 			// the limit the compact trigger uses.
 			"context_window": st.contextWindow, "max_tokens": st.maxTokens,
-		}, nil)
+		}
+		if st.meteringAvailable {
+			data["total_tokens"] = st.sessionUsage.TotalTokens
+		}
+		s.respond(req, data, nil)
 	case "usage":
 		s.mu.Lock()
 		st := s.state

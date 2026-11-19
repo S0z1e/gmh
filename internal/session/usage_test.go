@@ -177,3 +177,30 @@ func TestUsageInvalidCountersAndCostCannotCorruptReopen(t *testing.T) {
 		})
 	}
 }
+
+func TestUsageAggregateOverflowRecordedAsUnknown(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	s, err := Open("overflow", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for i, u := range []llm.Usage{{PromptTokens: math.MaxInt}, {CompletionTokens: 1}} {
+		id := []string{"first", "second"}[i]
+		err := s.RecordUsage(UsageAttempt{ID: id, Request: llm.RequestTrace{ID: id, Usage: &u}})
+		if (i == 0 && err != nil) || (i == 1 && err == nil) {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	s.Close()
+	s, err = Open("overflow", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	totals, err := s.UsageTotals()
+	if err != nil || !totals.Usage.Valid() || totals.Attempts != 2 || totals.InvalidAttempts != 1 {
+		t.Fatalf("totals=%+v %v", totals, err)
+	}
+}

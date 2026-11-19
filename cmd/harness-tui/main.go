@@ -145,7 +145,7 @@ func main() {
 			// Session totals for the meta line's right side, plus
 			// the current model/api so a /model switch shows up,
 			// and the tool mode so a /plan switch shows its chip.
-			prog.Send(tui.MetaUpdateMsg{Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns, Model: a.Model.ID, API: a.Cfg.Client.API, ToolMode: string(a.ToolMode())})
+			prog.Send(tui.MetaUpdateMsg{UsageUnavailable: !runner.MeteringAvailable, Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns, Model: a.Model.ID, API: a.Cfg.Client.API, ToolMode: string(a.ToolMode())})
 			if quit {
 				prog.Quit()
 				return

@@ -243,6 +243,7 @@ func (u Usage) Valid() bool {
 
 // CanAdd checks the arithmetic used by Add without modifying either operand.
 func (u Usage) CanAdd(o Usage) bool {
+	o.normalize()
 	if !u.Valid() || !o.Valid() {
 		return false
 	}
@@ -253,5 +254,7 @@ func (u Usage) CanAdd(o Usage) bool {
 			return false
 		}
 	}
-	return true
+	combined := u
+	combined.Add(o)
+	return combined.Valid()
 }
