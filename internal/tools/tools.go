@@ -761,7 +761,7 @@ type PluginRunner interface {
 // alongside its marker text instead of the file's bytes as text.
 func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result ToolResult, resultErr error) {
 	defer func() {
-		if resultErr != nil {
+		if resultErr != nil && result.Status != ResultNotExecuted {
 			result.Status = ResultError
 		} else if result.Status == "" {
 			result.Status = ResultSuccess

@@ -129,6 +129,9 @@ func (c *Config) verificationFinish(ctx context.Context, a *verificationAttempt,
 	if a == nil || c.verifier == nil {
 		return nil
 	}
+	if res.Status == tools.ResultNotExecuted {
+		return nil
+	}
 	record := verification.Evidence{InvocationID: a.invocationID, ToolCallID: a.toolCallID, Command: a.checks[0].Command, Cwd: a.cwd, Version: a.before.Version, ExitCode: res.ExitCode, Started: a.started, Finished: time.Now().UTC()}
 	state, err := verification.Capture(ctx, c.Exec.Root, c.verifier.policy.Exclude)
 	switch {
