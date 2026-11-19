@@ -16,8 +16,6 @@ import (
 	"slices"
 	"sync"
 	"time"
-
-	"minimalharness/internal/privatefile"
 )
 
 // timeoutError marks a bash run killed by its timeout. Its message is
@@ -286,7 +284,7 @@ func (e *outputCapError) Error() string {
 // child that outlives its shell. Both streams share one owned pipe copier;
 // the shell exit starts a bounded drain independently of its exit status.
 type bashOutputCapture struct {
-	file    *os.File
+	file    io.Writer
 	summary *bashOutputSink
 	stop    func()
 	bytes   int64
@@ -317,7 +315,9 @@ func (c *bashOutputCapture) Write(p []byte) (int, error) {
 // The shell and its captured stdout/stderr have separate lifetimes. A short
 // bounded drain captures buffered output without waiting indefinitely for inherited
 // handles; only background:true with a live shell retains captured output.
-func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration, outPath, dir string, preview *BashOutputPreview) (string, int, error) {
+func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration, output *bashOutputFile, dir string, preview *BashOutputPreview) (string, int, error) {
+	defer output.Close()
+	outPath := output.path
 	var runCtx context.Context
 	var cancel context.CancelFunc
 	if timeout > 0 {
@@ -364,21 +364,9 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		return stopProcess(runCtx.Err())
 	}
 
-	legacy := outPath == ""
-	filePath := outPath
-	if legacy {
-		tmp, err := os.CreateTemp("", "gmh-bash-*")
-		if err == nil {
-			filePath = tmp.Name()
-			_ = tmp.Close()
-			defer os.Remove(filePath)
-		}
-	}
-	f, err := privatefile.Open(filePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY)
-	if err != nil {
-		return "", -1, fmt.Errorf("open bash output: %w", err)
-	}
-	capture := &bashOutputCapture{file: f, summary: newBashOutputSink(), stop: func() {
+	legacy := output.legacy
+	f := output.file
+	capture := &bashOutputCapture{file: output, summary: newBashOutputSink(), stop: func() {
 		// Capture errors still stop the inherited process group during
 		// output drain, after the command deadline has been retired.
 		_ = stopProcess(nil)
@@ -468,18 +456,27 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	if ownedGroup && (cleanupErr == nil || errors.Is(cleanupErr, os.ErrProcessDone)) {
 		closureNotice = "\n[Output capture closed; remaining processes in the command group were stopped.]"
 	}
+	var quota *OutputQuotaError
+	quotaNotice := ""
+	if errors.As(capture.err, &quota) {
+		quotaNotice = "\n[" + quota.Error() + "; command stopped.]"
+	}
 	if legacy {
-		data, _ := readFileHead(filePath, MaxOutBytes)
+		data, _ := readFileHead(outPath, MaxOutBytes)
 		s := truncate(string(data), MaxOutBytes)
 		if preview != nil {
 			*preview = bashPreview([]string{s}, []string{s}, true)
 			if captureClosed {
 				preview.Notice = closureNotice
 			}
+			if quotaNotice != "" {
+				preview.Notice = quotaNotice
+			}
 		}
 		if captureClosed {
 			s += closureNotice
 		}
+		s += quotaNotice
 		if capture.capped {
 			return s, -1, &outputCapError{bytes: int64(len(data))}
 		}
@@ -506,11 +503,15 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		if captureClosed {
 			preview.Notice = closureNotice
 		}
+		if quotaNotice != "" {
+			preview.Notice = quotaNotice
+		}
 	}
 	s := FormatBashOutput(lines, bytes, fileCapped || capture.capped, head, tail, outPath, dir)
 	if captureClosed {
 		s += closureNotice + "\n[Use background:true with a foreground server command for a long-lived service.]"
 	}
+	s += quotaNotice
 	if capture.capped {
 		return s, -1, &outputCapError{bytes: bytes}
 	}
@@ -585,10 +586,14 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	if a.Background && a.Timeout == 0 {
 		timeout = 0
 	}
-	outPath := e.nextOutputFile()
+	output, err := e.newBashOutput(commandCtx)
+	if err != nil {
+		e.audit(ctx, AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
+		return nil, err
+	}
 	identity := invocationFromContext(ctx)
 	key, _ := ctx.Value(failureKeyContext{}).(string)
-	job := &Job{InvocationID: identity.id, ToolCallID: identity.callID, failureKey: key, Command: a.Command, Cwd: dir, OutputFile: outPath, Started: time.Now(), done: make(chan struct{}), cancel: cancel,
+	job := &Job{InvocationID: identity.id, ToolCallID: identity.callID, failureKey: key, Command: a.Command, Cwd: dir, OutputFile: output.publicPath(), Started: time.Now(), done: make(chan struct{}), cancel: cancel,
 		closeCancel: func() { cancelCause(ErrExecutorClosed) }}
 	if foreground {
 		job.stopParent = context.AfterFunc(ctx, cancel)
@@ -600,6 +605,7 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		e.jobsMu.Unlock()
 		job.Cancel()
 		job.Detach()
+		output.Close()
 		return nil, ErrExecutorClosed
 	}
 	if e.jobs == nil {
@@ -617,7 +623,7 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		defer cancel()
 		defer finish()
 		preview := &BashOutputPreview{}
-		out, code, err := e.runBashCmd(commandCtx, a.Command, timeout, outPath, dir, preview)
+		out, code, err := e.runBashCmd(commandCtx, a.Command, timeout, output, dir, preview)
 		if audit != nil {
 			entry := AuditEntry{InvocationID: job.InvocationID, ToolCallID: job.ToolCallID, TS: time.Now(), Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
 			if err != nil {

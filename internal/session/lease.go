@@ -22,7 +22,10 @@ func acquireWriter(id string) (*os.File, error) {
 }
 
 func acquireWriterFile(id string) (*os.File, error) {
-	dir := filepath.Join(Dir(), ".writers")
+	return acquireWriterIn(filepath.Join(Dir(), ".writers"), id)
+}
+
+func acquireWriterIn(dir, id string) (*os.File, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}

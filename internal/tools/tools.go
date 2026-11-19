@@ -90,6 +90,9 @@ type Executor struct {
 	// result). Read allows absolute paths under it even though they
 	// sit outside the workspace root; Write/Edit/Glob/Grep do not.
 	OutputDir string
+	// OutputMaxBytes bounds all retained Bash output for the session. Zero uses
+	// DefaultSessionOutputMaxBytes. A session switch selects a separate budget.
+	OutputMaxBytes int64
 	// Plugins runs plugin-registered tools (nil = no plugins loaded).
 	// The interface keeps this package free of the moejs dependency:
 	// app.Setup sets it to the loaded *plugins.Registry. A plugin
@@ -104,8 +107,8 @@ type Executor struct {
 	jobsClosed  bool
 	activeBash  map[*bashRun]struct{}
 
-	outMu  sync.Mutex
-	outSeq int
+	outMu         sync.Mutex
+	outputBudgets map[string]*bashOutputBudget
 
 	cacheOnce  sync.Once
 	fetchCache *webfetchCache
@@ -650,14 +653,18 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 	if err != nil {
 		return ToolResult{}, err
 	}
-	path := e.nextOutputFile()
-	out, code, err := e.runBashCmd(ctx, a.Command, e.bashTimeout(a), path, dir, nil)
+	output, err := e.newBashOutput(ctx)
+	if err != nil {
+		e.audit(ctx, AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
+		return ToolResult{}, err
+	}
+	out, code, err := e.runBashCmd(ctx, a.Command, e.bashTimeout(a), output, dir, nil)
 	entry := AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
 	if err != nil {
 		entry.Error = err.Error()
 	}
 	e.audit(ctx, entry)
-	return ToolResult{Text: out, ExitCode: &code, OutputFile: path}, err
+	return ToolResult{Text: out, ExitCode: &code, OutputFile: output.publicPath()}, err
 }
 
 // ToolResult is one tool call's observation. Images is set only by

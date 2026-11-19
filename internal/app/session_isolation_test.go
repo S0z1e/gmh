@@ -158,8 +158,8 @@ func TestSessionRenameDoesNotGrantReusedOutputDirectory(t *testing.T) {
 	if err := a.RenameSession(old, "renamed"); err != nil {
 		t.Fatal(err)
 	}
-	if a.Cfg.Exec.OutputDir != sessionOutputDir("renamed") {
-		t.Fatal("renamed session still writes into the old output directory")
+	if a.Cfg.Exec.OutputDir != filepath.Dir(owned.OutputFile) {
+		t.Fatal("rename changed the persistent output directory")
 	}
 	fresh, err := a.NewSession()
 	if err != nil {

@@ -2,19 +2,18 @@
 // writes its FULL stdout+stderr to a per-call file under the
 // executor's OutputDir (session-scoped, set by app.Setup), and the
 // observation returned to the model carries only head + tail plus
-// the file's path. The file grows while a background job runs, so
+// the file's path. Per-file and session quotas stop excessive capture. The
+// file grows while a background job runs, so
 // the model can read partial output mid-run with the read tool —
 // the pull affordance every surveyed production agent has (Claude
 // reads an output file, OpenCode a synthetic task message, Codex
-// wait_agent). Without OutputDir the executor falls back to the old
-// in-memory behaviour (CombinedOutput capped at MaxOutBytes).
+// wait_agent). Without OutputDir a temporary capture file backs a bounded
+// inline result.
 package tools
 
 import (
 	"fmt"
-	"minimalharness/internal/privatefile"
 	"minimalharness/internal/textutil"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -210,33 +209,6 @@ func FormatBashOutput(lines int, bytes int64, fileCapped bool, head, tail []stri
 		}
 		tail = tail[1:]
 	}
-}
-
-// nextOutputFile allocates the path for one bash call's output
-// file, creating OutputDir on first use. It returns "" when
-// OutputDir is unset or cannot be created: callers then fall back
-// to the in-memory behaviour. Names carry the pid so two processes
-// resuming the same session never share a file. The file is
-// created (empty) here, so the path exists from the moment a
-// background job starts — a reader polling it mid-run never races
-// the goroutine that fills it.
-func (e *Executor) nextOutputFile() string {
-	if e.OutputDir == "" {
-		return ""
-	}
-	e.outMu.Lock()
-	defer e.outMu.Unlock()
-	if err := os.MkdirAll(e.OutputDir, 0o755); err != nil {
-		return ""
-	}
-	e.outSeq++
-	path := filepath.Join(e.OutputDir, fmt.Sprintf("bash-%d-%d.log", os.Getpid(), e.outSeq))
-	f, err := privatefile.Open(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY)
-	if err != nil {
-		return ""
-	}
-	_ = f.Close()
-	return path
 }
 
 // outputDirBase resolves p for the read tool's narrow exception:

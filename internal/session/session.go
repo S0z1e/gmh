@@ -17,12 +17,13 @@ import (
 )
 
 type Store struct {
-	ID        string
-	Path      string
-	file      *os.File
-	writer    *os.File // lifetime lease, independent of rewritten transcript inode
-	header    *Header
-	auditFile *os.File // lazily opened sidecar for audit records
+	ID           string
+	Path         string
+	file         *os.File
+	writer       *os.File // lifetime lease, independent of rewritten transcript inode
+	outputWriter *os.File // output identity lease, independent of session name
+	header       *Header
+	auditFile    *os.File // lazily opened sidecar for audit records
 	// mu guards Append and Audit: a background job's completion audit
 	// can land on its own goroutine while the loop appends or audits
 	// on the main one.
@@ -438,7 +439,23 @@ func (s *Store) Close() error {
 		err = errors.Join(err, s.writer.Close())
 		s.writer = nil
 	}
+	if s.outputWriter != nil {
+		err = errors.Join(err, s.outputWriter.Close())
+		s.outputWriter = nil
+	}
 	return err
+}
+
+// OutputDir follows the persistent output identity, including for old sessions
+// whose original directory is adopted on first open with this version.
+func (s *Store) OutputDir() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.ID
+	if s.header != nil && s.header.OutputID != "" {
+		id = s.header.OutputID
+	}
+	return filepath.Join(Dir(), id, "bash-output")
 }
 
 // Load replays the active checkpoint and repairs incomplete tool batches

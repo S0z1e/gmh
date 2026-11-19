@@ -298,7 +298,7 @@ func Setup(p Params) (*App, error) {
 	// the project tree): the loop's read tool can pull them, and a
 	// new session / resume re-points the executor (see newSession
 	// and LoadSession, which reset it alongside the audit hook).
-	executor.OutputDir = sessionOutputDir(store.ID)
+	executor.OutputDir = store.OutputDir()
 	executor.SwitchSession(store.ID)
 	if p.BashTimeoutSeconds > 0 {
 		executor.BashTimeout = time.Duration(p.BashTimeoutSeconds) * time.Second
@@ -718,14 +718,6 @@ func (a *App) fireSessionEvents(oldID, newID string) {
 	}
 }
 
-// sessionOutputDir is where one session's bash output files go:
-// <sessions dir>/<session id>/bash-output. The files are named
-// bash-<pid>-<seq>.log by the executor, so two processes resuming
-// the same session never share a file.
-func sessionOutputDir(id string) string {
-	return filepath.Join(session.Dir(), id, "bash-output")
-}
-
 func (a *App) NewSession() (*session.Store, error) {
 	return a.newSession(true)
 }
@@ -759,7 +751,7 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 		if a.Cfg.Exec != nil {
 			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 			// Bash output files follow the current session too.
-			a.Cfg.Exec.OutputDir = sessionOutputDir(store.ID)
+			a.Cfg.Exec.OutputDir = store.OutputDir()
 			a.Cfg.Exec.SwitchSession(store.ID)
 		}
 	}
@@ -828,7 +820,7 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 		if a.Cfg.Exec != nil {
 			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 			// Bash output files follow the resumed session too.
-			a.Cfg.Exec.OutputDir = sessionOutputDir(store.ID)
+			a.Cfg.Exec.OutputDir = store.OutputDir()
 			a.Cfg.Exec.SwitchSession(store.ID)
 		}
 	}
@@ -867,7 +859,7 @@ func (a *App) RenameSession(oldID, newID string) error {
 	if a.Cfg != nil && a.Cfg.Exec != nil {
 		a.Cfg.Exec.RenameSession(oldID, newID)
 		if current {
-			a.Cfg.Exec.OutputDir = sessionOutputDir(newID)
+			a.Cfg.Exec.OutputDir = a.Store.OutputDir()
 		}
 	}
 	if current && a.Cfg != nil && a.Cfg.Client != nil {

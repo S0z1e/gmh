@@ -3,6 +3,7 @@ package session
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +29,9 @@ type Header struct {
 	Workspace  workspace.Identity  `json:"workspace"`
 	Repository *workspace.Identity `json:"repository,omitempty"`
 	Created    time.Time           `json:"created"`
+	// OutputID remains stable across rename. New sessions never reuse a prior
+	// session's output directory even when its transcript name becomes free.
+	OutputID string `json:"output_id,omitempty"`
 }
 
 type OpenOptions struct {
@@ -50,8 +54,10 @@ func Open(id string, opts OpenOptions) (*Store, error) {
 	var header *Header
 	var skip int64
 	var replace bool
+	var fresh bool
 	s, err := newStore(id, func(f *os.File, created bool) error {
 		if created {
+			fresh = true
 			replace = true
 			return nil
 		}
@@ -74,10 +80,33 @@ func Open(id string, opts OpenOptions) (*Store, error) {
 	}
 	if replace {
 		created := time.Now().UTC()
+		outputID := ""
 		if header != nil {
 			created = header.Created
+			outputID = header.OutputID
 		}
-		header = &Header{Role: headerRole, Version: headerVersion, Workspace: identity, Repository: repo, Created: created}
+		header = &Header{Role: headerRole, Version: headerVersion, Workspace: identity, Repository: repo, Created: created, OutputID: outputID}
+	}
+	if header.OutputID == "" {
+		header.OutputID = s.ID // Adopt the existing output directory of old sessions.
+		if fresh {
+			var token [16]byte
+			if _, err := rand.Read(token[:]); err != nil {
+				s.Close()
+				return nil, err
+			}
+			header.OutputID = fmt.Sprintf("output-%x", token)
+		}
+		replace = true
+	}
+	// A copied transcript must not acquire independent writers into one output
+	// directory. This lease survives transcript rename and header replacement.
+	s.outputWriter, err = acquireWriterIn(filepath.Join(Dir(), ".output-writers"), header.OutputID)
+	if err != nil {
+		s.Close()
+		return nil, err
+	}
+	if replace {
 		if err := s.replaceHeader(header, skip); err != nil {
 			s.Close()
 			return nil, err
@@ -131,6 +160,9 @@ func decodeHeader(line []byte) (*Header, error) {
 	}
 	if h.Repository != nil && (h.Repository.Path == "" || !absoluteIdentityPath(h.Repository.Path)) {
 		return nil, fmt.Errorf("invalid session repository identity")
+	}
+	if h.OutputID != "" && ValidateSessionID(h.OutputID) != nil {
+		return nil, fmt.Errorf("invalid session output identity")
 	}
 	return &h, nil
 }

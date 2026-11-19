@@ -186,7 +186,56 @@ func RenameSession(oldID, newID string) error {
 		return err
 	}
 	defer target.Close()
+	if err := pinLegacyOutputID(oldID); err != nil {
+		return err
+	}
 	return renameSessionFiles(oldID, newID)
+}
+
+// Offline rename pins old output ownership before changing the filename.
+// Unbound legacy sessions with output must be adopted first.
+func pinLegacyOutputID(id string) error {
+	path := filepath.Join(Dir(), id+".jsonl")
+	if err := checkTranscriptPath(path); err != nil {
+		return err
+	}
+	f, err := privatefile.Open(path, os.O_RDWR|metadataReadFlags)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("unknown session %q", id)
+		}
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("session transcript must be a regular file")
+	}
+	if err := checkTranscriptLinks(f); err != nil {
+		return err
+	}
+	h, skip, err := readHeader(f)
+	if err != nil {
+		return err
+	}
+	if h == nil {
+		if _, err := os.Stat(filepath.Join(Dir(), id, "bash-output")); err == nil {
+			return fmt.Errorf("adopt legacy session with --rebind-session before renaming its output")
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	if h.OutputID != "" {
+		return nil
+	}
+	h.OutputID = id
+	s := &Store{ID: id, Path: path, file: f}
+	defer func() { _ = s.file.Close() }()
+	return s.replaceHeader(h, skip)
 }
 
 // DeleteSession removes a session that is not currently open: its
