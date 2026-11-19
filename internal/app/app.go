@@ -821,6 +821,9 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 			// Bash output files follow the resumed session too.
 			a.Cfg.Exec.OutputDir = store.OutputDir()
+			if !reuse {
+				a.Cfg.Exec.ReacquireOutput(store.OutputDir())
+			}
 			a.Cfg.Exec.SwitchSession(store.ID)
 		}
 	}

@@ -232,7 +232,11 @@ func pinLegacyOutputID(id string) error {
 	if h.OutputID != "" {
 		return nil
 	}
-	h.OutputID = id
+	output, err := acquireOutputWriter(h, id)
+	if err != nil {
+		return err
+	}
+	defer output.Close()
 	s := &Store{ID: id, Path: path, file: f}
 	defer func() { _ = s.file.Close() }()
 	return s.replaceHeader(h, skip)

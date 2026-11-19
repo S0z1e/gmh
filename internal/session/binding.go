@@ -3,7 +3,6 @@ package session
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -88,20 +87,18 @@ func Open(id string, opts OpenOptions) (*Store, error) {
 		header = &Header{Role: headerRole, Version: headerVersion, Workspace: identity, Repository: repo, Created: created, OutputID: outputID}
 	}
 	if header.OutputID == "" {
-		header.OutputID = s.ID // Adopt the existing output directory of old sessions.
+		replace = true
 		if fresh {
-			var token [16]byte
-			if _, err := rand.Read(token[:]); err != nil {
+			header.OutputID, err = randomOutputID()
+			if err != nil {
 				s.Close()
 				return nil, err
 			}
-			header.OutputID = fmt.Sprintf("output-%x", token)
 		}
-		replace = true
 	}
 	// A copied transcript must not acquire independent writers into one output
 	// directory. This lease survives transcript rename and header replacement.
-	s.outputWriter, err = acquireWriterIn(filepath.Join(Dir(), ".output-writers"), header.OutputID)
+	s.outputWriter, err = acquireOutputWriter(header, s.ID)
 	if err != nil {
 		s.Close()
 		return nil, err

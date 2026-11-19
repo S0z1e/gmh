@@ -52,6 +52,20 @@ func (f *bashOutputFile) publicPath() string {
 	return f.path
 }
 
+// ReacquireOutput discards cached counters when a session writer is newly
+// acquired. The previous lease was released only after all its captures ended;
+// another process may have appended output while this app selected a different
+// session. Retained writers must keep their live budget instead.
+func (e *Executor) ReacquireOutput(dir string) {
+	key, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	e.outMu.Lock()
+	delete(e.outputBudgets, key)
+	e.outMu.Unlock()
+}
+
 func (e *Executor) newBashOutput(ctx context.Context) (*bashOutputFile, error) {
 	e.outMu.Lock()
 	defer e.outMu.Unlock()
