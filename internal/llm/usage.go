@@ -205,7 +205,7 @@ func traceWireUsage(ctx context.Context, usage Usage, data string, responses boo
 	}
 	// Empty usage objects contain no metering evidence. Preserve earlier
 	// snapshots when a later empty object arrives, but never invent a zero.
-	if input == nil && output == nil && counts.Total == nil && !usage.CacheUsageReported && usage.ReasoningTokens == 0 && observer.trace.Usage == nil {
+	if !usage.Invalid && input == nil && output == nil && counts.Total == nil && !usage.CacheUsageReported && usage.ReasoningTokens == 0 && observer.trace.Usage == nil {
 		return
 	}
 	complete := input != nil && output != nil

@@ -20,7 +20,7 @@ func (c *Config) recordAttempt(operation string, attempt int, trace llm.RequestT
 		return
 	}
 	record := session.UsageAttempt{ID: trace.ID, Operation: operation, Attempt: attempt, Request: trace}
-	if trace.Usage != nil && !invalid && trace.PriceCountsComplete && c.UsageRates.Configured {
+	if trace.Usage != nil && !invalid && trace.PriceCountsComplete && trace.Usage.TotalTokens == trace.Usage.PromptTokens+trace.Usage.CompletionTokens && c.UsageRates.Configured {
 		if amount, known := c.UsageRates.BudgetCost(*trace.Usage, trace.StartedAt); known {
 			estimate, _ := amount.Float64()
 			if !math.IsNaN(estimate) && !math.IsInf(estimate, 0) && estimate >= 0 {
