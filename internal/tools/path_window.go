@@ -40,7 +40,7 @@ func (w *pathWindow) sorted() []string {
 	return paths
 }
 func displayPath(path string) string {
-	if !utf8.ValidString(path) || strings.TrimSpace(path) != path {
+	if !utf8.ValidString(path) || strings.TrimSpace(path) != path || strings.ContainsAny(path, "\"\\") {
 		return strconv.Quote(path)
 	}
 	for _, r := range path {

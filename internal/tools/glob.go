@@ -92,11 +92,10 @@ func (e *Executor) globWalkResult(ctx context.Context, dir, pattern string, limi
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	root, rel, err := fileguard.Root(e.Root, dir)
+	rel, err := fileguard.RelativePath(e.Root, dir)
 	if err != nil {
 		return ToolResult{}, err
 	}
-	defer root.Close()
 	paths := pathWindow{limit: limit}
 	scanned := 0
 	truncated := false
@@ -109,11 +108,21 @@ func (e *Executor) globWalkResult(ctx context.Context, dir, pattern string, limi
 			truncated = true
 			return fmt.Errorf("glob: directory depth limit reached")
 		}
-		f, err := root.Open(path)
+		f, err := fileguard.Open(e.Root, filepath.Join(e.Root, path))
 		if err != nil {
 			return err
 		}
 		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			if matchGlob(pattern, filepath.ToSlash(path)) {
+				paths.add(filepath.ToSlash(path))
+			}
+			return nil
+		}
 		for {
 			if err := ctx.Err(); err != nil {
 				return err
