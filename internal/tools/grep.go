@@ -153,6 +153,10 @@ func (e *Executor) grepFallback(ctx context.Context, dir string, a GrepArgs, max
 // single record. On a cap or parsing/read error, stop and reap the producer
 // before returning instead of waiting with its stdout pipe left full.
 func (e *Executor) streamGrep(ctx context.Context, binary string, args []string, consume func(string) error) (bool, error) {
+	return e.streamSearch(ctx, binary, args, '\n', "grep", consume)
+}
+
+func (e *Executor) streamSearch(ctx context.Context, binary string, args []string, delimiter byte, label string, consume func(string) error) (bool, error) {
 	searchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	processCtx, stop := context.WithCancel(searchCtx)
@@ -176,14 +180,18 @@ func (e *Executor) streamGrep(ctx context.Context, binary string, args []string,
 	truncated := false
 	var readErr error
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := reader.ReadString(delimiter)
 		readBytes += len(line)
 		if readBytes > MaxGrepBytes {
 			truncated = true
 			break
 		}
 		if len(line) > 0 {
-			if readErr = consume(strings.TrimSuffix(line, "\n")); readErr != nil {
+			if delimiter == 0 && line[len(line)-1] != 0 {
+				readErr = fmt.Errorf("%s: incomplete path record", label)
+				break
+			}
+			if readErr = consume(strings.TrimSuffix(line, string(delimiter))); readErr != nil {
 				break
 			}
 		}
@@ -200,7 +208,7 @@ func (e *Executor) streamGrep(ctx context.Context, binary string, args []string,
 	}
 	waitErr := cmd.Wait()
 	if err := searchCtx.Err(); err != nil {
-		return truncated, fmt.Errorf("grep: %w", err)
+		return truncated, fmt.Errorf("%s: %w", label, err)
 	}
 	if readErr != nil {
 		return truncated, readErr

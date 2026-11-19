@@ -4,26 +4,21 @@
 package tools
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"minimalharness/internal/textutil"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"minimalharness/internal/fileguard"
 	"minimalharness/internal/guidance"
@@ -51,7 +46,7 @@ type Executor struct {
 	UntrustedWorkspace bool
 	Guidance           *guidance.Resolver
 	Root               string
-	editMu             sync.Mutex
+	editMu             editMutex
 	snapshots          map[string][32]byte
 	// BashTimeout overrides the default 120s bash timeout (0 = default).
 	// The per-call timeout argument still caps at 600s.
@@ -146,106 +141,6 @@ type ReadArgs struct {
 	Path   string `json:"path"`
 	Offset int    `json:"offset,omitempty"`
 	Limit  int    `json:"limit,omitempty"`
-}
-
-func (e *Executor) Read(a ReadArgs) (string, error) {
-	e.editMu.Lock()
-	defer e.editMu.Unlock()
-	base := e.Root
-	if dir, ok := e.outputDirBase(a.Path); ok {
-		base = dir
-	}
-	f, err := fileguard.Open(base, a.Path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-	if info.IsDir() {
-		entries, err := f.ReadDir(-1)
-		if err != nil {
-			return "", err
-		}
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-		var names []string
-		for _, en := range entries {
-			n := en.Name()
-			if en.IsDir() {
-				n += "/"
-			}
-			names = append(names, n)
-		}
-		return "directory " + a.Path + ":\n" + strings.Join(names, "\n"), nil
-	}
-	if base == e.Root {
-		// Hash through the open, jailed descriptor; the edit checks this exact version.
-		h := sha256.New()
-		if _, err := io.Copy(h, f); err != nil {
-			return "", err
-		}
-		if _, err := f.Seek(0, 0); err != nil {
-			return "", err
-		}
-		var digest [32]byte
-		copy(digest[:], h.Sum(nil))
-		e.rememberSnapshot(a.Path, digest)
-	}
-	start := max(a.Offset-1, 0)
-	reader := bufio.NewReader(f)
-	var out strings.Builder
-	for line := 0; ; line++ {
-		var data []byte
-		eof := false
-		clipped := false
-		for {
-			part, err := reader.ReadSlice('\n')
-			if line >= start {
-				take := min(len(part), MaxReadBytes-len(data))
-				clipped = clipped || take < len(part)
-				data = append(data, part[:take]...)
-			}
-			if err == bufio.ErrBufferFull {
-				continue
-			}
-			if err != nil && err != io.EOF {
-				return "", err
-			}
-			eof = err == io.EOF
-			break
-		}
-		if line >= start {
-			// A byte cap may end in the middle of a valid final character.
-			for i := 0; clipped && i < utf8.UTFMax-1 && !utf8.Valid(data) && len(data) > 0; i++ {
-				data = data[:len(data)-1]
-			}
-			if bytes.IndexByte(data, 0) >= 0 || !utf8.Valid(data) {
-				return "", fmt.Errorf("read: binary or non-UTF-8 file; use a binary inspection command instead")
-			}
-			for _, b := range data {
-				if b < 0x20 && b != '\n' && b != '\r' && b != '\t' {
-					return "", fmt.Errorf("read: binary control bytes in file; use a binary inspection command instead")
-				}
-			}
-			fmt.Fprintf(&out, "%d\t%s\n", line+1, strings.TrimSuffix(string(data), "\n"))
-			if clipped {
-				out.WriteString("... [line truncated at read byte limit]\n")
-				return out.String(), nil
-			}
-			if (a.Limit > 0 && line-start+1 >= a.Limit) || eof {
-				return out.String(), nil
-			}
-			if out.Len() >= MaxReadBytes {
-				out.WriteString("... [truncated: use offset to continue]\n")
-				return out.String(), nil
-			}
-		}
-		if eof {
-			return out.String(), nil
-		}
-	}
 }
 
 type WriteArgs struct {
@@ -801,7 +696,7 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 				Images: []llm.Image{img},
 			}, nil
 		}
-		out, err := e.Read(a)
+		out, err := e.ReadContext(ctx, a)
 		return ToolResult{Text: out}, err
 	case "write":
 		var a WriteArgs
@@ -874,8 +769,7 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 			return ToolResult{}, &InputError{Err: fmt.Errorf("bad glob args: %w", err)}
 		}
-		out, n, err := e.Glob(ctx, a)
-		return ToolResult{Text: out, Count: n}, err
+		return e.globResult(ctx, a)
 	case "load_skill":
 		var a LoadSkillArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {

@@ -49,7 +49,20 @@ func Open(base, path string) (*os.File, error) {
 		return nil, err
 	}
 	defer r.Close()
-	return r.Open(rel)
+	f, err := r.OpenFile(rel, os.O_RDONLY|nonblockingRead, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() && !info.IsDir() {
+		f.Close()
+		return nil, fmt.Errorf("read requires a regular file or directory")
+	}
+	return f, nil
 }
 
 func ReadFile(base, path string) ([]byte, error) {
