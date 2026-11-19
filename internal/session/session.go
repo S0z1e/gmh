@@ -190,7 +190,11 @@ func (s *Store) Append(m llm.Message) error {
 	if len(b)+1 >= maxRecordBytes {
 		return fmt.Errorf("session message exceeds the %d-byte record limit", maxRecordBytes)
 	}
-	return s.writeRecord(b)
+	if err := s.writeRecord(b); err != nil {
+		return err
+	}
+	s.acknowledgeOutputs(m)
+	return nil
 }
 
 // writeRecord runs under mu. A successful append is synced before the caller

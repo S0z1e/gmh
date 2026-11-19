@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"minimalharness/internal/outputreceipt"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 const DefaultSessionOutputMaxBytes int64 = 512 << 20
@@ -37,10 +39,12 @@ func (e *OutputQuotaError) Error() string {
 // One owner is selected before starting a goroutine and stays with the capture
 // across session switches. The session store holds the cross-process lease.
 type bashOutputBudget struct {
-	mu    sync.Mutex
-	used  int64
-	files int
-	limit int64
+	mu        sync.Mutex
+	used      int64
+	files     int
+	limit     int64
+	active    map[string]bool
+	lastSweep time.Time
 }
 
 type bashOutputFile struct {
@@ -101,7 +105,7 @@ func (e *Executor) allocateBashOutput(ctx context.Context) (*bashOutputFile, err
 		if limit <= 0 {
 			limit = DefaultSessionOutputMaxBytes
 		}
-		budget = &bashOutputBudget{limit: limit}
+		budget = &bashOutputBudget{limit: limit, active: make(map[string]bool)}
 		if key != "" {
 			if err := os.MkdirAll(key, 0700); err != nil {
 				return nil, fmt.Errorf("create bash output directory: %w", err)
@@ -116,6 +120,11 @@ func (e *Executor) allocateBashOutput(ctx context.Context) (*bashOutputFile, err
 	defer budget.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if key != "" && (budget.lastSweep.IsZero() || time.Since(budget.lastSweep) >= time.Hour || budget.used >= budget.limit || budget.files >= sessionOutputMaxFiles) {
+		if err := budget.load(ctx, key); err != nil {
+			return nil, err
+		}
 	}
 	if budget.used >= budget.limit {
 		return nil, &OutputQuotaError{Limit: budget.limit}
@@ -148,23 +157,36 @@ func (e *Executor) allocateBashOutput(ctx context.Context) (*bashOutputFile, err
 	}
 	budget.files++
 	path := f.Name()
+	budget.active[filepath.Base(path)] = true
 	return &bashOutputFile{path: path, file: f, budget: budget, legacy: key == ""}, nil
 }
 
 // Scan metadata in bounded batches. Old output counts immediately on resume;
 // unexpected file types fail closed instead of following a link or blocking.
 func (b *bashOutputBudget) load(ctx context.Context, dir string) error {
-	f, err := os.Open(dir)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	f, err := root.Open(".")
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	var used int64
+	var files, scanned int
+	now := time.Now()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		entries, err := f.ReadDir(128)
 		for _, entry := range entries {
+			scanned++
+			if scanned > sessionOutputMaxFiles*4 {
+				return &OutputQuotaError{Files: true}
+			}
 			info, err := entry.Info()
 			if err != nil {
 				return err
@@ -172,16 +194,24 @@ func (b *bashOutputBudget) load(ctx context.Context, dir string) error {
 			if !info.Mode().IsRegular() {
 				return fmt.Errorf("non-regular bash output: %q", entry.Name())
 			}
-			b.files++
-			if info.Size() > b.limit-b.used {
-				return &OutputQuotaError{Limit: b.limit}
+			if !b.active[entry.Name()] && outputreceipt.Expired(dir, entry.Name(), now) {
+				if err := root.Remove(entry.Name()); err != nil {
+					return fmt.Errorf("expire bash output: %w", err)
+				}
+				outputreceipt.Remove(dir, entry.Name())
+				continue
 			}
-			b.used += info.Size()
-			if b.files > sessionOutputMaxFiles {
+			files++
+			if files > sessionOutputMaxFiles {
 				return &OutputQuotaError{Files: true}
 			}
+			if info.Size() > b.limit-used {
+				return &OutputQuotaError{Limit: b.limit}
+			}
+			used += info.Size()
 		}
 		if err == io.EOF {
+			b.used, b.files, b.lastSweep = used, files, now
 			return nil
 		}
 		if err != nil {
@@ -210,6 +240,9 @@ func (f *bashOutputFile) Close() {
 
 func (f *bashOutputFile) close() {
 	_ = f.file.Close()
+	f.budget.mu.Lock()
+	delete(f.budget.active, filepath.Base(f.path))
+	f.budget.mu.Unlock()
 	if f.legacy {
 		// Temporary captures share a concurrent budget but release storage on
 		// completion. Persistent output is charged until explicit cleanup.
