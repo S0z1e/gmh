@@ -887,6 +887,7 @@ type Runner struct {
 	RunCost         float64
 	SessionMetering session.UsageTotals
 	usageStore      *session.Store
+	runBaseline     session.UsageTotals
 	SessionCost     float64 // USD estimate, accumulated per turn
 	// Turns counts completed agent turns (slash commands excluded),
 	// for the TUI meta line.
@@ -977,11 +978,6 @@ func (r *Runner) RunCommand(ctx context.Context, name, args string) (string, err
 
 // Handle runs one input line. It returns true when the UI should quit.
 func (r *Runner) Handle(ctx context.Context, line string) bool {
-	if err := r.RefreshUsage(); err != nil {
-		r.LastErr = err
-		r.Print("[error] %v", err)
-		return false
-	}
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return false
@@ -1085,7 +1081,12 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 		}
 		return true
 	case "/usage":
-		r.Print("[usage] session: %s | %s | %s\n[usage] current run: %s | %s", r.SessionUsage, r.sessionCostLine(), r.usageCoverage(), r.RunUsage, r.costLine(r.RunCost))
+		if err := r.RefreshUsage(); err != nil {
+			r.LastErr = err
+			r.Print("[error] %v", err)
+			return false
+		}
+		r.Print("[usage] session: %s | %s | %s\n[usage] current run: %s | %s", r.SessionUsage, r.sessionCostLine(), r.usageCoverage(), r.RunUsage, r.runCostLine())
 		return false
 	case "/jobs":
 		r.printJobs()
@@ -1099,6 +1100,11 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 		r.Print("Context cleared. Cleared messages stay in %s but won't reload on --resume (it starts from the clear point).", r.App.Store.Path)
 		return false
 	case "/compact":
+		if err := r.RefreshUsage(); err != nil {
+			r.LastErr = err
+			r.Print("[error] %v", err)
+			return false
+		}
 		r.doCompact(ctx)
 		return false
 	}
@@ -1242,6 +1248,11 @@ func (r *Runner) printJobs() {
 }
 
 func (r *Runner) runOnce(ctx context.Context, task string) {
+	if err := r.RefreshUsage(); err != nil {
+		r.LastErr = err
+		r.Print("[error] %v", err)
+		return
+	}
 	if r.historyLoadErr != nil {
 		msgs, err := session.Load(r.App.Store.ID)
 		if err != nil {
@@ -1319,6 +1330,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	history = append(append([]llm.Message(nil), history...), turnContext)
 	r.configureCompaction()
 	previousCost := r.SessionCost
+	previousMetering := r.SessionMetering
 	text, usage, err := r.App.Cfg.Run(ctx, history)
 	r.LastErr = err
 	if err != nil {
@@ -1346,7 +1358,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	// reverse their order in Bubble Tea v2 (verified), so the turn
 	// and session lines must travel as a single print.
 	turnLine := fmt.Sprintf("[usage] turn: %s", usage)
-	if r.App.Rates.Configured {
+	if r.App.Rates.Configured && r.SessionMetering.Attempts-previousMetering.Attempts == r.SessionMetering.PricedAttempts-previousMetering.PricedAttempts {
 		turnLine += " | " + r.costLine(turnCost)
 	}
 	r.Print("\n%s\n[usage] session: %s | %s", turnLine, r.SessionUsage, r.sessionCostLine())

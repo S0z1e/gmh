@@ -56,6 +56,7 @@ type serverState struct {
 	sessionUsage                llm.Usage
 	runUsage                    llm.Usage
 	runCost                     float64
+	runCostKnown                bool
 	metering                    session.UsageTotals
 	sessionCost                 float64
 	messages                    int
@@ -484,10 +485,13 @@ func (s *Server) handleQuery(req Request) {
 		s.mu.Unlock()
 		data := map[string]any{
 			"session":     usageJSON(st.sessionUsage),
-			"current_run": usageJSON(st.runUsage), "current_run_cost_usd": st.runCost, "metering": st.metering,
+			"current_run": usageJSON(st.runUsage), "metering": st.metering,
 			"fee": s.feeLabel(), "turns": st.turns,
 		}
-		if st.ratesConfigured {
+		if st.runCostKnown {
+			data["current_run_cost_usd"] = st.runCost
+		}
+		if st.metering.Attempts == st.metering.PricedAttempts && !st.metering.LegacyHistory && (st.metering.Attempts > 0 || st.ratesConfigured) {
 			c := st.sessionCost
 			data["cost_usd"] = &c
 		}
@@ -906,13 +910,14 @@ func (s *Server) refreshState() {
 	s.state.turns = s.runner.Turns
 	s.state.sessionUsage = s.runner.SessionUsage
 	s.state.runUsage, s.state.runCost, s.state.metering = s.runner.RunUsage, s.runner.RunCost, s.runner.SessionMetering
+	s.state.runCostKnown = s.runner.CurrentRunCost() != nil
 	s.state.sessionCost = s.runner.SessionCost
 	s.state.toolMode = string(s.runner.App.ToolMode())
 	s.state.model, s.state.api = s.app.Cfg.Client.Model, s.app.Cfg.Client.API
 	s.state.mode, s.state.root = s.app.Cfg.Mode, s.app.Root
 	s.state.workspaceTrusted = s.app.WorkspaceTrusted
 	s.state.contextWindow, s.state.maxTokens = s.app.ContextLimit, s.app.Cfg.Client.MaxTokens
-	s.state.ratesConfigured = s.app.Rates.Configured || s.runner.SessionMetering.PricedAttempts > 0
+	s.state.ratesConfigured = s.app.Rates.Configured
 	s.state.fee = s.app.Cfg.Client.ProviderName() + " price unverified"
 	s.mu.Unlock()
 }
@@ -938,6 +943,7 @@ func (s *Server) runTurn(req Request) {
 	s.turnMu.Unlock()
 	s.writeEvent(Event{Type: "turn_started", Text: truncateRunes(req.Message, 200)})
 	previousCost := s.runner.SessionCost
+	previousMetering := s.runner.SessionMetering
 	s.runner.Handle(ctx, req.Message)
 	s.turnMu.Lock()
 	s.turnCancel = nil
@@ -993,14 +999,18 @@ func (s *Server) runTurn(req Request) {
 		Outcome:  string(outcome),
 		ToolMode: st.toolMode,
 	}
-	if s.app.Rates.Configured {
+	if s.app.Rates.Configured && st.metering.Attempts-previousMetering.Attempts == st.metering.PricedAttempts-previousMetering.PricedAttempts {
 		c := st.sessionCost - previousCost
 		settled.CostUSD = &c
 
 	}
-	if st.metering.PricedAttempts > 0 {
+	if st.metering.PricedAttempts > 0 && st.metering.PricedAttempts == st.metering.Attempts && !st.metering.LegacyHistory {
 		sc := st.sessionCost
 		settled.SessionCostUSD = &sc
+	}
+	if st.runCostKnown {
+		cost := st.runCost
+		settled.RunCostUSD = &cost
 	}
 	if err != nil {
 		settled.Error = err.Error()

@@ -425,6 +425,9 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			usage.CacheUsageSource = "cache_read_input_tokens"
 		}
 		usage.normalize()
+		if !inputUsage.hasInput && !inputUsage.hasOutput && !inputUsage.hasCreation && !inputUsage.CacheUsageReported {
+			return
+		}
 		traceUsage(ctx, usage, finalOutputUsage && inputUsage.hasInput && inputUsage.hasOutput && inputUsage.hasCreation && inputUsage.CacheUsageReported, false)
 	}
 	type acc struct {

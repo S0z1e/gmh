@@ -158,6 +158,12 @@ func (m Model) WithMeta(mode, api, model string) Model {
 	return m
 }
 
+// WithSessionTotals seeds restored usage before the first input or paint.
+func (m Model) WithSessionTotals(tokens, turns int) Model {
+	m.sessionTokens, m.turnCount = tokens, turns
+	return m
+}
+
 // WithBranch records the workspace's git branch for the meta line.
 // Call it before NewProgram, like WithMeta.
 func (m Model) WithBranch(branch string) Model {

@@ -18,6 +18,7 @@ func (r *Runner) RefreshUsage() error {
 	if r.usageStore != r.App.Store {
 		r.usageStore = r.App.Store
 		r.RunUsage, r.RunCost = llm.Usage{}, 0
+		r.runBaseline = totals
 	}
 	r.SessionMetering = totals
 	r.SessionUsage, r.SessionCost = totals.Usage, totals.EstimateUSD
@@ -42,7 +43,28 @@ func (r *Runner) usageCoverage() string {
 
 func (r *Runner) sessionCostLine() string {
 	if r.SessionMetering.PricedAttempts == 0 {
-		return r.costLine(0)
+		return "fee: " + r.App.Cfg.Client.ProviderName() + " price unverified"
+	}
+	if r.SessionMetering.PricedAttempts != r.SessionMetering.Attempts || r.SessionMetering.LegacyHistory {
+		return fmt.Sprintf("est. recorded subtotal: ~$%.4f (pricing incomplete; provider price unverified)", r.SessionCost)
 	}
 	return fmt.Sprintf("est. cost: ~$%.4f (rates: recorded attempt schedules; provider price unverified)", r.SessionCost)
+}
+
+// A nil cost means at least one attempt in this run could not be priced.
+// An empty run and explicitly configured free rates both have a known zero.
+func (r *Runner) CurrentRunCost() *float64 {
+	attempts := r.SessionMetering.Attempts - r.runBaseline.Attempts
+	priced := r.SessionMetering.PricedAttempts - r.runBaseline.PricedAttempts
+	if attempts != priced {
+		return nil
+	}
+	cost := r.RunCost
+	return &cost
+}
+func (r *Runner) runCostLine() string {
+	if r.CurrentRunCost() == nil {
+		return "fee: provider price unverified (current-run pricing incomplete)"
+	}
+	return r.costLine(r.RunCost)
 }

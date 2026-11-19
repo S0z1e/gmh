@@ -230,6 +230,9 @@ func (s *Store) openUsageLocked(create bool) (*os.File, error) {
 		if err := root.Mkdir(family, 0700); err != nil && !os.IsExist(err) {
 			return nil, err
 		}
+		if err := syncRecoveryDirectory(Dir()); err != nil {
+			return nil, err
+		}
 	}
 	info, err := root.Lstat(family)
 	if err != nil {

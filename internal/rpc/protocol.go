@@ -126,6 +126,7 @@ type Event struct {
 	// agent_settled cost: null when no rates are configured.
 	CostUSD        *float64 `json:"cost_usd,omitempty"`
 	SessionCostUSD *float64 `json:"session_cost_usd,omitempty"`
+	RunCostUSD     *float64 `json:"current_run_cost_usd,omitempty"`
 	Fee            string   `json:"fee,omitempty"`
 	// tool_start / tool_end / background events.
 	ToolCallID   string `json:"tool_call_id,omitempty"`

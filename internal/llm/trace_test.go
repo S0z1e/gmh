@@ -128,6 +128,13 @@ func TestRequestTraceUsageEventsAcrossAPIs(t *testing.T) {
 		reported            bool
 	}{
 		{"chat_no_usage", "chat", "data: [DONE]\n\n", false, false, 0, 0, false},
+
+		{"chat_empty_usage", "chat", "data: {\"usage\":{}}\n\ndata: [DONE]\n\n", false, false, 0, 0, false},
+		{"chat_zero_usage", "chat", "data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\ndata: [DONE]\n\n", false, true, 0, 0, false},
+		{"responses_empty_usage", "responses", "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n", false, false, 0, 0, false},
+		{"responses_zero_usage", "responses", "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n", false, true, 0, 0, false},
+		{"anthropic_empty_usage", "anthropic", "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{}}\n\ndata: {\"type\":\"message_stop\"}\n\n", false, false, 0, 0, false},
+		{"anthropic_zero_usage", "anthropic", "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":0}}\n\ndata: {\"type\":\"message_stop\"}\n\n", false, true, 0, 0, false},
 		{"chat_null_usage", "chat", "data: {\"usage\":null}\n\ndata: [DONE]\n\n", false, false, 0, 0, false},
 		{"anthropic_no_usage", "anthropic", "data: {\"type\":\"message_stop\"}\n\n", false, false, 0, 0, false},
 		{"anthropic_cutoff", "anthropic", "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":90,\"cache_creation_input_tokens\":20}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\n", true, true, 120, 90, true},
