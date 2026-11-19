@@ -637,6 +637,11 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 	if strings.TrimSpace(a.KillJobID) != "" {
 		return e.killJob(a.KillJobID)
 	}
+	ctx, finish, err := e.beginBashRun(ctx)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	defer finish()
 	if reason := DeniedCommand(a.Command); reason != "" {
 		e.audit(ctx, AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
 		return ToolResult{}, &PolicyError{Reason: reason}
@@ -645,11 +650,6 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 	if err != nil {
 		return ToolResult{}, err
 	}
-	ctx, finish, err := e.beginBashRun(ctx)
-	if err != nil {
-		return ToolResult{}, err
-	}
-	defer finish()
 	path := e.nextOutputFile()
 	out, code, err := e.runBashCmd(ctx, a.Command, e.bashTimeout(a), path, dir, nil)
 	entry := AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}

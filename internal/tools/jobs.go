@@ -558,6 +558,20 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	runCtx, cancelCause := context.WithCancelCause(context.Background())
+	cancel := func() { cancelCause(context.Canceled) }
+	commandCtx, finish, err := e.beginBashRun(runCtx)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			finish()
+			cancel()
+		}
+	}()
 	if reason := DeniedCommand(a.Command); reason != "" {
 		e.audit(ctx, AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
 		return nil, &PolicyError{Reason: reason}
@@ -572,8 +586,6 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		timeout = 0
 	}
 	outPath := e.nextOutputFile()
-	runCtx, cancelCause := context.WithCancelCause(context.Background())
-	cancel := func() { cancelCause(context.Canceled) }
 	identity := invocationFromContext(ctx)
 	key, _ := ctx.Value(failureKeyContext{}).(string)
 	job := &Job{InvocationID: identity.id, ToolCallID: identity.callID, failureKey: key, Command: a.Command, Cwd: dir, OutputFile: outPath, Started: time.Now(), done: make(chan struct{}), cancel: cancel,
@@ -600,15 +612,12 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	if ctx.Err() != nil {
 		job.Cancel()
 	}
+	transferred = true
 	go func() {
 		defer cancel()
+		defer finish()
 		preview := &BashOutputPreview{}
-		commandCtx, finish, err := e.beginBashRun(runCtx)
-		out, code := "", -1
-		if err == nil {
-			defer finish()
-			out, code, err = e.runBashCmd(commandCtx, a.Command, timeout, outPath, dir, preview)
-		}
+		out, code, err := e.runBashCmd(commandCtx, a.Command, timeout, outPath, dir, preview)
 		if audit != nil {
 			entry := AuditEntry{InvocationID: job.InvocationID, ToolCallID: job.ToolCallID, TS: time.Now(), Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
 			if err != nil {
