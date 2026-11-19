@@ -55,10 +55,11 @@ type Job struct {
 	Cwd     string
 	// OutputFile is the per-call file holding the full stdout+stderr
 	// ("" when OutputDir was unset); it grows while the job runs.
-	OutputFile string
-	Started    time.Time
-	cancel     context.CancelFunc
-	stopParent func() bool
+	OutputFile  string
+	Started     time.Time
+	cancel      context.CancelFunc
+	closeCancel context.CancelFunc
+	stopParent  func() bool
 
 	mu         sync.Mutex
 	done       chan struct{}
@@ -325,23 +326,6 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		runCtx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
-	run := &bashRun{cancel: cancel, done: make(chan struct{})}
-	e.jobsMu.Lock()
-	if e.jobsClosed {
-		e.jobsMu.Unlock()
-		return "", -1, ErrExecutorClosed
-	}
-	if e.activeBash == nil {
-		e.activeBash = make(map[*bashRun]struct{})
-	}
-	e.activeBash[run] = struct{}{}
-	e.jobsMu.Unlock()
-	defer func() {
-		e.jobsMu.Lock()
-		delete(e.activeBash, run)
-		close(run.done)
-		e.jobsMu.Unlock()
-	}()
 	var cmd *exec.Cmd
 	if e.Sandbox {
 		bwrap := e.BwrapPath
@@ -508,7 +492,7 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		if processContextErr != nil {
 			return s, -1, processContextErr
 		}
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && !errors.Is(context.Cause(ctx), ErrExecutorClosed) {
 			return s, -1, ctx.Err()
 		}
 		if runErr != nil {
@@ -539,7 +523,7 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	if processContextErr != nil {
 		return s, -1, processContextErr
 	}
-	if ctx.Err() != nil {
+	if ctx.Err() != nil && !errors.Is(context.Cause(ctx), ErrExecutorClosed) {
 		return s, -1, ctx.Err()
 	}
 	if runErr != nil {
@@ -588,10 +572,12 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		timeout = 0
 	}
 	outPath := e.nextOutputFile()
-	runCtx, cancel := context.WithCancel(context.Background())
+	runCtx, cancelCause := context.WithCancelCause(context.Background())
+	cancel := func() { cancelCause(context.Canceled) }
 	identity := invocationFromContext(ctx)
 	key, _ := ctx.Value(failureKeyContext{}).(string)
-	job := &Job{InvocationID: identity.id, ToolCallID: identity.callID, failureKey: key, Command: a.Command, Cwd: dir, OutputFile: outPath, Started: time.Now(), done: make(chan struct{}), cancel: cancel}
+	job := &Job{InvocationID: identity.id, ToolCallID: identity.callID, failureKey: key, Command: a.Command, Cwd: dir, OutputFile: outPath, Started: time.Now(), done: make(chan struct{}), cancel: cancel,
+		closeCancel: func() { cancelCause(ErrExecutorClosed) }}
 	if foreground {
 		job.stopParent = context.AfterFunc(ctx, cancel)
 	}
@@ -617,7 +603,12 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	go func() {
 		defer cancel()
 		preview := &BashOutputPreview{}
-		out, code, err := e.runBashCmd(runCtx, a.Command, timeout, outPath, dir, preview)
+		commandCtx, finish, err := e.beginBashRun(runCtx)
+		out, code := "", -1
+		if err == nil {
+			defer finish()
+			out, code, err = e.runBashCmd(commandCtx, a.Command, timeout, outPath, dir, preview)
+		}
 		if audit != nil {
 			entry := AuditEntry{InvocationID: job.InvocationID, ToolCallID: job.ToolCallID, TS: time.Now(), Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
 			if err != nil {

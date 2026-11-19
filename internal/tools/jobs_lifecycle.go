@@ -12,6 +12,30 @@ type bashRun struct {
 	done   chan struct{}
 }
 
+// A run lasts through its audit callback, so shutdown cannot release the owning
+// writer in the gap between process cleanup and synchronous Bash returning.
+func (e *Executor) beginBashRun(ctx context.Context) (context.Context, func(), error) {
+	e.jobsMu.Lock()
+	defer e.jobsMu.Unlock()
+	if e.jobsClosed {
+		return nil, nil, ErrExecutorClosed
+	}
+	ctx, cancel := context.WithCancelCause(ctx)
+	run := &bashRun{cancel: func() { cancel(ErrExecutorClosed) }, done: make(chan struct{})}
+	if e.activeBash == nil {
+		e.activeBash = make(map[*bashRun]struct{})
+	}
+	e.activeBash[run] = struct{}{}
+	finish := func() {
+		cancel(context.Canceled)
+		e.jobsMu.Lock()
+		delete(e.activeBash, run)
+		close(run.done)
+		e.jobsMu.Unlock()
+	}
+	return ctx, finish, nil
+}
+
 // SessionJobs returns an existing owner's jobs without selecting that session.
 func (e *Executor) SessionJobs(id string) []*Job {
 	e.jobsMu.Lock()
@@ -51,9 +75,16 @@ func (e *Executor) CloseJobs(ctx context.Context) error {
 	}
 	e.jobsMu.Unlock()
 	for _, job := range jobs {
-		if job.Status() == JobRunning {
-			job.Cancel()
+		job.mu.Lock()
+		if !job.finished {
+			job.stopRequested = true
+			if job.closeCancel != nil {
+				job.closeCancel()
+			} else if job.cancel != nil {
+				job.cancel()
+			}
 		}
+		job.mu.Unlock()
 	}
 	for _, run := range runs {
 		run.cancel()

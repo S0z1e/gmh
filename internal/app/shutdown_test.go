@@ -2,7 +2,10 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -111,4 +114,48 @@ func TestRetainedSessionKeepsWriterAndCanResume(t *testing.T) {
 	} else {
 		reopened.Close()
 	}
+}
+
+func TestCloseTimeoutKeepsWriterUntilRawCleanup(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test")
+	root := t.TempDir()
+	writeMockProvider(t, root)
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Cfg.Exec.Bash(context.Background(), tools.BashArgs{Command: "sleep 30 & printf ready > raw-ready; exit 7"})
+		done <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(root, "raw-ready")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("not ready")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(30 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := a.CloseContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled close, got %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("raw cleanup finished before failed close")
+	default:
+	}
+	reopened, err := session.Open(a.Store.ID, session.OpenOptions{Workspace: root})
+	if err == nil {
+		reopened.Close()
+		t.Error("writer released while raw Bash cleanup was still active")
+	}
+	<-done
 }

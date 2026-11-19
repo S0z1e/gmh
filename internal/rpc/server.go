@@ -1101,6 +1101,10 @@ func (s *Server) doControl(req Request) {
 		s.refreshState()
 		s.respond(req, map[string]any{"tool_mode": string(s.app.ToolMode())}, nil)
 	case "quit":
+		if err := s.app.Close(); err != nil {
+			s.respond(req, nil, err)
+			return
+		}
 		s.respond(req, map[string]any{"ok": true}, nil)
 		s.shutdown()
 	case "command":

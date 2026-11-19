@@ -65,3 +65,24 @@ func TestCloseJobsStopsDirectAndRetainedCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCloseJobsWaitsForDirectAuditBeforeReturning(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	e := &Executor{Root: t.TempDir(), Audit: func(AuditEntry) { close(entered); <-release }}
+	done := make(chan struct{})
+	go func() {
+		_, _ = e.Bash(context.Background(), BashArgs{Command: "printf audited"})
+		close(done)
+	}()
+	<-entered
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := e.CloseJobs(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("unfinished direct audit was not retained: %v", err)
+	}
+	close(release)
+	<-done
+	if err := e.CloseJobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

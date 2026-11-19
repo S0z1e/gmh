@@ -38,10 +38,11 @@ func (a *App) Close() error {
 }
 
 func (a *App) CloseContext(ctx context.Context) error {
-	var closeErr error
+	var cleanupErr error
 	if a.Cfg != nil && a.Cfg.Exec != nil {
-		closeErr = a.Cfg.Exec.CloseJobs(ctx)
+		cleanupErr = a.Cfg.Exec.CloseJobs(ctx)
 	}
+	closeErr := cleanupErr
 	stores := map[*session.Store]bool{}
 	if a.Store != nil {
 		stores[a.Store] = true
@@ -63,7 +64,9 @@ func (a *App) CloseContext(ctx context.Context) error {
 				}
 			}
 		}
-		if unfinished {
+		// Raw synchronous runs have no session registry entry. Until
+		// cleanup succeeds, conservatively retain all writer leases.
+		if unfinished || cleanupErr != nil {
 			continue
 		}
 		closeErr = errors.Join(closeErr, store.Close())

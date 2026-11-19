@@ -645,6 +645,11 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 	if err != nil {
 		return ToolResult{}, err
 	}
+	ctx, finish, err := e.beginBashRun(ctx)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	defer finish()
 	path := e.nextOutputFile()
 	out, code, err := e.runBashCmd(ctx, a.Command, e.bashTimeout(a), path, dir, nil)
 	entry := AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}

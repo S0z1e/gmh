@@ -842,7 +842,7 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 // RenameSession keeps the executor and plugin state under the transcript's id.
 func (a *App) RenameSession(oldID, newID string) error {
 	var err error
-	current := a.Store != nil && a.Store.ID == oldID
+	current := a.Store != nil && a.Store.Owns(oldID)
 	owner := a.Store
 	if !current {
 		owner = nil
@@ -854,6 +854,9 @@ func (a *App) RenameSession(oldID, newID string) error {
 		}
 	}
 	if owner != nil {
+		// A filesystem alias can select this writer, but registries and
+		// plugin ownership use the actual ID captured at launch.
+		oldID = owner.ID
 		err = owner.Rename(newID)
 	} else {
 		err = session.RenameSession(oldID, newID)
