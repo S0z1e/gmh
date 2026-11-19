@@ -58,6 +58,7 @@ type serverState struct {
 	runCost                     float64
 	runCostKnown                bool
 	meteringAvailable           bool
+	sessionUsageComplete        bool
 	metering                    session.UsageTotals
 	sessionCost                 float64
 	messages                    int
@@ -473,7 +474,8 @@ func (s *Server) handleQuery(req Request) {
 			"mode": st.mode, "tool_mode": st.toolMode, "root": st.root, "streaming": st.streaming,
 			"workspace_trusted": st.workspaceTrusted,
 			"queued":            len(s.work), "messages": st.messages, "turns": st.turns,
-			"metering_available": st.meteringAvailable,
+			"metering_available":     st.meteringAvailable,
+			"session_usage_complete": st.sessionUsageComplete,
 			// The effective window and output cap for the current
 			// model (Setup/SwitchModel resolved flag/env/model/
 			// config/default), so the GUI can meter context against
@@ -489,9 +491,10 @@ func (s *Server) handleQuery(req Request) {
 		st := s.state
 		s.mu.Unlock()
 		data := map[string]any{
-			"metering_available": st.meteringAvailable,
-			"current_run":        usageJSON(st.runUsage),
-			"fee":                s.feeLabel(), "turns": st.turns,
+			"metering_available":     st.meteringAvailable,
+			"session_usage_complete": st.sessionUsageComplete,
+			"current_run":            usageJSON(st.runUsage),
+			"fee":                    s.feeLabel(), "turns": st.turns,
 		}
 		if st.meteringAvailable {
 			data["session"] = usageJSON(st.sessionUsage)
@@ -500,7 +503,7 @@ func (s *Server) handleQuery(req Request) {
 		if st.runCostKnown {
 			data["current_run_cost_usd"] = st.runCost
 		}
-		if st.meteringAvailable && st.metering.Attempts == st.metering.PricedAttempts && !st.metering.LegacyHistory && (st.metering.Attempts > 0 || st.ratesConfigured) {
+		if st.meteringAvailable && st.metering.Attempts == st.metering.PricedAttempts && !st.metering.LegacyHistory && !st.metering.RecoveryGap && (st.metering.Attempts > 0 || st.ratesConfigured) {
 			c := st.sessionCost
 			data["cost_usd"] = &c
 		}
@@ -923,6 +926,7 @@ func (s *Server) refreshState() {
 	s.state.runUsage, s.state.runCost, s.state.metering = s.runner.RunUsage, s.runner.RunCost, s.runner.SessionMetering
 	s.state.runCostKnown = s.runner.CurrentRunCost() != nil
 	s.state.meteringAvailable = s.runner.MeteringAvailable
+	s.state.sessionUsageComplete = s.runner.SessionUsageComplete()
 	s.state.sessionCost = s.runner.SessionCost
 	s.state.toolMode = string(s.runner.App.ToolMode())
 	s.state.model, s.state.api = s.app.Cfg.Client.Model, s.app.Cfg.Client.API
@@ -1016,11 +1020,12 @@ func (s *Server) runTurn(req Request) {
 		settled.CostUSD = &c
 
 	}
-	if st.meteringAvailable && st.metering.PricedAttempts > 0 && st.metering.PricedAttempts == st.metering.Attempts && !st.metering.LegacyHistory {
+	if st.meteringAvailable && st.metering.PricedAttempts > 0 && st.metering.PricedAttempts == st.metering.Attempts && !st.metering.LegacyHistory && !st.metering.RecoveryGap {
 		sc := st.sessionCost
 		settled.SessionCostUSD = &sc
 	}
 	settled.MeteringAvailable = &st.meteringAvailable
+	settled.SessionUsageComplete = &st.sessionUsageComplete
 	if !st.meteringAvailable {
 		settled.SessionUsage = nil
 		settled.Metering = nil

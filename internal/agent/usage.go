@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"math"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
 )
@@ -20,8 +21,12 @@ func (c *Config) recordAttempt(operation string, attempt int, trace llm.RequestT
 	}
 	record := session.UsageAttempt{ID: trace.ID, Operation: operation, Attempt: attempt, Request: trace}
 	if trace.Usage != nil && !invalid && trace.PriceCountsComplete && c.UsageRates.Configured {
-		estimate := c.UsageRates.Cost(*trace.Usage, trace.StartedAt)
-		record.EstimateUSD, record.RateSource = &estimate, c.UsageRates.Source
+		if amount, known := c.UsageRates.BudgetCost(*trace.Usage, trace.StartedAt); known {
+			estimate, _ := amount.Float64()
+			if !math.IsNaN(estimate) && !math.IsInf(estimate, 0) && estimate >= 0 {
+				record.EstimateUSD, record.RateSource = &estimate, c.UsageRates.Source
+			}
+		}
 	}
 	if err := c.Session.RecordUsage(record); err != nil && c.persistErr == nil {
 		c.persistErr = fmt.Errorf("save provider usage: %w", err)

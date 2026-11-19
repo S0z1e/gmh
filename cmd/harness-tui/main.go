@@ -99,7 +99,7 @@ func main() {
 	if err := runner.RefreshUsage(); err != nil {
 		fatal(err)
 	}
-	m := tui.NewModel(info).WithMeta(a.Cfg.Mode, a.Cfg.Client.API, a.Cfg.Client.Model).WithBranch(gitBranch(a.Root)).WithSessionTotals(runner.SessionUsage.TotalTokens, runner.Turns)
+	m := tui.NewModel(info).WithMeta(a.Cfg.Mode, a.Cfg.Client.API, a.Cfg.Client.Model).WithBranch(gitBranch(a.Root)).WithSessionTotals(runner.SessionUsage.TotalTokens, runner.Turns).WithUsageCoverage(runner.SessionMetering.TokenCountsComplete())
 	// Set OnSubmit BEFORE NewProgram: the program holds its own copy of
 	// the model, so fields set afterwards on this copy would never fire.
 	m.OnSubmit = func(line string) {
@@ -145,7 +145,7 @@ func main() {
 			// Session totals for the meta line's right side, plus
 			// the current model/api so a /model switch shows up,
 			// and the tool mode so a /plan switch shows its chip.
-			prog.Send(tui.MetaUpdateMsg{UsageUnavailable: !runner.MeteringAvailable, Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns, Model: a.Model.ID, API: a.Cfg.Client.API, ToolMode: string(a.ToolMode())})
+			prog.Send(tui.MetaUpdateMsg{UsageIncomplete: !runner.SessionMetering.TokenCountsComplete(), UsageUnavailable: !runner.MeteringAvailable, Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns, Model: a.Model.ID, API: a.Cfg.Client.API, ToolMode: string(a.ToolMode())})
 			if quit {
 				prog.Quit()
 				return

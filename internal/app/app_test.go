@@ -371,6 +371,7 @@ func TestRunnerCostEstimate(t *testing.T) {
 	t.Setenv("OPENAI_BASE_URL", srv.URL)
 	t.Setenv("OPENAI_PRICE_INPUT_PER_MTOK", "1000")
 	t.Setenv("OPENAI_PRICE_OUTPUT_PER_MTOK", "2000")
+	t.Setenv("OPENAI_PRICE_CACHED_PER_MTOK", "1000")
 	t.Setenv("OPENAI_PRICE_SOURCE", "test rates")
 	root := t.TempDir()
 	writeMockProvider(t, root)

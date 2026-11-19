@@ -18,7 +18,7 @@ func TestUsageLifetimeAndRunAcrossResumeAndRateChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rates := llm.Rates{Configured: true, InputPerMTok: 1000, OutputPerMTok: 2000, Source: "first schedule"}
+	rates := llm.Rates{Configured: true, Complete: true, InputPerMTok: 1000, CachedPerMTok: 1000, OutputPerMTok: 2000, Source: "first schedule"}
 	a.Rates = rates
 	a.Cfg.UsageRates = rates
 	r := &Runner{App: a, Print: func(string, ...any) {}}
@@ -36,7 +36,7 @@ func TestUsageLifetimeAndRunAcrossResumeAndRateChanges(t *testing.T) {
 	if r.SessionUsage.TotalTokens != 15 || r.RunUsage.TotalTokens != 0 || r.SessionCost != 0.02 {
 		t.Fatalf("resume: %+v run=%+v cost=%v", r.SessionMetering, r.RunUsage, r.SessionCost)
 	}
-	a.Rates = llm.Rates{Configured: true, InputPerMTok: 3000, OutputPerMTok: 4000, Source: "second schedule"}
+	a.Rates = llm.Rates{Configured: true, Complete: true, InputPerMTok: 3000, CachedPerMTok: 3000, OutputPerMTok: 4000, Source: "second schedule"}
 	a.Cfg.UsageRates = a.Rates
 	r.Handle(context.Background(), "second")
 	if r.LastErr != nil || r.SessionUsage.TotalTokens != 30 || r.RunUsage.TotalTokens != 15 || r.SessionCost != 0.07 || r.RunCost != 0.05 {

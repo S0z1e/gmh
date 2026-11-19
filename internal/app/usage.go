@@ -52,14 +52,14 @@ func (r *Runner) accountRun(usage llm.Usage, previousCost float64) float64 {
 
 func (r *Runner) usageCoverage() string {
 	t := r.SessionMetering
-	return fmt.Sprintf("attempts=%d unreported=%d partial=%d invalid=%d priced=%d legacy_history=%t", t.Attempts, t.UnreportedAttempts, t.PartialAttempts, t.InvalidAttempts, t.PricedAttempts, t.LegacyHistory)
+	return fmt.Sprintf("attempts=%d unreported=%d partial=%d invalid=%d priced=%d legacy_history=%t recovery_gap=%t", t.Attempts, t.UnreportedAttempts, t.PartialAttempts, t.InvalidAttempts, t.PricedAttempts, t.LegacyHistory, t.RecoveryGap)
 }
 
 func (r *Runner) sessionCostLine() string {
 	if r.SessionMetering.PricedAttempts == 0 {
 		return "fee: " + r.App.Cfg.Client.ProviderName() + " price unverified"
 	}
-	if r.SessionMetering.PricedAttempts != r.SessionMetering.Attempts || r.SessionMetering.LegacyHistory {
+	if r.SessionMetering.PricedAttempts != r.SessionMetering.Attempts || (r.SessionMetering.LegacyHistory || r.SessionMetering.RecoveryGap) {
 		return fmt.Sprintf("est. recorded subtotal: ~$%.4f (pricing incomplete; provider price unverified)", r.SessionCost)
 	}
 	return fmt.Sprintf("est. cost: ~$%.4f (rates: recorded attempt schedules; provider price unverified)", r.SessionCost)
@@ -68,7 +68,7 @@ func (r *Runner) sessionCostLine() string {
 // A nil cost means at least one attempt in this run could not be priced.
 // An empty run and explicitly configured free rates both have a known zero.
 func (r *Runner) CurrentRunCost() *float64 {
-	if !r.MeteringAvailable {
+	if !r.MeteringAvailable || r.SessionMetering.RecoveryGap && !r.runBaseline.RecoveryGap {
 		return nil
 	}
 	attempts := r.SessionMetering.Attempts - r.runBaseline.Attempts
@@ -84,4 +84,17 @@ func (r *Runner) runCostLine() string {
 		return "fee: provider price unverified (current-run pricing incomplete)"
 	}
 	return r.costLine(r.RunCost)
+}
+
+func (r *Runner) SessionUsageComplete() bool {
+	return r.MeteringAvailable && r.SessionMetering.TokenCountsComplete()
+}
+func (r *Runner) sessionUsageLine() string {
+	if !r.MeteringAvailable {
+		return "unavailable (accounting error)"
+	}
+	if !r.SessionMetering.TokenCountsComplete() {
+		return fmt.Sprintf("%s (recorded subtotal; usage incomplete: %s)", r.SessionUsage, r.usageCoverage())
+	}
+	return r.SessionUsage.String()
 }

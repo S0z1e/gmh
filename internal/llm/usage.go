@@ -16,6 +16,7 @@ func (u *Usage) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*u = Usage(decoded)
+	u.Invalid = u.Invalid || !u.Valid()
 	var fields struct {
 		Cached  *int `json:"cached_tokens"`
 		Hit     *int `json:"prompt_cache_hit_tokens"`
@@ -42,6 +43,7 @@ func (u *Usage) UnmarshalJSON(data []byte) error {
 			}
 		}
 	}
+	u.Invalid = u.Invalid || !u.Valid()
 	u.normalize()
 	return nil
 }
@@ -62,11 +64,12 @@ func (u *responsesUsage) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	u.CacheUsageReported = fields.Details.Cached != nil
+	u.invalid = !validTokenSum(u.InputTokens, u.OutputTokens) || u.TotalTokens < 0 || u.InputTokensDetails.CachedTokens < 0 || u.OutputTokensDetails.ReasoningTokens < 0
 	return nil
 }
 
 func (u responsesUsage) sharedUsage() Usage {
-	usage := Usage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens, CachedTokens: u.InputTokensDetails.CachedTokens, ReasoningTokens: u.OutputTokensDetails.ReasoningTokens, CacheUsageReported: u.CacheUsageReported}
+	usage := Usage{Invalid: u.invalid, PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens, CachedTokens: u.InputTokensDetails.CachedTokens, ReasoningTokens: u.OutputTokensDetails.ReasoningTokens, CacheUsageReported: u.CacheUsageReported}
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
@@ -97,6 +100,7 @@ func (u *anthropicUsage) UnmarshalJSON(data []byte) error {
 	u.hasInput = fields.Input != nil
 	u.hasOutput = fields.Output != nil
 	u.hasCreation = fields.Creation != nil
+	u.invalid = !validTokenSum(u.InputTokens, u.OutputTokens, u.CacheCreationInputTokens, u.CacheReadInputTokens)
 	return nil
 }
 
@@ -125,6 +129,7 @@ func (u *Usage) normalize() {
 
 // Add accumulates another Usage into this one (session totals).
 func (u *Usage) Add(o Usage) {
+	u.Invalid = u.Invalid || o.Invalid
 	o.normalize()
 	if o.PromptTokens != 0 || o.CompletionTokens != 0 || o.TotalTokens != 0 {
 		if u.PromptTokens == 0 && u.CompletionTokens == 0 && u.TotalTokens == 0 {
@@ -233,6 +238,9 @@ func traceWireUsage(ctx context.Context, usage Usage, data string, responses boo
 // total may exceed the input/output sum, but counters must never be negative
 // and the sum must be representable.
 func (u Usage) Valid() bool {
+	if u.Invalid {
+		return false
+	}
 	for _, n := range []int{u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CachedTokens, u.ReasoningTokens, u.CacheReportedPromptTokens, u.PromptCacheHitTokens, u.PromptTokensDetails.CachedTokens, u.CompletionTokensDetails.ReasoningTokens} {
 		if n < 0 {
 			return false
@@ -257,4 +265,15 @@ func (u Usage) CanAdd(o Usage) bool {
 	combined := u
 	combined.Add(o)
 	return combined.Valid()
+}
+
+func validTokenSum(values ...int) bool {
+	total := 0
+	for _, v := range values {
+		if v < 0 || v > math.MaxInt-total {
+			return false
+		}
+		total += v
+	}
+	return true
 }

@@ -92,9 +92,10 @@ func Tool(name, description, parameters string) ToolDef {
 }
 
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	Invalid          bool `json:"invalid,omitempty"`
+	PromptTokens     int  `json:"prompt_tokens"`
+	CompletionTokens int  `json:"completion_tokens"`
+	TotalTokens      int  `json:"total_tokens"`
 	// ReasoningTokens is the thinking part of the completion tokens:
 	// a subset of CompletionTokens, never an extra charge. Filled
 	// from completion_tokens_details.reasoning_tokens (chat) or
@@ -201,6 +202,7 @@ type reasoningParams struct {
 }
 
 type responsesUsage struct {
+	invalid            bool
 	CacheUsageReported bool `json:"-"`
 	InputTokens        int  `json:"input_tokens"`
 	OutputTokens       int  `json:"output_tokens"`

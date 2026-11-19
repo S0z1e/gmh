@@ -204,3 +204,38 @@ func TestUsageAggregateOverflowRecordedAsUnknown(t *testing.T) {
 		t.Fatalf("totals=%+v %v", totals, err)
 	}
 }
+
+func TestUsageRecoveryRetainsDurableCoverageGap(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	s, err := Open("gap", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cost := 1.0
+	tr := llm.RequestTrace{ID: "one", Usage: &llm.Usage{TotalTokens: 1}}
+	if err := s.RecordUsage(UsageAttempt{ID: tr.ID, Request: tr, EstimateUSD: &cost}); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"version":1,"id":"torn`); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	for i := 0; i < 2; i++ {
+		s, err = Open("gap", OpenOptions{Workspace: root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		totals, err := s.UsageTotals()
+		s.Close()
+		if err != nil || !totals.RecoveryGap || totals.TokenCountsComplete() {
+			t.Fatalf("lost durable gap on reopen %d: %+v %v", i, totals, err)
+		}
+	}
+}

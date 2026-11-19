@@ -185,6 +185,7 @@ type anthropicEvent struct {
 }
 
 type anthropicUsage struct {
+	invalid                          bool
 	hasInput, hasOutput, hasCreation bool
 	CacheCreationInputTokens         int  `json:"cache_creation_input_tokens"`
 	CacheUsageReported               bool `json:"-"`
@@ -416,6 +417,7 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			inputUsage.OutputTokens = delta.OutputTokens
 			inputUsage.hasOutput = true
 		}
+		usage.Invalid = usage.Invalid || delta.invalid || !validTokenSum(inputUsage.InputTokens, inputUsage.CacheReadInputTokens, inputUsage.CacheCreationInputTokens, inputUsage.OutputTokens)
 		usage.PromptTokens = inputUsage.InputTokens + inputUsage.CacheReadInputTokens + inputUsage.CacheCreationInputTokens
 		usage.CachedTokens = inputUsage.CacheReadInputTokens
 		usage.CompletionTokens = inputUsage.OutputTokens

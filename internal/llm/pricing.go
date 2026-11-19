@@ -137,8 +137,8 @@ func (r Rates) at(t time.Time) (in, out, cached float64) {
 	return
 }
 
-// BudgetReady requires a complete finite rate schedule; UI estimates may use
-// partial schedules, but enforcement cannot treat omitted rates as zero.
+// BudgetReady requires a complete finite rate schedule. Persisted estimates
+// and budget enforcement must not treat omitted rates as zero.
 func (r Rates) BudgetReady() bool {
 	if !r.Complete {
 		return false
@@ -156,7 +156,7 @@ func (r Rates) BudgetReady() bool {
 // The caller must separately establish that input/output counters are present.
 func (r Rates) BudgetCost(u Usage, t time.Time) (*big.Rat, bool) {
 	u.normalize()
-	if !r.BudgetReady() || u.PromptTokens < 0 || u.CompletionTokens < 0 || u.CachedTokens < 0 || u.CachedTokens > u.PromptTokens {
+	if !r.BudgetReady() || !u.Valid() || u.PromptTokens < 0 || u.CompletionTokens < 0 || u.CachedTokens < 0 || u.CachedTokens > u.PromptTokens {
 		return nil, false
 	}
 	in, out, cached := r.at(t)

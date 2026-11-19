@@ -31,7 +31,7 @@ func usageRegressionServer(t *testing.T, rates bool) (*Server, *bytes.Buffer) {
 	})}}
 	a := &app.App{Root: root, Store: store, Cfg: &agent.Config{Client: client, Session: store, Exec: &tools.Executor{Root: root}, Mode: "auto", MaxLLMAttempts: 1}}
 	if rates {
-		a.Rates = llm.Rates{Configured: true, InputPerMTok: 1000, OutputPerMTok: 2000, Source: "test"}
+		a.Rates = llm.Rates{Configured: true, Complete: true, InputPerMTok: 1000, CachedPerMTok: 1000, OutputPerMTok: 2000, Source: "test"}
 		a.Cfg.UsageRates = a.Rates
 	}
 	r := &app.Runner{App: a, Print: func(string, ...any) {}}
@@ -82,7 +82,7 @@ func TestUsageRegressionUnknownCurrentRunCostIsNotZero(t *testing.T) {
 
 func TestUsageRegressionFreeRunCostIsKnownZero(t *testing.T) {
 	s, out := usageRegressionServer(t, true)
-	s.app.Rates = llm.Rates{Configured: true, Source: "explicit zero"}
+	s.app.Rates = llm.Rates{Configured: true, Complete: true, Source: "explicit zero"}
 	s.app.Cfg.UsageRates = s.app.Rates
 	s.runTurn(Request{Message: "free"})
 	out.Reset()
@@ -100,7 +100,7 @@ func TestUsageRegressionFreeRunCostIsKnownZero(t *testing.T) {
 func TestUsageRegressionMixedRunPricingRemainsUnknown(t *testing.T) {
 	s, out := usageRegressionServer(t, false)
 	s.runTurn(Request{Message: "unpriced"})
-	s.app.Rates = llm.Rates{Configured: true, InputPerMTok: 1000, Source: "later rates"}
+	s.app.Rates = llm.Rates{Configured: true, Complete: true, InputPerMTok: 1000, CachedPerMTok: 1000, Source: "later rates"}
 	s.app.Cfg.UsageRates = s.app.Rates
 	s.runTurn(Request{Message: "priced"})
 	out.Reset()

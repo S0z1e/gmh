@@ -138,6 +138,7 @@ type Model struct {
 	// MetaUpdateMsg from the runner; shown on the meta line's right.
 	sessionTokens    int
 	usageUnavailable bool
+	usageIncomplete  bool
 	turnCount        int
 
 	// OnSubmit is called with the submitted line on Enter. The caller
@@ -178,6 +179,7 @@ func (m Model) WithBranch(branch string) Model {
 // unchanged. ToolMode is the loop's tool mode ("default" or "plan");
 // the meta line shows a plan chip while it is "plan".
 type MetaUpdateMsg struct {
+	UsageIncomplete  bool
 	UsageUnavailable bool
 	Tokens           int
 	Turns            int
@@ -296,6 +298,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case MetaUpdateMsg:
 		m.sessionTokens = msg.Tokens
 		m.usageUnavailable = msg.UsageUnavailable
+		m.usageIncomplete = msg.UsageIncomplete
 		m.turnCount = msg.Turns
 		if msg.Model != "" {
 			m.metaModel = msg.Model
@@ -1014,12 +1017,19 @@ func (m Model) metaLine() string {
 	if m.metaBranch != "" {
 		right = styleMuted.Render(m.metaBranch)
 	}
-	if m.turnCount > 0 || m.sessionTokens > 0 || m.usageUnavailable {
+	if m.turnCount > 0 || m.sessionTokens > 0 || m.usageUnavailable || m.usageIncomplete {
 		turnWord := "turns"
 		if m.turnCount == 1 {
 			turnWord = "turn"
 		}
 		tokens := formatInt(m.sessionTokens)
+		if m.usageIncomplete {
+			if m.sessionTokens == 0 {
+				tokens = "unknown"
+			} else {
+				tokens += "+ unknown"
+			}
+		}
 		if m.usageUnavailable {
 			tokens = "unavailable"
 		}
@@ -1173,3 +1183,5 @@ func wrapText(s string, width int) []string {
 	}
 	return lines
 }
+
+func (m Model) WithUsageCoverage(complete bool) Model { m.usageIncomplete = !complete; return m }

@@ -20,3 +20,18 @@ func TestUsageUnavailableHidesStaleTotals(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestUsageCoverageDistinguishesUnknownFromExplicitZero(t *testing.T) {
+	m := NewModel("").WithMeta("auto", "chat", "model").WithSessionTotals(0, 1).WithUsageCoverage(false)
+	if got := m.metaLine(); !strings.Contains(got, "unknown tokens") || strings.Contains(got, "0 tokens") {
+		t.Fatal(got)
+	}
+	m = m.WithSessionTotals(123, 1)
+	if got := m.metaLine(); !strings.Contains(got, "123+ unknown tokens") {
+		t.Fatal(got)
+	}
+	m = m.WithSessionTotals(0, 1).WithUsageCoverage(true)
+	if got := m.metaLine(); !strings.Contains(got, "0 tokens") || strings.Contains(got, "unknown") {
+		t.Fatal(got)
+	}
+}

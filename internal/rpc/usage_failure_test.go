@@ -3,6 +3,7 @@ package rpc
 import (
 	"encoding/json"
 	"io"
+	"minimalharness/internal/session"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -69,5 +70,48 @@ func TestUsageRegressionFailedAccountingCoverage(t *testing.T) {
 	}
 	if _, exists := settled["cost_usd"]; exists {
 		t.Error("failed accounting is reported as a known zero turn cost")
+	}
+}
+
+func TestUsageRegressionRecoveredGapWithholdsLifetimeCost(t *testing.T) {
+	s, out := usageRegressionServer(t, true)
+	s.runTurn(Request{Message: "first"})
+	path := filepath.Join(filepath.Dir(s.app.Store.OutputDir()), "usage.jsonl")
+	s.app.Store.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"version":1,"id":"lost`); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	store, err := session.Open("native", session.OpenOptions{Workspace: s.app.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	s.app.Store = store
+	s.app.Cfg.Session = store
+	if err := s.runner.RefreshUsage(); err != nil {
+		t.Fatal(err)
+	}
+	s.refreshState()
+	out.Reset()
+	s.handleQuery(Request{Type: "usage"})
+	var result map[string]any
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	data := result["data"].(map[string]any)
+	if _, ok := data["cost_usd"]; ok {
+		t.Fatal("recovered gap advertised complete cost", data)
+	}
+	if data["session_usage_complete"] != false {
+		t.Fatal("recovered gap advertised complete tokens", data)
+	}
+	s.runTurn(Request{Message: "new measured run"})
+	if s.runner.CurrentRunCost() == nil {
+		t.Fatal("historical gap erased known new-run cost")
 	}
 }

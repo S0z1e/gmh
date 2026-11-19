@@ -33,6 +33,7 @@ type UsageTotals struct {
 	PartialAttempts    int       `json:"partial_attempts"`
 	PricedAttempts     int       `json:"priced_attempts"`
 	EstimateUSD        float64   `json:"estimate_usd"`
+	RecoveryGap        bool      `json:"recovery_gap"`
 	LegacyHistory      bool      `json:"legacy_history"`
 }
 
@@ -108,7 +109,11 @@ func (s *Store) loadUsageLocked() error {
 	if _, err := f.Seek(0, 0); err != nil {
 		return err
 	}
-	var totals UsageTotals
+	backups, err := recoveryBackups(f.Name())
+	if err != nil {
+		return err
+	}
+	totals := UsageTotals{RecoveryGap: len(backups) > 0}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 4096), 64<<10)
 	first := true
@@ -307,4 +312,11 @@ func (s *Store) openUsageLocked(create bool) (*os.File, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+// TokenCountsComplete describes measured coverage separately from whether the
+// writer/journal is available. A recovery backup is durable evidence that a
+// final attempt was lost, even after its invalid tail has been truncated.
+func (t UsageTotals) TokenCountsComplete() bool {
+	return !t.LegacyHistory && !t.RecoveryGap && t.UnreportedAttempts == 0 && t.PartialAttempts == 0 && t.InvalidAttempts == 0
 }

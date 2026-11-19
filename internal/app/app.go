@@ -1088,7 +1088,7 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 			r.Print("[error] %v", err)
 			return false
 		}
-		r.Print("[usage] session: %s | %s | %s\n[usage] current run: %s | %s", r.SessionUsage, r.sessionCostLine(), r.usageCoverage(), r.RunUsage, r.runCostLine())
+		r.Print("[usage] session: %s | %s | %s\n[usage] current run: %s | %s", r.sessionUsageLine(), r.sessionCostLine(), r.usageCoverage(), r.RunUsage, r.runCostLine())
 		return false
 	case "/jobs":
 		r.printJobs()
@@ -1367,7 +1367,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		r.Print("\n%s\n[usage] session: unavailable (accounting error)", turnLine)
 		return
 	}
-	r.Print("\n%s\n[usage] session: %s | %s", turnLine, r.SessionUsage, r.sessionCostLine())
+	r.Print("\n%s\n[usage] session: %s | %s", turnLine, r.sessionUsageLine(), r.sessionCostLine())
 }
 
 // Rollback drops the last n turns from the session — Codex's
