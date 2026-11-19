@@ -77,6 +77,7 @@ func Open(id string, opts OpenOptions) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	headerless := header == nil
 	if replace {
 		created := time.Now().UTC()
 		outputID := ""
@@ -85,6 +86,20 @@ func Open(id string, opts OpenOptions) (*Store, error) {
 			outputID = header.OutputID
 		}
 		header = &Header{Role: headerRole, Version: headerVersion, Workspace: identity, Repository: repo, Created: created, OutputID: outputID}
+	}
+	if headerless && !fresh {
+		// First adopt the headerless transcript durably. A failed/crashed
+		// output claim must retry with this same creation identity.
+		if err := s.replaceHeader(header, skip); err != nil {
+			s.Close()
+			return nil, err
+		}
+		encoded, err := json.Marshal(header)
+		if err != nil {
+			s.Close()
+			return nil, err
+		}
+		skip = int64(len(encoded) + 1)
 	}
 	if header.OutputID == "" {
 		replace = true

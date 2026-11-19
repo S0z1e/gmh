@@ -20,6 +20,13 @@ type OutputQuotaError struct {
 	Files bool
 }
 
+// BashAdmissionError means capture storage was refused before any command
+// execution. Capture-time quota failures remain plain OutputQuotaError values.
+type BashAdmissionError struct{ Err error }
+
+func (e *BashAdmissionError) Error() string { return e.Err.Error() }
+func (e *BashAdmissionError) Unwrap() error { return e.Err }
+
 func (e *OutputQuotaError) Error() string {
 	if e.Files {
 		return fmt.Sprintf("session bash output reached the %d-file limit", sessionOutputMaxFiles)
@@ -67,6 +74,14 @@ func (e *Executor) ReacquireOutput(dir string) {
 }
 
 func (e *Executor) newBashOutput(ctx context.Context) (*bashOutputFile, error) {
+	output, err := e.allocateBashOutput(ctx)
+	if err != nil {
+		return nil, &BashAdmissionError{Err: err}
+	}
+	return output, nil
+}
+
+func (e *Executor) allocateBashOutput(ctx context.Context) (*bashOutputFile, error) {
 	e.outMu.Lock()
 	defer e.outMu.Unlock()
 	key := e.OutputDir

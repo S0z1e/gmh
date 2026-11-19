@@ -656,7 +656,7 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 	output, err := e.newBashOutput(ctx)
 	if err != nil {
 		e.audit(ctx, AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
-		return ToolResult{}, err
+		return ToolResult{Status: ResultNotExecuted}, err
 	}
 	out, code, err := e.runBashCmd(ctx, a.Command, e.bashTimeout(a), output, dir, nil)
 	entry := AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
@@ -679,10 +679,11 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 type ResultStatus string
 
 const (
-	ResultSuccess    ResultStatus = "success"
-	ResultError      ResultStatus = "error"
-	ResultDeferred   ResultStatus = "deferred"
-	ResultBackground ResultStatus = "background"
+	ResultSuccess     ResultStatus = "success"
+	ResultError       ResultStatus = "error"
+	ResultDeferred    ResultStatus = "deferred"
+	ResultNotExecuted ResultStatus = "not_executed"
+	ResultBackground  ResultStatus = "background"
 )
 
 type ToolResult struct {

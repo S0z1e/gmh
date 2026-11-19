@@ -1509,9 +1509,14 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					res.Status = tools.ResultDeferred
 				}
 			}
+			var admission *tools.BashAdmissionError
+			notExecuted := errors.As(err, &admission)
 			if err != nil {
 				if res.Status != tools.ResultDeferred {
 					res.Status = tools.ResultError
+				}
+				if notExecuted {
+					res.Status = tools.ResultNotExecuted
 				}
 				obs = fmt.Sprintf("Error: %v\nOutput:\n%s", err, res.Text)
 			} else {
@@ -1556,6 +1561,10 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				deliveries = c.stoppedJobDeliveries()
 			}
 			result := llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil, Observation: observation}
+			if notExecuted {
+				result.Kind = notExecutedKind
+				observation.Failure = nil
+			}
 			if isStop && res.Status == tools.ResultDeferred {
 				result.Kind = stopPendingKind
 				observation.Failure = nil

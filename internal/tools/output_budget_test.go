@@ -22,11 +22,15 @@ func TestSessionOutputQuotaResumeAndAdmission(t *testing.T) {
 	<-job.Done()
 	result, _ := job.Result()
 	var quota *OutputQuotaError
+	var admission *BashAdmissionError
+	if errors.As(result.Err, &admission) {
+		t.Fatalf("capture failure classified as admission: %v", result.Err)
+	}
 	if !errors.As(result.Err, &quota) || !strings.Contains(result.Output, "3 bytes") || !strings.Contains(result.Preview.Notice, "10-byte limit") {
 		t.Fatalf("quota result: %+v", result)
 	}
 	for _, exec := range []*Executor{e, {Root: e.Root, OutputDir: e.OutputDir, OutputMaxBytes: 10}} {
-		if _, err := exec.Bash(ctx, BashArgs{Command: ": > forbidden"}); !errors.As(err, &quota) {
+		if _, err := exec.Bash(ctx, BashArgs{Command: ": > forbidden"}); !errors.As(err, &quota) || !errors.As(err, &admission) {
 			t.Fatalf("full budget admitted a command: %v", err)
 		}
 		if _, err := exec.BashBackground(ctx, BashArgs{Command: ": > forbidden"}); !errors.As(err, &quota) {
