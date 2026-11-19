@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 )
 
 // UnmarshalJSON preserves explicit zero separately from absent/null cache
@@ -226,4 +227,31 @@ func traceWireUsage(ctx context.Context, usage Usage, data string, responses boo
 	}
 	final := !responses || envelope.Type == "response.completed" || envelope.Type == "response.incomplete"
 	traceUsage(ctx, usage, final && (counts.Total != nil || complete), final && complete)
+}
+
+// Valid reports whether counters can safely participate in accounting. A wire
+// total may exceed the input/output sum, but counters must never be negative
+// and the sum must be representable.
+func (u Usage) Valid() bool {
+	for _, n := range []int{u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CachedTokens, u.ReasoningTokens, u.CacheReportedPromptTokens, u.PromptCacheHitTokens, u.PromptTokensDetails.CachedTokens, u.CompletionTokensDetails.ReasoningTokens} {
+		if n < 0 {
+			return false
+		}
+	}
+	return u.CompletionTokens <= math.MaxInt-u.PromptTokens
+}
+
+// CanAdd checks the arithmetic used by Add without modifying either operand.
+func (u Usage) CanAdd(o Usage) bool {
+	if !u.Valid() || !o.Valid() {
+		return false
+	}
+	a := []int{u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CachedTokens, u.ReasoningTokens, u.CacheReportedPromptTokens}
+	b := []int{o.PromptTokens, o.CompletionTokens, o.TotalTokens, o.CachedTokens, o.ReasoningTokens, o.CacheReportedPromptTokens}
+	for i, n := range a {
+		if b[i] > math.MaxInt-n {
+			return false
+		}
+	}
+	return true
 }

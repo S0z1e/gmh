@@ -693,8 +693,10 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 			return attempt - 1, spent, err
 		}
 		requestCtx := llm.WithRequestObserver(ctx, func(trace llm.RequestTrace) {
-			if trace.Usage != nil {
+			if trace.Usage != nil && trace.Usage.Valid() && spent.CanAdd(*trace.Usage) {
 				spent.Add(*trace.Usage)
+			} else if trace.Usage != nil && c.persistErr == nil {
+				c.persistErr = fmt.Errorf("invalid or overflowing provider usage")
 			}
 			c.recordAttempt(operation, attempt, trace)
 			if c.TraceRequests {

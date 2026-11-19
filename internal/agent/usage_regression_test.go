@@ -89,3 +89,26 @@ func TestUsageRegressionCancellationKeepsObservedUsage(t *testing.T) {
 		t.Fatalf("spent=%+v ledger=%+v err=%v", spent, got, err)
 	}
 }
+
+func TestUsageRegressionInvalidCountersDoNotPoisonJournal(t *testing.T) {
+	c, s := usageRegressionConfig(t, "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":-1,\"total_tokens\":-1}}\n\ndata: [DONE]\n\n")
+	c.UsageRates = llm.Rates{Configured: true, InputPerMTok: 1, OutputPerMTok: 1, Source: "test"}
+	_, spent, err := c.Run(context.Background(), []llm.Message{{Role: "user", Content: "hello"}})
+	if err == nil || spent.TotalTokens != 0 {
+		t.Fatalf("invalid usage was accepted: spent=%+v err=%v", spent, err)
+	}
+	got, err := s.UsageTotals()
+	if err != nil || got.Attempts != 1 || got.InvalidAttempts != 1 || got.PricedAttempts != 0 || got.Usage.TotalTokens != 0 {
+		t.Fatalf("invalid ledger: %+v %v", got, err)
+	}
+	s.Close()
+	reopened, err := session.Open("native", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, err = reopened.UsageTotals()
+	if err != nil || got.InvalidAttempts != 1 {
+		t.Fatalf("reopened=%+v %v", got, err)
+	}
+}

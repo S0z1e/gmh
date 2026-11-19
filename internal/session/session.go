@@ -27,10 +27,11 @@ type Store struct {
 	// mu guards Append and Audit: a background job's completion audit
 	// can land on its own goroutine while the loop appends or audits
 	// on the main one.
-	mu          sync.Mutex
-	closed      bool
-	usageLoaded bool
-	usageTotals UsageTotals
+	mu               sync.Mutex
+	closed           bool
+	usageWriteFailed bool
+	usageLoaded      bool
+	usageTotals      UsageTotals
 }
 
 // AuditPath is the sidecar file holding approval/bash audit records

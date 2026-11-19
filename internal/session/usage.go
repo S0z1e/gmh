@@ -21,12 +21,14 @@ type UsageAttempt struct {
 	Request       llm.RequestTrace `json:"request"`
 	EstimateUSD   *float64         `json:"estimate_usd,omitempty"`
 	RateSource    string           `json:"rate_source,omitempty"`
+	InvalidUsage  bool             `json:"invalid_usage,omitempty"`
 	LegacyHistory bool             `json:"legacy_history,omitempty"`
 }
 
 type UsageTotals struct {
 	Usage              llm.Usage `json:"usage"`
 	Attempts           int       `json:"attempts"`
+	InvalidAttempts    int       `json:"invalid_attempts"`
 	UnreportedAttempts int       `json:"unreported_attempts"`
 	PartialAttempts    int       `json:"partial_attempts"`
 	PricedAttempts     int       `json:"priced_attempts"`
@@ -40,6 +42,9 @@ func (t *UsageTotals) add(a UsageAttempt) {
 		return
 	}
 	t.Attempts++
+	if a.InvalidUsage {
+		t.InvalidAttempts++
+	}
 	if a.Request.Usage == nil {
 		t.UnreportedAttempts++
 	} else {
@@ -118,6 +123,15 @@ func (s *Store) loadUsageLocked() error {
 		if a.EstimateUSD != nil && (*a.EstimateUSD < 0 || math.IsInf(*a.EstimateUSD, 0) || math.IsNaN(*a.EstimateUSD)) {
 			return fmt.Errorf("invalid usage cost")
 		}
+		if a.Request.Usage != nil && (!a.Request.Usage.Valid() || !totals.Usage.CanAdd(*a.Request.Usage)) {
+			return fmt.Errorf("invalid or overflowing usage counters")
+		}
+		if a.InvalidUsage && (a.Request.Usage != nil || a.EstimateUSD != nil) {
+			return fmt.Errorf("invalid usage marker")
+		}
+		if a.EstimateUSD != nil && math.IsInf(totals.EstimateUSD+*a.EstimateUSD, 0) {
+			return fmt.Errorf("usage cost overflow")
+		}
 		totals.add(a)
 		first = false
 	}
@@ -135,6 +149,12 @@ func (s *Store) loadUsageLocked() error {
 func (s *Store) UsageTotals() (UsageTotals, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A readable journal does not prove an append that failed reached disk.
+	// Keep this writer's accounting unavailable, even if reconciliation can read
+	// its previous valid prefix. Loading a different writer starts a new run.
+	if s.usageWriteFailed {
+		return UsageTotals{}, fmt.Errorf("provider usage persistence failed; accounting incomplete for this writer")
+	}
 	if s.closed {
 		return UsageTotals{}, os.ErrClosed
 	}
@@ -149,9 +169,11 @@ func (s *Store) UsageTotals() (UsageTotals, error) {
 func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	recorded := false
 	defer func() {
-		if writeErr != nil {
+		if writeErr != nil && !recorded {
 			s.usageLoaded = false
+			s.usageWriteFailed = true
 		}
 	}()
 	if s.closed {
@@ -166,6 +188,20 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 	}
 	// Keep only accounting fields. Request hashes/message arrays are diagnostics,
 	// and never grow the durable ledger with the entire request's shape.
+	if a.Request.Usage != nil && (!a.Request.Usage.Valid() || !s.usageTotals.Usage.CanAdd(*a.Request.Usage)) {
+		a.InvalidUsage = true
+		a.Request.Usage = nil
+		a.Request.TokensComplete = false
+		a.Request.PriceCountsComplete = false
+		a.EstimateUSD = nil
+		a.RateSource = ""
+	}
+	if a.InvalidUsage && (a.Request.Usage != nil || a.EstimateUSD != nil) {
+		return fmt.Errorf("invalid usage marker")
+	}
+	if a.EstimateUSD != nil && (*a.EstimateUSD < 0 || math.IsNaN(*a.EstimateUSD) || math.IsInf(*a.EstimateUSD, 0) || math.IsInf(s.usageTotals.EstimateUSD+*a.EstimateUSD, 0)) {
+		return fmt.Errorf("invalid or overflowing usage cost")
+	}
 	tr := a.Request
 	a.Request = llm.RequestTrace{ID: tr.ID, StartedAt: tr.StartedAt, Model: tr.Model, API: tr.API, EndpointHash: tr.EndpointHash, DurationMS: tr.DurationMS, Outcome: tr.Outcome, Usage: tr.Usage, TokensComplete: tr.TokensComplete, PriceCountsComplete: tr.PriceCountsComplete}
 	data, err := json.Marshal(a)
@@ -213,6 +249,10 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 		return err
 	}
 	s.usageTotals.add(a)
+	recorded = true
+	if a.InvalidUsage {
+		return fmt.Errorf("invalid or overflowing provider usage recorded as unknown")
+	}
 	return nil
 }
 

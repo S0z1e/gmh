@@ -1,6 +1,7 @@
 package session
 
 import (
+	"math"
 	"minimalharness/internal/llm"
 	"os"
 	"path/filepath"
@@ -136,5 +137,43 @@ func TestUsageLedgerRejectsAliasedJournal(t *testing.T) {
 	if s, err := Open("usage", OpenOptions{Workspace: root}); err == nil {
 		s.Close()
 		t.Fatal("nonregular journal accepted")
+	}
+}
+
+func TestUsageInvalidCountersAndCostCannotCorruptReopen(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		usage llm.Usage
+		cost  *float64
+	}{
+		{name: "negative", usage: llm.Usage{TotalTokens: -1}},
+		{name: "overflow", usage: llm.Usage{PromptTokens: math.MaxInt, CompletionTokens: 1}},
+		{name: "cost", cost: func() *float64 { v := -1.0; return &v }()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			root := t.TempDir()
+			s, err := Open("invalid", OpenOptions{Workspace: root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr := llm.RequestTrace{ID: "one", Usage: &tc.usage}
+			if err := s.RecordUsage(UsageAttempt{ID: tr.ID, Request: tr, EstimateUSD: tc.cost}); err == nil {
+				t.Fatal("invalid accounting accepted")
+			}
+			s.Close()
+			s, err = Open("invalid", OpenOptions{Workspace: root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			totals, err := s.UsageTotals()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.cost == nil && (totals.Attempts != 1 || totals.InvalidAttempts != 1 || totals.PricedAttempts != 0) {
+				t.Fatalf("lost invalid attempt: %+v", totals)
+			}
+		})
 	}
 }

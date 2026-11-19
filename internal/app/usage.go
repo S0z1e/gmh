@@ -42,7 +42,7 @@ func (r *Runner) accountRun(usage llm.Usage, previousCost float64) float64 {
 
 func (r *Runner) usageCoverage() string {
 	t := r.SessionMetering
-	return fmt.Sprintf("attempts=%d unreported=%d partial=%d priced=%d legacy_history=%t", t.Attempts, t.UnreportedAttempts, t.PartialAttempts, t.PricedAttempts, t.LegacyHistory)
+	return fmt.Sprintf("attempts=%d unreported=%d partial=%d invalid=%d priced=%d legacy_history=%t", t.Attempts, t.UnreportedAttempts, t.PartialAttempts, t.InvalidAttempts, t.PricedAttempts, t.LegacyHistory)
 }
 
 func (r *Runner) sessionCostLine() string {
