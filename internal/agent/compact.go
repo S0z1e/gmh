@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -225,20 +226,19 @@ func (c *Config) Summarize(ctx context.Context, history []llm.Message, extras []
 		return "", llm.Usage{}, &summaryInputError{fmt.Errorf("summary request exceeds context input budget")}
 	}
 	var msg llm.Message
-	var usage llm.Usage
-	attempts, err := c.streamStep(ctx, "Compaction", msgs, nil, nil, func(m llm.Message, u llm.Usage) {
-		msg, usage = m, u
+	attempts, spent, err := c.streamStep(ctx, "Compaction", msgs, nil, nil, func(m llm.Message, u llm.Usage) {
+		msg = m
 	}, nil, nil)
 	if err != nil {
 		if attempts > 1 {
 			err = fmt.Errorf("%w (after %d attempts)", err, attempts)
 		}
-		return "", usage, err
+		return "", spent, err
 	}
 	if msg.FinishReason == "length" || msg.FinishReason == "max_tokens" || msg.FinishReason == "incomplete" {
-		return "", usage, fmt.Errorf("summary was truncated by the model output limit")
+		return "", spent, fmt.Errorf("summary was truncated by the model output limit")
 	}
-	return msg.Content, usage, nil
+	return msg.Content, spent, nil
 }
 
 // estimatePromptTokens is a conservative local guard, not provider usage.
@@ -424,6 +424,7 @@ func (c *Config) pruneCheckpoint(msgs []llm.Message, defs []llm.ToolDef) ([]llm.
 // Compact manually replaces narration, retaining the same source facts and
 // rollback boundary as automatic compaction.
 func (c *Config) Compact(ctx context.Context, history []llm.Message) ([]llm.Message, llm.Usage, error) {
+	c.persistErr, c.persistErrEmitted = nil, false
 	return c.compactMessages(ctx, history, false)
 }
 
@@ -476,10 +477,7 @@ func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message
 			return nil, llm.Usage{}, err
 		}
 		started := time.Now()
-		var before int64
-		if c.resources != nil {
-			before = c.resources.attempts
-		}
+		before := c.usageAttempts
 		summary, usage, err = c.CompactHistory(ctx, summaryHistory)
 		// This legacy callback cannot distinguish omitted usage from explicit zero.
 		// Treat an all-zero report as unknown rather than invent evidence.
@@ -488,14 +486,21 @@ func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message
 			measured = &usage
 		}
 		var inputErr *summaryInputError
-		if !errors.As(err, &inputErr) && (c.resources == nil || c.resources.attempts == before) {
+		if !errors.As(err, &inputErr) && c.usageAttempts == before {
 			// A total alone proves tokens, not an input/output price breakdown.
 			breakdownKnown := usage.PromptTokens != 0 || usage.CompletionTokens != 0
 			tokensKnown := breakdownKnown || usage.TotalTokens != 0
-			c.recordBudgetUsage(measured, started, tokensKnown, breakdownKnown)
+			tr := llm.RequestTrace{ID: rand.Text(), StartedAt: started, API: "callback", Outcome: "complete", Usage: measured, TokensComplete: tokensKnown, PriceCountsComplete: breakdownKnown}
+			if err != nil {
+				tr.Outcome = "error"
+			}
+			c.recordAttempt("Compaction callback", 1, tr)
 		}
 		if budgetErr := c.budgetError(); budgetErr != nil {
 			err = budgetErr
+		}
+		if c.persistErr != nil {
+			err = c.persistErr
 		}
 	} else {
 		summary, usage, err = c.Summarize(ctx, summaryHistory, nil)

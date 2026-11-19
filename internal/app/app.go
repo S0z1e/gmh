@@ -880,10 +880,14 @@ func (a *App) RenameSession(oldID, newID string) error {
 // rates are configured (App.Rates); the estimate is always labelled
 // with its source, and the provider's real price stays unverified.
 type Runner struct {
-	historyLoadErr error
-	App            *App
-	SessionUsage   llm.Usage
-	SessionCost    float64 // USD estimate, accumulated per turn
+	historyLoadErr  error
+	App             *App
+	SessionUsage    llm.Usage
+	RunUsage        llm.Usage
+	RunCost         float64
+	SessionMetering session.UsageTotals
+	usageStore      *session.Store
+	SessionCost     float64 // USD estimate, accumulated per turn
 	// Turns counts completed agent turns (slash commands excluded),
 	// for the TUI meta line.
 	Turns int
@@ -910,22 +914,24 @@ func (r *Runner) ResetSession() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	r.SessionUsage = llm.Usage{}
-	r.SessionCost = 0
+	if err := r.RefreshUsage(); err != nil {
+		return "", err
+	}
 	r.Turns = 0
 	r.LastErr = nil
 	return store.ID, nil
 }
 
-// ResumeSession switches to an existing session and zeroes the
-// runner's totals. It returns how many messages were loaded.
+// ResumeSession restores lifetime totals and starts fresh current-run totals. It returns how many messages were loaded.
 func (r *Runner) ResumeSession(id string) (int, error) {
 	history, err := r.App.LoadSession(id)
 	if err != nil {
 		return 0, err
 	}
-	r.SessionUsage = llm.Usage{}
-	r.SessionCost = 0
+	r.usageStore = nil
+	if err := r.RefreshUsage(); err != nil {
+		return 0, err
+	}
 	r.Turns = 0
 	r.LastErr = nil
 	return len(history), nil
@@ -971,6 +977,11 @@ func (r *Runner) RunCommand(ctx context.Context, name, args string) (string, err
 
 // Handle runs one input line. It returns true when the UI should quit.
 func (r *Runner) Handle(ctx context.Context, line string) bool {
+	if err := r.RefreshUsage(); err != nil {
+		r.LastErr = err
+		r.Print("[error] %v", err)
+		return false
+	}
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return false
@@ -1074,7 +1085,7 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 		}
 		return true
 	case "/usage":
-		r.Print("[usage] session: %s | %s", r.SessionUsage, r.costLine(r.SessionCost))
+		r.Print("[usage] session: %s | %s | %s\n[usage] current run: %s | %s", r.SessionUsage, r.sessionCostLine(), r.usageCoverage(), r.RunUsage, r.costLine(r.RunCost))
 		return false
 	case "/jobs":
 		r.printJobs()
@@ -1307,6 +1318,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	r.App.History = append(r.App.History, turnContext)
 	history = append(append([]llm.Message(nil), history...), turnContext)
 	r.configureCompaction()
+	previousCost := r.SessionCost
 	text, usage, err := r.App.Cfg.Run(ctx, history)
 	r.LastErr = err
 	if err != nil {
@@ -1329,17 +1341,15 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		}
 		r.Print("[error] %v", loadErr)
 	}
-	r.SessionUsage.Add(usage)
-	turnCost := r.App.Rates.Cost(usage, time.Now())
-	r.SessionCost += turnCost
+	turnCost := r.accountRun(usage, previousCost)
 	// One Print call for both lines: consecutive tea.Println calls
 	// reverse their order in Bubble Tea v2 (verified), so the turn
 	// and session lines must travel as a single print.
 	turnLine := fmt.Sprintf("[usage] turn: %s", usage)
 	if r.App.Rates.Configured {
-		turnLine += fmt.Sprintf(" | est. cost: ~$%.4f", turnCost)
+		turnLine += " | " + r.costLine(turnCost)
 	}
-	r.Print("\n%s\n[usage] session: %s | %s", turnLine, r.SessionUsage, r.costLine(r.SessionCost))
+	r.Print("\n%s\n[usage] session: %s | %s", turnLine, r.SessionUsage, r.sessionCostLine())
 }
 
 // Rollback drops the last n turns from the session — Codex's
@@ -1382,9 +1392,9 @@ func (r *Runner) doCompact(ctx context.Context) {
 		return
 	}
 	r.configureCompaction()
+	previousCost := r.SessionCost
 	_, usage, err := r.App.Cfg.Compact(ctx, r.App.History)
-	r.SessionUsage.Add(usage)
-	r.SessionCost += r.App.Rates.Cost(usage, time.Now())
+	r.accountRun(usage, previousCost)
 	if err != nil {
 		r.Print("[compact] failed: %v (history unchanged)", err)
 		return

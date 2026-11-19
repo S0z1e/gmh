@@ -125,6 +125,10 @@ func Open(id string, opts OpenOptions) (*Store, error) {
 		}
 	}
 	s.header = header
+	if _, err := s.UsageTotals(); err != nil {
+		s.Close()
+		return nil, fmt.Errorf("load session usage: %w", err)
+	}
 	return s, nil
 }
 

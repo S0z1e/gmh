@@ -125,6 +125,9 @@ func main() {
 	runner := &app.Runner{App: a, Print: func(format string, args ...any) {
 		prog.Send(tui.PrintMsg{Text: fmt.Sprintf(format, args...)})
 	}}
+	if err := runner.RefreshUsage(); err != nil {
+		fatal(err)
+	}
 
 	runnerDone := make(chan struct{})
 	go func() {

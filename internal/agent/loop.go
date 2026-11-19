@@ -97,6 +97,7 @@ type Config struct {
 	// doomLoop is the per-Config guard: its streak and session
 	// allowlist outlive one turn, like Qwen's agent-context guard.
 	doomLoop          *DoomLoopGuard
+	usageAttempts     int64
 	persistErr        error
 	persistErrEmitted bool
 	progress          *turnProgress
@@ -683,20 +684,20 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // this step, and onRetry resets the caller's per-attempt state —
 // then the call is replayed from scratch, so the GUI never shows
 // the half-reply followed by the replay.
-func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm.Message, tools []llm.ToolDef, onText func(string), onDone func(llm.Message, llm.Usage), onThinking func(string), onRetry func()) (int, error) {
+func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm.Message, tools []llm.ToolDef, onText func(string), onDone func(llm.Message, llm.Usage), onThinking func(string), onRetry func()) (int, llm.Usage, error) {
 	attempts := c.maxLLMAttempts()
 	var err error
+	var spent llm.Usage
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := c.budgetRequest(); err != nil {
-			return attempt - 1, err
+			return attempt - 1, spent, err
 		}
-		requestCtx := ctx
-		if c.TraceRequests || c.resources != nil {
-			requestCtx = llm.WithRequestObserver(ctx, func(trace llm.RequestTrace) {
-				c.recordBudgetUsage(trace.Usage, trace.StartedAt, trace.TokensComplete, trace.PriceCountsComplete)
-				if !c.TraceRequests {
-					return
-				}
+		requestCtx := llm.WithRequestObserver(ctx, func(trace llm.RequestTrace) {
+			if trace.Usage != nil {
+				spent.Add(*trace.Usage)
+			}
+			c.recordAttempt(operation, attempt, trace)
+			if c.TraceRequests {
 				c.emit(Event{Kind: EventLLMRequest, Request: &trace, Operation: operation, Attempt: attempt})
 				if c.Session != nil {
 					_ = c.Session.Audit(struct {
@@ -706,8 +707,8 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 						Request   llm.RequestTrace `json:"request"`
 					}{"llm_request", operation, attempt, trace})
 				}
-			})
-		}
+			}
+		})
 		outputSeen := false
 		doneSeen := false
 		wrappedText := func(s string) {
@@ -730,11 +731,14 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 			}
 		}
 		err = c.Client.Stream(requestCtx, apiMsgs, tools, wrappedText, wrappedDone, wrappedThinking)
+		if c.persistErr != nil {
+			return attempt, spent, c.persistErr
+		}
 		if budgetErr := c.budgetError(); budgetErr != nil {
-			return attempt, budgetErr
+			return attempt, spent, budgetErr
 		}
 		if err == nil {
-			return attempt, nil
+			return attempt, spent, nil
 		}
 		retry := !doneSeen && ctx.Err() == nil && llm.IsRetryable(err) && attempt < attempts
 		var protocolErr *llm.ProtocolError
@@ -756,18 +760,18 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 			}
 		}
 		if !retry {
-			return attempt, err
+			return attempt, spent, err
 		}
 		if budgetErr := c.budgetRequest(); budgetErr != nil {
-			return attempt, budgetErr
+			return attempt, spent, budgetErr
 		}
 		delay := retryDelay(attempt, llm.RetryAfter(err))
 		c.emit(Event{Kind: EventStepRetry, Text: fmt.Sprintf("%s failed (attempt %d/%d): %v; retrying in %s", operation, attempt, attempts, err, delay), RetryAttempt: attempt + 1})
 		if !sleepCtx(ctx, delay) {
-			return attempt, err
+			return attempt, spent, err
 		}
 	}
-	return attempts, err
+	return attempts, spent, err
 }
 
 // Run executes one user turn. It appends messages to the session store
@@ -927,7 +931,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 		}
 		apiMsgs := c.promptView(msgs)
-		attempts, err := c.streamStep(ctx, "LLM call", apiMsgs, c.Tools, func(s string) {
+		attempts, spent, err := c.streamStep(ctx, "LLM call", apiMsgs, c.Tools, func(s string) {
 			c.emit(Event{Kind: EventTextDelta, Text: s})
 		}, func(m llm.Message, u llm.Usage) {
 			assistant = m
@@ -944,6 +948,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// this step's thinking, and the discard drops it.
 			thinking.Reset()
 		})
+		total.Add(spent)
+		c.emit(Event{Kind: EventStepUsage, Usage: spent})
 		if err != nil {
 			wrapped := fmt.Errorf("step %d: %w", step+1, err)
 			if attempts > 1 {
@@ -974,8 +980,6 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		}
 		c.LastPromptTokens = usage.PromptTokens
 		c.lastPromptEstimate = estimatePromptTokens(apiMsgs, c.Tools)
-		total.Add(usage)
-		c.emit(Event{Kind: EventStepUsage, Usage: usage})
 		lastText = assistant.Content
 		// A job can finish during any provider response, including a final
 		// answer. Save the outcome before the newer batch; a final answer
@@ -1733,7 +1737,7 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	var final llm.Message
 	var usage llm.Usage
 	var thinking strings.Builder
-	_, err := c.streamStep(graceCtx, "LLM call", apiMsgs, nil, func(s string) {
+	_, spent, err := c.streamStep(graceCtx, "LLM call", apiMsgs, nil, func(s string) {
 		c.emit(Event{Kind: EventTextDelta, Text: s})
 	}, func(m llm.Message, u llm.Usage) {
 		final = m
@@ -1747,12 +1751,12 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	}, func() {
 		thinking.Reset()
 	})
-	total.Add(usage)
+	total.Add(spent)
 	if usage.PromptTokens > 0 {
 		c.LastPromptTokens = usage.PromptTokens
 		c.lastPromptEstimate = estimatePromptTokens(apiMsgs, nil)
 	}
-	c.emit(Event{Kind: EventStepUsage, Usage: usage})
+	c.emit(Event{Kind: EventStepUsage, Usage: spent})
 	if err != nil || final.Content == "" || len(final.ToolCalls) > 0 || final.FinishReason == "length" || final.FinishReason == "max_tokens" || final.FinishReason == "incomplete" {
 		return "", total, false
 	}

@@ -54,6 +54,9 @@ type serverState struct {
 	streaming                   bool
 	turns                       int
 	sessionUsage                llm.Usage
+	runUsage                    llm.Usage
+	runCost                     float64
+	metering                    session.UsageTotals
 	sessionCost                 float64
 	messages                    int
 	sessionID                   string
@@ -170,6 +173,9 @@ func Run(a *app.App, runner *app.Runner, in io.Reader, out io.Writer) error {
 }
 
 func (s *Server) run() error {
+	if err := s.runner.RefreshUsage(); err != nil {
+		return err
+	}
 	s.app.Cfg.OnEvent = s.onEvent
 	s.app.Cfg.Ask = s.ask
 	s.app.Cfg.ConfirmContinuation = s.confirmContinuation
@@ -477,8 +483,9 @@ func (s *Server) handleQuery(req Request) {
 		st := s.state
 		s.mu.Unlock()
 		data := map[string]any{
-			"session": usageJSON(st.sessionUsage),
-			"fee":     s.feeLabel(), "turns": st.turns,
+			"session":     usageJSON(st.sessionUsage),
+			"current_run": usageJSON(st.runUsage), "current_run_cost_usd": st.runCost, "metering": st.metering,
+			"fee": s.feeLabel(), "turns": st.turns,
 		}
 		if st.ratesConfigured {
 			c := st.sessionCost
@@ -898,13 +905,14 @@ func (s *Server) refreshState() {
 	s.state.sessionID = s.app.Store.ID
 	s.state.turns = s.runner.Turns
 	s.state.sessionUsage = s.runner.SessionUsage
+	s.state.runUsage, s.state.runCost, s.state.metering = s.runner.RunUsage, s.runner.RunCost, s.runner.SessionMetering
 	s.state.sessionCost = s.runner.SessionCost
 	s.state.toolMode = string(s.runner.App.ToolMode())
 	s.state.model, s.state.api = s.app.Cfg.Client.Model, s.app.Cfg.Client.API
 	s.state.mode, s.state.root = s.app.Cfg.Mode, s.app.Root
 	s.state.workspaceTrusted = s.app.WorkspaceTrusted
 	s.state.contextWindow, s.state.maxTokens = s.app.ContextLimit, s.app.Cfg.Client.MaxTokens
-	s.state.ratesConfigured = s.app.Rates.Configured
+	s.state.ratesConfigured = s.app.Rates.Configured || s.runner.SessionMetering.PricedAttempts > 0
 	s.state.fee = s.app.Cfg.Client.ProviderName() + " price unverified"
 	s.mu.Unlock()
 }
@@ -929,6 +937,7 @@ func (s *Server) runTurn(req Request) {
 	s.turnCancel = cancel
 	s.turnMu.Unlock()
 	s.writeEvent(Event{Type: "turn_started", Text: truncateRunes(req.Message, 200)})
+	previousCost := s.runner.SessionCost
 	s.runner.Handle(ctx, req.Message)
 	s.turnMu.Lock()
 	s.turnCancel = nil
@@ -979,14 +988,17 @@ func (s *Server) runTurn(req Request) {
 	s.mu.Unlock()
 	settled := Event{
 		Type: "agent_settled", Text: text, Usage: usageJSON(usage),
-		SessionUsage: usageJSON(st.sessionUsage), Fee: s.feeLabel(), Aborted: aborted,
+		SessionUsage: usageJSON(st.sessionUsage), RunUsage: usageJSON(st.runUsage), Metering: &st.metering, Fee: s.feeLabel(), Aborted: aborted,
 		Reason:   string(reason),
 		Outcome:  string(outcome),
 		ToolMode: st.toolMode,
 	}
 	if s.app.Rates.Configured {
-		c := s.app.Rates.Cost(usage, time.Now())
+		c := st.sessionCost - previousCost
 		settled.CostUSD = &c
+
+	}
+	if st.metering.PricedAttempts > 0 {
 		sc := st.sessionCost
 		settled.SessionCostUSD = &sc
 	}

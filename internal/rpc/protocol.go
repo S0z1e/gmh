@@ -14,6 +14,7 @@ import (
 
 	"minimalharness/internal/agent"
 	"minimalharness/internal/llm"
+	"minimalharness/internal/session"
 )
 
 // Request is one line from the GUI. ID is echoed in the response when
@@ -118,8 +119,10 @@ type Event struct {
 	// text_delta, background_wait, turn_started: the text.
 	Text string `json:"text,omitempty"`
 	// step_usage, agent_settled.
-	Usage        *UsageJSON `json:"usage,omitempty"`
-	SessionUsage *UsageJSON `json:"session_usage,omitempty"`
+	Usage        *UsageJSON           `json:"usage,omitempty"`
+	SessionUsage *UsageJSON           `json:"session_usage,omitempty"`
+	RunUsage     *UsageJSON           `json:"current_run_usage,omitempty"`
+	Metering     *session.UsageTotals `json:"metering,omitempty"`
 	// agent_settled cost: null when no rates are configured.
 	CostUSD        *float64 `json:"cost_usd,omitempty"`
 	SessionCostUSD *float64 `json:"session_cost_usd,omitempty"`

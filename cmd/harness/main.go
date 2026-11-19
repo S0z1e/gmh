@@ -113,6 +113,9 @@ func main() {
 	runner := &app.Runner{App: a, Print: func(format string, args ...any) {
 		fmt.Printf(format+"\n", args...)
 	}}
+	if err := runner.RefreshUsage(); err != nil {
+		fatal(err)
+	}
 
 	// RPC mode: the server owns the event stream and the approval
 	// bridge; usage lines and diagnostics go to stderr so stdout
