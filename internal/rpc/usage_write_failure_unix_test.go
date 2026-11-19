@@ -3,16 +3,30 @@
 package rpc
 
 import (
+	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestUsageRegressionAppendFailureKeepsAccountingUnavailable(t *testing.T) {
+	if os.Getenv("GMH_USAGE_EFBIG_CHILD") != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestUsageRegressionAppendFailureKeepsAccountingUnavailable$", "-test.count=1")
+		cmd.Env = append(os.Environ(), "GMH_USAGE_EFBIG_CHILD=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("isolated file-size fault: %v\n%s", err, out)
+		}
+		return
+	}
+
 	s, out := usageRegressionServer(t, true)
 	// Keep the usage journal larger than the transcript, so only its append
 	// encounters the filesystem file-size limit on the second turn.

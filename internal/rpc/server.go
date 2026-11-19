@@ -840,7 +840,9 @@ func (s *Server) onEvent(ev agent.Event) {
 	case agent.EventThinkingEnd:
 		s.writeEvent(Event{Type: "thinking_end", Text: ev.Text})
 	case agent.EventStepUsage:
-		s.turnUsage.Add(ev.Usage)
+		if s.turnUsage.CanAdd(ev.Usage) {
+			s.turnUsage.Add(ev.Usage)
+		}
 		s.writeEvent(Event{Type: "step_usage", Usage: usageJSON(ev.Usage)})
 	case agent.EventLLMRequest:
 		s.writeEvent(Event{Type: "llm_request", Request: ev.Request, Operation: ev.Operation, Attempt: ev.Attempt})

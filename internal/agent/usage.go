@@ -27,3 +27,15 @@ func (c *Config) recordAttempt(operation string, attempt int, trace llm.RequestT
 		c.persistErr = fmt.Errorf("save provider usage: %w", err)
 	}
 }
+
+// Preserve a valid measured subtotal if provider counters exceed the range of
+// a turn aggregate. The ledger separately records the attempt's coverage gap.
+func (c *Config) addObservedUsage(total *llm.Usage, usage llm.Usage) {
+	if total.CanAdd(usage) {
+		total.Add(usage)
+		return
+	}
+	if c.persistErr == nil {
+		c.persistErr = fmt.Errorf("invalid or overflowing turn usage")
+	}
+}

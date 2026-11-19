@@ -26,6 +26,9 @@ func (r *Runner) RefreshUsage() error {
 	r.MeteringAvailable = !r.runAccountingIncomplete
 	r.SessionMetering = totals
 	r.SessionUsage, r.SessionCost = totals.Usage, totals.EstimateUSD
+	if r.runAccountingIncomplete {
+		return fmt.Errorf("usage accounting is incomplete for the current run")
+	}
 	return nil
 }
 
@@ -35,7 +38,14 @@ func (r *Runner) accountRun(usage llm.Usage, previousCost float64) float64 {
 		r.Print("[error] %v", err)
 	}
 	cost := r.SessionCost - previousCost
-	r.RunUsage.Add(usage)
+	if r.RunUsage.CanAdd(usage) {
+		r.RunUsage.Add(usage)
+	} else {
+		r.runAccountingIncomplete = true
+		r.MeteringAvailable = false
+		r.LastErr = fmt.Errorf("current-run usage is invalid or exceeds the accounting range")
+		r.Print("[error] %v", r.LastErr)
+	}
 	r.RunCost += cost
 	return cost
 }

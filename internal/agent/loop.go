@@ -868,7 +868,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		blocked := fmt.Errorf("task blocked: %d tool attempts failed without proven state or result progress", MaxFailedFixAttempts)
 		if ctx.Err() == nil {
 			graceText, graceUsage, ok := c.graceCall(ctx, msgs, blockedGracePrompt(blocked, c.progress.lastErrors), guidanceState)
-			total.Add(graceUsage)
+			c.addObservedUsage(&total, graceUsage)
 			if ok {
 				lastText = graceText
 			}
@@ -912,7 +912,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				prepare = &checkpointPreparation{guidance: guidanceState}
 			}
 			compacted, usage, err := c.compactInLoop(ctx, msgs, prepare)
-			total.Add(usage)
+			c.addObservedUsage(&total, usage)
 			c.emit(Event{Kind: EventStepUsage, Usage: usage})
 			if err != nil {
 				c.LastTerminalReason = TerminalError
@@ -950,7 +950,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// this step's thinking, and the discard drops it.
 			thinking.Reset()
 		})
-		total.Add(spent)
+		c.addObservedUsage(&total, spent)
 		c.emit(Event{Kind: EventStepUsage, Usage: spent})
 		if err != nil {
 			wrapped := fmt.Errorf("step %d: %w", step+1, err)
@@ -1697,7 +1697,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	// message; a context checkpoint may already have been committed.
 	if ctx.Err() == nil {
 		graceText, graceUsage, ok := c.graceCall(ctx, msgs, "You have reached the step limit. Give your best final answer now, summarising what was done and what remains unfinished. Do not call any more tools.", guidanceState)
-		total.Add(graceUsage)
+		c.addObservedUsage(&total, graceUsage)
 		if ok {
 			lastText = graceText
 		}
@@ -1725,7 +1725,7 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	var total llm.Usage
 	if c.ContextLimit > 0 && c.contextTokens(c.promptView(graceMsgs), nil) >= c.contextBudget() {
 		compacted, u, err := c.compactInLoop(graceCtx, msgs, &checkpointPreparation{guidance: guidanceState, closing: &instructionMsg})
-		total.Add(u)
+		c.addObservedUsage(&total, u)
 		c.emit(Event{Kind: EventStepUsage, Usage: u})
 		if err != nil {
 			return "", total, false
@@ -1753,7 +1753,7 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	}, func() {
 		thinking.Reset()
 	})
-	total.Add(spent)
+	c.addObservedUsage(&total, spent)
 	if usage.PromptTokens > 0 {
 		c.LastPromptTokens = usage.PromptTokens
 		c.lastPromptEstimate = estimatePromptTokens(apiMsgs, nil)
