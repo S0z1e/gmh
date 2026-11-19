@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -197,36 +198,12 @@ func (c *Config) reconcileJobDeliveries() error {
 	if err != nil {
 		return fmt.Errorf("reconcile background deliveries: %w", err)
 	}
-	type incarnation struct{ id, started string }
-	key := func(id string, started time.Time) incarnation {
-		return incarnation{id, started.UTC().Format(time.RFC3339Nano)}
-	}
-	delivered := make(map[incarnation]bool)
-	remember := func(jobs []checkpoint.Job) {
-		for _, job := range jobs {
-			if job.Status == checkpoint.Done && job.Delivered && !job.Started.IsZero() {
-				k := key(job.ID, job.Started)
-				delivered[k] = true
-			}
-		}
-	}
-	for _, m := range saved {
-		if m.Kind == "checkpoint" {
-			state, err := checkpoint.Decode([]byte(m.Content))
-			if err != nil {
-				return fmt.Errorf("reconcile background deliveries: %w", err)
-			}
-			remember(state.Jobs)
-		}
-		if m.Observation != nil {
-			remember(m.Observation.Jobs)
-			for _, completed := range m.Observation.JobCompletions() {
-				remember([]checkpoint.Job{completed.Job})
-			}
-		}
+	delivered, err := recordedJobDeliveries(saved)
+	if err != nil {
+		return fmt.Errorf("reconcile background deliveries: %w", err)
 	}
 	for _, job := range jobs {
-		if job.Delivered() || !delivered[key(job.ID, job.Started)] {
+		if job.Delivered() || !delivered[jobDeliveryKey(job.ID, job.Started)] {
 			continue
 		}
 		if result, done := job.Result(); done {
@@ -238,6 +215,81 @@ func (c *Config) reconcileJobDeliveries() error {
 				JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID,
 				ToolExitCode: &result.ExitCode, ToolOutputFile: job.OutputFile})
 		}
+	}
+	return nil
+}
+
+type jobIncarnation struct{ id, started string }
+
+func jobDeliveryKey(id string, started time.Time) jobIncarnation {
+	return jobIncarnation{id, started.UTC().Format(time.RFC3339Nano)}
+}
+
+func recordedJobDeliveries(saved []llm.Message) (map[jobIncarnation]bool, error) {
+	delivered := make(map[jobIncarnation]bool)
+	remember := func(jobs []checkpoint.Job) {
+		for _, job := range jobs {
+			if job.Status == checkpoint.Done && job.Delivered && !job.Started.IsZero() {
+				k := jobDeliveryKey(job.ID, job.Started)
+				delivered[k] = true
+			}
+		}
+	}
+	for _, m := range saved {
+		if m.Kind == "checkpoint" {
+			state, err := checkpoint.Decode([]byte(m.Content))
+			if err != nil {
+				return nil, err
+			}
+			remember(state.Jobs)
+		}
+		if m.Observation != nil {
+			remember(m.Observation.Jobs)
+			for _, completed := range m.Observation.JobCompletions() {
+				remember([]checkpoint.Job{completed.Job})
+			}
+		}
+	}
+	return delivered, nil
+}
+
+// SaveJobResults settles finished jobs while their owning session writer is
+// still open. Call between turns; it performs no model request or event callback.
+// A failed append leaves its job undelivered so shutdown can be retried.
+func SaveJobResults(store *session.Store, jobs []*tools.Job) error {
+	var ready []*tools.Job
+	for _, job := range jobs {
+		if _, done := job.Result(); done && !job.Delivered() {
+			ready = append(ready, job)
+		}
+	}
+	if len(ready) == 0 {
+		return nil
+	}
+	saved, err := session.Load(store.ID)
+	if err != nil {
+		return err
+	}
+	delivered, err := recordedJobDeliveries(saved)
+	if err != nil {
+		return err
+	}
+	sort.SliceStable(ready, func(i, j int) bool {
+		iTime, _ := ready[i].FinishedAt()
+		jTime, _ := ready[j].FinishedAt()
+		return iTime.Before(jTime)
+	})
+	for _, job := range ready {
+		if !delivered[jobDeliveryKey(job.ID, job.Started)] {
+			result, _ := job.Result()
+			output, _ := jobResultMessage(job, result)
+			m := pendingStopCompletion(saved, job, result, output)
+			if err := store.Append(m); err != nil {
+				return err
+			}
+			saved = append(saved, m)
+		}
+		job.MarkDelivered()
 	}
 	return nil
 }

@@ -69,7 +69,13 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	defer a.Store.Close()
+	defer func() {
+		if err := a.Close(); err != nil {
+			fatal(err)
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Header lines, opencode-mini style: a one-line mark plus the
 	// session meta, both muted apart from the bold name and the plain
@@ -92,7 +98,12 @@ func main() {
 	m := tui.NewModel(info).WithMeta(a.Cfg.Mode, a.Cfg.Client.API, a.Cfg.Client.Model).WithBranch(gitBranch(a.Root))
 	// Set OnSubmit BEFORE NewProgram: the program holds its own copy of
 	// the model, so fields set afterwards on this copy would never fire.
-	m.OnSubmit = func(line string) { lines <- line }
+	m.OnSubmit = func(line string) {
+		select {
+		case lines <- line:
+		case <-ctx.Done():
+		}
+	}
 	prog := tea.NewProgram(m)
 
 	// The agent loop runs in a goroutine and feeds events into the
@@ -115,9 +126,19 @@ func main() {
 		prog.Send(tui.PrintMsg{Text: fmt.Sprintf(format, args...)})
 	}}
 
-	ctx := context.Background()
+	runnerDone := make(chan struct{})
 	go func() {
-		for line := range lines {
+		defer close(runnerDone)
+		for {
+			var line string
+			select {
+			case <-ctx.Done():
+				return
+			case line = <-lines:
+			}
+			if ctx.Err() != nil {
+				return
+			}
 			quit := runner.Handle(ctx, line)
 			// Session totals for the meta line's right side, plus
 			// the current model/api so a /model switch shows up,
@@ -130,8 +151,17 @@ func main() {
 		}
 	}()
 
-	if _, err := prog.Run(); err != nil {
-		fatal(err)
+	_, runErr := prog.Run()
+	cancel()
+	<-runnerDone
+	if err := a.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "close session jobs: %v\n", err)
+		if runErr == nil {
+			runErr = err
+		}
+	}
+	if runErr != nil {
+		fatal(runErr)
 	}
 }
 

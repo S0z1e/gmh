@@ -104,7 +104,11 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	defer a.Store.Close()
+	defer func() {
+		if err := a.Close(); err != nil {
+			fatal(err)
+		}
+	}()
 
 	runner := &app.Runner{App: a, Print: func(format string, args ...any) {
 		fmt.Printf(format+"\n", args...)
@@ -118,6 +122,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, format+"\n", args...)
 		}
 		if err := rpc.Run(a, runner, os.Stdin, os.Stdout); err != nil {
+			_ = a.Close()
 			fatal(err)
 		}
 		return
@@ -172,6 +177,9 @@ func main() {
 	if *printMode != "" {
 		runner.Handle(ctx, *printMode)
 		if runner.LastErr != nil {
+			if err := a.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "close session jobs: %v\n", err)
+			}
 			os.Exit(1)
 		}
 		return

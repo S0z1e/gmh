@@ -325,6 +325,23 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		runCtx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
+	run := &bashRun{cancel: cancel, done: make(chan struct{})}
+	e.jobsMu.Lock()
+	if e.jobsClosed {
+		e.jobsMu.Unlock()
+		return "", -1, ErrExecutorClosed
+	}
+	if e.activeBash == nil {
+		e.activeBash = make(map[*bashRun]struct{})
+	}
+	e.activeBash[run] = struct{}{}
+	e.jobsMu.Unlock()
+	defer func() {
+		e.jobsMu.Lock()
+		delete(e.activeBash, run)
+		close(run.done)
+		e.jobsMu.Unlock()
+	}()
 	var cmd *exec.Cmd
 	if e.Sandbox {
 		bwrap := e.BwrapPath
@@ -488,6 +505,9 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		if processContextErr == context.DeadlineExceeded {
 			return s, -1, &timeoutError{timeout}
 		}
+		if processContextErr != nil {
+			return s, -1, processContextErr
+		}
 		if ctx.Err() != nil {
 			return s, -1, ctx.Err()
 		}
@@ -515,6 +535,9 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	}
 	if processContextErr == context.DeadlineExceeded {
 		return s, -1, &timeoutError{timeout}
+	}
+	if processContextErr != nil {
+		return s, -1, processContextErr
 	}
 	if ctx.Err() != nil {
 		return s, -1, ctx.Err()
@@ -574,7 +597,18 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	}
 	// Capture the audit destination: a later session switch must not redirect it.
 	audit := e.Audit
-	e.registry().add(job)
+	e.jobsMu.Lock()
+	if e.jobsClosed {
+		e.jobsMu.Unlock()
+		job.Cancel()
+		job.Detach()
+		return nil, ErrExecutorClosed
+	}
+	if e.jobs == nil {
+		e.jobs = &JobRegistry{}
+	}
+	e.jobs.add(job)
+	e.jobsMu.Unlock()
 	// Close the race with an abort that ran its registry snapshot just
 	// before this job was registered.
 	if ctx.Err() != nil {

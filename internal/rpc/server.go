@@ -191,7 +191,7 @@ func (s *Server) run() error {
 	})
 	go s.readLoop()
 	s.agentLoop()
-	return nil
+	return s.app.Close()
 }
 
 // readLoop decodes stdin lines (LF only) until EOF, then shuts down.

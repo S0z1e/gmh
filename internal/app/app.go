@@ -114,6 +114,8 @@ type App struct {
 	// pendingReminder is a reminder for the next turn snapshot set by a mode
 	// switch and persisted by the next runOnce with that snapshot.
 	pendingReminder string
+	// Writers with undelivered jobs remain owned across session switches.
+	retainedStores map[*session.Store]struct{}
 }
 
 // Setup builds the client, session and agent config. The caller sets
@@ -761,9 +763,7 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 			a.Cfg.Exec.SwitchSession(store.ID)
 		}
 	}
-	if old != nil {
-		_ = old.Close()
-	}
+	a.retainOrClose(old)
 	if fire {
 		a.fireSessionEvents(oldID, store.ID)
 	}
@@ -780,8 +780,16 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	old := a.Store
 	store := old
 	reuse := old != nil && old.Owns(id)
+	if !reuse {
+		for retained := range a.retainedStores {
+			if retained.Owns(id) {
+				store, reuse = retained, true
+				break
+			}
+		}
+	}
 	if reuse {
-		if err := old.CheckWorkspace(a.Root); err != nil {
+		if err := store.CheckWorkspace(a.Root); err != nil {
 			return nil, err
 		}
 	}
@@ -804,6 +812,7 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 		oldID = old.ID
 	}
 	a.Store = store
+	delete(a.retainedStores, store)
 	a.hydrateImages(history)
 	a.History = history
 	a.PendingImages = nil
@@ -823,8 +832,8 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 			a.Cfg.Exec.SwitchSession(store.ID)
 		}
 	}
-	if old != nil && !reuse {
-		_ = old.Close()
+	if old != store {
+		a.retainOrClose(old)
 	}
 	a.fireSessionEvents(oldID, store.ID)
 	return history, nil
@@ -834,8 +843,18 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 func (a *App) RenameSession(oldID, newID string) error {
 	var err error
 	current := a.Store != nil && a.Store.ID == oldID
-	if current {
-		err = a.Store.Rename(newID)
+	owner := a.Store
+	if !current {
+		owner = nil
+		for retained := range a.retainedStores {
+			if retained.Owns(oldID) {
+				owner = retained
+				break
+			}
+		}
+	}
+	if owner != nil {
+		err = owner.Rename(newID)
 	} else {
 		err = session.RenameSession(oldID, newID)
 	}
@@ -1051,16 +1070,9 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 	}
 	switch line {
 	case "/quit", "/exit":
-		// Quitting abandons running background jobs (their child
-		// processes keep running, orphaned): say so plainly.
-		var running []string
-		for _, j := range r.App.Cfg.Exec.Jobs() {
-			if j.Status() == tools.JobRunning {
-				running = append(running, j.ID)
-			}
-		}
-		if len(running) > 0 {
-			r.Print("Background jobs still running (%s); quitting abandons them.", strings.Join(running, ", "))
+		if err := r.App.Close(); err != nil {
+			r.Print("[error] close session jobs: %v", err)
+			return false
 		}
 		return true
 	case "/usage":

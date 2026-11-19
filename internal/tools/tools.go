@@ -101,6 +101,8 @@ type Executor struct {
 	jobs        *JobRegistry
 	sessionJobs map[string]*JobRegistry
 	sessionID   string
+	jobsClosed  bool
+	activeBash  map[*bashRun]struct{}
 
 	outMu  sync.Mutex
 	outSeq int
