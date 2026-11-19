@@ -13,13 +13,17 @@ func (r *Runner) RefreshUsage() error {
 	}
 	totals, err := r.App.Store.UsageTotals()
 	if err != nil {
+		r.MeteringAvailable = false
+		r.runAccountingIncomplete = true
 		return fmt.Errorf("load usage: %w", err)
 	}
 	if r.usageStore != r.App.Store {
 		r.usageStore = r.App.Store
 		r.RunUsage, r.RunCost = llm.Usage{}, 0
 		r.runBaseline = totals
+		r.runAccountingIncomplete = false
 	}
+	r.MeteringAvailable = !r.runAccountingIncomplete
 	r.SessionMetering = totals
 	r.SessionUsage, r.SessionCost = totals.Usage, totals.EstimateUSD
 	return nil
@@ -54,6 +58,9 @@ func (r *Runner) sessionCostLine() string {
 // A nil cost means at least one attempt in this run could not be priced.
 // An empty run and explicitly configured free rates both have a known zero.
 func (r *Runner) CurrentRunCost() *float64 {
+	if !r.MeteringAvailable {
+		return nil
+	}
 	attempts := r.SessionMetering.Attempts - r.runBaseline.Attempts
 	priced := r.SessionMetering.PricedAttempts - r.runBaseline.PricedAttempts
 	if attempts != priced {

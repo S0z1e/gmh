@@ -57,6 +57,7 @@ type serverState struct {
 	runUsage                    llm.Usage
 	runCost                     float64
 	runCostKnown                bool
+	meteringAvailable           bool
 	metering                    session.UsageTotals
 	sessionCost                 float64
 	messages                    int
@@ -484,14 +485,18 @@ func (s *Server) handleQuery(req Request) {
 		st := s.state
 		s.mu.Unlock()
 		data := map[string]any{
-			"session":     usageJSON(st.sessionUsage),
-			"current_run": usageJSON(st.runUsage), "metering": st.metering,
-			"fee": s.feeLabel(), "turns": st.turns,
+			"metering_available": st.meteringAvailable,
+			"current_run":        usageJSON(st.runUsage),
+			"fee":                s.feeLabel(), "turns": st.turns,
+		}
+		if st.meteringAvailable {
+			data["session"] = usageJSON(st.sessionUsage)
+			data["metering"] = st.metering
 		}
 		if st.runCostKnown {
 			data["current_run_cost_usd"] = st.runCost
 		}
-		if st.metering.Attempts == st.metering.PricedAttempts && !st.metering.LegacyHistory && (st.metering.Attempts > 0 || st.ratesConfigured) {
+		if st.meteringAvailable && st.metering.Attempts == st.metering.PricedAttempts && !st.metering.LegacyHistory && (st.metering.Attempts > 0 || st.ratesConfigured) {
 			c := st.sessionCost
 			data["cost_usd"] = &c
 		}
@@ -911,6 +916,7 @@ func (s *Server) refreshState() {
 	s.state.sessionUsage = s.runner.SessionUsage
 	s.state.runUsage, s.state.runCost, s.state.metering = s.runner.RunUsage, s.runner.RunCost, s.runner.SessionMetering
 	s.state.runCostKnown = s.runner.CurrentRunCost() != nil
+	s.state.meteringAvailable = s.runner.MeteringAvailable
 	s.state.sessionCost = s.runner.SessionCost
 	s.state.toolMode = string(s.runner.App.ToolMode())
 	s.state.model, s.state.api = s.app.Cfg.Client.Model, s.app.Cfg.Client.API
@@ -999,14 +1005,19 @@ func (s *Server) runTurn(req Request) {
 		Outcome:  string(outcome),
 		ToolMode: st.toolMode,
 	}
-	if s.app.Rates.Configured && st.metering.Attempts-previousMetering.Attempts == st.metering.PricedAttempts-previousMetering.PricedAttempts {
+	if st.meteringAvailable && s.app.Rates.Configured && st.metering.Attempts-previousMetering.Attempts == st.metering.PricedAttempts-previousMetering.PricedAttempts {
 		c := st.sessionCost - previousCost
 		settled.CostUSD = &c
 
 	}
-	if st.metering.PricedAttempts > 0 && st.metering.PricedAttempts == st.metering.Attempts && !st.metering.LegacyHistory {
+	if st.meteringAvailable && st.metering.PricedAttempts > 0 && st.metering.PricedAttempts == st.metering.Attempts && !st.metering.LegacyHistory {
 		sc := st.sessionCost
 		settled.SessionCostUSD = &sc
+	}
+	settled.MeteringAvailable = &st.meteringAvailable
+	if !st.meteringAvailable {
+		settled.SessionUsage = nil
+		settled.Metering = nil
 	}
 	if st.runCostKnown {
 		cost := st.runCost

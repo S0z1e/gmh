@@ -15,7 +15,7 @@ func (c *Config) recordAttempt(operation string, attempt int, trace llm.RequestT
 		return
 	}
 	record := session.UsageAttempt{ID: trace.ID, Operation: operation, Attempt: attempt, Request: trace}
-	if trace.Usage != nil && c.UsageRates.Configured {
+	if trace.Usage != nil && trace.PriceCountsComplete && c.UsageRates.Configured {
 		estimate := c.UsageRates.Cost(*trace.Usage, trace.StartedAt)
 		record.EstimateUSD, record.RateSource = &estimate, c.UsageRates.Source
 	}

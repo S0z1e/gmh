@@ -880,15 +880,17 @@ func (a *App) RenameSession(oldID, newID string) error {
 // rates are configured (App.Rates); the estimate is always labelled
 // with its source, and the provider's real price stays unverified.
 type Runner struct {
-	historyLoadErr  error
-	App             *App
-	SessionUsage    llm.Usage
-	RunUsage        llm.Usage
-	RunCost         float64
-	SessionMetering session.UsageTotals
-	usageStore      *session.Store
-	runBaseline     session.UsageTotals
-	SessionCost     float64 // USD estimate, accumulated per turn
+	historyLoadErr          error
+	App                     *App
+	SessionUsage            llm.Usage
+	RunUsage                llm.Usage
+	RunCost                 float64
+	SessionMetering         session.UsageTotals
+	usageStore              *session.Store
+	runBaseline             session.UsageTotals
+	MeteringAvailable       bool
+	runAccountingIncomplete bool
+	SessionCost             float64 // USD estimate, accumulated per turn
 	// Turns counts completed agent turns (slash commands excluded),
 	// for the TUI meta line.
 	Turns int
@@ -1358,8 +1360,12 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	// reverse their order in Bubble Tea v2 (verified), so the turn
 	// and session lines must travel as a single print.
 	turnLine := fmt.Sprintf("[usage] turn: %s", usage)
-	if r.App.Rates.Configured && r.SessionMetering.Attempts-previousMetering.Attempts == r.SessionMetering.PricedAttempts-previousMetering.PricedAttempts {
+	if r.MeteringAvailable && r.App.Rates.Configured && r.SessionMetering.Attempts-previousMetering.Attempts == r.SessionMetering.PricedAttempts-previousMetering.PricedAttempts {
 		turnLine += " | " + r.costLine(turnCost)
+	}
+	if !r.MeteringAvailable {
+		r.Print("\n%s\n[usage] session: unavailable (accounting error)", turnLine)
+		return
 	}
 	r.Print("\n%s\n[usage] session: %s | %s", turnLine, r.SessionUsage, r.sessionCostLine())
 }
