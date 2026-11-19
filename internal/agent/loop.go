@@ -716,7 +716,7 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 				return nil
 			}
 			if err := c.Session.BeginUsageAttempt(trace.ID); err != nil {
-				c.persistErr = fmt.Errorf("save pending provider attempt: %w", err)
+				c.persistErr = fmt.Errorf("save pending provider usage attempt: %w", err)
 				return c.persistErr
 			}
 			return nil

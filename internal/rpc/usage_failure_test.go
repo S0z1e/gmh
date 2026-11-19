@@ -38,8 +38,13 @@ func TestUsageRegressionFailedAccountingCoverage(t *testing.T) {
 	previous := s.app.Cfg.Client.HTTP.Transport
 	s.app.Cfg.Client.HTTP.Transport = usageRegressionTransport(func(r *http.Request) (*http.Response, error) {
 		path := filepath.Join(filepath.Dir(s.app.Store.OutputDir()), "usage.jsonl")
+		// BeginUsageAttempt has created the empty journal before dispatch.
+		// Replace it only now, to inject failure after the provider was called.
+		if err := os.Remove(path); err != nil {
+			return nil, err
+		}
 		if err := os.MkdirAll(path, 0700); err != nil {
-			t.Fatal(err)
+			return nil, err
 		}
 		return previous.RoundTrip(r)
 	})
