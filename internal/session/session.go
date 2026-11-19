@@ -32,6 +32,7 @@ type Store struct {
 	usageWriteFailed bool
 	usageLoaded      bool
 	usageTotals      UsageTotals
+	usageInfo        os.FileInfo
 }
 
 // AuditPath is the sidecar file holding approval/bash audit records

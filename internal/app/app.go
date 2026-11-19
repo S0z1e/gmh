@@ -1088,7 +1088,7 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 			r.Print("[error] %v", err)
 			return false
 		}
-		r.Print("[usage] session: %s | %s | %s\n[usage] current run: %s | %s", r.sessionUsageLine(), r.sessionCostLine(), r.usageCoverage(), r.RunUsage, r.runCostLine())
+		r.Print("[usage] session: %s | %s | %s\n[usage] current run: %s | %s", r.sessionUsageLine(), r.sessionCostLine(), r.usageCoverage(), r.runUsageLine(), r.runCostLine())
 		return false
 	case "/jobs":
 		r.printJobs()

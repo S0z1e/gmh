@@ -123,6 +123,7 @@ type Event struct {
 	SessionUsage         *UsageJSON           `json:"session_usage,omitempty"`
 	RunUsage             *UsageJSON           `json:"current_run_usage,omitempty"`
 	Metering             *session.UsageTotals `json:"metering,omitempty"`
+	RunUsageComplete     *bool                `json:"current_run_usage_complete,omitempty"`
 	SessionUsageComplete *bool                `json:"session_usage_complete,omitempty"`
 	MeteringAvailable    *bool                `json:"metering_available,omitempty"`
 	// agent_settled cost: null when no rates are configured.

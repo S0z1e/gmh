@@ -12,9 +12,14 @@ const usagePendingPrefix = "usage-pending-"
 
 // BeginUsageAttempt persists evidence before dispatch. An interrupted or failed
 // append can then never make the missing request disappear on a cold reopen.
-func (s *Store) BeginUsageAttempt(id string) error {
+func (s *Store) BeginUsageAttempt(id string) (beginErr error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer func() {
+		if beginErr != nil {
+			s.usageWriteFailed = true
+		}
+	}()
 	if s.closed {
 		return os.ErrClosed
 	}

@@ -197,6 +197,8 @@ func traceResponseHeaders(ctx context.Context, response *http.Response) {
 
 func traceUsage(ctx context.Context, usage Usage, tokensComplete, priceCountsComplete bool) {
 	if o, _ := ctx.Value(traceKey{}).(*requestObservation); o != nil {
+		// An attempt cannot regain valid metering after any invalid snapshot.
+		usage.Invalid = !usage.Valid() || o.trace.Usage != nil && !o.trace.Usage.Valid()
 		o.trace.Usage = &usage
 		o.trace.TokensComplete = tokensComplete
 		o.trace.PriceCountsComplete = priceCountsComplete

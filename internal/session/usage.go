@@ -2,7 +2,9 @@ package session
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -157,6 +159,10 @@ func (s *Store) loadUsageLocked() error {
 		totals.LegacyHistory = true
 	}
 	totals.RecoveryGap = totals.RecoveryGap || len(pending) > 0
+	s.usageInfo, err = f.Stat()
+	if err != nil {
+		return err
+	}
 	s.usageTotals = totals
 	s.usageLoaded = true
 	return nil
@@ -264,6 +270,10 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 	if err := syncRecoveryDirectory(filepath.Dir(path)); err != nil {
 		return err
 	}
+	s.usageInfo, err = f.Stat()
+	if err != nil {
+		return err
+	}
 	if err := s.clearPendingUsageLocked(a.ID); err != nil {
 		return err
 	}
@@ -301,12 +311,24 @@ func (s *Store) openUsageLocked(create bool) (*os.File, error) {
 		return nil, fmt.Errorf("usage artifact family must be a directory without symlinks")
 	}
 	rel := filepath.Join(family, "usage.jsonl")
-	if info, err := root.Lstat(rel); err == nil {
-		if !info.Mode().IsRegular() {
+	current, statErr := root.Lstat(rel)
+	if s.usageInfo != nil && (statErr != nil || !os.SameFile(s.usageInfo, current) || current.Size() != s.usageInfo.Size() || !current.ModTime().Equal(s.usageInfo.ModTime())) {
+		// A hot writer must never recreate/rebase a vanished or replaced ledger.
+		// Persist the discontinuity separately before reporting it, so a cold
+		// writer still sees the missing history even when the prefix is gone.
+		pending, markerErr := root.OpenFile(filepath.Join(family, usagePendingPrefix+rand.Text()), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if markerErr == nil {
+			markerErr = pending.Sync()
+			markerErr = errors.Join(markerErr, pending.Close(), syncRecoveryDirectory(filepath.Dir(path)))
+		}
+		return nil, errors.Join(fmt.Errorf("usage journal changed outside this writer"), markerErr)
+	}
+	if statErr == nil {
+		if !current.Mode().IsRegular() {
 			return nil, fmt.Errorf("usage journal must be a regular file without symlinks")
 		}
-	} else if !os.IsNotExist(err) {
-		return nil, err
+	} else if !os.IsNotExist(statErr) {
+		return nil, statErr
 	}
 	flags := os.O_RDWR | imageBlobReadFlags
 	if create {

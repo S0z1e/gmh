@@ -98,3 +98,19 @@ func (r *Runner) sessionUsageLine() string {
 	}
 	return r.SessionUsage.String()
 }
+
+// RunUsageComplete measures only attempts since this writer was acquired.
+// Historical gaps stay visible on lifetime totals without tainting a new run.
+func (r *Runner) RunUsageComplete() bool {
+	t, b := r.SessionMetering, r.runBaseline
+	return r.MeteringAvailable && t.UnreportedAttempts == b.UnreportedAttempts && t.PartialAttempts == b.PartialAttempts && t.InvalidAttempts == b.InvalidAttempts && (!t.RecoveryGap || b.RecoveryGap) && (!t.LegacyHistory || b.LegacyHistory)
+}
+func (r *Runner) runUsageLine() string {
+	if !r.MeteringAvailable {
+		return "unavailable (accounting error)"
+	}
+	if !r.RunUsageComplete() {
+		return fmt.Sprintf("%s (recorded subtotal; current-run usage incomplete)", r.RunUsage)
+	}
+	return r.RunUsage.String()
+}

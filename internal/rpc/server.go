@@ -59,6 +59,7 @@ type serverState struct {
 	runCostKnown                bool
 	meteringAvailable           bool
 	sessionUsageComplete        bool
+	runUsageComplete            bool
 	metering                    session.UsageTotals
 	sessionCost                 float64
 	messages                    int
@@ -474,8 +475,9 @@ func (s *Server) handleQuery(req Request) {
 			"mode": st.mode, "tool_mode": st.toolMode, "root": st.root, "streaming": st.streaming,
 			"workspace_trusted": st.workspaceTrusted,
 			"queued":            len(s.work), "messages": st.messages, "turns": st.turns,
-			"metering_available":     st.meteringAvailable,
-			"session_usage_complete": st.sessionUsageComplete,
+			"metering_available":         st.meteringAvailable,
+			"session_usage_complete":     st.sessionUsageComplete,
+			"current_run_usage_complete": st.runUsageComplete,
 			// The effective window and output cap for the current
 			// model (Setup/SwitchModel resolved flag/env/model/
 			// config/default), so the GUI can meter context against
@@ -491,10 +493,11 @@ func (s *Server) handleQuery(req Request) {
 		st := s.state
 		s.mu.Unlock()
 		data := map[string]any{
-			"metering_available":     st.meteringAvailable,
-			"session_usage_complete": st.sessionUsageComplete,
-			"current_run":            usageJSON(st.runUsage),
-			"fee":                    s.feeLabel(), "turns": st.turns,
+			"metering_available":         st.meteringAvailable,
+			"session_usage_complete":     st.sessionUsageComplete,
+			"current_run_usage_complete": st.runUsageComplete,
+			"current_run":                usageJSON(st.runUsage),
+			"fee":                        s.feeLabel(), "turns": st.turns,
 		}
 		if st.meteringAvailable {
 			data["session"] = usageJSON(st.sessionUsage)
@@ -927,6 +930,7 @@ func (s *Server) refreshState() {
 	s.state.runCostKnown = s.runner.CurrentRunCost() != nil
 	s.state.meteringAvailable = s.runner.MeteringAvailable
 	s.state.sessionUsageComplete = s.runner.SessionUsageComplete()
+	s.state.runUsageComplete = s.runner.RunUsageComplete()
 	s.state.sessionCost = s.runner.SessionCost
 	s.state.toolMode = string(s.runner.App.ToolMode())
 	s.state.model, s.state.api = s.app.Cfg.Client.Model, s.app.Cfg.Client.API
@@ -1026,6 +1030,7 @@ func (s *Server) runTurn(req Request) {
 	}
 	settled.MeteringAvailable = &st.meteringAvailable
 	settled.SessionUsageComplete = &st.sessionUsageComplete
+	settled.RunUsageComplete = &st.runUsageComplete
 	if !st.meteringAvailable {
 		settled.SessionUsage = nil
 		settled.Metering = nil
