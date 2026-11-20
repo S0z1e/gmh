@@ -501,6 +501,11 @@ func (c *Client) doPost(ctx context.Context, body []byte) (*http.Response, conte
 // cancelling first releases that read so Body.Close cannot wait on it.
 // On any error the cancel is already called and nil is returned.
 func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[string]string, withBearer bool) (*http.Response, context.CancelFunc, error) {
+	// An already-cancelled context cannot dispatch an HTTP request. Check it
+	// before creating durable evidence of a potentially billable attempt.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if err := c.traceRequest(ctx, body); err != nil {
 		return nil, nil, err
 	}

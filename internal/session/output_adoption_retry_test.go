@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -22,37 +23,26 @@ func TestHeaderlessAdoptionRetryKeepsOriginalOutput(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{\"role\":\"user\",\"content\":\"old history\"}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	w, err := acquireWriter(id)
+	w, err := acquireWriterIn(filepath.Join(Dir(), ".output-writers"), id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	w.Close()
-	w, err = acquireWriterIn(filepath.Join(Dir(), ".output-writers"), id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w.Close()
-	// Permit existing files/claims to open, but fail the atomic header replacement.
-	if err := os.Chmod(Dir(), 0500); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chmod(Dir(), 0700)
-	s, openErr := Open(id, OpenOptions{Workspace: root, Rebind: true})
+	opts := OpenOptions{Workspace: root, Rebind: true}
+	replaceErr := errors.New("header replacement failed")
+	s, openErr := open(id, opts, func(*Store, *Header, int64) error { return replaceErr })
 	if s != nil {
 		s.Close()
 		t.Fatal("expected header replacement failure")
 	}
-	if openErr == nil {
-		t.Fatal("expected header replacement failure")
+	if !errors.Is(openErr, replaceErr) {
+		t.Fatalf("expected header replacement failure, got %v", openErr)
 	}
 	claim, err := os.ReadFile(filepath.Join(Dir(), ".output-writers", id+".lock"))
 	if err != nil || len(claim) != 0 {
 		t.Fatalf("claim committed before adoption header: %q %v", claim, err)
 	}
-	if err := os.Chmod(Dir(), 0700); err != nil {
-		t.Fatal(err)
-	}
-	s, err = Open(id, OpenOptions{Workspace: root, Rebind: true})
+	s, err = Open(id, opts)
 	if err != nil {
 		t.Fatal(err)
 	}

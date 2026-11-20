@@ -47,6 +47,10 @@ type OpenOptions struct {
 func New(id string) (*Store, error) { return Open(id, OpenOptions{}) }
 
 func Open(id string, opts OpenOptions) (*Store, error) {
+	return open(id, opts, (*Store).replaceHeader)
+}
+
+func open(id string, opts OpenOptions, replaceHeader func(*Store, *Header, int64) error) (*Store, error) {
 	if id != "" {
 		if err := ValidateSessionID(id); err != nil {
 			return nil, err
@@ -130,7 +134,7 @@ func Open(id string, opts OpenOptions) (*Store, error) {
 	if headerless && !fresh {
 		// First adopt the headerless transcript durably. A failed/crashed
 		// output claim must retry with this same creation identity.
-		if err := s.replaceHeader(header, skip); err != nil {
+		if err := replaceHeader(s, header, skip); err != nil {
 			s.Close()
 			return nil, err
 		}
@@ -159,7 +163,7 @@ func Open(id string, opts OpenOptions) (*Store, error) {
 		return nil, err
 	}
 	if replace {
-		if err := s.replaceHeader(header, skip); err != nil {
+		if err := replaceHeader(s, header, skip); err != nil {
 			s.Close()
 			return nil, err
 		}

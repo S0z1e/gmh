@@ -182,3 +182,18 @@ func TestLiveInjectionRequiresProviderExposure(t *testing.T) {
 		})
 	}
 }
+
+func TestLiveCancellationResumesWithCompleteUsage(t *testing.T) {
+	task := liveTasks()[8]
+	options, calls := scriptedLiveProvider(t,
+		scriptedCall{"write", map[string]any{"path": "checkpoint.txt", "content": "pending"}},
+		scriptedCall{"read", map[string]any{"path": "checkpoint.txt"}},
+		scriptedCall{"write", map[string]any{"path": "result.txt", "content": "resumed"}},
+		scriptedCall{"bash", map[string]any{"command": task.check}},
+	)
+	result, totals, err := runLiveTask(context.Background(), task, options, 0, 0)
+	if err != nil || !result.Passed || calls.Load() != 5 || totals.Attempts != 5 ||
+		result.ProviderTokens == nil || *result.ProviderTokens != 75 || result.CostUSD == nil {
+		t.Fatalf("result=%+v totals=%+v calls=%d err=%v", result, totals, calls.Load(), err)
+	}
+}
