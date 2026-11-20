@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -292,7 +293,12 @@ func TestRepositoryGitdirWhitespaceChangesIdentity(t *testing.T) {
 	root := t.TempDir()
 	parent := t.TempDir()
 	first := filepath.Join(parent, "meta")
-	second := first + " "
+	suffix := " "
+	if runtime.GOOS == "windows" {
+		// Win32 strips a trailing ASCII space when creating a directory.
+		suffix = "\u00a0" // A no-break space still tests whitespace preservation.
+	}
+	second := first + suffix
 	for _, path := range []string{first, second} {
 		if err := os.Mkdir(path, 0700); err != nil {
 			t.Fatal(err)
