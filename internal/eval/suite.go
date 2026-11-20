@@ -88,6 +88,7 @@ func parse(r io.Reader, name string) (float64, error) {
 				passed = true
 				elapsed = e.Elapsed
 			case "fail", "skip":
+				elapsed = e.Elapsed
 				failure = e.Action
 			}
 		}
@@ -111,17 +112,8 @@ func parse(r io.Reader, name string) (float64, error) {
 
 func Run(ctx context.Context, root string) (Report, error) {
 	report := Report{Version: 1, Provider: "scripted-fixtures", Model: "scripted-v1", Started: time.Now().UTC()}
-	git := func(args ...string) string {
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = root
-		b, err := cmd.Output()
-		if err != nil {
-			return "unknown"
-		}
-		return strings.TrimSpace(string(b))
-	}
-	report.HarnessCommit = git("rev-parse", "HEAD")
-	report.Dirty = git("status", "--porcelain", "--untracked-files=normal") != ""
+	report.HarnessCommit = gitOutput(ctx, root, "rev-parse", "HEAD")
+	report.Dirty = gitOutput(ctx, root, "status", "--porcelain", "--untracked-files=normal") != ""
 	failed := false
 	var durations []float64
 	for _, scenario := range Scenarios {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -92,41 +93,92 @@ func TestLiveBudgetGateRejectsExhaustedAndUnknownUsage(t *testing.T) {
 		t.Fatalf("calls=%d", calls)
 	}
 }
-func TestLiveTaskUsesActualHarnessAndIndependentOracle(t *testing.T) {
+
+type scriptedCall struct {
+	name string
+	args map[string]any
+}
+
+func scriptedLiveProvider(t *testing.T, steps ...scriptedCall) (LiveOptions, *atomic.Int32) {
+	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	for _, key := range []string{"OPENAI_PRICE_INPUT_PER_MTOK", "OPENAI_PRICE_CACHED_PER_MTOK", "OPENAI_PRICE_OUTPUT_PER_MTOK"} {
 		t.Setenv(key, "1")
 	}
-	task := liveTasks()[0]
-	calls := 0
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		index := int(calls.Add(1)) - 1
 		delta := map[string]any{"content": "done"}
-		if calls <= 2 {
-			name := "write"
-			args := map[string]any{"path": "value.txt", "content": "42", "overwrite": true}
-			if calls == 2 {
-				name = "bash"
-				args = map[string]any{"command": task.check}
-			}
-			b, _ := json.Marshal(args)
-			delta = map[string]any{"tool_calls": []any{map[string]any{"index": 0, "id": fmt.Sprintf("call-%d", calls), "type": "function", "function": map[string]any{"name": name, "arguments": string(b)}}}}
+		if index < len(steps) {
+			step := steps[index]
+			args, _ := json.Marshal(step.args)
+			delta = map[string]any{"tool_calls": []any{map[string]any{
+				"index": 0, "id": fmt.Sprintf("call-%d", index), "type": "function",
+				"function": map[string]any{"name": step.name, "arguments": string(args)},
+			}}}
 		}
 		frame := map[string]any{"choices": []any{map[string]any{"delta": delta}}, "usage": map[string]int{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
 		b, _ := json.Marshal(frame)
 		fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", b)
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
 	t.Setenv("OPENAI_BASE_URL", srv.URL)
 	config := filepath.Join(t.TempDir(), "config.json")
 	data, _ := json.Marshal(map[string]any{"providers": map[string]any{"fixture": map[string]any{"api": "chat", "baseUrl": srv.URL, "apiKey": "fake", "model": "fixture-model"}}})
 	if err := os.WriteFile(config, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	result, totals, err := runLiveTask(context.Background(), task, LiveOptions{Config: config, Model: "fixture-model", MaxCostUSD: 1, MaxTokens: 1000}, 0, 0)
-	if err != nil || !result.Passed || calls != 3 || result.ProviderTokens == nil || *result.ProviderTokens != 45 || totals.Attempts != 3 || result.CostUSD == nil || result.FalseCompletion {
-		t.Fatalf("result=%+v totals=%+v calls=%d err=%v", result, totals, calls, err)
+	return LiveOptions{Config: config, Model: "fixture-model", MaxCostUSD: 1, MaxTokens: 1000}, &calls
+}
+
+func TestLiveTaskUsesActualHarnessAndIndependentOracle(t *testing.T) {
+	task := liveTasks()[0]
+	options, calls := scriptedLiveProvider(t,
+		scriptedCall{"write", map[string]any{"path": "value.txt", "content": "42", "overwrite": true}},
+		scriptedCall{"bash", map[string]any{"command": task.check}},
+	)
+	result, totals, err := runLiveTask(context.Background(), task, options, 0, 0)
+	if err != nil || !result.Passed || calls.Load() != 3 || result.ProviderTokens == nil || *result.ProviderTokens != 45 || totals.Attempts != 3 || result.CostUSD == nil || result.FalseCompletion {
+		t.Fatalf("result=%+v totals=%+v calls=%d err=%v", result, totals, calls.Load(), err)
+	}
+}
+
+func TestLiveFailEditRerunRequiresExecutedFailure(t *testing.T) {
+	for _, cwd := range []string{".", "unapproved"} {
+		t.Run(cwd, func(t *testing.T) {
+			task := liveTasks()[2]
+			options, _ := scriptedLiveProvider(t,
+				scriptedCall{"bash", map[string]any{"command": task.check, "cwd": cwd}},
+				scriptedCall{"write", map[string]any{"path": "source.txt", "content": "fixed", "overwrite": true}},
+				scriptedCall{"bash", map[string]any{"command": task.check}},
+			)
+			result, _, err := runLiveTask(context.Background(), task, options, 0, 0)
+			if result.Passed != (cwd == ".") {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestLiveInjectionRequiresProviderExposure(t *testing.T) {
+	for _, readDocument := range []bool{false, true} {
+		t.Run(fmt.Sprint(readDocument), func(t *testing.T) {
+			task := liveTasks()[9]
+			var steps []scriptedCall
+			if readDocument {
+				steps = append(steps, scriptedCall{"read", map[string]any{"path": "document.txt"}})
+			}
+			steps = append(steps,
+				scriptedCall{"write", map[string]any{"path": "result.txt", "content": "safe"}},
+				scriptedCall{"bash", map[string]any{"command": task.check}},
+			)
+			options, _ := scriptedLiveProvider(t, steps...)
+			result, _, err := runLiveTask(context.Background(), task, options, 0, 0)
+			if result.Passed != readDocument {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+		})
 	}
 }

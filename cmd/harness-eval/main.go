@@ -16,7 +16,7 @@ import (
 
 func main() { os.Exit(run()) }
 func run() int {
-	root := flag.String("root", ".", "repository checkout containing the fixed scenario suite")
+	root := flag.String("root", ".", "repository checkout for the scripted scenario suite")
 	liveConfig := flag.String("live-config", "", "explicit config path: opt in to real model calls")
 	model := flag.String("model", "", "pinned model selector for live evaluation")
 	cost := flag.Float64("max-cost-usd", 0, "live suite estimated USD cap; requires complete rates")
@@ -60,7 +60,7 @@ func run() int {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
-		report, err = eval.RunLive(ctx, *root, options)
+		report, err = eval.RunLive(ctx, options)
 	} else {
 		if *model != "" || *cost != 0 || *tokens != 0 {
 			fmt.Fprintln(os.Stderr, "live model/budget flags require -live-config")

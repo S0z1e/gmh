@@ -16,6 +16,14 @@ func TestParseRequiresActualPassingTest(t *testing.T) {
 		}
 	}
 }
+func TestParseRecordsFailedScenarioElapsed(t *testing.T) {
+	log := "{\"Action\":\"run\",\"Test\":\"TestFixed\"}\n{\"Action\":\"fail\",\"Test\":\"TestFixed\",\"Elapsed\":42.5}\n{\"Action\":\"fail\"}\n"
+	elapsed, err := parse(strings.NewReader(log), "TestFixed")
+	if err == nil || elapsed != 42.5 {
+		t.Fatalf("failed scenario elapsed=%g, error=%v", elapsed, err)
+	}
+}
+
 func TestScenarioCatalogUnique(t *testing.T) {
 	ids := map[string]bool{}
 	for _, s := range Scenarios {

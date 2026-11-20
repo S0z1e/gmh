@@ -21,8 +21,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -70,6 +72,7 @@ type budgetTransport struct {
 	options     LiveOptions
 	priorTokens int64
 	priorCost   float64
+	observe     func(*http.Request, *http.Response)
 }
 
 func (b budgetTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -83,7 +86,55 @@ func (b budgetTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if int64(totals.Usage.TotalTokens) >= b.options.MaxTokens-b.priorTokens || totals.EstimateUSD >= b.options.MaxCostUSD-b.priorCost {
 		return nil, fmt.Errorf("live evaluation suite budget exhausted")
 	}
-	return b.base.RoundTrip(r)
+	resp, err := b.base.RoundTrip(r)
+	if err == nil && b.observe != nil {
+		b.observe(r, resp)
+	}
+	return resp, err
+}
+
+// A document only exercises the injection fixture if a completed HTTP request
+// actually sent the exact payload as tool output.
+func sawToolOutput(req *http.Request, payload string) bool {
+	if req.GetBody == nil {
+		return false
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return false
+	}
+	defer body.Close()
+	var request struct {
+		Messages []struct {
+			Role    string
+			Content json.RawMessage
+		}
+		Input []struct {
+			Type   string
+			Output json.RawMessage
+		}
+	}
+	if json.NewDecoder(body).Decode(&request) != nil {
+		return false
+	}
+	for _, msg := range request.Messages {
+		var content string
+		if msg.Role == "tool" && json.Unmarshal(msg.Content, &content) == nil && strings.Contains(content, payload) {
+			return true
+		}
+	}
+	for _, item := range request.Input {
+		var output string
+		if item.Type == "function_call_output" && json.Unmarshal(item.Output, &output) == nil && strings.Contains(output, payload) {
+			return true
+		}
+	}
+	return false
+}
+
+func fixtureCommand(argsJSON, command string) bool {
+	var args tools.BashArgs
+	return json.Unmarshal([]byte(argsJSON), &args) == nil && args.Command == command
 }
 func pixel(c color.RGBA) []byte {
 	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
@@ -192,14 +243,24 @@ func oracle(root string, before, want map[string]string) ([]string, error) {
 
 // RunLive uses isolated HOME/session storage supplied by the CLI. The config is
 // an explicit external input; no live call is made by the deterministic runner.
-func RunLive(ctx context.Context, repo string, options LiveOptions) (Report, error) {
+func RunLive(ctx context.Context, options LiveOptions) (Report, error) {
 	if err := options.Validate(); err != nil {
 		return Report{}, err
 	}
 	report := Report{Version: 1, Provider: "live", Model: options.Model, Started: time.Now().UTC()}
-	// Reuse the checkout identity, without running its test suite.
-	report.HarnessCommit = gitOutput(ctx, repo, "rev-parse", "HEAD")
-	report.Dirty = gitOutput(ctx, repo, "status", "--porcelain", "--untracked-files=normal") != ""
+	// This mode executes the linked harness, which may come from a different
+	// checkout than the process's working directory.
+	report.HarnessCommit, report.Dirty = "unknown", true
+	if build, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range build.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				report.HarnessCommit = setting.Value
+			case "vcs.modified":
+				report.Dirty = setting.Value != "false"
+			}
+		}
+	}
 	var priorTokens int64
 	priorCost := 0.0
 	failed, stopped := false, false
@@ -251,6 +312,11 @@ func fixtureApproval(root string, task liveTask) func(agent.ApprovalRequest) (bo
 	return func(request agent.ApprovalRequest) (bool, error) {
 		switch request.ToolName {
 		case "write", "edit":
+			for path := range task.files {
+				if strings.HasSuffix(path, ".sh") && filepath.Join(root, path) == request.TargetPath {
+					return false, nil
+				}
+			}
 			return true, nil
 		case "bash":
 			var args tools.BashArgs
@@ -335,7 +401,17 @@ func runLiveTask(ctx context.Context, task liveTask, options LiveOptions, priorT
 	if a.Cfg.Client.HTTP != nil && a.Cfg.Client.HTTP.Transport != nil {
 		base = a.Cfg.Client.HTTP.Transport
 	}
-	a.Cfg.Client.HTTP = &http.Client{Transport: budgetTransport{base: base, store: a.Store, options: options, priorTokens: priorTokens, priorCost: priorCost}}
+	var exposed atomic.Bool
+	transport := budgetTransport{base: base, store: a.Store, options: options, priorTokens: priorTokens, priorCost: priorCost}
+	if task.id == "document-injection" {
+		payload := strings.TrimSpace(task.files["document.txt"])
+		transport.observe = func(req *http.Request, resp *http.Response) {
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 && sawToolOutput(req, payload) {
+				exposed.Store(true)
+			}
+		}
+	}
+	a.Cfg.Client.HTTP = &http.Client{Transport: transport}
 	r := &app.Runner{App: a, Print: func(string, ...any) {}}
 	if err := r.RefreshUsage(); err != nil {
 		return result, totals, err
@@ -377,7 +453,8 @@ func runLiveTask(ctx context.Context, task liveTask, options LiveOptions, priorT
 		case agent.EventToolEnd:
 			if e.ToolErr != nil {
 				errorsN++
-				if strings.Contains(commands[e.InvocationID], task.check) && !mutationSeen {
+				if e.ToolName == "bash" && e.ToolExitCode != nil && *e.ToolExitCode == 1 &&
+					fixtureCommand(commands[e.InvocationID], task.check) && !mutationSeen {
 					failedCheck = true
 				}
 			}
@@ -393,7 +470,8 @@ func runLiveTask(ctx context.Context, task liveTask, options LiveOptions, priorT
 				}
 			}
 		case agent.EventToolBackgroundDone:
-			if e.ToolErr != nil && strings.Contains(commands[e.InvocationID], task.check) {
+			if e.ToolErr != nil && e.ToolExitCode != nil && *e.ToolExitCode == 2 &&
+				fixtureCommand(commands[e.InvocationID], task.check) {
 				bgFailed = true
 			}
 		}
@@ -467,6 +545,9 @@ func runLiveTask(ctx context.Context, task liveTask, options LiveOptions, priorT
 	}
 	if runErr == nil && task.failedCheck && !failedCheck {
 		runErr = fmt.Errorf("required initial failing check was not observed")
+	}
+	if runErr == nil && task.id == "document-injection" && !exposed.Load() {
+		runErr = fmt.Errorf("injected document did not reach the provider as tool output")
 	}
 	if runErr == nil && task.background && !bgFailed {
 		runErr = fmt.Errorf("required failed background result was not observed")
