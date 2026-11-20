@@ -28,18 +28,56 @@ const maxListSessions = 30
 // List returns the sessions in Dir(), newest first. Audit sidecars
 // and pre-compact archives are not sessions, so they never appear.
 func List() ([]Info, error) {
+	unlock, err := lockManagement()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if _, err := recoverOperations(); err != nil {
+		return nil, err
+	}
+
 	dir := Dir()
-	entries, err := os.ReadDir(dir)
+	entries, err := artifactEntries()
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
+	// Registries identify arbitrary archive names without relying on a suffix.
+	headers := map[string]*Header{}
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".jsonl") || entry.IsDir() {
+			continue
+		}
+		h, err := readArtifactHeader(filepath.Join(dir, entry.Name()))
+		if err == nil {
+			headers[entry.Name()] = h
+		}
+	}
+	archives := map[string]bool{}
+	seen := map[string]bool{}
+	for _, h := range headers {
+		if h == nil || h.OutputID == "" || seen[h.OutputID] {
+			continue
+		}
+		seen[h.OutputID] = true
+		r, err := loadArtifactRegistry(h)
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range r.Archives {
+			ah, exists := headers[name]
+			if exists && (ah == nil || ah.OutputID == h.OutputID && ah.Created.Equal(h.Created)) {
+				archives[name] = true
+			}
+		}
+	}
 	var out []Info
 	for _, en := range entries {
 		name := en.Name()
-		if en.IsDir() || !strings.HasSuffix(name, ".jsonl") {
+		if en.IsDir() || !strings.HasSuffix(name, ".jsonl") || archives[name] {
 			continue
 		}
 		id := strings.TrimSuffix(name, ".jsonl")
@@ -129,53 +167,54 @@ func renameSessionFiles(oldID, newID string) error {
 	if oldID == newID {
 		return fmt.Errorf("session %q already has that name", oldID)
 	}
-	dir := Dir()
-	oldPath := filepath.Join(dir, oldID+".jsonl")
-	if _, err := os.Stat(oldPath); os.IsNotExist(err) {
+	if _, err := os.Lstat(filepath.Join(Dir(), newID+".jsonl")); err == nil {
+		return fmt.Errorf("session %q already exists", newID)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	m, err := sessionManifest(oldID)
+	if os.IsNotExist(err) {
 		return fmt.Errorf("unknown session %q", oldID)
 	}
-	newPath := filepath.Join(dir, newID+".jsonl")
-	if _, err := os.Stat(newPath); err == nil {
-		return fmt.Errorf("session %q already exists", newID)
-	}
-	backups, err := recoveryBackups(oldPath)
 	if err != nil {
 		return err
 	}
-	var moved []string
-	rollback := func(cause error) error {
-		for i := len(moved) - 1; i >= 0; i-- {
-			old := moved[i]
-			cause = errors.Join(cause, os.Rename(newPath+recoveryBackupSuffix(old), old))
-		}
-		return cause
+	op, err := prepareOperation("rename", oldID, newID, m)
+	if err != nil {
+		return err
 	}
-	for _, old := range backups {
-		if err := os.Rename(old, newPath+recoveryBackupSuffix(old)); err != nil {
-			return rollback(err)
-		}
-		moved = append(moved, old)
-	}
-	if err := os.Rename(oldPath, newPath); err != nil {
-		return rollback(err)
-	}
-	// Audit sidecar follows the transcript.
-	_ = os.Rename(filepath.Join(dir, oldID+"-audit.jsonl"), filepath.Join(dir, newID+"-audit.jsonl"))
-	// Pre-compact archives keep the family together.
-	if entries, err := os.ReadDir(dir); err == nil {
-		for _, en := range entries {
-			name := en.Name()
-			if strings.HasPrefix(name, oldID+"-pre-compact-") && strings.HasSuffix(name, ".jsonl") {
-				_ = os.Rename(filepath.Join(dir, name), filepath.Join(dir, newID+name[len(oldID):]))
-			}
-		}
-	}
-	return nil
+	return performOperation(op)
 }
 
 // RenameSession renames a session that is not currently open. For the
 // open store, use Store.Rename, which also re-points the handles.
 func RenameSession(oldID, newID string) error {
+	if err := ValidateSessionID(oldID); err != nil {
+		return err
+	}
+	if err := ValidateSessionID(newID); err != nil {
+		return err
+	}
+	unlock, err := lockManagement()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	oldID, err = canonicalSessionID(oldID)
+	if err != nil {
+		return err
+	}
+	recovered, err := recoverOperations(oldID, newID)
+	if err != nil {
+		return err
+	}
+	if recovered {
+		if _, err := os.Stat(filepath.Join(Dir(), oldID+".jsonl")); os.IsNotExist(err) {
+			if _, err := os.Stat(filepath.Join(Dir(), newID+".jsonl")); err == nil {
+				return nil
+			}
+		}
+	}
 	old, err := acquireWriter(oldID)
 	if err != nil {
 		return err
@@ -188,6 +227,17 @@ func RenameSession(oldID, newID string) error {
 	defer target.Close()
 	if err := pinLegacyOutputID(oldID); err != nil {
 		return err
+	}
+	h, err := readArtifactHeader(filepath.Join(Dir(), oldID+".jsonl"))
+	if err != nil {
+		return err
+	}
+	if h != nil && h.OutputID != "" {
+		output, err := acquireOutputWriter(h, oldID)
+		if err != nil {
+			return err
+		}
+		defer output.Close()
 	}
 	return renameSessionFiles(oldID, newID)
 }
@@ -251,40 +301,55 @@ func DeleteSession(id string) error {
 	if err := ValidateSessionID(id); err != nil {
 		return err
 	}
+	unlock, err := lockManagement()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	id, err = canonicalSessionID(id)
+	if err != nil {
+		return err
+	}
+	recovered, err := recoverOperations(id)
+	if err != nil {
+		return err
+	}
+	if recovered {
+		if _, err := os.Stat(filepath.Join(Dir(), id+".jsonl")); os.IsNotExist(err) {
+			return nil
+		}
+	}
 	writer, err := acquireWriter(id)
 	if err != nil {
 		return err
 	}
 	defer writer.Close()
-	dir := Dir()
-	path := filepath.Join(dir, id+".jsonl")
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	if err := pinLegacyOutputID(id); err != nil {
+		return err
+	}
+	h, err := readArtifactHeader(filepath.Join(Dir(), id+".jsonl"))
+	if os.IsNotExist(err) {
 		return fmt.Errorf("unknown session %q", id)
 	}
-	backups, err := recoveryBackups(path)
 	if err != nil {
 		return err
 	}
-	for _, backup := range backups {
-		if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
+	if h != nil && h.OutputID != "" {
+		output, err := acquireOutputWriter(h, id)
+		if err != nil {
 			return err
 		}
+		defer output.Close()
 	}
-	if err := os.Remove(path); err != nil {
+	m, err := sessionManifest(id)
+	if err != nil {
 		return err
 	}
-	// Audit sidecar follows the transcript.
-	_ = os.Remove(filepath.Join(dir, id+"-audit.jsonl"))
-	// Pre-compact archives keep the family together.
-	if entries, err := os.ReadDir(dir); err == nil {
-		for _, en := range entries {
-			name := en.Name()
-			if strings.HasPrefix(name, id+"-pre-compact-") && strings.HasSuffix(name, ".jsonl") {
-				_ = os.Remove(filepath.Join(dir, name))
-			}
-		}
+	op, err := prepareOperation("delete", id, "", m)
+	if err != nil {
+		return err
 	}
-	return nil
+	return performOperation(op)
 }
 
 // Rename renames the open store's session: the handles are closed,
@@ -297,6 +362,11 @@ func (s *Store) Rename(newID string) error {
 	if s.closed || s.file == nil {
 		return os.ErrClosed
 	}
+	unlock, err := lockManagement()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	oldID := s.ID
 	// Validate/existence checks before taking the destination lease also avoid
 	// treating a case-only rename of the active file as a competing writer.
@@ -324,8 +394,12 @@ func (s *Store) Rename(newID string) error {
 	}
 	s.file.Close()
 	if err := renameSessionFiles(oldID, newID); err != nil {
-		// Put the store back on its old file so it stays usable.
-		f, err2 := privatefile.Open(s.Path, os.O_CREATE|os.O_APPEND|os.O_RDWR)
+		// A failed rollback freezes writes until the journal can be recovered.
+		if errors.Is(err, ErrOperationPending) {
+			s.file = nil
+			return err
+		}
+		f, err2 := privatefile.Open(s.Path, os.O_APPEND|os.O_RDWR)
 		if err2 == nil {
 			s.file = f
 		}

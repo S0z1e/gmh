@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -229,16 +228,11 @@ func Setup(p Params) (*App, error) {
 	if p.Resume != "" {
 		id = p.Resume
 	}
-	if p.Resume != "" {
-		if err := session.ValidateSessionID(p.Resume); err != nil {
-			return nil, err
-		}
-		if _, err := os.Stat(filepath.Join(session.Dir(), p.Resume+".jsonl")); err != nil {
+	store, err := session.Open(id, session.OpenOptions{Workspace: absRoot, Rebind: p.RebindSession, Existing: p.Resume != ""})
+	if err != nil {
+		if p.Resume != "" {
 			return nil, fmt.Errorf("cannot resume session %q: %w", p.Resume, err)
 		}
-	}
-	store, err := session.Open(id, session.OpenOptions{Workspace: absRoot, Rebind: p.RebindSession})
-	if err != nil {
 		return nil, err
 	}
 
@@ -250,7 +244,7 @@ func Setup(p Params) (*App, error) {
 	}()
 	a := &App{Store: store, Root: absRoot, WorkspaceTrusted: trusted}
 	if p.Resume != "" {
-		history, err := session.Load(p.Resume)
+		history, err := session.Load(store.ID)
 		if err != nil {
 			store.Close()
 			return nil, err
@@ -766,8 +760,8 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 // (like --resume) and the store is opened for appending. The id must
 // name a session file; a missing one is an error, not a new session.
 func (a *App) LoadSession(id string) ([]llm.Message, error) {
-	if _, err := os.Stat(filepath.Join(session.Dir(), id+".jsonl")); os.IsNotExist(err) {
-		return nil, fmt.Errorf("unknown session %q (see /sessions)", id)
+	if err := session.ValidateSessionID(id); err != nil {
+		return nil, err
 	}
 	old := a.Store
 	store := old
@@ -787,12 +781,15 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	}
 	if !reuse {
 		var err error
-		store, err = session.Open(id, session.OpenOptions{Workspace: a.Root})
+		store, err = session.Open(id, session.OpenOptions{Workspace: a.Root, Existing: true})
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("unknown session %q (see /sessions): %w", id, err)
+		}
 		if err != nil {
 			return nil, err
 		}
 	}
-	history, err := session.Load(id)
+	history, err := session.Load(store.ID)
 	if err != nil {
 		if !reuse {
 			store.Close()
@@ -1089,6 +1086,14 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 			return false
 		}
 		r.Print("[usage] session: %s | %s | %s\n[usage] current run: %s | %s", r.sessionUsageLine(), r.sessionCostLine(), r.usageCoverage(), r.runUsageLine(), r.runCostLine())
+		return false
+	case "/prune-artifacts":
+		report, err := session.PruneArtifacts(ctx, time.Now())
+		r.Print("[retention] removed %d unreferenced image blobs (%d bytes)", report.DeletedBlobs, report.ReclaimedBytes)
+		if err != nil {
+			r.LastErr = err
+			r.Print("[error] %v", err)
+		}
 		return false
 	case "/jobs":
 		r.printJobs()

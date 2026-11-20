@@ -196,8 +196,23 @@ func TestDeleteRemovesTornBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, entry := range entries {
-		if entry.Name() != ".writers" {
+		if entry.Name() != ".writers" && entry.Name() != ".management" && entry.Name() != ".operations" {
 			t.Fatalf("deleted session left recovered private content: %s", entry.Name())
+		}
+		if entry.Name() == ".operations" || entry.Name() == ".management" {
+			children, err := os.ReadDir(filepath.Join(Dir(), entry.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, child := range children {
+				st, err := child.Info()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if entry.Name() != ".management" || child.Name() != "namespace.lock" || st.Size() != 0 || !st.Mode().IsRegular() {
+					t.Fatalf("private operation content left after deletion: %s/%s", entry.Name(), child.Name())
+				}
+			}
 		}
 	}
 }
@@ -409,4 +424,4 @@ func TestBackupLifecyclePreservesCaseDistinctSession(t *testing.T) {
 	}
 }
 
-func newLegacyFixture(id string) (*Store, error) { return newStore(id, nil) }
+func newLegacyFixture(id string) (*Store, error) { return newStore(id, false, nil) }

@@ -189,7 +189,7 @@ func main() {
 	}
 
 	// REPL
-	fmt.Println("Type a task, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /clear to drop context, /compact to summarise context, /rollback [N] to drop the last N turns, or /quit to exit.")
+	fmt.Println("Type a task, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /prune-artifacts to remove unreferenced images older than seven days, /clear to drop context, /compact to summarise context, /rollback [N] to drop the last N turns, or /quit to exit.")
 	scanner := input.New(os.Stdin)
 	defer scanner.Close()
 	// The approval prompt shares the REPL's scanner: the scanner

@@ -62,7 +62,7 @@ func TestBindingHeaderPersistsWithoutEnteringHistory(t *testing.T) {
 func TestBindingLegacyRequiresExplicitAdoptionAndKeepsRecords(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
-	s, err := newStore("legacy", nil)
+	s, err := newStore("legacy", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

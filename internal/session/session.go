@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"minimalharness/internal/privatefile"
 	"os"
 	"path/filepath"
@@ -47,7 +48,28 @@ func (s *Store) AuditPath() string {
 func (s *Store) Audit(v any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := lockManagement()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	if s.closed {
+		// Late job diagnostics may arrive after Close. Never recreate a deleted
+		// family or append them to an independent session that reused its name.
+		writer, err := acquireWriter(s.ID)
+		if err != nil {
+			return err
+		}
+		defer writer.Close()
+		h, err := readArtifactHeader(s.Path)
+		if err != nil {
+			return err
+		}
+		if (s.header == nil) != (h == nil) || h != nil && (!h.Created.Equal(s.header.Created) || h.OutputID != s.header.OutputID) {
+			return fmt.Errorf("audit session identity changed")
+		}
+
 		b, err := json.Marshal(v)
 		if err != nil {
 			return err
@@ -83,7 +105,7 @@ func Dir() string {
 	return filepath.Join(home, ".minimal-harness", "sessions")
 }
 
-func newStore(id string, preflight func(*os.File, bool) error) (*Store, error) {
+func newStore(id string, existing bool, preflight func(*os.File, bool) error) (*Store, error) {
 	auto := id == ""
 	if !auto {
 		if err := ValidateSessionID(id); err != nil {
@@ -144,7 +166,11 @@ func newStore(id string, preflight func(*os.File, bool) error) (*Store, error) {
 	}
 	_, statErr := os.Stat(path)
 	created := os.IsNotExist(statErr)
-	f, err := privatefile.Open(path, os.O_CREATE|os.O_RDWR)
+	flags := os.O_RDWR
+	if !existing {
+		flags |= os.O_CREATE
+	}
+	f, err := privatefile.Open(path, flags)
 	if err != nil {
 		return nil, err
 	}
@@ -180,10 +206,16 @@ func newStore(id string, preflight func(*os.File, bool) error) (*Store, error) {
 func (s *Store) Append(m llm.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := lockManagement()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	if s.closed || s.file == nil {
 		return os.ErrClosed
 	}
-	m, err := persistImages(m)
+	m, err = persistImages(m)
 	if err != nil {
 		return err
 	}
@@ -241,10 +273,16 @@ func (s *Store) MarkCompact(summary string) error {
 func (s *Store) MarkCompactMessages(msgs []llm.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := lockManagement()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	if s.closed || s.file == nil {
 		return os.ErrClosed
 	}
-	msgs, err := persistMessageImages(msgs)
+	msgs, err = persistMessageImages(msgs)
 	if err != nil {
 		return err
 	}
@@ -286,6 +324,11 @@ func marshalCheckpoint(msgs []llm.Message) ([]byte, error) {
 func (s *Store) ArchiveCopy(name string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := lockManagement()
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
 	// Archives add a suffix to a valid (up to 128-byte) session ID.
 	if err := validateSessionName(name, 240); err != nil {
 		return "", err
@@ -295,19 +338,30 @@ func (s *Store) ArchiveCopy(name string) (string, error) {
 		return "", err
 	}
 	defer writer.Close()
-	data, err := os.ReadFile(s.Path)
+	source, err := os.OpenFile(s.Path, os.O_RDONLY|metadataReadFlags, 0)
 	if err != nil {
 		return "", err
+	}
+	defer source.Close()
+	if st, err := source.Stat(); err != nil || !st.Mode().IsRegular() {
+		return "", fmt.Errorf("archive source must be regular: %v", err)
 	}
 	dst := filepath.Join(Dir(), name+".jsonl")
 	f, err := privatefile.Open(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
 	if err != nil {
 		return "", err
 	}
-	_, writeErr := f.Write(data)
+	if err := s.registerArchiveLocked(name + ".jsonl"); err != nil {
+		f.Close()
+		return "", errors.Join(err, os.Remove(dst))
+	}
+	_, writeErr := io.Copy(f, source)
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+		return "", err
+	}
+	if err := syncRecoveryDirectory(Dir()); err != nil {
 		return "", err
 	}
 	return dst, nil
@@ -373,10 +427,16 @@ func Rollback(msgs []llm.Message, n int) ([]llm.Message, int) {
 func (s *Store) Rewrite(msgs []llm.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := lockManagement()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	if s.closed || s.file == nil {
 		return os.ErrClosed
 	}
-	msgs, err := persistMessageImages(msgs)
+	msgs, err = persistMessageImages(msgs)
 	if err != nil {
 		return err
 	}

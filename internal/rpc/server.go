@@ -244,7 +244,7 @@ func (s *Server) handleLine(line string) {
 		s.handlePrompt(req)
 	case "clear_queue":
 		s.handleClearQueue(req)
-	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "set_model", "rename_session", "resume_session", "delete_session", "set_tool_mode", "rollback", "command":
+	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "set_model", "rename_session", "resume_session", "delete_session", "set_tool_mode", "rollback", "prune_artifacts", "command":
 		s.enqueue(req, workControl)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown request type %q", req.Type))
@@ -330,6 +330,8 @@ func slashRequest(line string) (typ, arg string) {
 	switch {
 	case line == "/quit" || line == "/exit":
 		return "quit", ""
+	case line == "/prune-artifacts":
+		return "prune_artifacts", ""
 	case line == "/usage":
 		return "usage", ""
 	case line == "/jobs":
@@ -1050,6 +1052,9 @@ func (s *Server) runTurn(req Request) {
 func (s *Server) doControl(req Request) {
 	ctx := context.Background()
 	switch req.Type {
+	case "prune_artifacts":
+		report, err := session.PruneArtifacts(ctx, time.Now())
+		s.respond(req, map[string]any{"deleted_blobs": report.DeletedBlobs, "reclaimed_bytes": report.ReclaimedBytes}, err)
 	case "clear":
 		s.runner.Handle(ctx, "/clear")
 		s.refreshState()

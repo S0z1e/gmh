@@ -35,6 +35,8 @@ type Header struct {
 
 type OpenOptions struct {
 	Workspace string
+	// Existing requires a transcript after interrupted operations are recovered.
+	Existing bool
 	// Rebind is a direct user choice to adopt legacy history or move a session to
 	// this workspace. Never set it from project config or an automatic resume.
 	Rebind bool
@@ -45,6 +47,33 @@ type OpenOptions struct {
 func New(id string) (*Store, error) { return Open(id, OpenOptions{}) }
 
 func Open(id string, opts OpenOptions) (*Store, error) {
+	if id != "" {
+		if err := ValidateSessionID(id); err != nil {
+			return nil, err
+		}
+	}
+	unlock, err := lockManagement()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if opts.Existing && id == "" {
+		return nil, fmt.Errorf("an existing session id is required")
+	}
+	if id == "" {
+		_, err = recoverOperations()
+	} else {
+		_, err = recoverOperations(id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("recover session operations: %w", err)
+	}
+	if id != "" {
+		id, err = canonicalSessionID(id)
+		if err != nil {
+			return nil, err
+		}
+	}
 	identity, err := workspace.Identify(opts.Workspace)
 	if err != nil {
 		return nil, err
@@ -54,7 +83,7 @@ func Open(id string, opts OpenOptions) (*Store, error) {
 	var skip int64
 	var replace bool
 	var fresh bool
-	s, err := newStore(id, func(f *os.File, created bool) error {
+	s, err := newStore(id, opts.Existing, func(f *os.File, created bool) error {
 		if created {
 			fresh = true
 			replace = true
