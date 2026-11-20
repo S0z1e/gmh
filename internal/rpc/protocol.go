@@ -14,12 +14,15 @@ import (
 
 	"minimalharness/internal/agent"
 	"minimalharness/internal/llm"
+	"minimalharness/internal/session"
 )
 
 // Request is one line from the GUI. ID is echoed in the response when
 // present; a request without one still gets a response, without an id.
 type Request struct {
-	ID string `json:"id,omitempty"`
+	turnID   string
+	accepted <-chan struct{}
+	ID       string `json:"id,omitempty"`
 	// Type is one of: prompt, approval_response, continuation_response,
 	// question_response, abort, clear_queue, get_state, new_session,
 	// clear, compact, usage, jobs, skill, quit, attach_image,
@@ -75,10 +78,11 @@ type Request struct {
 // Response is the reply to one request, correlated by ID. Exactly one
 // of Data and Error is set: Type is "response" or "error".
 type Response struct {
-	ID    string `json:"id,omitempty"`
-	Type  string `json:"type"`
-	Data  any    `json:"data,omitempty"`
-	Error string `json:"error,omitempty"`
+	Sequence uint64 `json:"sequence,omitempty"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type"`
+	Data     any    `json:"data,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 // UsageJSON is one usage object: prompt/cached/completion/total tokens.
@@ -102,10 +106,18 @@ type UsageJSON struct {
 // tool_backgrounded, background_wait, tool_background_done,
 // approval_request, agent_settled, compacted, error.
 type Event struct {
-	Request   *llm.RequestTrace `json:"request,omitempty"`
-	Operation string            `json:"operation,omitempty"`
-	Attempt   int               `json:"attempt,omitempty"`
-	Type      string            `json:"type"`
+	OriginTurnID    string            `json:"origin_turn_id,omitempty"`
+	OriginRequestID string            `json:"origin_request_id,omitempty"`
+	OriginStepID    string            `json:"origin_step_id,omitempty"`
+	Sequence        uint64            `json:"sequence,omitempty"`
+	ConnectionID    string            `json:"connection_id,omitempty"`
+	TurnID          string            `json:"turn_id,omitempty"`
+	RequestID       string            `json:"request_id,omitempty"`
+	StepID          string            `json:"step_id,omitempty"`
+	Request         *llm.RequestTrace `json:"request,omitempty"`
+	Operation       string            `json:"operation,omitempty"`
+	Attempt         int               `json:"attempt,omitempty"`
+	Type            string            `json:"type"`
 	// ready: protocol version and session identity.
 	Protocol int    `json:"protocol,omitempty"`
 	Session  string `json:"session,omitempty"`
@@ -118,15 +130,25 @@ type Event struct {
 	// text_delta, background_wait, turn_started: the text.
 	Text string `json:"text,omitempty"`
 	// step_usage, agent_settled.
-	Usage        *UsageJSON `json:"usage,omitempty"`
-	SessionUsage *UsageJSON `json:"session_usage,omitempty"`
+	Usage                *UsageJSON           `json:"usage,omitempty"`
+	SessionUsage         *UsageJSON           `json:"session_usage,omitempty"`
+	RunUsage             *UsageJSON           `json:"current_run_usage,omitempty"`
+	Metering             *session.UsageTotals `json:"metering,omitempty"`
+	RunUsageComplete     *bool                `json:"current_run_usage_complete,omitempty"`
+	SessionUsageComplete *bool                `json:"session_usage_complete,omitempty"`
+	MeteringAvailable    *bool                `json:"metering_available,omitempty"`
 	// agent_settled cost: null when no rates are configured.
 	CostUSD        *float64 `json:"cost_usd,omitempty"`
 	SessionCostUSD *float64 `json:"session_cost_usd,omitempty"`
+	RunCostUSD     *float64 `json:"current_run_cost_usd,omitempty"`
 	Fee            string   `json:"fee,omitempty"`
 	// tool_start / tool_end / background events.
+	ToolCallID   string `json:"tool_call_id,omitempty"`
+	InvocationID string `json:"invocation_id,omitempty"`
+	TargetPath   string `json:"target_path,omitempty"`
+
 	Tool       string `json:"tool,omitempty"`
-	Status     string `json:"status,omitempty"`
+	Status     string `json:"status,omitempty"` // deferred means the tool did not execute
 	ExitCode   *int   `json:"exit_code,omitempty"`
 	OutputFile string `json:"output_file,omitempty"`
 	Args       any    `json:"args,omitempty"`
@@ -137,8 +159,9 @@ type Event struct {
 	// for grep/glob, the match count (0 omitted; the output text
 	// says "no matches" then). The GUI renders these; the model
 	// never sees them.
-	Detail string `json:"detail,omitempty"`
-	Count  int    `json:"count,omitempty"`
+	Detail          string `json:"detail,omitempty"`
+	Count           int    `json:"count,omitempty"`
+	CountLowerBound bool   `json:"count_lower_bound,omitempty"`
 	// tool_backgrounded / tool_background_done.
 	Job string `json:"job,omitempty"`
 	// background_wait: the waiting job ids, comma-separated.
@@ -154,6 +177,9 @@ type Event struct {
 	// the turn ended. Aborted turns carry reason "abort" and no
 	// error string: cancellation is not an error.
 	Reason string `json:"reason,omitempty"`
+	// outcome is a separate task-level result. Omitted when no completion claim
+	// was established; end_turn alone does not mean the task is completed.
+	Outcome string `json:"outcome,omitempty"`
 	// continuation_request: how many identical calls were seen and
 	// the threshold that tripped the guard.
 	RepeatCount int `json:"repeat_count,omitempty"`

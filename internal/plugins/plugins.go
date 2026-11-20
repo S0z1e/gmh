@@ -48,6 +48,7 @@ import (
 	"github.com/MoeForge/moejs"
 
 	"minimalharness/internal/llm"
+	"minimalharness/internal/toolargs"
 )
 
 const (
@@ -68,7 +69,7 @@ const (
 // register one, or the model could not tell whose tool it called.
 var builtinTools = map[string]bool{
 	"read": true, "write": true, "edit": true, "bash": true,
-	"grep": true, "glob": true, "load_skill": true, "webfetch": true,
+	"grep": true, "glob": true, "load_skill": true, "webfetch": true, "read_guidance": true, "git_status": true,
 }
 
 var validToolName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
@@ -233,6 +234,18 @@ func (r *Registry) ToolDefs() []llm.ToolDef {
 func (r *Registry) Has(name string) bool {
 	_, ok := r.byTool[name]
 	return ok
+}
+
+// Untrusted discovers names for display without reading or executing plugins.
+func Untrusted(root string) *Registry {
+	r := &Registry{byTool: map[string]*Tool{}, byCommand: map[string]*Command{}, dir: filepath.Join(root, ".agents", "plugins")}
+	entries, _ := os.ReadDir(r.dir)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			r.infos = append(r.infos, Info{Name: entry.Name(), State: "disabled", Reason: "workspace is untrusted"})
+		}
+	}
+	return r
 }
 
 // Load discovers and loads plugins from <root>/.agents/plugins/.
@@ -427,6 +440,9 @@ func (r *Registry) Call(ctx context.Context, name, argsJSON string) (string, err
 	t, ok := r.byTool[name]
 	if !ok {
 		return "", fmt.Errorf("unknown plugin tool: %s", name)
+	}
+	if err := toolargs.Validate(t.Parameters, argsJSON); err != nil {
+		return "", fmt.Errorf("bad %s args: %w", name, err)
 	}
 	return t.plugin.call(ctx, t, argsJSON, r.timeout())
 }
@@ -715,16 +731,17 @@ func hookMessagesResult(p *Plugin, res moejs.Value) ([]llm.Message, bool) {
 }
 
 // rehydrateImages restores image bytes on a context hook's rewritten
-// history: the hook input JSON carries paths only (Data is json:"-"),
+// history: hook input JSON carries immutable references (Data is json:"-"),
 // so a verbatim round-trip would silently drop the bytes. Images are
-// matched by path; an image the hook invented (no matching path in
+// matched by origin and digest; an image the hook invented (no matching reference in
 // the original) is dropped — a hook cannot inject image bytes it
 // never had.
 func rehydrateImages(orig, rewritten []llm.Message) []llm.Message {
-	byPath := map[string]llm.Image{}
+	type key struct{ path, digest string }
+	byImage := map[key]llm.Image{}
 	for _, m := range orig {
 		for _, img := range m.Images {
-			byPath[img.Path] = img
+			byImage[key{img.Path, img.Digest}] = img
 		}
 	}
 	for i := range rewritten {
@@ -733,9 +750,8 @@ func rehydrateImages(orig, rewritten []llm.Message) []llm.Message {
 		}
 		kept := rewritten[i].Images[:0]
 		for _, img := range rewritten[i].Images {
-			if src, ok := byPath[img.Path]; ok {
-				img.Data = src.Data
-				kept = append(kept, img)
+			if src, ok := byImage[key{img.Path, img.Digest}]; ok {
+				kept = append(kept, src)
 			}
 		}
 		rewritten[i].Images = kept

@@ -11,12 +11,27 @@ with `--rpc`; `--ui` is ignored.
 harness --rpc -root /path/to/project -mode suggest
 ```
 
-Startup: the first line on stdout is a `ready` event:
+The first line on stdout is a `ready` event:
 `{"type":"ready","protocol":1,"session":"<id>","model":"...","api":"chat","mode":"suggest","root":"...","resumed":false,"messages":0}`.
+
+All responses and events carry a strictly increasing `sequence` for the
+connection. Events carry `connection_id` and, when applicable, `session`,
+`turn_id`, `step_id`, and `request_id`. Tool events retain `invocation_id`
+for their start/result pair. When a background result arrives in a later
+turn, `origin_turn_id`, `origin_request_id`, and `origin_step_id` identify
+the originating call if it was launched on this connection.
+
+Read stdout continuously. If a write stays blocked for five seconds or
+a write would exceed 1,024 queued frames or 16 MiB, the server disconnects
+and cancels active provider calls and control operations. A failed write
+also disconnects. The client should treat the stream as closed and
+reconnect before sending further requests. The server returns an error
+for output failure and for input frames over 4 MiB. Individual output
+frames are limited to 8 MiB.
 
 Requests (each `{"id":"<req>","type":"..."}`; `id` is optional and
 echoed in the response):
-- `prompt` `{"message":"..."}` → `{"disposition":"started"|"queued"}`.
+- `prompt` `{"message":"..."}` → `{"disposition":"started"|"queued","turn_id":"<turn>"}`.
   The response only means accepted; the turn ends with
   `agent_settled`. A second prompt while a turn runs is queued (cap
   64; beyond that an error). A known slash line (`/usage`, `/jobs`,
@@ -54,13 +69,16 @@ echoed in the response):
   `abort` alone lets queued prompts continue after the turn ends.
 - `get_state` → session/model/api/mode/root, `tool_mode`
   (`"default"` or `"plan"`), `streaming`, `queued`, `messages`,
-  `turns`, `total_tokens`, `context_window` and `max_tokens` (the
+  `turns`, `total_tokens`, `metering_available`, `session_usage_complete`,
+  `current_run_usage_complete`, `context_window` and `max_tokens` (the
   effective window and output cap for the current model — the values
   Setup resolved, so a GUI can meter context against the limit the
   compact trigger uses).
-- `usage` → session usage object, `cost_usd` (null when no rates are
-  configured), `fee` (a note that the price is unverified against the
-  provider's actual prices), `turns`.
+- `usage` returns lifetime `session` and `current_run` usage. Treat counts
+  as subtotals when their corresponding completeness flag is false.
+  `metering_available` indicates whether lifetime metering can be read.
+  `cost_usd` and `current_run_cost_usd` are present only when the respective
+  provider usage has complete pricing evidence.
 - `jobs` → background bash jobs (id, status, elapsed seconds,
   command, exit code once done).
 - `new_session` → `{"session":"<new id>"}`. Starts a fresh session
@@ -82,15 +100,23 @@ echoed in the response):
   only path/media type/dimensions). Defaults to the current session;
   `{"session":"<id>"}` fetches another session's transcript (an
   unknown id is an error). The full history, no truncation — the GUI
-  asked for it. After a `/clear` or a compact the file only holds
+  asked for it, subject to the output frame limit. After a `/clear` or a compact the active view only holds
   what the model still sees, so history matches the live context.
   `user` messages with `kind:"turn_context"` are harness mode/plugin snapshots,
   appended after each task. They are turn-internal records, not additional user
   tasks; rollback removes them with their task. Automatic compaction retains
   the active task's snapshot alongside its summary.
+  Compaction also retains `kind:"checkpoint"` user records containing versioned
+  historical source facts, independent of the model's summary. The latest task
+  stays a rollback boundary, with its summary and full facts after it; a preceding
+  checkpoint, when present, contains only the earlier baseline. These records do
+  not grant approval or certify the current workspace. Tool results and job
+  deliveries may carry harness-only `observation` metadata for actual errors,
+  output references and job snapshots; provider wire adapters omit that metadata.
 - `rename_session` `{"name":"old","new":"new"}` → `{"renamed":true,"from":"old","to":"new"}`. Same rename as `/rename` in the REPL.
 - `resume_session` `{"session":"..."}` → `{"session":"...","messages":N}`. Same switch as `/resume` in the REPL; `get_state` reports the new session at once.
-- `delete_session` `{"session":"..."}` → `{"deleted":true,"session":"..."}`. Removes another session's transcript, audit sidecar and pre-compact archives. The current session cannot be deleted (resume or start another one first); an unknown id is an error.
+- `prune_artifacts` → `{"deleted_blobs":N,"reclaimed_bytes":N}`. Reclaims unreferenced image blobs older than seven days after scanning session history, archives and recovery records.
+- `delete_session` `{"session":"..."}` → `{"deleted":true,"session":"..."}`. Removes another session's owned transcript, archives, audit, recovery records and unshared output family. The current session cannot be deleted (resume or start another one first); an unknown id is an error.
 - `set_tool_mode` `{"mode":"plan"|"default"}` → `{"tool_mode":"plan"}`. First-class switch of the loop's tool set (read-only plan mode, or back to the full default set): the same effect as the plan plugin's `/plan` / `/execute`, but it works even when the project has no plan plugin. An unknown or missing mode is an error; switching to the current mode is a no-op. `get_state` and `agent_settled` report the new mode at once. The mode is session-only: a new or resumed session resets it to default.
 - `command` `{"name":"plan","message":""}` → `{"ok":true,"output":"..."}`. Runs a plugin command by name (`message` is the raw args string, the text after `/name`); same as typing `/name` in the REPL. A `/name ...` prompt line behaves the same way.
 - `quit` → `{"ok":true}`, then the process exits 0. It waits for the
@@ -165,15 +191,29 @@ GUI to drop it), so streamed text is never duplicated. Only a
 completed message is never replayed: once the done message has
 arrived, a later error ends the turn instead. A turn that still fails reports
 `(after 4 attempts)` in the step error.
+- `agent_settled` has separate `reason` (why the turn stopped) and optional
+  `outcome` (a task result). `end_turn` alone does not assert completion and
+  normally omits `outcome`. A configured required-verification policy reports
+  `completed` only after all exact checks pass for the current workspace version.
+  Missing, failed or stale evidence receives up to three feedback rounds; another
+  failure reports `reason: verification_failed`, `outcome: verification_failed`
+  and an error. Verification evidence is persisted as `kind: verification` user
+  messages, including invocation, command, cwd, exit code, timestamps and version.
+  Error/cap exits report `incomplete`, blocked/denied exits
+  report `blocked`, and cancellation reports `aborted`. Stop hooks can supply
+  at most three feedback rounds; another veto ends with `reason: stop_cap`,
+  `outcome: incomplete` and an error. The final veto is retained in resumed
+  conversation context. Completion/required-verification records are a separate
+  contract; consumers must not infer `completed` from a missing outcome.
 - `agent_settled` — exactly one per turn, whatever happened:
-  `{"text":"...","usage":{...},"session_usage":{...},"cost_usd":null|N,"session_cost_usd":null|N,"fee":"...","aborted":false,"reason":"end_turn"|"output_limit"|"max_turns"|"abort"|"error"|"repeated_tool_call_denied"|"blocked","error":null|"...","tool_mode":"default"|"plan"}`.
+  `{"text":"...","usage":{...},"session_usage":{...},"cost_usd":null|N,"session_cost_usd":null|N,"fee":"...","aborted":false,"reason":"end_turn"|"output_limit"|"max_turns"|"abort"|"error"|"repeated_tool_call_denied"|"blocked"|"stop_cap"|"verification_failed","outcome":"completed"|"incomplete"|"blocked"|"aborted"|"verification_failed" (optional),"error":null|"...","tool_mode":"default"|"plan"}`.
   `reason` is the structured terminal reason: `"end_turn"` (the model
   finished), `"max_turns"` (step cap), `"abort"` (the GUI aborted the
   turn), `"error"` (LLM/provider failure),
   `"repeated_tool_call_denied"` (the user denied a repeated call at
   the continuation prompt, or no prompt was available) or `"blocked"`
-  (3 consecutive steps whose tool calls all failed — the task was
-  marked blocked instead of looping). `aborted` is
+  (three failed tool attempts without proven state or result progress,
+  including background failures). `aborted` is
   true only when the GUI aborted the turn — and an aborted turn
   carries no `error` string: cancellation is semantic, not an error.
   Any other failure is in `error`. `text` is the turn's final answer
@@ -198,8 +238,14 @@ arrived, a later error ends the turn instead. A turn that still fails reports
   `agent_settled`.
 
 `tool_end` and `tool_background_done` include `status` (`success`, `error`,
-`background`), and bash results include `exit_code` and `output_file` when
-available. `exit_code: 0` is preserved. `agent_settled.reason: output_limit`
+`background`, or `deferred`). `deferred` is a `tool_end` for a call skipped
+pending updated project guidance; the call did not execute and has no `error`.
+Bash results include `exit_code` and `output_file` when available. `exit_code: 0` is preserved. `agent_settled.reason: output_limit`
 means the provider stopped with incomplete output; unfinished tool arguments
 are never executed. History messages may carry `kind`, `tool_error` and
 `finish_reason` metadata; these fields are not forwarded as provider inputs.
+
+Turn budgets also settle with `reason: "budget_exceeded"` or
+`reason: "budget_unavailable"`, `outcome: "incomplete"`, and an error. A resource
+deadline is not a user abort. Expired approval/question/continuation requests no
+longer accept replies; the client should dismiss pending prompts on settlement.

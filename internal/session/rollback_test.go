@@ -70,7 +70,7 @@ func TestRollbackZeroAndNoTurns(t *testing.T) {
 }
 
 func TestStoreRewriteRoundTrip(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("rollback-test")
 	if err != nil {
 		t.Fatal(err)

@@ -2,10 +2,29 @@
 
 Model setup lives in a JSON file instead of a dozen exports, following
 the `models.json` shape.
-Two files, merged field by field (project wins where it sets a value):
+Two files, merged field by field after the workspace is explicitly trusted
+(project wins where it sets a value):
 
 - global: `~/.minimal-harness/config.json`
 - project: `<root>/.harness.json`
+
+Workspaces start untrusted. Run `harness --workspace-trust trust` (or the
+same flag with `harness-tui`) to save trust for this canonical directory.
+Future runs reuse the decision. `--workspace-trust untrust` revokes it.
+Decisions live under `~/.minimal-harness/trust/`, bind the directory identity,
+including creation time, and do not apply to child or replacement directories.
+Case/Unicode aliases of the same directory share the decision. Filesystems
+without a creation identity remain untrusted;
+global and explicit configuration still work there. Older trust-record formats
+require a new explicit decision.
+
+Untrusted workspaces use global configuration; project config, plugins,
+project instructions, project skills and `git_status` are disabled.
+Explicit CLI flags and `--config <path>` remain direct user choices; an
+explicit config does not enable project plugins. Trust takes effect on the
+next process start. It allows project configuration and executable plugins;
+it does not create an OS sandbox. RPC `get_state.workspace_trusted` reports
+the active decision.
 
 ```json
 {
@@ -54,9 +73,21 @@ rejected — the harness has no client for it.
 
 `apiKey` accepts a literal key or a `"$NAME"` / `"${NAME}"` environment
 reference. An unset referenced variable is an error; `!command` is not supported.
-When a provider sets no `apiKey`, `OPENAI_API_KEY` is used.
+Global and explicitly selected config files may omit `apiKey` to use
+`OPENAI_API_KEY`. A provider introduced by project config must explicitly
+declare its credential, for example `"apiKey": "$OPENAI_API_KEY"`.
 `headers` (provider and per-model, model wins) accept the same
 `$NAME` references; auth headers are never taken from them.
+
+Credentials are bound to the endpoints declared by their configuration
+source. A project override of a provider or model `baseUrl` cannot silently
+inherit a global API key or header at the new destination. Declare `apiKey`
+and any inherited headers explicitly alongside the new endpoint, or configure
+a separate provider globally. A model-only override that keeps the endpoint
+continues to inherit credentials. Startup and `/model` use the same check.
+The direct `OPENAI_BASE_URL` environment override remains a user choice.
+Provider HTTP redirects are rejected, including redirects to another API
+path, so custom credential headers cannot be forwarded automatically.
 
 `samplingParams` (e.g. `temperature`, `top_p`) is merged into every
 request body of the two OpenAI modes only; Anthropic
@@ -102,6 +133,18 @@ disables backgrounding), `denyInsteadOfPrompt`, `contextLimit`,
 (`default|terminal|catppuccin-mocha`). Precedence is flag >
 environment variable > model value > project file > global file > the
 default, so existing flag/env usage keeps working unchanged.
+
+`bashEnv` replaces the list of environment variables inherited by Bash,
+including background and sandboxed jobs. Omit it for OS basics: `PATH`,
+`HOME`, user/shell/locale/terminal names, temporary-directory variables,
+and Windows system/profile/application directories. Provider keys, arbitrary
+application variables, proxy/SSH-agent settings and shell startup variables
+are excluded by default. Add required variables explicitly, for example
+`"bashEnv": ["PATH", "HOME", "LANG", "GOCACHE", "HTTPS_PROXY"]`.
+An empty list (`"bashEnv": []`) disables optional inheritance; Windows may
+retain required system variables, and Bash may initialize its own variables.
+Project overrides require workspace trust. This controls
+environment inheritance; Bash retains its existing filesystem permissions.
 
 With that file in place, `harness` needs nothing but the keys — no
 `OPENAI_BASE_URL` / `OPENAI_MODEL` / `OPENAI_API_MODE` exports.

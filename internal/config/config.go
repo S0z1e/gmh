@@ -53,11 +53,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"minimalharness/internal/turnbudget"
+	"minimalharness/internal/verification"
+	"minimalharness/internal/workspace"
 )
 
 // Defaults for optional model fields. A model that omits contextWindow/maxTokens gets these.
@@ -161,9 +166,10 @@ type Model struct {
 // overrides them where it sets a value. A provider needs a baseUrl
 // and an api at provider or model level.
 type Provider struct {
-	BaseURL string `json:"baseUrl"`
-	API     string `json:"api"`
-	Model   string `json:"model"`
+	credentials credentialBindings
+	BaseURL     string `json:"baseUrl"`
+	API         string `json:"api"`
+	Model       string `json:"model"`
 	// APIKey is a literal key or a "$NAME" / "${NAME}" environment reference.
 	// "!command" is not supported.
 	APIKey  string            `json:"apiKey"`
@@ -175,6 +181,8 @@ type Provider struct {
 // (inherit from the other file, the environment, or the default)
 // from an explicitly set value, including 0 and false.
 type File struct {
+	TurnBudget           *turnbudget.Policy `json:"turnBudget"`
+	shorthandCredentials credentialBindings
 	// Schema is accepted and ignored: config files may carry
 	// "$schema": "https://example.com/schemas/models.schema.json"
 	// for editor validation.
@@ -188,14 +196,16 @@ type File struct {
 	API     string `json:"api"`
 	Model   string `json:"model"`
 
-	Mode                string `json:"mode"`
-	BashTimeoutSeconds  *int   `json:"bashTimeoutSeconds"`
-	BgThresholdSeconds  *int   `json:"bgThresholdSeconds"`
-	DenyInsteadOfPrompt *bool  `json:"denyInsteadOfPrompt"`
-	Sandbox             *bool  `json:"sandbox"`
-	ContextLimit        *int   `json:"contextLimit"`
-	AnthropicMaxTokens  *int   `json:"anthropicMaxTokens"`
-	TUITheme            string `json:"tuiTheme"`
+	Mode                string               `json:"mode"`
+	BashTimeoutSeconds  *int                 `json:"bashTimeoutSeconds"`
+	BashEnv             []string             `json:"bashEnv"`
+	Verification        *verification.Policy `json:"verification"`
+	BgThresholdSeconds  *int                 `json:"bgThresholdSeconds"`
+	DenyInsteadOfPrompt *bool                `json:"denyInsteadOfPrompt"`
+	Sandbox             *bool                `json:"sandbox"`
+	ContextLimit        *int                 `json:"contextLimit"`
+	AnthropicMaxTokens  *int                 `json:"anthropicMaxTokens"`
+	TUITheme            string               `json:"tuiTheme"`
 	// Plugins is the optional plugins section (nil = unset: nothing
 	// is disabled). A project file's section replaces the global
 	// one, like a provider's models list.
@@ -258,12 +268,27 @@ func LoadExplicit(path string) (*File, error) {
 	if err := Validate(f); err != nil {
 		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
+	f.bindInitialCredentials()
 	return f, nil
 }
 
 // LoadFor loads the global file, then the project file for root on
 // top of it, field by field (nested-merge behaviour).
 func LoadFor(root string) (*File, error) {
+	id, err := workspace.Identify(root)
+	if err != nil {
+		return nil, err
+	}
+	trusted, err := workspace.Trusted(id)
+	if err != nil {
+		return nil, err
+	}
+	return LoadForTrust(root, trusted)
+}
+
+// LoadForTrust merges project settings only after an explicit trust decision.
+// Untrusted project files are not parsed, including malformed or hostile files.
+func LoadForTrust(root string, trusted bool) (*File, error) {
 	global, err := GlobalPath()
 	if err != nil {
 		return nil, err
@@ -272,11 +297,14 @@ func LoadFor(root string) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	project, err := Load(ProjectPath(root))
-	if err != nil {
-		return nil, err
+	f.bindInitialCredentials()
+	if trusted {
+		project, err := Load(ProjectPath(root))
+		if err != nil {
+			return nil, err
+		}
+		Merge(f, project)
 	}
-	Merge(f, project)
 	if err := Validate(f); err != nil {
 		return nil, err
 	}
@@ -288,6 +316,7 @@ func LoadFor(root string) (*File, error) {
 // A source models list replaces the provider's whole list:
 // a baseUrl/headers-only override keeps the destination's models.
 func Merge(dst, src *File) {
+	dst.bindInitialCredentials()
 	if src.Schema != "" {
 		dst.Schema = src.Schema
 	}
@@ -311,6 +340,18 @@ func Merge(dst, src *File) {
 	}
 	if src.BashTimeoutSeconds != nil {
 		dst.BashTimeoutSeconds = src.BashTimeoutSeconds
+	}
+	if src.BashEnv != nil {
+		dst.BashEnv = append([]string{}, src.BashEnv...)
+	}
+	if src.TurnBudget != nil {
+		dst.TurnBudget = src.TurnBudget.Clone()
+	}
+	if src.Verification != nil {
+		policy := *src.Verification
+		policy.Required = append([]verification.Check(nil), policy.Required...)
+		policy.Exclude = append([]string(nil), policy.Exclude...)
+		dst.Verification = &policy
 	}
 	if src.BgThresholdSeconds != nil {
 		dst.BgThresholdSeconds = src.BgThresholdSeconds
@@ -338,6 +379,9 @@ func Merge(dst, src *File) {
 			dst.Providers = map[string]Provider{}
 		}
 		dp := dst.Providers[name]
+		if dp.credentials == nil {
+			dp.credentials = credentialBindings{}
+		}
 		if sp.BaseURL != "" {
 			dp.BaseURL = sp.BaseURL
 		}
@@ -351,16 +395,19 @@ func Merge(dst, src *File) {
 			dp.APIKey = sp.APIKey
 		}
 		if len(sp.Headers) > 0 {
-			if dp.Headers == nil {
-				dp.Headers = map[string]string{}
+			mergedHeaders := map[string]string{}
+			for k, v := range dp.Headers {
+				mergedHeaders[http.CanonicalHeaderKey(k)] = v
 			}
 			for k, v := range sp.Headers {
-				dp.Headers[k] = v
+				mergedHeaders[http.CanonicalHeaderKey(k)] = v
 			}
+			dp.Headers = mergedHeaders
 		}
 		if len(sp.Models) > 0 {
 			dp.Models = sp.Models
 		}
+		dp.bindExplicit(sp)
 		dst.Providers[name] = dp
 	}
 }
@@ -400,7 +447,7 @@ func (f *File) Select(name string) (Provider, bool) {
 		}
 	}
 	if f.BaseURL != "" || f.API != "" || f.Model != "" {
-		return Provider{BaseURL: f.BaseURL, API: f.API, Model: f.Model}, true
+		return Provider{BaseURL: f.BaseURL, API: f.API, Model: f.Model, credentials: f.shorthandCredentials}, true
 	}
 	return Provider{}, true
 }
@@ -573,6 +620,17 @@ func Validate(f *File) error {
 	}
 	if f.BashTimeoutSeconds != nil && *f.BashTimeoutSeconds <= 0 {
 		return fmt.Errorf("bashTimeoutSeconds must be > 0")
+	}
+	if _, err := f.TurnBudget.Resolve(); err != nil {
+		return fmt.Errorf("turnBudget: %w", err)
+	}
+	if err := f.Verification.Validate(); err != nil {
+		return err
+	}
+	for _, name := range f.BashEnv {
+		if !validEnvName(name) {
+			return fmt.Errorf("bashEnv entries must be environment variable names")
+		}
 	}
 	if f.BgThresholdSeconds != nil && *f.BgThresholdSeconds < 0 {
 		return fmt.Errorf("bgThresholdSeconds must be >= 0 (0 disables backgrounding)")

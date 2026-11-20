@@ -2,7 +2,12 @@
 
 Plugins extend the agent with new tools written in JavaScript (or
 TypeScript, types stripped). One directory per plugin under
-`.agents/plugins/<name>/`, with a `plugin.json` and one entry file:
+`.agents/plugins/<name>/`, with a `plugin.json` and one entry file.
+Project plugins load only after `--workspace-trust trust`; the saved decision
+is reused on later runs. An untrusted workspace lists them as disabled and
+does not execute their top-level code or hooks.
+
+Example manifest:
 
 ```json
 {"name": "todo", "description": "A personal todo list.", "version": "1.0.0", "entry": "todo.js"}
@@ -198,11 +203,12 @@ harness.on("stop", (input) => {
 });
 ```
 
-Separately, the loop marks a task blocked on its own: after 3
-consecutive steps whose tool calls all failed, the turn ends with
-the structured terminal reason `"blocked"` instead of looping.
-Any successful tool call resets the count; denials and refusals
-do not count as fix attempts.
+Separately, the loop marks a task blocked on its own: after three failed tool attempts
+without proven state or result progress, the turn ends with the structured
+terminal reason `"blocked"`. Denials and refusals count. Successful reads and
+unchanged writes do not reset failures; a proven workspace change after a
+successful mutating tool or a successful rerun of a previously failing
+invocation does. Background failures use the same guard.
 
 | Hook | Input | Return | On failure |
 | --- | --- | --- | --- |

@@ -249,3 +249,28 @@ func TestResponsesSendsReasoningEffort(t *testing.T) {
 		t.Fatalf("reasoning must be absent without effort: %+v", body)
 	}
 }
+
+func TestResponsesPreservesOptionalToolParameters(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n")
+	}))
+	defer srv.Close()
+	c := &Client{BaseURL: srv.URL, APIKey: "test", Model: "test", API: "responses"}
+	defs := []ToolDef{Tool("read", "read a file", `{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"}},"required":["path"]}`)}
+	if err := c.Stream(context.Background(), []Message{{Role: "user", Content: "read file"}}, defs, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	tool := body["tools"].([]any)[0].(map[string]any)
+	if strict, ok := tool["strict"]; !ok || strict != false {
+		t.Fatalf("must explicitly disable strict normalization: %v", tool)
+	}
+	parameters := tool["parameters"].(map[string]any)
+	if got := parameters["required"].([]any); len(got) != 1 || got[0] != "path" {
+		t.Fatalf("optional limit became required: %v", parameters)
+	}
+}

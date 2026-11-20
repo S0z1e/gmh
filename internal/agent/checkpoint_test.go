@@ -64,7 +64,7 @@ func TestPruneCheckpointPersistsAndPreservesNewestBatch(t *testing.T) {
 	if !cfg.needsCompact(msgs) {
 		t.Fatal("fixture did not reach context budget")
 	}
-	out, _, err := cfg.compactInLoop(context.Background(), msgs)
+	out, _, err := cfg.compactInLoop(context.Background(), msgs, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,14 +93,14 @@ func TestPruneCheckpointPersistsAndPreservesNewestBatch(t *testing.T) {
 }
 
 func TestCheckpointFallsBackToSummaryWithoutEnoughHeadroom(t *testing.T) {
-	msgs := []llm.Message{{Role: "user", Kind: "task", Content: strings.Repeat("task ", 10000)}}
+	msgs := []llm.Message{{Role: "user", Kind: "task", Content: "keep the sources"}, {Role: "assistant", Content: strings.Repeat("decision", 5000)}}
 	msgs = appendFixtureBatch(msgs, 0, 1000)
 	calls := 0
 	cfg := &Config{ContextLimit: 20000, CompactHistory: func(context.Context, []llm.Message) (string, llm.Usage, error) {
 		calls++
 		return "task remains", llm.Usage{}, nil
 	}}
-	if _, _, err := cfg.compactInLoop(context.Background(), msgs); err != nil {
+	if _, _, err := cfg.compactInLoop(context.Background(), msgs, nil); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 1 {
@@ -126,7 +126,7 @@ func TestPruneCheckpointDoesNotPersistTransientContext(t *testing.T) {
 	}
 	msgs = append(msgs, llm.Message{Role: "user", Content: "transient context hook instruction"})
 	cfg := &Config{Session: store, ContextLimit: 40000}
-	if _, ok := cfg.pruneCheckpoint(msgs); ok {
+	if _, ok := cfg.pruneCheckpoint(msgs, cfg.Tools); ok {
 		t.Fatal("transient context must not be committed as raw history")
 	}
 	saved, err := session.Load(store.ID)
@@ -156,7 +156,7 @@ func TestCheckpointLargeRawResultsFallBackToSummary(t *testing.T) {
 		called = true
 		return "summary", llm.Usage{}, nil
 	}}
-	if _, _, err := cfg.compactInLoop(context.Background(), msgs); err != nil {
+	if _, _, err := cfg.compactInLoop(context.Background(), msgs, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !called {
@@ -184,7 +184,7 @@ func TestPruneCheckpointAcceptsHydratedImages(t *testing.T) {
 		}
 	}
 	cfg := &Config{Session: store, ContextLimit: 40000}
-	out, ok := cfg.pruneCheckpoint(msgs)
+	out, ok := cfg.pruneCheckpoint(msgs, cfg.Tools)
 	if !ok || out[0].Images[0].Data != msgs[0].Images[0].Data {
 		t.Fatal("hydrated image blocked pruning or lost its data")
 	}
@@ -209,7 +209,7 @@ func TestGraceCallCheckpointsNewResultsBeforeFinalRequest(t *testing.T) {
 	}))
 	defer srv.Close()
 	cfg := &Config{Client: &llm.Client{BaseURL: srv.URL, Model: "mock", APIKey: "fake"}, ContextLimit: DefaultContextLimit}
-	text, _, ok := cfg.graceCall(context.Background(), msgs, "summarize now")
+	text, _, ok := cfg.graceCall(context.Background(), msgs, "summarize now", nil)
 	if !ok || text != "final report" {
 		t.Fatalf("grace call=%q, %t", text, ok)
 	}
@@ -233,7 +233,8 @@ func TestGraceCheckpointUsageIncludesFinalAttempt(t *testing.T) {
 					return "summary", llm.Usage{PromptTokens: 5, CompletionTokens: 2, TotalTokens: 7}, nil
 				},
 			}
-			_, usage, ok := cfg.graceCall(context.Background(), []llm.Message{{Role: "user", Kind: "summary", Content: strings.Repeat("x", 24000)}}, "summarize now")
+			cfg.LastPromptTokens = 8000
+			_, usage, ok := cfg.graceCall(context.Background(), []llm.Message{{Role: "user", Kind: "task", Content: "finish"}}, "summarize now", nil)
 			if usage.TotalTokens != 30 || events.TotalTokens != 30 || ok != (finish == "stop") {
 				t.Fatalf("usage=%d events=%d ok=%t", usage.TotalTokens, events.TotalTokens, ok)
 			}
@@ -249,7 +250,7 @@ func TestCheckpointRewriteFrequency(t *testing.T) {
 		msgs = appendFixtureBatch(msgs, i, 16*1024)
 		if cfg.needsCompact(msgs) {
 			var err error
-			msgs, _, err = cfg.compactInLoop(context.Background(), msgs)
+			msgs, _, err = cfg.compactInLoop(context.Background(), msgs, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -374,7 +375,9 @@ func TestBlockedGraceCheckpointIncludesDrainedJob(t *testing.T) {
 			b, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"tool_calls": []any{map[string]any{"index": 0, "id": msg.ToolCalls[0].ID, "function": msg.ToolCalls[0].Function}}}}}})
 			prompt := 10
 			if calls == 3 {
-				prompt = 6900
+				// Leave 100 tokens before the tool-less prompt hits its
+				// trigger; the drained job and closing instruction exceed it.
+				prompt = 6900 + estimatePromptTokens(nil, cfg.Tools) - estimatePromptTokens(nil, nil)
 			}
 			return fmt.Sprintf("data: %s\n\ndata: {\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n", b, prompt)
 		}()

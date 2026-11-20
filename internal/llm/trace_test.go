@@ -10,6 +10,18 @@ import (
 	"testing"
 )
 
+func TestTraceWireUsagePreservesInvalidAndOmittedTotals(t *testing.T) {
+	for _, total := range []int{-1, 20} {
+		o := &requestObservation{}
+		ctx := context.WithValue(context.Background(), traceKey{}, o)
+		traceWireUsage(ctx, Usage{TotalTokens: total}, fmt.Sprintf(`{"usage":{"total_tokens":%d}}`, total), false)
+		traceWireUsage(ctx, Usage{PromptTokens: 10}, `{"usage":{"prompt_tokens":10}}`, false)
+		if o.trace.Usage.TotalTokens != total || o.trace.TokensComplete || o.trace.PriceCountsComplete {
+			t.Fatalf("omitted total lost or completed: %+v", o.trace)
+		}
+	}
+}
+
 func TestRequestTraceComparesActualWireRequests(t *testing.T) {
 	status := http.StatusOK
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -116,6 +128,13 @@ func TestRequestTraceUsageEventsAcrossAPIs(t *testing.T) {
 		reported            bool
 	}{
 		{"chat_no_usage", "chat", "data: [DONE]\n\n", false, false, 0, 0, false},
+
+		{"chat_empty_usage", "chat", "data: {\"usage\":{}}\n\ndata: [DONE]\n\n", false, false, 0, 0, false},
+		{"chat_zero_usage", "chat", "data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\ndata: [DONE]\n\n", false, true, 0, 0, false},
+		{"responses_empty_usage", "responses", "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n", false, false, 0, 0, false},
+		{"responses_zero_usage", "responses", "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n", false, true, 0, 0, false},
+		{"anthropic_empty_usage", "anthropic", "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{}}\n\ndata: {\"type\":\"message_stop\"}\n\n", false, false, 0, 0, false},
+		{"anthropic_zero_usage", "anthropic", "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":0}}\n\ndata: {\"type\":\"message_stop\"}\n\n", false, true, 0, 0, false},
 		{"chat_null_usage", "chat", "data: {\"usage\":null}\n\ndata: [DONE]\n\n", false, false, 0, 0, false},
 		{"anthropic_no_usage", "anthropic", "data: {\"type\":\"message_stop\"}\n\n", false, false, 0, 0, false},
 		{"anthropic_cutoff", "anthropic", "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":90,\"cache_creation_input_tokens\":20}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\n", true, true, 120, 90, true},

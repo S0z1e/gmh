@@ -1,201 +1,185 @@
 package tools
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io/fs"
+	"io"
+	"minimalharness/internal/fileguard"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
 
-const (
-	// DefaultGlobLimit is the default cap on reported paths.
-	DefaultGlobLimit = 100
-	// MaxGlobLimit is the hard cap a caller can request.
-	MaxGlobLimit = 500
-)
+const DefaultGlobLimit = 100
+const MaxGlobLimit = 500
 
 type GlobArgs struct {
-	Pattern string `json:"pattern"`         // glob, e.g. "**/*.go" or "src/*.ts"
-	Path    string `json:"path,omitempty"`  // search root, default "."
-	Limit   int    `json:"limit,omitempty"` // default 100, max 500
+	Pattern string `json:"pattern"`
+	Path    string `json:"path,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
 }
 
-// Glob lists files matching Pattern under Path, respecting .gitignore
-// (via ripgrep when available). Results are sorted and capped;
-// truncation is always reported, never silent.
 func (e *Executor) Glob(ctx context.Context, a GlobArgs) (string, int, error) {
-	if strings.TrimSpace(a.Pattern) == "" {
-		return "", 0, fmt.Errorf("glob: empty pattern")
+	r, err := e.globResult(ctx, a)
+	return r.Text, r.Count, err
+}
+
+func (e *Executor) globResult(ctx context.Context, a GlobArgs) (ToolResult, error) {
+	if strings.TrimSpace(a.Pattern) == "" || len(a.Pattern) > 4096 || len(strings.Split(a.Pattern, "/")) > 128 {
+		return ToolResult{}, &InputError{Err: fmt.Errorf("glob: invalid or excessive pattern")}
 	}
+
 	root := a.Path
 	if root == "" {
 		root = "."
 	}
 	dir, err := e.resolve(root)
 	if err != nil {
-		return "", 0, err
+		return ToolResult{}, err
 	}
 	limit := a.Limit
 	if limit <= 0 {
 		limit = DefaultGlobLimit
 	}
-	if limit > MaxGlobLimit {
-		limit = MaxGlobLimit
-	}
-
+	limit = min(limit, MaxGlobLimit)
 	if _, err := exec.LookPath("rg"); err == nil {
-		return e.globRg(ctx, dir, a.Pattern, limit)
+		return e.globRgResult(ctx, dir, a.Pattern, limit)
 	}
-	out, n, err := e.globWalk(dir, a.Pattern, limit)
-	return "warning: ripgrep (rg) not found, fell back to directory walk\n" + out, n, err
+	r, err := e.globWalkResult(ctx, dir, a.Pattern, limit)
+	r.Text = "warning: ripgrep (rg) not found, fell back to directory walk\n" + r.Text
+	return r, err
 }
 
 func (e *Executor) globRg(ctx context.Context, dir, pattern string, limit int) (string, int, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+	r, err := e.globRgResult(ctx, dir, pattern, limit)
+	return r.Text, r.Count, err
+}
+
+func (e *Executor) globRgResult(ctx context.Context, dir, pattern string, limit int) (ToolResult, error) {
 	rel, err := filepath.Rel(e.Root, dir)
 	if err != nil {
-		return "", 0, err
+		return ToolResult{}, err
 	}
-	cmd := exec.CommandContext(ctx, "rg", "--files", "-g", pattern, "--", rel)
-	cmd.Dir = e.Root
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", 0, err
-	}
-	if err := cmd.Start(); err != nil {
-		return "", 0, err
-	}
-	var paths []string
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		p := strings.TrimSpace(scanner.Text())
-		if p == "" {
-			continue
+	paths := pathWindow{limit: limit}
+	truncated, err := e.streamSearch(ctx, "rg", []string{"--files", "-0", "-g", pattern, "--", rel}, 0, "glob", func(path string) error {
+		if path == "" {
+			return fmt.Errorf("glob: empty path record")
 		}
-		if !filepath.IsAbs(p) {
-			p = filepath.Join(e.Root, p)
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(e.Root, path)
 		}
-		rel, rerr := filepath.Rel(e.Root, p)
-		if rerr != nil {
-			rel = p
-		}
-		paths = append(paths, rel)
-	}
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 && len(paths) == 0 {
-			return "no files match " + pattern, 0, nil
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", 0, fmt.Errorf("glob timed out after 30s")
-		}
-		if len(paths) == 0 {
-			return "", 0, fmt.Errorf("rg --files failed: %w", err)
-		}
-	}
-	sort.Strings(paths)
-	return formatGlobPaths(paths, limit, pattern), len(paths), nil
-}
-
-// globWalk is the stdlib fallback: walk the tree, match each relative
-// path against the pattern segment by segment, skipping hidden dirs.
-func (e *Executor) globWalk(dir, pattern string, limit int) (string, int, error) {
-	var paths []string
-	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		rel, err := fileguard.RelativePath(e.Root, path)
 		if err != nil {
-			return nil // skip unreadable entries, do not fail the walk
+			return err
 		}
-		if d.IsDir() {
-			name := d.Name()
-			if name == ".git" || name == "node_modules" || (strings.HasPrefix(name, ".") && p != dir) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !filepath.IsAbs(p) {
-			p = filepath.Join(e.Root, p)
-		}
-		rel, rerr := filepath.Rel(e.Root, p)
-		if rerr != nil {
-			return nil
-		}
-		if matchGlob(pattern, rel) {
-			paths = append(paths, rel)
-		}
+		paths.add(filepath.ToSlash(rel))
 		return nil
 	})
-	if err != nil {
-		return "", 0, err
-	}
-	if len(paths) == 0 {
-		return "no files match " + pattern, 0, nil
-	}
-	sort.Strings(paths)
-	return formatGlobPaths(paths, limit, pattern), len(paths), nil
+	return globPathsResult(paths, pattern, truncated, err != nil), err
 }
 
-// matchGlob matches a slash-separated path against a glob pattern where
-// "**" crosses directories and "*" / "?" match within one segment.
-// A pattern with no slash (e.g. "*.go") matches the basename at any depth,
-// matching ripgrep's -g behaviour so both backends agree.
-func matchGlob(pattern, path string) bool {
-	if !strings.Contains(pattern, "/") {
-		base := path
-		if i := strings.LastIndex(path, "/"); i >= 0 {
-			base = path[i+1:]
+func (e *Executor) globWalk(dir, pattern string, limit int) (string, int, error) {
+	r, err := e.globWalkResult(context.Background(), dir, pattern, limit)
+	return r.Text, r.Count, err
+}
+
+func (e *Executor) globWalkResult(ctx context.Context, dir, pattern string, limit int) (ToolResult, error) {
+	for _, segment := range strings.Split(pattern, "/") {
+		if _, err := filepath.Match(segment, ""); err != nil {
+			return ToolResult{}, &InputError{Err: fmt.Errorf("glob: %w", err)}
 		}
-		ok, err := filepath.Match(pattern, base)
-		return err == nil && ok
 	}
-	pSegs := strings.Split(pattern, "/")
-	fSegs := strings.Split(path, "/")
-	return matchSegs(pSegs, fSegs)
-}
-
-func matchSegs(p, f []string) bool {
-	if len(p) == 0 {
-		return len(f) == 0
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	rel, err := fileguard.RelativePath(e.Root, dir)
+	if err != nil {
+		return ToolResult{}, err
 	}
-	if p[0] == "**" {
-		// "**" matches zero or more segments.
-		for i := 0; i <= len(f); i++ {
-			if matchSegs(p[1:], f[i:]) {
-				return true
+	paths := pathWindow{limit: limit}
+	scanned := 0
+	truncated := false
+	var walk func(string, int) error
+	walk = func(path string, depth int) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if depth > 128 {
+			truncated = true
+			return fmt.Errorf("glob: directory depth limit reached")
+		}
+		f, err := fileguard.Open(e.Root, filepath.Join(e.Root, path))
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			if matchGlob(pattern, filepath.ToSlash(path)) {
+				paths.add(filepath.ToSlash(path))
+			}
+			return nil
+		}
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			entries, err := f.ReadDir(256)
+			for _, entry := range entries {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				scanned++
+				if scanned > maxDirectoryEntries {
+					truncated = true
+					return nil
+				}
+				name := entry.Name()
+				child := filepath.Join(path, name)
+				if entry.IsDir() {
+					if name == ".git" || name == "node_modules" || strings.HasPrefix(name, ".") {
+						continue
+					}
+					if err := walk(child, depth+1); err != nil {
+						return err
+					}
+					if truncated {
+						return nil
+					}
+				} else if matchGlob(pattern, filepath.ToSlash(child)) {
+					paths.add(filepath.ToSlash(child))
+				}
+			}
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
 			}
 		}
-		return false
 	}
-	if len(f) == 0 {
-		return false
-	}
-	ok, err := filepath.Match(p[0], f[0])
-	if err != nil || !ok {
-		return false
-	}
-	return matchSegs(p[1:], f[1:])
+	err = walk(rel, 0)
+	return globPathsResult(paths, pattern, truncated, err != nil), err
 }
 
-func formatGlobPaths(paths []string, limit int, pattern string) string {
-	if len(paths) == 0 {
-		return "no files match " + pattern
-	}
-	total := len(paths)
-	if total > limit {
-		paths = paths[:limit]
-	}
+func globPathsResult(paths pathWindow, pattern string, truncated, failed bool) ToolResult {
+	incomplete := truncated || failed
 	var b strings.Builder
-	for _, p := range paths {
-		b.WriteString(p)
-		b.WriteString("\n")
+	for _, path := range paths.sorted() {
+		b.WriteString(displayPath(path))
+		b.WriteByte('\n')
 	}
-	if total > limit {
-		fmt.Fprintf(&b, "... [truncated: %d files shown, %d total]\n", limit, total)
+	if paths.total == 0 && !incomplete {
+		fmt.Fprintf(&b, "no files match %s", pattern)
 	}
-	return strings.TrimRight(b.String(), "\n")
+	if paths.total > paths.limit {
+		fmt.Fprintf(&b, "... [truncated: %d files shown, %d total]\n", paths.limit, paths.total)
+	}
+	if incomplete {
+		b.WriteString("... [search incomplete; count is a lower bound; narrow the path or pattern]\n")
+	}
+	return ToolResult{Text: strings.TrimSuffix(b.String(), "\n"), Count: paths.total, Truncated: incomplete || paths.total > paths.limit, CountLowerBound: incomplete}
 }

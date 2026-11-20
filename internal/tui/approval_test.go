@@ -52,3 +52,13 @@ func TestApproverAskAnsweredByKey(t *testing.T) {
 	run('y', true)
 	run('n', false)
 }
+
+func TestToolApprovalDisplaysResolvedTarget(t *testing.T) {
+	input := agent.ApprovalRequest{ToolName: "write", Arguments: `{"path":"settings","content":"x","overwrite":true}`, TargetPath: ".harness.json"}
+	m := NewModel("")
+	m.width = 100
+	m.approval = &ApprovalRequest{ToolName: input.ToolName, Arguments: input.Arguments, Prompt: input.Prompt()}
+	if view := m.approvalBox(); !strings.Contains(view, ".harness.json") || !strings.Contains(view, "settings") {
+		t.Fatalf("approval omitted requested or resolved target: %s", view)
+	}
+}

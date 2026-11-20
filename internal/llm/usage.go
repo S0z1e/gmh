@@ -1,9 +1,15 @@
 package llm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 )
+
+type usageDecodeError struct{ error }
+
+func (e *usageDecodeError) Unwrap() error { return e.error }
 
 // UnmarshalJSON preserves explicit zero separately from absent/null cache
 // counters. It also accepts our own serialized Usage without losing unknowns.
@@ -11,9 +17,10 @@ func (u *Usage) UnmarshalJSON(data []byte) error {
 	type plain Usage
 	var decoded plain
 	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
+		return &usageDecodeError{err}
 	}
 	*u = Usage(decoded)
+	u.Invalid = u.Invalid || !u.Valid()
 	var fields struct {
 		Cached  *int `json:"cached_tokens"`
 		Hit     *int `json:"prompt_cache_hit_tokens"`
@@ -23,7 +30,7 @@ func (u *Usage) UnmarshalJSON(data []byte) error {
 		Reported *bool `json:"cache_usage_reported"`
 	}
 	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
+		return &usageDecodeError{err}
 	}
 	if fields.Reported == nil {
 		u.CachedTokens = 0
@@ -40,6 +47,7 @@ func (u *Usage) UnmarshalJSON(data []byte) error {
 			}
 		}
 	}
+	u.Invalid = u.Invalid || !u.Valid()
 	u.normalize()
 	return nil
 }
@@ -48,7 +56,7 @@ func (u *responsesUsage) UnmarshalJSON(data []byte) error {
 	type plain responsesUsage
 	var decoded plain
 	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
+		return &usageDecodeError{err}
 	}
 	*u = responsesUsage(decoded)
 	var fields struct {
@@ -57,14 +65,15 @@ func (u *responsesUsage) UnmarshalJSON(data []byte) error {
 		} `json:"input_tokens_details"`
 	}
 	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
+		return &usageDecodeError{err}
 	}
 	u.CacheUsageReported = fields.Details.Cached != nil
+	u.invalid = !validTokenSum(u.InputTokens, u.OutputTokens) || u.TotalTokens < 0 || u.InputTokensDetails.CachedTokens < 0 || u.OutputTokensDetails.ReasoningTokens < 0
 	return nil
 }
 
 func (u responsesUsage) sharedUsage() Usage {
-	usage := Usage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens, CachedTokens: u.InputTokensDetails.CachedTokens, ReasoningTokens: u.OutputTokensDetails.ReasoningTokens, CacheUsageReported: u.CacheUsageReported}
+	usage := Usage{Invalid: u.invalid, PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens, CachedTokens: u.InputTokensDetails.CachedTokens, ReasoningTokens: u.OutputTokensDetails.ReasoningTokens, CacheUsageReported: u.CacheUsageReported}
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
@@ -79,7 +88,7 @@ func (u *anthropicUsage) UnmarshalJSON(data []byte) error {
 	type plain anthropicUsage
 	var decoded plain
 	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
+		return &usageDecodeError{err}
 	}
 	*u = anthropicUsage(decoded)
 	var fields struct {
@@ -89,12 +98,13 @@ func (u *anthropicUsage) UnmarshalJSON(data []byte) error {
 		Creation *int `json:"cache_creation_input_tokens"`
 	}
 	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
+		return &usageDecodeError{err}
 	}
 	u.CacheUsageReported = fields.Cached != nil
 	u.hasInput = fields.Input != nil
 	u.hasOutput = fields.Output != nil
 	u.hasCreation = fields.Creation != nil
+	u.invalid = !validTokenSum(u.InputTokens, u.OutputTokens, u.CacheCreationInputTokens, u.CacheReadInputTokens)
 	return nil
 }
 
@@ -123,6 +133,7 @@ func (u *Usage) normalize() {
 
 // Add accumulates another Usage into this one (session totals).
 func (u *Usage) Add(o Usage) {
+	u.Invalid = u.Invalid || o.Invalid
 	o.normalize()
 	if o.PromptTokens != 0 || o.CompletionTokens != 0 || o.TotalTokens != 0 {
 		if u.PromptTokens == 0 && u.CompletionTokens == 0 && u.TotalTokens == 0 {
@@ -163,4 +174,110 @@ func (u Usage) String() string {
 		s += fmt.Sprintf(" reasoning=%d", u.ReasoningTokens)
 	}
 	return s
+}
+
+// traceWireUsage preserves missing/null scalar counters separately from zero.
+// A reported total can establish tokens even when the price breakdown is absent.
+func traceWireUsage(ctx context.Context, usage Usage, data string, responses bool) {
+	observer, _ := ctx.Value(traceKey{}).(*requestObservation)
+	if observer == nil {
+		return
+	}
+	var envelope struct {
+		Type     string          `json:"type"`
+		Usage    json.RawMessage `json:"usage"`
+		Response struct {
+			Usage json.RawMessage `json:"usage"`
+		} `json:"response"`
+	}
+	_ = json.Unmarshal([]byte(data), &envelope)
+	raw := envelope.Usage
+	if responses {
+		raw = envelope.Response.Usage
+	}
+	var counts struct {
+		Prompt     *int `json:"prompt_tokens"`
+		Completion *int `json:"completion_tokens"`
+		Input      *int `json:"input_tokens"`
+		Output     *int `json:"output_tokens"`
+		Total      *int `json:"total_tokens"`
+	}
+	_ = json.Unmarshal(raw, &counts)
+	input, output := counts.Prompt, counts.Completion
+	if responses {
+		input, output = counts.Input, counts.Output
+	}
+	// Empty usage objects contain no metering evidence. Preserve earlier
+	// snapshots when a later empty object arrives, but never invent a zero.
+	if !usage.Invalid && input == nil && output == nil && counts.Total == nil && !usage.CacheUsageReported && usage.ReasoningTokens == 0 && observer.trace.Usage == nil {
+		return
+	}
+	complete := input != nil && output != nil
+	// Usage objects are cumulative snapshots, not deltas. Missing counters do
+	// not erase earlier evidence, while explicit zeros replace previous values.
+	// Completeness still depends on the current final wire object below.
+	if previous := observer.trace.Usage; previous != nil {
+		if input == nil {
+			usage.PromptTokens = previous.PromptTokens
+		}
+		if output == nil {
+			usage.CompletionTokens = previous.CompletionTokens
+		}
+	}
+	if counts.Total != nil {
+		observer.wireTotal = counts.Total
+	}
+	usage.TotalTokens = 0
+	if observer.wireTotal != nil {
+		usage.TotalTokens = *observer.wireTotal
+	}
+	if sum := usage.PromptTokens + usage.CompletionTokens; usage.TotalTokens >= 0 && sum > usage.TotalTokens {
+		usage.TotalTokens = sum
+	}
+	final := !responses || envelope.Type == "response.completed" || envelope.Type == "response.incomplete"
+	traceUsage(ctx, usage, final && (counts.Total != nil || complete), final && complete)
+}
+
+// Valid reports whether counters can safely participate in accounting. A wire
+// total may exceed the input/output sum, but counters must never be negative
+// and the sum must be representable.
+func (u Usage) Valid() bool {
+	if u.Invalid {
+		return false
+	}
+	for _, n := range []int{u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CachedTokens, u.ReasoningTokens, u.CacheReportedPromptTokens, u.PromptCacheHitTokens, u.PromptTokensDetails.CachedTokens, u.CompletionTokensDetails.ReasoningTokens} {
+		if n < 0 {
+			return false
+		}
+	}
+	return u.CompletionTokens <= math.MaxInt-u.PromptTokens
+}
+
+// CanAdd checks the arithmetic used by Add without modifying either operand.
+func (u Usage) CanAdd(o Usage) bool {
+	o.normalize()
+	if !u.Valid() || !o.Valid() {
+		return false
+	}
+	a := []int{u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CachedTokens, u.ReasoningTokens, u.CacheReportedPromptTokens}
+	b := []int{o.PromptTokens, o.CompletionTokens, o.TotalTokens, o.CachedTokens, o.ReasoningTokens, o.CacheReportedPromptTokens}
+	for i, n := range a {
+		if b[i] > math.MaxInt-n {
+			return false
+		}
+	}
+	combined := u
+	combined.Add(o)
+	return combined.Valid()
+}
+
+func validTokenSum(values ...int) bool {
+	total := 0
+	for _, v := range values {
+		if v < 0 || v > math.MaxInt-total {
+			return false
+		}
+		total += v
+	}
+	return true
 }

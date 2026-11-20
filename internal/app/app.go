@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,22 +16,28 @@ import (
 
 	"minimalharness/internal/agent"
 	"minimalharness/internal/config"
+	"minimalharness/internal/guidance"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/plugins"
 	"minimalharness/internal/session"
 	"minimalharness/internal/skills"
 	"minimalharness/internal/tools"
+	"minimalharness/internal/workspace"
 )
 
 type Params struct {
-	Root         string
-	Mode         string // suggest (ask) or auto
-	Model        string
-	API          string // chat, responses or anthropic
-	MaxSteps     int
-	ContextLimit int
-	Resume       string
-	SessionID    string
+	// WorkspaceTrust records a direct user decision: trust, untrust, or empty
+	// to use the saved decision. It never comes from a project config.
+	WorkspaceTrust string
+	Root           string
+	Mode           string // suggest (ask) or auto
+	Model          string
+	API            string // chat, responses or anthropic
+	MaxSteps       int
+	ContextLimit   int
+	Resume         string
+	RebindSession  bool // direct startup consent, only valid with Resume
+	SessionID      string
 	// Provider selects a provider entry from the config file
 	// (defaultProvider when empty).
 	Provider string
@@ -65,12 +70,13 @@ type Params struct {
 }
 
 type App struct {
-	Cfg          *agent.Config
-	Store        *session.Store
-	History      []llm.Message
-	Skills       []skills.Skill
-	ContextLimit int
-	Root         string
+	WorkspaceTrusted bool
+	Cfg              *agent.Config
+	Store            *session.Store
+	History          []llm.Message
+	Skills           []skills.Skill
+	ContextLimit     int
+	Root             string
 	// Model is the resolved model entry: id, api, baseUrl,
 	// contextWindow, maxTokens, samplingParams, headers, input, cost.
 	Model config.Model
@@ -107,17 +113,29 @@ type App struct {
 	// pendingReminder is a reminder for the next turn snapshot set by a mode
 	// switch and persisted by the next runOnce with that snapshot.
 	pendingReminder string
+	// Writers with undelivered jobs remain owned across session switches.
+	retainedStores map[*session.Store]struct{}
 }
 
 // Setup builds the client, session and agent config. The caller sets
 // Cfg.OnEvent (the event renderer) before running anything.
 func Setup(p Params) (*App, error) {
-	absRoot, err := filepath.Abs(p.Root)
+	if p.RebindSession && p.Resume == "" {
+		return nil, fmt.Errorf("--rebind-session requires --resume")
+	}
+	identity, err := workspace.Identify(p.Root)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Stat(absRoot); err != nil {
-		return nil, fmt.Errorf("root not found: %s", absRoot)
+	absRoot := identity.Path
+	if p.WorkspaceTrust != "" {
+		if err := workspace.Decide(identity, p.WorkspaceTrust); err != nil {
+			return nil, err
+		}
+	}
+	trusted, err := workspace.Trusted(identity)
+	if err != nil {
+		return nil, err
 	}
 
 	// Config: flag > env > project file > global file > built-in
@@ -132,7 +150,7 @@ func Setup(p Params) (*App, error) {
 		}
 	} else {
 		var err error
-		cfg, err = config.LoadFor(absRoot)
+		cfg, err = config.LoadForTrust(absRoot, trusted)
 		if err != nil {
 			return nil, err
 		}
@@ -150,23 +168,7 @@ func Setup(p Params) (*App, error) {
 	// built-in default provider any more.
 	if !cfg.HasProviders() {
 		global, _ := config.GlobalPath()
-		return nil, fmt.Errorf("no providers configured: add a provider to %s (global) or %s (project)", global, config.ProjectPath(absRoot))
-	}
-
-	// API key: the provider's literal key or environment reference wins,
-	// else OPENAI_API_KEY.
-	apiKey := ""
-	if prov.APIKey != "" {
-		k, err := config.ResolveAPIKey(prov.APIKey)
-		if err != nil {
-			return nil, err
-		}
-		apiKey = k
-	} else {
-		apiKey = os.Getenv("OPENAI_API_KEY")
-	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("missing API key: set OPENAI_API_KEY, or set apiKey to a key or \"$NAME\" for provider %q in the config file", provName)
+		return nil, fmt.Errorf("no providers configured: add a provider to %s; project config requires a trusted workspace (--workspace-trust trust)", global)
 	}
 
 	// Model: flag > env > defaultModel (when the selected provider
@@ -210,6 +212,10 @@ func Setup(p Params) (*App, error) {
 	if baseURL == "" {
 		return nil, fmt.Errorf("provider %q: baseUrl is required", provName)
 	}
+	apiKey, headers, err := prov.ResolveCredentials(mdl, baseURL, os.Getenv("OPENAI_BASE_URL") != "")
+	if err != nil {
+		return nil, fmt.Errorf("provider %q: %w", provName, err)
+	}
 	mode := p.Mode
 	if mode == "" {
 		mode = cfg.Mode
@@ -222,14 +228,23 @@ func Setup(p Params) (*App, error) {
 	if p.Resume != "" {
 		id = p.Resume
 	}
-	store, err := session.New(id)
+	store, err := session.Open(id, session.OpenOptions{Workspace: absRoot, Rebind: p.RebindSession, Existing: p.Resume != ""})
 	if err != nil {
+		if p.Resume != "" {
+			return nil, fmt.Errorf("cannot resume session %q: %w", p.Resume, err)
+		}
 		return nil, err
 	}
 
-	a := &App{Store: store, Root: absRoot}
+	setupComplete := false
+	defer func() {
+		if !setupComplete {
+			_ = store.Close()
+		}
+	}()
+	a := &App{Store: store, Root: absRoot, WorkspaceTrusted: trusted}
 	if p.Resume != "" {
-		history, err := session.Load(p.Resume)
+		history, err := session.Load(store.ID)
 		if err != nil {
 			store.Close()
 			return nil, err
@@ -238,9 +253,10 @@ func Setup(p Params) (*App, error) {
 		a.ResumedMessage = fmt.Sprintf("Resumed session %s (%d messages).", p.Resume, len(history))
 	}
 
-	skillList := skills.Discover(absRoot)
+	skillList := skills.DiscoverForTrust(absRoot, trusted)
 	a.Skills = skillList
-	system := agent.SystemPrompt + agent.ProjectContext(absRoot) + skills.Listing(skillList)
+	system := agent.SystemPrompt
+	system += skills.Listing(skillList)
 
 	// Plugins: a bad plugin is skipped with a warning on stderr; it
 	// never fails Setup. Disabled with HARNESS_PLUGINS=0, or one by
@@ -249,7 +265,11 @@ func Setup(p Params) (*App, error) {
 	if cfg.Plugins != nil {
 		disabled = cfg.Plugins.Disabled
 	}
-	pluginReg, pluginErrs := plugins.Load(absRoot, disabled)
+	pluginReg := plugins.Untrusted(absRoot)
+	var pluginErrs []error
+	if trusted {
+		pluginReg, pluginErrs = plugins.Load(absRoot, disabled)
+	}
 	for _, err := range pluginErrs {
 		fmt.Fprintf(os.Stderr, "warning: plugin: %v\n", err)
 	}
@@ -263,12 +283,16 @@ func Setup(p Params) (*App, error) {
 	pluginReg.ModeGetter = func() string { return string(a.ToolMode()) }
 	pluginReg.SessionGetter = a.sessionID
 
-	executor := &tools.Executor{Root: absRoot, ImageInput: slices.Contains(mdl.Input, "image"), Plugins: pluginReg}
+	executor := &tools.Executor{Root: absRoot, UntrustedWorkspace: !trusted, ImageInput: slices.Contains(mdl.Input, "image"), Plugins: pluginReg}
+	if trusted {
+		executor.Guidance = guidance.ForWorkspace(identity)
+	}
+	executor.BashEnv = cfg.BashEnv
 	// Bash output files live in this session's directory (never in
 	// the project tree): the loop's read tool can pull them, and a
 	// new session / resume re-points the executor (see newSession
 	// and LoadSession, which reset it alongside the audit hook).
-	executor.OutputDir = sessionOutputDir(store.ID)
+	executor.OutputDir = store.OutputDir()
 	executor.SwitchSession(store.ID)
 	if p.BashTimeoutSeconds > 0 {
 		executor.BashTimeout = time.Duration(p.BashTimeoutSeconds) * time.Second
@@ -355,33 +379,17 @@ func Setup(p Params) (*App, error) {
 		maxTokens = config.DefaultMaxTokens
 	}
 
-	// Headers: provider headers, model headers on top. A "$NAME"
-	// value reads the environment; literals pass through.
-	var headers map[string]string
-	merged := map[string]string{}
-	for k, v := range prov.Headers {
-		merged[k] = v
-	}
-	for k, v := range mdl.Headers {
-		merged[k] = v
-	}
-	if len(merged) > 0 {
-		headers = make(map[string]string, len(merged))
-		for k, v := range merged {
-			rv, err := config.ResolveValue(v)
-			if err != nil {
-				return nil, err
-			}
-			headers[k] = rv
-		}
-	}
-
 	a.Model = mdl
 	a.Config = cfg
 	a.Provider = provName
 	// The tool mode starts at default, with the full tool list.
 	a.toolMode = agent.ToolModeDefault
 	a.allTools = append(agent.ToolDefs(), pluginTools...)
+	if !trusted {
+		a.allTools = slices.DeleteFunc(a.allTools, func(d llm.ToolDef) bool {
+			return d.Function.Name == tools.GuidanceTool || d.Function.Name == tools.GitStatusTool
+		})
+	}
 	timeout, idle := clientTimeouts(mdl)
 	a.Cfg = &agent.Config{
 		Client:              &llm.Client{BaseURL: baseURL, APIKey: apiKey, Model: mdl.ID, API: apiMode, MaxTokens: maxTokens, SamplingParams: mdl.SamplingParams, Headers: headers, Effort: mdl.Effort, Thinking: mdl.Thinking, PromptCacheKey: a.sessionID(), Timeout: timeout, IdleTimeout: idle},
@@ -392,6 +400,8 @@ func Setup(p Params) (*App, error) {
 		Mode:                mode,
 		MaxSteps:            p.MaxSteps,
 		Session:             store,
+		Verification:        cfg.Verification,
+		TurnBudget:          cfg.TurnBudget,
 		DenyInsteadOfPrompt: deny,
 	}
 
@@ -424,6 +434,7 @@ func Setup(p Params) (*App, error) {
 		return nil, err
 	}
 	a.Rates = rates
+	a.Cfg.UsageRates = rates
 
 	// Images stored in a resumed session carry only paths; re-read
 	// their bytes now, while the executor exists.
@@ -435,6 +446,7 @@ func Setup(p Params) (*App, error) {
 			return nil, fmt.Errorf("-image %s: %w", p, err)
 		}
 	}
+	setupComplete = true
 	return a, nil
 }
 
@@ -452,28 +464,8 @@ func (a *App) AttachImage(path string) (llm.Image, error) {
 	return img, nil
 }
 
-// hydrateImages re-reads the bytes of every image in msgs whose
-// session file stored only the path (Data is never written to the
-// file). Images whose file is gone stay in history as text only:
-// the marker line says an image was there, and the payload builders
-// skip images with no bytes.
-func (a *App) hydrateImages(msgs []llm.Message) {
-	for i := range msgs {
-		for j := range msgs[i].Images {
-			img := &msgs[i].Images[j]
-			if img.Data != "" || img.Path == "" {
-				continue
-			}
-			loader := a.Cfg.Exec.LoadImage
-			if img.Workspace || msgs[i].Kind == "image" {
-				loader = a.Cfg.Exec.ReadImage
-			}
-			if loaded, err := loader(img.Path); err == nil {
-				*img = loaded
-			}
-		}
-	}
-}
+// hydrateImages uses the same immutable-blob loader for every history entry point.
+func (a *App) hydrateImages(msgs []llm.Message) { session.HydrateImages(msgs) }
 
 // SplitModelArg parses a /model argument: "provider/model" or a bare
 // model id (the provider is resolved by FindModel, current first).
@@ -582,21 +574,6 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 	if mdl.ID == "" {
 		return "", "", "", fmt.Errorf("provider %q: no model configured (set \"model\" or add a \"models\" entry)", provName)
 	}
-	// API key: the provider's literal key or environment reference wins,
-	// else OPENAI_API_KEY.
-	apiKey := ""
-	if prov.APIKey != "" {
-		k, err := config.ResolveAPIKey(prov.APIKey)
-		if err != nil {
-			return "", "", "", err
-		}
-		apiKey = k
-	} else {
-		apiKey = os.Getenv("OPENAI_API_KEY")
-	}
-	if apiKey == "" {
-		return "", "", "", fmt.Errorf("missing API key: set OPENAI_API_KEY, or set apiKey to a key or \"$NAME\" for provider %q in the config file", provName)
-	}
 	apiMode := a.Cfg.Client.API
 	if mdl.API != "" {
 		m, err := config.NormalizeAPI(mdl.API)
@@ -612,6 +589,10 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 	if baseURL == "" {
 		return "", "", "", fmt.Errorf("provider %q: baseUrl is required", provName)
 	}
+	apiKey, headers, err := prov.ResolveCredentials(mdl, baseURL, os.Getenv("OPENAI_BASE_URL") != "")
+	if err != nil {
+		return "", "", "", fmt.Errorf("provider %q: %w", provName, err)
+	}
 	maxTokens := 0
 	if v := os.Getenv("ANTHROPIC_MAX_TOKENS"); v != "" {
 		fmt.Sscanf(v, "%d", &maxTokens)
@@ -622,24 +603,6 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 	}
 	if maxTokens <= 0 {
 		maxTokens = config.DefaultMaxTokens
-	}
-	var headers map[string]string
-	merged := map[string]string{}
-	for k, v := range prov.Headers {
-		merged[k] = v
-	}
-	for k, v := range mdl.Headers {
-		merged[k] = v
-	}
-	if len(merged) > 0 {
-		headers = make(map[string]string, len(merged))
-		for k, v := range merged {
-			rv, err := config.ResolveValue(v)
-			if err != nil {
-				return "", "", "", err
-			}
-			headers[k] = rv
-		}
 	}
 	contextLimit := 0
 	if v := os.Getenv("OPENAI_CONTEXT_LIMIT"); v != "" {
@@ -749,14 +712,6 @@ func (a *App) fireSessionEvents(oldID, newID string) {
 	}
 }
 
-// sessionOutputDir is where one session's bash output files go:
-// <sessions dir>/<session id>/bash-output. The files are named
-// bash-<pid>-<seq>.log by the executor, so two processes resuming
-// the same session never share a file.
-func sessionOutputDir(id string) string {
-	return filepath.Join(session.Dir(), id, "bash-output")
-}
-
 func (a *App) NewSession() (*session.Store, error) {
 	return a.newSession(true)
 }
@@ -766,7 +721,7 @@ func (a *App) NewSession() (*session.Store, error) {
 // ResetSession (/clear) creates a fresh session too, but the design
 // says it does NOT fire the session events, so it passes false.
 func (a *App) newSession(fire bool) (*session.Store, error) {
-	store, err := session.New("")
+	store, err := session.Open("", session.OpenOptions{Workspace: a.Root})
 	if err != nil {
 		return nil, err
 	}
@@ -790,13 +745,11 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 		if a.Cfg.Exec != nil {
 			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 			// Bash output files follow the current session too.
-			a.Cfg.Exec.OutputDir = sessionOutputDir(store.ID)
+			a.Cfg.Exec.OutputDir = store.OutputDir()
 			a.Cfg.Exec.SwitchSession(store.ID)
 		}
 	}
-	if old != nil {
-		_ = old.Close()
-	}
+	a.retainOrClose(old)
 	if fire {
 		a.fireSessionEvents(oldID, store.ID)
 	}
@@ -807,23 +760,49 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 // (like --resume) and the store is opened for appending. The id must
 // name a session file; a missing one is an error, not a new session.
 func (a *App) LoadSession(id string) ([]llm.Message, error) {
-	if _, err := os.Stat(filepath.Join(session.Dir(), id+".jsonl")); os.IsNotExist(err) {
-		return nil, fmt.Errorf("unknown session %q (see /sessions)", id)
-	}
-	history, err := session.Load(id)
-	if err != nil {
-		return nil, err
-	}
-	store, err := session.New(id)
-	if err != nil {
+	if err := session.ValidateSessionID(id); err != nil {
 		return nil, err
 	}
 	old := a.Store
+	store := old
+	reuse := old != nil && old.Owns(id)
+	if !reuse {
+		for retained := range a.retainedStores {
+			if retained.Owns(id) {
+				store, reuse = retained, true
+				break
+			}
+		}
+	}
+	if reuse {
+		if err := store.CheckWorkspace(a.Root); err != nil {
+			return nil, err
+		}
+	}
+	if !reuse {
+		var err error
+		store, err = session.Open(id, session.OpenOptions{Workspace: a.Root, Existing: true})
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("unknown session %q (see /sessions): %w", id, err)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	history, err := session.Load(store.ID)
+	if err != nil {
+		if !reuse {
+			store.Close()
+		}
+		return nil, err
+	}
 	oldID := ""
 	if old != nil {
 		oldID = old.ID
 	}
 	a.Store = store
+	delete(a.retainedStores, store)
+	a.hydrateImages(history)
 	a.History = history
 	a.PendingImages = nil
 	a.ResumedMessage = fmt.Sprintf("Resumed session %s (%d messages).", id, len(history))
@@ -838,12 +817,15 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 		if a.Cfg.Exec != nil {
 			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 			// Bash output files follow the resumed session too.
-			a.Cfg.Exec.OutputDir = sessionOutputDir(store.ID)
+			a.Cfg.Exec.OutputDir = store.OutputDir()
+			if !reuse {
+				a.Cfg.Exec.ReacquireOutput(store.OutputDir())
+			}
 			a.Cfg.Exec.SwitchSession(store.ID)
 		}
 	}
-	if old != nil {
-		_ = old.Close()
+	if old != store {
+		a.retainOrClose(old)
 	}
 	a.fireSessionEvents(oldID, store.ID)
 	return history, nil
@@ -852,9 +834,22 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 // RenameSession keeps the executor and plugin state under the transcript's id.
 func (a *App) RenameSession(oldID, newID string) error {
 	var err error
-	current := a.Store != nil && a.Store.ID == oldID
-	if current {
-		err = a.Store.Rename(newID)
+	current := a.Store != nil && a.Store.Owns(oldID)
+	owner := a.Store
+	if !current {
+		owner = nil
+		for retained := range a.retainedStores {
+			if retained.Owns(oldID) {
+				owner = retained
+				break
+			}
+		}
+	}
+	if owner != nil {
+		// A filesystem alias can select this writer, but registries and
+		// plugin ownership use the actual ID captured at launch.
+		oldID = owner.ID
+		err = owner.Rename(newID)
 	} else {
 		err = session.RenameSession(oldID, newID)
 	}
@@ -864,7 +859,7 @@ func (a *App) RenameSession(oldID, newID string) error {
 	if a.Cfg != nil && a.Cfg.Exec != nil {
 		a.Cfg.Exec.RenameSession(oldID, newID)
 		if current {
-			a.Cfg.Exec.OutputDir = sessionOutputDir(newID)
+			a.Cfg.Exec.OutputDir = a.Store.OutputDir()
 		}
 	}
 	if current && a.Cfg != nil && a.Cfg.Client != nil {
@@ -882,10 +877,17 @@ func (a *App) RenameSession(oldID, newID string) error {
 // rates are configured (App.Rates); the estimate is always labelled
 // with its source, and the provider's real price stays unverified.
 type Runner struct {
-	historyLoadErr error
-	App            *App
-	SessionUsage   llm.Usage
-	SessionCost    float64 // USD estimate, accumulated per turn
+	historyLoadErr          error
+	App                     *App
+	SessionUsage            llm.Usage
+	RunUsage                llm.Usage
+	RunCost                 float64
+	SessionMetering         session.UsageTotals
+	usageStore              *session.Store
+	runBaseline             session.UsageTotals
+	MeteringAvailable       bool
+	runAccountingIncomplete bool
+	SessionCost             float64 // USD estimate, accumulated per turn
 	// Turns counts completed agent turns (slash commands excluded),
 	// for the TUI meta line.
 	Turns int
@@ -912,22 +914,24 @@ func (r *Runner) ResetSession() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	r.SessionUsage = llm.Usage{}
-	r.SessionCost = 0
+	if err := r.RefreshUsage(); err != nil {
+		return "", err
+	}
 	r.Turns = 0
 	r.LastErr = nil
 	return store.ID, nil
 }
 
-// ResumeSession switches to an existing session and zeroes the
-// runner's totals. It returns how many messages were loaded.
+// ResumeSession restores lifetime totals and starts fresh current-run totals. It returns how many messages were loaded.
 func (r *Runner) ResumeSession(id string) (int, error) {
 	history, err := r.App.LoadSession(id)
 	if err != nil {
 		return 0, err
 	}
-	r.SessionUsage = llm.Usage{}
-	r.SessionCost = 0
+	r.usageStore = nil
+	if err := r.RefreshUsage(); err != nil {
+		return 0, err
+	}
 	r.Turns = 0
 	r.LastErr = nil
 	return len(history), nil
@@ -1070,20 +1074,26 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 	}
 	switch line {
 	case "/quit", "/exit":
-		// Quitting abandons running background jobs (their child
-		// processes keep running, orphaned): say so plainly.
-		var running []string
-		for _, j := range r.App.Cfg.Exec.Jobs() {
-			if j.Status() == tools.JobRunning {
-				running = append(running, j.ID)
-			}
-		}
-		if len(running) > 0 {
-			r.Print("Background jobs still running (%s); quitting abandons them.", strings.Join(running, ", "))
+		if err := r.App.Close(); err != nil {
+			r.Print("[error] close session jobs: %v", err)
+			return false
 		}
 		return true
 	case "/usage":
-		r.Print("[usage] session: %s | %s", r.SessionUsage, r.costLine(r.SessionCost))
+		if err := r.RefreshUsage(); err != nil {
+			r.LastErr = err
+			r.Print("[error] %v", err)
+			return false
+		}
+		r.Print("[usage] session: %s | %s | %s\n[usage] current run: %s | %s", r.sessionUsageLine(), r.sessionCostLine(), r.usageCoverage(), r.runUsageLine(), r.runCostLine())
+		return false
+	case "/prune-artifacts":
+		report, err := session.PruneArtifacts(ctx, time.Now())
+		r.Print("[retention] removed %d unreferenced image blobs (%d bytes)", report.DeletedBlobs, report.ReclaimedBytes)
+		if err != nil {
+			r.LastErr = err
+			r.Print("[error] %v", err)
+		}
 		return false
 	case "/jobs":
 		r.printJobs()
@@ -1097,6 +1107,11 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 		r.Print("Context cleared. Cleared messages stay in %s but won't reload on --resume (it starts from the clear point).", r.App.Store.Path)
 		return false
 	case "/compact":
+		if err := r.RefreshUsage(); err != nil {
+			r.LastErr = err
+			r.Print("[error] %v", err)
+			return false
+		}
 		r.doCompact(ctx)
 		return false
 	}
@@ -1240,6 +1255,11 @@ func (r *Runner) printJobs() {
 }
 
 func (r *Runner) runOnce(ctx context.Context, task string) {
+	if err := r.RefreshUsage(); err != nil {
+		r.LastErr = err
+		r.Print("[error] %v", err)
+		return
+	}
 	if r.historyLoadErr != nil {
 		msgs, err := session.Load(r.App.Store.ID)
 		if err != nil {
@@ -1271,22 +1291,6 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		r.Print("Unknown skill: %s", name)
 		return
 	}
-	// Keyword trigger: if the task names a skill as a whole word, load
-	// its full text into the turn before the model sees the task.
-	for _, sk := range skills.MatchKeywords(task, r.App.Skills) {
-		body, err := sk.Load()
-		if err != nil {
-			continue
-		}
-		r.Print("Auto-loaded skill %s (mentioned in your task).", sk.Name)
-		skillMsg := llm.Message{Role: "user", Kind: "skill", Content: "Skill " + sk.Name + ":\n" + body}
-		r.App.History = append(r.App.History, skillMsg)
-		if err := r.App.Store.Append(skillMsg); err != nil {
-			r.LastErr = fmt.Errorf("save session: %w", err)
-			r.Print("[error] %v", r.LastErr)
-			return
-		}
-	}
 	userMsg := llm.Message{Role: "user", Content: task, Kind: "task"}
 	// Images attached for this turn (-image, /image, RPC) ride on
 	// the task message itself, then clear: they live in history
@@ -1305,7 +1309,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	// Context hooks retain their explicit, transient rewrite semantics.
 	// The harness snapshot is appended afterwards, so mode and plugin state
 	// no longer change the system prefix or disappear on the next turn.
-	history := r.App.History
+	history := agent.WithoutHistoricalGuidance(r.App.History)
 	if r.App.Plugins != nil {
 		history = r.App.Plugins.RunContextHooks(ctx, r.App.sessionID(), string(r.App.ToolMode()), history)
 	}
@@ -1332,6 +1336,8 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	r.App.History = append(r.App.History, turnContext)
 	history = append(append([]llm.Message(nil), history...), turnContext)
 	r.configureCompaction()
+	previousCost := r.SessionCost
+	previousMetering := r.SessionMetering
 	text, usage, err := r.App.Cfg.Run(ctx, history)
 	r.LastErr = err
 	if err != nil {
@@ -1348,22 +1354,25 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		r.historyLoadErr = loadErr
 		r.LastErr = errors.Join(r.LastErr, loadErr)
 		r.App.Cfg.LastTerminalReason = agent.TerminalError
+		r.App.Cfg.LastTaskOutcome = agent.OutcomeIncomplete
 		if r.App.Cfg.OnEvent != nil {
-			r.App.Cfg.OnEvent(agent.Event{Kind: agent.EventError, Err: r.LastErr, Text: text, TerminalReason: agent.TerminalError})
+			r.App.Cfg.OnEvent(agent.Event{Kind: agent.EventError, Err: r.LastErr, Text: text, TerminalReason: agent.TerminalError, TaskOutcome: agent.OutcomeIncomplete})
 		}
 		r.Print("[error] %v", loadErr)
 	}
-	r.SessionUsage.Add(usage)
-	turnCost := r.App.Rates.Cost(usage, time.Now())
-	r.SessionCost += turnCost
+	turnCost := r.accountRun(usage, previousCost)
 	// One Print call for both lines: consecutive tea.Println calls
 	// reverse their order in Bubble Tea v2 (verified), so the turn
 	// and session lines must travel as a single print.
 	turnLine := fmt.Sprintf("[usage] turn: %s", usage)
-	if r.App.Rates.Configured {
-		turnLine += fmt.Sprintf(" | est. cost: ~$%.4f", turnCost)
+	if r.MeteringAvailable && r.App.Rates.Configured && r.SessionMetering.Attempts-previousMetering.Attempts == r.SessionMetering.PricedAttempts-previousMetering.PricedAttempts {
+		turnLine += " | " + r.costLine(turnCost)
 	}
-	r.Print("\n%s\n[usage] session: %s | %s", turnLine, r.SessionUsage, r.costLine(r.SessionCost))
+	if !r.MeteringAvailable {
+		r.Print("\n%s\n[usage] session: unavailable (accounting error)", turnLine)
+		return
+	}
+	r.Print("\n%s\n[usage] session: %s | %s", turnLine, r.sessionUsageLine(), r.sessionCostLine())
 }
 
 // Rollback drops the last n turns from the session — Codex's
@@ -1380,7 +1389,7 @@ func (r *Runner) Rollback(n int) (dropped int, archive string, err error) {
 	if dropped == 0 {
 		return 0, "", fmt.Errorf("nothing to roll back: no turns in this session")
 	}
-	archive, err = r.App.Store.ArchiveCopy(fmt.Sprintf("%s-pre-rollback-%s", r.App.Store.ID, time.Now().Format("150405")))
+	archive, err = r.App.Store.ArchiveCopy(fmt.Sprintf("%s-pre-rollback-%d", r.App.Store.ID, time.Now().UnixNano()))
 	if err != nil {
 		return 0, "", err
 	}
@@ -1401,15 +1410,17 @@ func (r *Runner) Rollback(n int) (dropped int, archive string, err error) {
 // doCompact summarises history, saves the original transcript to a
 // separate file, and replaces history with the summary.
 func (r *Runner) doCompact(ctx context.Context) {
+	r.LastErr = nil
 	if len(r.App.History) == 0 {
 		r.Print("[compact] nothing to compact.")
 		return
 	}
 	r.configureCompaction()
+	previousCost := r.SessionCost
 	_, usage, err := r.App.Cfg.Compact(ctx, r.App.History)
-	r.SessionUsage.Add(usage)
-	r.SessionCost += r.App.Rates.Cost(usage, time.Now())
+	r.accountRun(usage, previousCost)
 	if err != nil {
+		r.LastErr = err
 		r.Print("[compact] failed: %v (history unchanged)", err)
 		return
 	}

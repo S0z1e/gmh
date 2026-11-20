@@ -112,3 +112,15 @@ func TestImageDescribeAndDataURL(t *testing.T) {
 		t.Fatalf("session JSON must carry the path: %s", b)
 	}
 }
+
+func TestUnavailableImagesAreExplicitInEveryWireFormat(t *testing.T) {
+	m := Message{Role: "user", Images: []Image{{Path: "lost.png", Digest: strings.Repeat("a", 64), MediaType: "image/png", Unavailable: "saved blob is missing"}}}
+	_, responses := toResponsesInput([]Message{m})
+	_, anthropic := toAnthropicMessages([]Message{m})
+	for _, wire := range []any{toChatWireMessage(m), responses, anthropic} {
+		b, err := json.Marshal(wire)
+		if err != nil || !strings.Contains(string(b), "Image unavailable") || !strings.Contains(string(b), "lost.png") || strings.Contains(string(b), "base64") {
+			t.Fatalf("missing unavailable observation: %s %v", b, err)
+		}
+	}
+}

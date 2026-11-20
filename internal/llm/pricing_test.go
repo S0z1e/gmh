@@ -105,3 +105,37 @@ func TestRatesFromEnvErrors(t *testing.T) {
 		t.Fatal("negative rate should error")
 	}
 }
+
+func TestBudgetRatesRequireEveryComponentAndAcceptExplicitZero(t *testing.T) {
+	for _, key := range []string{"OPENAI_PRICE_INPUT_PER_MTOK", "OPENAI_PRICE_OUTPUT_PER_MTOK", "OPENAI_PRICE_CACHED_PER_MTOK", "OPENAI_PRICE_PEAK_INPUT_PER_MTOK", "OPENAI_PRICE_PEAK_OUTPUT_PER_MTOK", "OPENAI_PRICE_PEAK_CACHED_PER_MTOK"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("OPENAI_PRICE_INPUT_PER_MTOK", "1")
+	r, err := RatesFromEnv()
+	if err != nil || !r.Configured || r.Complete {
+		t.Fatalf("partial rates=%+v err=%v", r, err)
+	}
+	t.Setenv("OPENAI_PRICE_INPUT_PER_MTOK", "0")
+	t.Setenv("OPENAI_PRICE_OUTPUT_PER_MTOK", "0")
+	t.Setenv("OPENAI_PRICE_CACHED_PER_MTOK", "0")
+	r, err = RatesFromEnv()
+	if err != nil || !r.Configured || !r.Complete {
+		t.Fatalf("free rates=%+v err=%v", r, err)
+	}
+	for _, bad := range []string{"NaN", "+Inf", "-Inf"} {
+		t.Setenv("OPENAI_PRICE_INPUT_PER_MTOK", bad)
+		if _, err := RatesFromEnv(); err == nil {
+			t.Fatal("accepted non-finite rate", bad)
+		}
+	}
+}
+
+func TestBudgetCostZeroInputNeedsNoCacheCounter(t *testing.T) {
+	r := Rates{InputPerMTok: 1, OutputPerMTok: 1, CachedPerMTok: .5, Configured: true, Complete: true}
+	for _, output := range []int{0, 1} {
+		cost, known := r.BudgetCost(Usage{PromptTokens: 0, CompletionTokens: output, TotalTokens: output}, time.Unix(0, 0))
+		if !known || cost == nil || cost.RatString() != []string{"0", "1/1000000"}[output] {
+			t.Fatalf("zero input has known zero cached tokens: output=%d cost=%v known=%v", output, cost, known)
+		}
+	}
+}

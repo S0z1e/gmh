@@ -357,6 +357,7 @@ func TestLoadRejectsBadValues(t *testing.T) {
 func TestLoadForProjectOverridesGlobal(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	globalDir := filepath.Join(home, ".minimal-harness")
 	if err := os.MkdirAll(globalDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -371,7 +372,7 @@ func TestLoadForProjectOverridesGlobal(t *testing.T) {
 	// A project file may name a provider only the global file defines.
 	root := t.TempDir()
 	write(t, root, ".harness.json", `{"defaultProvider": "openconsole"}`)
-	f, err := LoadFor(root)
+	f, err := LoadForTrust(root, true)
 	if err != nil {
 		t.Fatal(err)
 	}

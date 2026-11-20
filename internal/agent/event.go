@@ -55,13 +55,13 @@ const (
 	// Text says which attempt failed and how long the wait is;
 	// RetryAttempt is the attempt number about to run.
 	EventStepRetry EventKind = "step_retry"
-	// EventStepDiscard fires before a retry of an LLM call whose
+	// EventStepDiscard fires when a corrupt partial reply is abandoned, or before a retry whose
 	// stream was cut off after partial output: it tells every
 	// renderer to drop everything streamed for the current step
 	// so far — text deltas and thinking deltas — because the
 	// stream is being replayed from scratch. Nothing from the
 	// discarded attempt enters history or the session. RetryAttempt
-	// is the attempt number about to run, like EventStepRetry.
+	// is the attempt number about to run, or 0 when no retry remains.
 	EventStepDiscard EventKind = "step_discard"
 )
 
@@ -75,8 +75,12 @@ type TerminalReason string
 
 const (
 	// TerminalEndTurn: the model finished with no more tool calls.
-	TerminalEndTurn     TerminalReason = "end_turn"
-	TerminalOutputLimit TerminalReason = "output_limit"
+	TerminalEndTurn            TerminalReason = "end_turn"
+	TerminalOutputLimit        TerminalReason = "output_limit"
+	TerminalBudgetExceeded     TerminalReason = "budget_exceeded"
+	TerminalBudgetUnavailable  TerminalReason = "budget_unavailable"
+	TerminalStopCap            TerminalReason = "stop_cap"
+	TerminalVerificationFailed TerminalReason = "verification_failed"
 	// TerminalMaxTurns: the step cap was hit.
 	TerminalMaxTurns TerminalReason = "max_turns"
 	// TerminalAbort: the turn was aborted (context cancelled).
@@ -94,7 +98,8 @@ const (
 )
 
 type Event struct {
-	Kind EventKind
+	StepID string
+	Kind   EventKind
 	// Text is a streamed delta for TextDelta, the final answer for Done.
 	// For Error it carries the turn's last text — the grace summary
 	// on a step cap, the model's last message otherwise — so a
@@ -103,8 +108,12 @@ type Event struct {
 	// produced no text.
 	Text string
 	// ToolName / ToolArgs identify the call for ToolStart.
-	ToolName string
-	ToolArgs string
+	ToolName   string
+	ToolArgs   string
+	ToolCallID string
+	// InvocationID identifies validated effective args. Early rejections
+	// carry only ToolCallID, since no invocation was committed.
+	InvocationID string
 	// ToolOutput is the observation for ToolEnd (including the "Error:"
 	// prefix when ToolErr is set).
 	ToolOutput     string
@@ -120,6 +129,10 @@ type Event struct {
 	// found, for ToolEnd. Only those two tools set it; other tools
 	// leave it 0.
 	ToolCount int
+	// ToolTruncated marks omitted results; ToolCountLowerBound distinguishes
+	// an incomplete search count from an exact total with capped display.
+	ToolTruncated       bool
+	ToolCountLowerBound bool
 	// JobID names the background job for the background events.
 	JobID string
 	// Usage is the per-call usage for StepUsage, the turn total for Done.
@@ -132,6 +145,7 @@ type Event struct {
 	// TerminalReason says why the turn ended, for Done and Error.
 	// Empty for all other events.
 	TerminalReason TerminalReason
+	TaskOutcome    TaskOutcome
 	// RetryAttempt is the attempt number about to run, for
 	// EventStepRetry and EventStepDiscard. 0 for all other events.
 	RetryAttempt int

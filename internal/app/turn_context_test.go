@@ -38,12 +38,12 @@ func TestTurnContextKeepsWirePrefixAcrossTurnsAndResume(t *testing.T) {
 				case "responses":
 					fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n")
 				case "anthropic":
-					fmt.Fprint(w, "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n")
+					fmt.Fprint(w, "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n")
 				}
 			}))
 			defer srv.Close()
 			t.Setenv("OPENAI_BASE_URL", srv.URL)
-			a, err := Setup(Params{Root: root, API: api, Mode: "auto", MaxSteps: 2})
+			a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, API: api, Mode: "auto", MaxSteps: 2})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -109,7 +109,7 @@ func TestTurnContextCapturesModeChangedByHook(t *testing.T) {
 	srv := recordingServer(t, &bodies)
 	defer srv.Close()
 	t.Setenv("OPENAI_BASE_URL", srv.URL)
-	a, err := Setup(Params{Root: root, Mode: "auto", MaxSteps: 2})
+	a, err := Setup(Params{WorkspaceTrust: "trust", Root: root, Mode: "auto", MaxSteps: 2})
 	if err != nil {
 		t.Fatal(err)
 	}

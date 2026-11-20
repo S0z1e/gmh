@@ -3,8 +3,8 @@
 package main
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -15,33 +15,47 @@ import (
 
 	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
+	"minimalharness/internal/input"
 	"minimalharness/internal/rpc"
+	"minimalharness/internal/session"
 	"minimalharness/internal/uimode"
 )
 
 func main() {
 	var (
-		printMode = flag.String("p", "", "print mode: run one task and exit")
-		root      = flag.String("root", ".", "workspace root")
-		mode      = flag.String("mode", "", "suggest (ask) or auto (default config or suggest)")
-		model     = flag.String("model", "", "model id (default OPENAI_MODEL or config defaultModel)")
-		api       = flag.String("api", "", "chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages (default OPENAI_API_MODE or config)")
-		provider  = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
-		config    = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
-		maxSteps  = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
-		resume    = flag.String("resume", "", "resume session id")
-		sessionID = flag.String("session", "", "session id (default: timestamp)")
-		ctxLimit  = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
-		ui        = flag.String("ui", "auto", "ui: auto, plain or tui (ignored by -p, which is always plain)")
-		deny      = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1; -p always denies)")
-		sandbox   = flag.Bool("sandbox", false, "run bash calls under bwrap (bubblewrap): the workspace is the only writable directory (also env HARNESS_SANDBOX=1 or config sandbox)")
-		bashTO    = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
-		bgThresh  = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
-		rpcMode   = flag.Bool("rpc", false, "RPC mode: JSONL over stdin/stdout for a GUI (see README); stdout carries protocol data only")
-		images    stringList
+		printMode      = flag.String("p", "", "print mode: run one task and exit")
+		root           = flag.String("root", ".", "workspace root")
+		workspaceTrust = flag.String("workspace-trust", "", "save workspace trust: trust or untrust (default: saved decision)")
+		mode           = flag.String("mode", "", "suggest (ask) or auto (default config or suggest)")
+		model          = flag.String("model", "", "model id (default OPENAI_MODEL or config defaultModel)")
+		api            = flag.String("api", "", "chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages (default OPENAI_API_MODE or config)")
+		provider       = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
+		config         = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
+		maxSteps       = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
+		viewSessionID  = flag.String("view-session", "", "read a session as JSONL without opening a writer or loading providers")
+		resume         = flag.String("resume", "", "resume session id")
+		rebindSession  = flag.Bool("rebind-session", false, "explicitly bind resumed or legacy history to this workspace")
+		sessionID      = flag.String("session", "", "session id (default: timestamp)")
+		ctxLimit       = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
+		ui             = flag.String("ui", "auto", "ui: auto, plain or tui (ignored by -p, which is always plain)")
+		deny           = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1; -p always denies)")
+		sandbox        = flag.Bool("sandbox", false, "run bash calls under bwrap (bubblewrap): the workspace is the only writable directory (also env HARNESS_SANDBOX=1 or config sandbox)")
+		bashTO         = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
+		bgThresh       = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
+		rpcMode        = flag.Bool("rpc", false, "RPC mode: JSONL over stdin/stdout for a GUI (see README); stdout carries protocol data only")
+		images         stringList
 	)
 	flag.Var(&images, "image", "attach an image file to the first turn (repeatable; png, jpg, gif, webp; the model must declare image input)")
 	flag.Parse()
+	if *viewSessionID != "" {
+		if *rpcMode || *printMode != "" || *resume != "" || *sessionID != "" || *rebindSession {
+			fatal(fmt.Errorf("--view-session conflicts with --rpc, -p, --resume and --session"))
+		}
+		if err := viewSession(os.Stdout, *viewSessionID); err != nil {
+			fatal(err)
+		}
+		return
+	}
 
 	if *rpcMode && *printMode != "" {
 		fatal(fmt.Errorf("--rpc conflicts with -p"))
@@ -57,11 +71,11 @@ func main() {
 			fatal(err)
 		}
 		if uiMode == "tui" {
-			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *sandbox, images); err != nil {
+			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *sandbox, images, *workspaceTrust, *rebindSession); err != nil {
 				fmt.Fprintf(os.Stderr, "harness: TUI unavailable (%v); continuing in plain mode.\n", err)
+			} else {
+				return // Windows waits for the child rather than replacing this process.
 			}
-			// execTUI replaces this process on success; reaching here
-			// means it failed and we fall back to plain mode.
 		} else if *ui == "tui" {
 			fmt.Fprintln(os.Stderr, "harness: --ui tui needs a terminal; using plain mode.")
 		}
@@ -69,6 +83,7 @@ func main() {
 
 	a, err := app.Setup(app.Params{
 		Root:                       *root,
+		WorkspaceTrust:             *workspaceTrust,
 		Mode:                       *mode,
 		Model:                      *model,
 		API:                        *api,
@@ -77,6 +92,7 @@ func main() {
 		MaxSteps:                   *maxSteps,
 		ContextLimit:               *ctxLimit,
 		Resume:                     *resume,
+		RebindSession:              *rebindSession,
 		SessionID:                  *sessionID,
 		DenyInsteadOfPrompt:        *deny || *printMode != "",
 		Sandbox:                    *sandbox,
@@ -88,11 +104,18 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	defer a.Store.Close()
+	defer func() {
+		if err := a.Close(); err != nil {
+			fatal(err)
+		}
+	}()
 
 	runner := &app.Runner{App: a, Print: func(format string, args ...any) {
 		fmt.Printf(format+"\n", args...)
 	}}
+	if err := runner.RefreshUsage(); err != nil {
+		fatal(err)
+	}
 
 	// RPC mode: the server owns the event stream and the approval
 	// bridge; usage lines and diagnostics go to stderr so stdout
@@ -102,11 +125,15 @@ func main() {
 			fmt.Fprintf(os.Stderr, format+"\n", args...)
 		}
 		if err := rpc.Run(a, runner, os.Stdin, os.Stdout); err != nil {
+			_ = a.Close()
 			fatal(err)
 		}
 		return
 	}
 
+	if !a.WorkspaceTrusted {
+		fmt.Fprintln(os.Stderr, "Workspace untrusted: project config and plugins disabled. Use --workspace-trust trust to enable them.")
+	}
 	if a.ResumedMessage != "" {
 		fmt.Println(a.ResumedMessage)
 	}
@@ -152,13 +179,19 @@ func main() {
 
 	if *printMode != "" {
 		runner.Handle(ctx, *printMode)
+		if runner.LastErr != nil {
+			if err := a.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "close session jobs: %v\n", err)
+			}
+			os.Exit(1)
+		}
 		return
 	}
 
 	// REPL
-	fmt.Println("Type a task, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /clear to drop context, /compact to summarise context, /rollback [N] to drop the last N turns, or /quit to exit.")
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	fmt.Println("Type a task, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /prune-artifacts to remove unreferenced images older than seven days, /clear to drop context, /compact to summarise context, /rollback [N] to drop the last N turns, or /quit to exit.")
+	scanner := input.New(os.Stdin)
+	defer scanner.Close()
 	// The approval prompt shares the REPL's scanner: the scanner
 	// buffers piped stdin ahead, so a fresh reader on os.Stdin in
 	// the loop's default ask would see EOF after the first task
@@ -175,10 +208,11 @@ func main() {
 	a.Cfg.AskQuestion = askQuestionFromScanner(scanner)
 	for {
 		fmt.Print("> ")
-		if !scanner.Scan() {
+		line, err := scanner.Read(ctx)
+		if err != nil {
 			break
 		}
-		if runner.Handle(ctx, strings.TrimSpace(scanner.Text())) {
+		if runner.Handle(ctx, strings.TrimSpace(line)) {
 			break
 		}
 	}
@@ -192,16 +226,14 @@ func main() {
 // terminal only delivers a line once it is typed — and type-ahead
 // ("y" typed before the prompt appears) now works too, instead of
 // being swallowed by the scanner's read-ahead.
-func askFromScanner(scanner *bufio.Scanner) func(agent.ApprovalRequest) (bool, error) {
+func askFromScanner(scanner *input.Lines) func(agent.ApprovalRequest) (bool, error) {
 	return func(req agent.ApprovalRequest) (bool, error) {
 		fmt.Printf("%s [y/N] ", req.Prompt())
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				return false, err
-			}
-			return false, io.EOF
+		line, err := scanner.Read(req.Context)
+		if err != nil {
+			return false, err
 		}
-		ans := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		ans := strings.ToLower(strings.TrimSpace(line))
 		return ans == "y" || ans == "yes", nil
 	}
 }
@@ -209,16 +241,14 @@ func askFromScanner(scanner *bufio.Scanner) func(agent.ApprovalRequest) (bool, e
 // confirmContinuationFromScanner is the plain CLI's doom-loop
 // prompt. It shares the REPL scanner with askFromScanner, for the
 // same buffered-stdin reason.
-func confirmContinuationFromScanner(scanner *bufio.Scanner) func(agent.ContinuationRequest) (agent.ContinuationDecision, error) {
+func confirmContinuationFromScanner(scanner *input.Lines) func(agent.ContinuationRequest) (agent.ContinuationDecision, error) {
 	return func(req agent.ContinuationRequest) (agent.ContinuationDecision, error) {
 		fmt.Printf("Repeated tool call: %s %s was requested %d times with identical input. Continue once (o), always this session (s), or stop (d)? [o/s/d] ", req.ToolName, req.InputPreview, req.RepeatCount)
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
-			}
-			return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, io.EOF
+		line, err := scanner.Read(req.Context)
+		if err != nil {
+			return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
 		}
-		switch strings.ToLower(strings.TrimSpace(scanner.Text())) {
+		switch strings.ToLower(strings.TrimSpace(line)) {
 		case "o", "once", "y", "yes":
 			return agent.ContinuationDecision{Outcome: agent.ContinuationOnce}, nil
 		case "s", "session", "always":
@@ -230,7 +260,7 @@ func confirmContinuationFromScanner(scanner *bufio.Scanner) func(agent.Continuat
 }
 
 // askQuestionFromScanner is the plain CLI's ask_user prompt.
-func askQuestionFromScanner(scanner *bufio.Scanner) func(agent.QuestionRequest) (agent.QuestionAnswers, error) {
+func askQuestionFromScanner(scanner *input.Lines) func(agent.QuestionRequest) (agent.QuestionAnswers, error) {
 	return func(req agent.QuestionRequest) (agent.QuestionAnswers, error) {
 		var answers []agent.QuestionAnswer
 		for i, q := range req.Questions {
@@ -246,13 +276,11 @@ func askQuestionFromScanner(scanner *bufio.Scanner) func(agent.QuestionRequest) 
 				}
 			}
 			fmt.Printf("  (pick %s, or type your own answer) > ", map[bool]string{true: "numbers, comma-separated", false: "a number"}[q.MultiSelect])
-			if !scanner.Scan() {
-				if err := scanner.Err(); err != nil {
-					return agent.QuestionAnswers{}, err
-				}
-				return agent.QuestionAnswers{}, io.EOF
+			line, err := scanner.Read(req.Context)
+			if err != nil {
+				return agent.QuestionAnswers{}, err
 			}
-			line := strings.TrimSpace(scanner.Text())
+			line = strings.TrimSpace(line)
 			ans := agent.QuestionAnswer{Question: i}
 			// Numbers select options; anything else is free text.
 			parts := strings.Split(line, ",")
@@ -282,20 +310,21 @@ func askQuestionFromScanner(scanner *bufio.Scanner) func(agent.QuestionRequest) 
 }
 
 // execTUI replaces this process with the sibling harness-tui binary,
-// passing the same flags through. It returns only if the sibling cannot
-// be started (then the caller falls back to plain mode).
-func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images []string) error {
-	self, err := os.Executable()
+// passing the same flags through. Windows waits for that process to finish.
+func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images []string, workspaceTrust string, rebindSession bool) error {
+	sibling, err := tuiSibling()
 	if err != nil {
 		return err
 	}
-	sibling := filepath.Join(filepath.Dir(self), tuiBinaryName)
-	if _, err := os.Stat(sibling); err != nil {
-		return fmt.Errorf("no harness-tui next to %s (build it with: go build -o <dir>/harness-tui ./cmd/harness-tui)", self)
-	}
+	return runTUIProcess(sibling, tuiArgs(sibling, root, mode, model, api, provider, config, maxSteps, resume, sessionID, ctxLimit, deny, bashTO, bgThresh, sandbox, images, workspaceTrust, rebindSession))
+}
+
+func tuiArgs(sibling, root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images []string, workspaceTrust string, rebindSession bool) []string {
 	args := []string{
 		sibling,
 		"-root", root,
+		"-workspace-trust", workspaceTrust,
+		"-rebind-session=" + strconv.FormatBool(rebindSession),
 		"-mode", mode,
 		"-model", model,
 		"-api", api,
@@ -305,15 +334,15 @@ func execTUI(root, mode, model, api, provider, config string, maxSteps int, resu
 		"-resume", resume,
 		"-session", sessionID,
 		"-context-limit", strconv.Itoa(ctxLimit),
-		"-deny-instead-of-prompt", strconv.FormatBool(deny),
+		"-deny-instead-of-prompt=" + strconv.FormatBool(deny),
 		"-bash-timeout", strconv.Itoa(bashTO),
 		"-bg-threshold", strconv.Itoa(bgThresh),
-		"-sandbox", strconv.FormatBool(sandbox),
+		"-sandbox=" + strconv.FormatBool(sandbox),
 	}
 	for _, img := range images {
 		args = append(args, "-image", img)
 	}
-	return runTUIProcess(sibling, args)
+	return args
 }
 
 // stringList is a repeatable -image flag: each occurrence appends one path.
@@ -328,4 +357,32 @@ func (s *stringList) Set(v string) error {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "harness:", err)
 	os.Exit(1)
+}
+
+// viewSession has no writable Store, provider configuration or tool executor.
+func viewSession(w io.Writer, id string) error {
+	msgs, err := session.Load(id)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(w)
+	for _, m := range msgs {
+		if err := enc.Encode(m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func tuiSibling() (string, error) {
+	self, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	sibling := filepath.Join(filepath.Dir(self), tuiBinaryName)
+	st, err := os.Stat(sibling)
+	if err != nil || !st.Mode().IsRegular() {
+		return "", fmt.Errorf("no harness-tui next to %s (install both binaries from the same release archive)", self)
+	}
+	return sibling, nil
 }

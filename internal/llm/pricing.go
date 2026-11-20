@@ -2,6 +2,8 @@ package llm
 
 import (
 	"fmt"
+	"math"
+	"math/big"
 	"os"
 	"strconv"
 	"time"
@@ -9,9 +11,10 @@ import (
 
 // Rates are USD per 1M tokens. They are NEVER hardcoded: they come from
 // the environment (the user's own OpenConsole bill or the provider's
-// published price), and every estimate names its source. All zero means
+// published price), and every estimate names its source. Unset rates mean
 // "no rates configured" — then no estimate is shown at all, only the
-// "real price unverified" label.
+// "real price unverified" label. Explicitly supplying all three zero base rates
+// configures free pricing.
 //
 // The harness never estimates tokens locally: the only token counts it
 // trusts are the ones the API returns in usage. (A local tokenizer
@@ -26,6 +29,9 @@ type Rates struct {
 	PeakCachedPerMTok float64
 	Source            string // human-readable rate source, shown with estimates
 	Configured        bool   // true when any rate is set
+	// Complete means every base rate (including explicit zero) was supplied;
+	// optional dollar budgets must never treat an omitted component as free.
+	Complete bool
 }
 
 // RatesFromEnv reads rates from the environment:
@@ -46,8 +52,8 @@ func RatesFromEnv() (Rates, error) {
 		if err != nil {
 			return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
 		}
-		if f < 0 {
-			return 0, fmt.Errorf("invalid %s %q: rates cannot be negative", key, v)
+		if f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+			return 0, fmt.Errorf("invalid %s %q: rates must be finite and nonnegative", key, v)
 		}
 		return f, nil
 	}
@@ -70,8 +76,14 @@ func RatesFromEnv() (Rates, error) {
 	if r.PeakCachedPerMTok, err = get("OPENAI_PRICE_PEAK_CACHED_PER_MTOK"); err != nil {
 		return r, err
 	}
+	r.Complete = true
+	for _, key := range []string{"OPENAI_PRICE_INPUT_PER_MTOK", "OPENAI_PRICE_OUTPUT_PER_MTOK", "OPENAI_PRICE_CACHED_PER_MTOK"} {
+		if os.Getenv(key) == "" {
+			r.Complete = false
+		}
+	}
 	r.Source = os.Getenv("OPENAI_PRICE_SOURCE")
-	r.Configured = r.InputPerMTok > 0 || r.OutputPerMTok > 0 || r.CachedPerMTok > 0 ||
+	r.Configured = r.Complete || r.InputPerMTok > 0 || r.OutputPerMTok > 0 || r.CachedPerMTok > 0 ||
 		r.PeakInputPerMTok > 0 || r.PeakOutputPerMTok > 0 || r.PeakCachedPerMTok > 0
 	if r.Configured && r.Source == "" {
 		r.Source = "env OPENAI_PRICE_*"
@@ -101,7 +113,16 @@ func (r Rates) Cost(u Usage, t time.Time) float64 {
 	if !r.Configured {
 		return 0
 	}
-	in, out, cached := r.InputPerMTok, r.OutputPerMTok, r.CachedPerMTok
+	in, out, cached := r.at(t)
+	nonCached := u.PromptTokens - u.CachedTokens
+	if nonCached < 0 {
+		nonCached = 0
+	}
+	return (float64(nonCached)*in + float64(u.CachedTokens)*cached + float64(u.CompletionTokens)*out) / 1e6
+}
+
+func (r Rates) at(t time.Time) (in, out, cached float64) {
+	in, out, cached = r.InputPerMTok, r.OutputPerMTok, r.CachedPerMTok
 	if IsPeak(t) {
 		if r.PeakInputPerMTok > 0 {
 			in = r.PeakInputPerMTok
@@ -113,9 +134,42 @@ func (r Rates) Cost(u Usage, t time.Time) float64 {
 			cached = r.PeakCachedPerMTok
 		}
 	}
-	nonCached := u.PromptTokens - u.CachedTokens
-	if nonCached < 0 {
-		nonCached = 0
+	return
+}
+
+// BudgetReady requires a complete finite rate schedule. Persisted estimates
+// and budget enforcement must not treat omitted rates as zero.
+func (r Rates) BudgetReady() bool {
+	if !r.Complete {
+		return false
 	}
-	return (float64(nonCached)*in + float64(u.CachedTokens)*cached + float64(u.CompletionTokens)*out) / 1e6
+	for _, v := range []float64{r.InputPerMTok, r.OutputPerMTok, r.CachedPerMTok, r.PeakInputPerMTok, r.PeakOutputPerMTok, r.PeakCachedPerMTok} {
+		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// BudgetCost applies the active schedule using exact decimal rate arithmetic.
+// Unknown cache counts matter only when the active input/cache prices differ.
+// The caller must separately establish that input/output counters are present.
+func (r Rates) BudgetCost(u Usage, t time.Time) (*big.Rat, bool) {
+	u.normalize()
+	if !r.BudgetReady() || !u.Valid() || u.PromptTokens < 0 || u.CompletionTokens < 0 || u.CachedTokens < 0 || u.CachedTokens > u.PromptTokens {
+		return nil, false
+	}
+	in, out, cached := r.at(t)
+	if u.PromptTokens > 0 && !u.CacheUsageReported && in != cached {
+		return nil, false
+	}
+	amount := new(big.Rat)
+	for _, part := range []struct {
+		tokens int
+		rate   float64
+	}{{u.PromptTokens - u.CachedTokens, in}, {u.CachedTokens, cached}, {u.CompletionTokens, out}} {
+		rate, _ := new(big.Rat).SetString(strconv.FormatFloat(part.rate, 'g', -1, 64))
+		amount.Add(amount, new(big.Rat).Mul(rate, new(big.Rat).SetInt64(int64(part.tokens))))
+	}
+	return amount.Quo(amount, big.NewRat(1000000, 1)), true
 }

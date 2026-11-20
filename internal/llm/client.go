@@ -24,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"minimalharness/internal/endpoint"
 )
 
 type Message struct {
@@ -35,12 +37,29 @@ type Message struct {
 	Content      string     `json:"content,omitempty"`
 	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID   string     `json:"tool_call_id,omitempty"`
+
+	// Execution provenance is stored in sessions, never sent to providers.
+	ToolInvocations []ToolInvocation `json:"tool_invocations,omitempty"`
+	InvocationID    string           `json:"invocation_id,omitempty"`
+	Observation     *ToolObservation `json:"observation,omitempty"`
+
+	// Only harness messages in the current turn can grant a continuation.
+	GuidanceOffers []GuidanceCursor `json:"-"`
+
 	// Images are attached images (user messages only). The session
 	// file stores their path and media type, never the bytes; the
 	// bytes are re-read from disk on --resume.
 	Images []Image `json:"images,omitempty"`
 	// AnthropicContent preserves provider blocks and signatures for exact replay.
 	AnthropicContent []AnthropicContentBlock `json:"anthropic_content,omitempty"`
+}
+
+// GuidanceCursor identifies an exact continuation the harness showed to the model.
+type GuidanceCursor struct {
+	Target string `json:"target"`
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Offset int    `json:"offset"`
 }
 
 type ToolCall struct {
@@ -73,9 +92,10 @@ func Tool(name, description, parameters string) ToolDef {
 }
 
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	Invalid          bool `json:"invalid,omitempty"`
+	PromptTokens     int  `json:"prompt_tokens"`
+	CompletionTokens int  `json:"completion_tokens"`
+	TotalTokens      int  `json:"total_tokens"`
 	// ReasoningTokens is the thinking part of the completion tokens:
 	// a subset of CompletionTokens, never an extra charge. Filled
 	// from completion_tokens_details.reasoning_tokens (chat) or
@@ -126,6 +146,7 @@ type streamOptions struct {
 // streamChunk is the wire shape for one Chat Completions SSE delta.
 type streamChunk struct {
 	Choices []struct {
+		Index int `json:"index"`
 		Delta struct {
 			Content string `json:"content"`
 			Refusal string `json:"refusal"`
@@ -134,8 +155,9 @@ type streamChunk struct {
 			// never enter msg.Content; it goes to onThinking instead.
 			ReasoningContent string `json:"reasoning_content"`
 			ToolCalls        []struct {
-				Index    int    `json:"index"`
+				Index    *int   `json:"index"`
 				ID       string `json:"id"`
+				Type     string `json:"type"`
 				Function struct {
 					Name      string `json:"name"`
 					Arguments string `json:"arguments"`
@@ -150,6 +172,9 @@ type streamChunk struct {
 // --- Responses API wire shapes ---
 
 type responsesTool struct {
+	// Keep optional tool arguments optional; Responses otherwise attempts
+	// to normalize schemas into strict mode, changing their contract.
+	Strict      bool            `json:"strict"`
 	Type        string          `json:"type"`
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
@@ -177,6 +202,7 @@ type reasoningParams struct {
 }
 
 type responsesUsage struct {
+	invalid            bool
 	CacheUsageReported bool `json:"-"`
 	InputTokens        int  `json:"input_tokens"`
 	OutputTokens       int  `json:"output_tokens"`
@@ -231,7 +257,8 @@ type Client struct {
 	API           string // "chat" (default), "responses" or "anthropic"
 	// MaxTokens is the per-response output budget, sent by all three
 	// modes (chat: max_tokens, responses: max_output_tokens,
-	// anthropic: max_tokens). 0 = defaultAnthropicMaxTokens.
+	// anthropic: max_tokens). 0 leaves OpenAI modes unspecified and uses
+	// defaultAnthropicMaxTokens for Anthropic.
 	MaxTokens int
 	// SamplingParams (e.g. temperature, top_p) is merged into every
 	// request body of the two OpenAI modes. Anthropic
@@ -274,6 +301,18 @@ type Client struct {
 	HTTP    *http.Client
 }
 
+// OutputTokenLimit reports the output reservation actually sent by this client.
+// Zero means the provider chooses its own limit.
+func (c *Client) OutputTokenLimit() int {
+	if c.MaxTokens > 0 {
+		return c.MaxTokens
+	}
+	if c.Mode() == "anthropic" {
+		return defaultAnthropicMaxTokens
+	}
+	return 0
+}
+
 // Mode returns the normalised API mode.
 func (c *Client) Mode() string {
 	switch strings.ToLower(strings.TrimSpace(c.API)) {
@@ -306,16 +345,7 @@ func (c *Client) ProviderName() string {
 // endpoint normalises baseURL to .../v1/chat/completions,
 // .../v1/responses or .../v1/messages.
 func (c *Client) endpoint() string {
-	base := strings.TrimSuffix(strings.TrimSpace(c.BaseURL), "/")
-	if base == "" {
-		base = "https://api.openai.com/v1"
-	}
-	base = strings.TrimSuffix(base, "/chat/completions")
-	base = strings.TrimSuffix(base, "/responses")
-	base = strings.TrimSuffix(base, "/messages")
-	if !strings.HasSuffix(base, "/v1") {
-		base += "/v1"
-	}
+	base := endpoint.Base(c.BaseURL)
 	switch c.Mode() {
 	case "responses":
 		return base + "/responses"
@@ -326,10 +356,15 @@ func (c *Client) endpoint() string {
 }
 
 func (c *Client) httpClient() *http.Client {
+	client := &http.Client{Timeout: c.totalTimeout()}
 	if c.HTTP != nil {
-		return c.HTTP
+		copy := *c.HTTP
+		client = &copy
 	}
-	return &http.Client{Timeout: c.totalTimeout()}
+	// Redirects can move custom credential headers to another destination.
+	// Require the configured API endpoint to answer directly.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return client
 }
 
 // DefaultTotalTimeout is the per-request backstop when the model
@@ -394,7 +429,8 @@ func newIdleLineScanner(body io.Reader, idle time.Duration, model string) *idleL
 	go func() {
 		defer close(s.lines)
 		sc := bufio.NewScanner(body)
-		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		sc.Buffer(make([]byte, 64*1024), maxSSEEventBytes)
+		sc.Split(splitSSELines())
 		for sc.Scan() {
 			line := sc.Text()
 			select {
@@ -465,7 +501,14 @@ func (c *Client) doPost(ctx context.Context, body []byte) (*http.Response, conte
 // cancelling first releases that read so Body.Close cannot wait on it.
 // On any error the cancel is already called and nil is returned.
 func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[string]string, withBearer bool) (*http.Response, context.CancelFunc, error) {
-	c.traceRequest(ctx, body)
+	// An already-cancelled context cannot dispatch an HTTP request. Check it
+	// before creating durable evidence of a potentially billable attempt.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if err := c.traceRequest(ctx, body); err != nil {
+		return nil, nil, err
+	}
 	// The request runs on a derived context so the first-byte idle
 	// deadline can abort it: if the server sends no response
 	// headers within the idle timeout, the stream is stalled before
@@ -648,22 +691,18 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 	accs := map[int]*acc{}
 	order := []int{}
 
-	lines := newIdleLineScanner(resp.Body, c.idleTimeout(), c.Model)
+	lines := newSSEScanner(resp.Body, c.idleTimeout(), c.Model, "chat")
 	defer lines.close()
 	sawDone := false
 	for {
-		raw, ok, scanErr := lines.next()
+		data, ok, scanErr := lines.next()
 		if !ok {
 			if scanErr != nil {
 				return scanErr
 			}
 			break
 		}
-		line := strings.TrimSpace(raw)
-		if line == "" || !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		data = strings.TrimSpace(data)
 		if data == "[DONE]" {
 			sawDone = true
 			break
@@ -672,8 +711,8 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 			return err
 		}
 		var chunk streamChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
+		if err := decodeStreamJSON(ctx, "chat", data, &chunk); err != nil {
+			return err
 		}
 		if chunk.Usage != nil {
 			usage = *chunk.Usage
@@ -681,9 +720,15 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 			}
 			usage.normalize()
-			traceUsage(ctx, usage)
+			traceWireUsage(ctx, usage, data, false)
 		}
 		for _, ch := range chunk.Choices {
+			if ch.Index != 0 {
+				return protocolError("chat", "unexpected choice index %d", ch.Index)
+			}
+			if msg.FinishReason != "" && (ch.Delta.Content != "" || len(ch.Delta.ToolCalls) > 0 || ch.Delta.Refusal != "" || ch.Delta.ReasoningContent != "" || ch.FinishReason != "" && ch.FinishReason != msg.FinishReason) {
+				return protocolError("chat", "delta after choice finished")
+			}
 			msg.Refusal += ch.Delta.Refusal
 			if ch.FinishReason != "" {
 				msg.FinishReason = ch.FinishReason
@@ -700,16 +745,29 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 				onThinking(ch.Delta.ReasoningContent)
 			}
 			for _, tc := range ch.Delta.ToolCalls {
-				a, ok := accs[tc.Index]
+				if tc.Index == nil || *tc.Index < 0 || tc.Type != "" && tc.Type != "function" {
+					return protocolError("chat", "invalid tool call index or type")
+				}
+				idx := *tc.Index
+				a, ok := accs[idx]
 				if !ok {
+					if tc.ID == "" || tc.Function.Name == "" {
+						return protocolError("chat", "arguments arrived before tool identity")
+					}
 					a = &acc{}
-					accs[tc.Index] = a
-					order = append(order, tc.Index)
+					accs[idx] = a
+					order = append(order, idx)
 				}
 				if tc.ID != "" {
+					if a.id != "" && a.id != tc.ID {
+						return protocolError("chat", "tool id changed at index %d", idx)
+					}
 					a.id = tc.ID
 				}
 				if tc.Function.Name != "" {
+					if a.name != "" && a.name != tc.Function.Name {
+						return protocolError("chat", "tool name changed at index %d", idx)
+					}
 					a.name = tc.Function.Name
 				}
 				a.args.WriteString(tc.Function.Arguments)
@@ -720,7 +778,7 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 	// half-accumulated tool call would otherwise run as if it were
 	// complete. Fail loudly instead of returning partial text.
 	if !sawDone {
-		return fmt.Errorf("stream ended without [DONE]")
+		return protocolError("chat", "stream ended without [DONE]")
 	}
 	for _, idx := range order {
 		a := accs[idx]
@@ -730,10 +788,7 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 			Function: FunctionCall{Name: a.name, Arguments: a.args.String()},
 		})
 	}
-	if onDone != nil {
-		onDone(msg, usage)
-	}
-	return nil
+	return completeStream("chat", msg, usage, onDone)
 }
 
 // toResponsesInput converts the shared Message history into Responses
@@ -752,6 +807,9 @@ func toResponsesInput(messages []Message) (string, []any) {
 				parts = append(parts, map[string]any{
 					"type": "input_text", "text": m.Content,
 				})
+			}
+			if text := unavailableImageText(m); text != "" {
+				parts = append(parts, map[string]any{"type": "input_text", "text": text})
 			}
 			for _, img := range imageParts(m) {
 				parts = append(parts, map[string]any{
@@ -837,9 +895,12 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 	msg.Role = "assistant"
 	var usage Usage
 	type acc struct {
-		callID string
-		name   string
-		args   strings.Builder
+		callID       string
+		name         string
+		args         strings.Builder
+		argsDone     bool
+		done         bool
+		argsConflict bool
 	}
 	accs := map[string]*acc{} // keyed by item_id
 	order := []string{}
@@ -864,38 +925,51 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 		}
 		return strings.Join(texts, "\n")
 	}
-	lines := newIdleLineScanner(resp.Body, c.idleTimeout(), c.Model)
+	lines := newSSEScanner(resp.Body, c.idleTimeout(), c.Model, "responses")
 	defer lines.close()
 	// OpenConsole's Responses stream ends with response.completed and
 	// no [DONE] (verified live), so completion — not [DONE] — is the
 	// terminal marker here.
 	sawCompleted := false
 	for {
-		raw, ok, scanErr := lines.next()
+		data, ok, scanErr := lines.next()
 		if !ok {
 			if scanErr != nil {
 				return scanErr
 			}
 			break
 		}
-		line := strings.TrimSpace(raw)
-		if line == "" || !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		data = strings.TrimSpace(data)
 		if data == "[DONE]" {
 			break
 		}
 		if err := streamProviderError("responses", data); err != nil {
 			return err
 		}
-		var ev responsesEvent
-		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if err := decodeStreamJSON(ctx, "responses", data, &envelope); err != nil {
+			return err
+		}
+		if envelope.Type == "" {
+			return protocolError("responses", "missing event type")
+		}
+		switch envelope.Type {
+		case "response.created", "response.in_progress", "response.refusal.delta", "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.output_item.added", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done", "response.incomplete", "response.completed":
+		default:
 			continue
+		}
+		var ev responsesEvent
+		if err := decodeStreamJSON(ctx, "responses", data, &ev); err != nil {
+			return err
+		}
+		if ev.Type == "" {
+			return protocolError("responses", "missing event type")
 		}
 		if u := ev.Response.Usage; u != nil {
 			usage = u.sharedUsage()
-			traceUsage(ctx, usage)
+			traceWireUsage(ctx, usage, data, true)
 		}
 		switch ev.Type {
 		case "response.refusal.delta":
@@ -922,33 +996,38 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 				if id == "" {
 					id = ev.Item.CallID
 				}
-				if _, ok := accs[id]; !ok {
-					accs[id] = &acc{callID: ev.Item.CallID, name: ev.Item.Name}
-					order = append(order, id)
+				if id == "" || ev.Item.CallID == "" || ev.Item.Name == "" {
+					return protocolError("responses", "function call missing identity")
 				}
+				if _, ok := accs[id]; ok {
+					return protocolError("responses", "duplicate added item %q", id)
+				}
+				accs[id] = &acc{callID: ev.Item.CallID, name: ev.Item.Name}
+				accs[id].args.WriteString(ev.Item.Arguments)
+				order = append(order, id)
 			}
 		case "response.function_call_arguments.delta":
 			id := ev.ItemID
 			a, ok := accs[id]
-			if !ok {
-				a = &acc{}
-				accs[id] = a
-				order = append(order, id)
+			if !ok || a.done || a.argsDone {
+				return protocolError("responses", "arguments delta outside open item %q", id)
 			}
 			a.args.WriteString(ev.Delta)
 		case "response.function_call_arguments.done":
 			id := ev.ItemID
 			a, ok := accs[id]
-			if !ok {
-				a = &acc{}
-				accs[id] = a
-				order = append(order, id)
+			if !ok || a.done || a.argsDone {
+				return protocolError("responses", "arguments done outside open item %q", id)
 			}
 			if ev.Arguments != "" {
+				if a.args.Len() > 0 && !sameJSON(a.args.String(), ev.Arguments) {
+					a.argsConflict = true
+				}
 				// done carries the full arguments; prefer it over fragments.
 				a.args.Reset()
 				a.args.WriteString(ev.Arguments)
 			}
+			a.argsDone = true
 		case "response.output_item.done":
 			if ev.Item.Type == "reasoning" {
 				// Backfill a reasoning item whose summary never
@@ -974,9 +1053,21 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 				}
 				a, ok := accs[id]
 				if !ok {
+					if id == "" {
+						return protocolError("responses", "done item missing identity")
+					}
 					a = &acc{}
 					accs[id] = a
 					order = append(order, id)
+				}
+				if a.done {
+					return protocolError("responses", "duplicate done item %q", id)
+				}
+				if a.callID != "" && ev.Item.CallID != "" && a.callID != ev.Item.CallID || a.name != "" && ev.Item.Name != "" && a.name != ev.Item.Name {
+					return protocolError("responses", "done item identity changed")
+				}
+				if ev.Item.Arguments != "" && a.args.Len() > 0 && !sameJSON(a.args.String(), ev.Item.Arguments) {
+					a.argsConflict = true
 				}
 				if ev.Item.CallID != "" {
 					a.callID = ev.Item.CallID
@@ -987,6 +1078,7 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 				if ev.Item.Arguments != "" && a.args.Len() == 0 {
 					a.args.WriteString(ev.Item.Arguments)
 				}
+				a.done = true
 			}
 			if ev.Item.Type == "message" {
 				for _, part := range ev.Item.Content {
@@ -1027,20 +1119,7 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 						}
 					}
 				case "function_call":
-					// Completed carries the authoritative call list.
-					found := false
-					for _, tc := range msg.ToolCalls {
-						if tc.ID == out.CallID {
-							found = true
-							_ = tc
-						}
-					}
-					if !found {
-						msg.ToolCalls = append(msg.ToolCalls, ToolCall{
-							ID: out.CallID, Type: "function",
-							Function: FunctionCall{Name: out.Name, Arguments: out.Arguments},
-						})
-					}
+					msg.ToolCalls = append(msg.ToolCalls, ToolCall{ID: out.CallID, Type: "function", Function: FunctionCall{Name: out.Name, Arguments: out.Arguments}})
 				case "message":
 					if msg.Content == "" {
 						for _, part := range out.Content {
@@ -1050,32 +1129,43 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 				}
 			}
 		}
+		if sawCompleted {
+			break
+		}
 	}
 	// A stream that ends without response.completed was cut off
 	// mid-reply; fail loudly instead of running a half-accumulated
 	// tool call as if it were complete.
 	if !sawCompleted {
-		return fmt.Errorf("stream ended without response.completed")
+		return protocolError("responses", "stream ended without response.completed")
 	}
 	// Merge any call the completed event did not already list, from
 	// the accumulated fragments — a partial completed list must not
 	// drop a call the stream actually carried.
-	have := map[string]bool{}
+	have := map[string]ToolCall{}
 	for _, tc := range msg.ToolCalls {
-		have[tc.ID] = true
+		if _, exists := have[tc.ID]; exists {
+			return protocolError("responses", "duplicate completed call id %q", tc.ID)
+		}
+		have[tc.ID] = tc
 	}
+	streamIDs := map[string]bool{}
 	for _, id := range order {
 		a := accs[id]
-		if a.name == "" || a.callID == "" || have[a.callID] {
+		if msg.FinishReason != "incomplete" && a.argsConflict {
+			return protocolError("responses", "terminal call arguments conflict with streamed fragments")
+		}
+		if streamIDs[a.callID] {
+			return protocolError("responses", "duplicate streamed call id %q", a.callID)
+		}
+		streamIDs[a.callID] = true
+		if tc, exists := have[a.callID]; exists {
+			if tc.Function.Name != a.name || a.args.Len() > 0 && !sameJSON(tc.Function.Arguments, a.args.String()) {
+				return protocolError("responses", "completed call conflicts with streamed call %q", a.callID)
+			}
 			continue
 		}
-		msg.ToolCalls = append(msg.ToolCalls, ToolCall{
-			ID: a.callID, Type: "function",
-			Function: FunctionCall{Name: a.name, Arguments: a.args.String()},
-		})
+		msg.ToolCalls = append(msg.ToolCalls, ToolCall{ID: a.callID, Type: "function", Function: FunctionCall{Name: a.name, Arguments: a.args.String()}})
 	}
-	if onDone != nil {
-		onDone(msg, usage)
-	}
-	return nil
+	return completeStream("responses", msg, usage, onDone)
 }

@@ -42,12 +42,11 @@ func TestCompactsInsideToolLoop(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Error(err)
 			}
-			last := request.Messages[len(request.Messages)-1]
-			if last.Role != "user" || last.Content != "read f" {
-				t.Errorf("active task lost: %+v", last)
+			if len(request.Messages) < 2 || request.Messages[1].Role != "user" || request.Messages[1].Content != "read f" {
+				t.Errorf("active task lost: %+v", request.Messages)
 			}
 			saved, err := session.Load(store.ID)
-			if err != nil || len(saved) != 2 || saved[1].Content != "read f" {
+			if err != nil || len(saved) != 3 || saved[0].Content != "read f" || saved[2].Kind != "checkpoint" {
 				t.Errorf("checkpoint = %+v, %v", saved, err)
 			}
 			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"done"}}]}`+"\n\n")
@@ -81,8 +80,8 @@ func TestAutomaticCompactionRetainsCurrentTurnSnapshot(t *testing.T) {
 	snapshot := llm.Message{Role: "user", Kind: "turn_context", Content: "current plugin state"}
 	msgs := []llm.Message{{Role: "user", Kind: "task", Content: "old task"}, {Role: "user", Kind: "turn_context", Content: "old state"}, task, snapshot}
 	cfg := &Config{CompactHistory: func(context.Context, []llm.Message) (string, llm.Usage, error) { return "summary", llm.Usage{}, nil }}
-	out, _, err := cfg.compactInLoop(context.Background(), msgs)
-	if err != nil || len(out) != 3 || out[1].Content != task.Content || out[2].Kind != "turn_context" || out[2].Content != snapshot.Content {
+	out, _, err := cfg.compactInLoop(context.Background(), msgs, nil)
+	if err != nil || len(out) != 5 || out[0].Kind != "checkpoint" || out[1].Content != task.Content || out[3].Kind != "checkpoint" || out[4].Kind != "turn_context" || out[4].Content != snapshot.Content {
 		t.Fatalf("compacted=%+v err=%v", out, err)
 	}
 }
@@ -90,8 +89,8 @@ func TestAutomaticCompactionRetainsCurrentTurnSnapshot(t *testing.T) {
 func TestAutomaticCompactionRetainsSnapshotWithoutTaskMarker(t *testing.T) {
 	msgs := []llm.Message{{Role: "user", Kind: "summary", Content: "context hook replaced task"}, {Role: "user", Kind: "turn_context", Content: "current state"}}
 	cfg := &Config{CompactHistory: func(context.Context, []llm.Message) (string, llm.Usage, error) { return "summary", llm.Usage{}, nil }}
-	out, _, err := cfg.compactInLoop(context.Background(), msgs)
-	if err != nil || len(out) != 2 || out[1].Kind != "turn_context" || out[1].Content != "current state" {
+	out, _, err := cfg.compactInLoop(context.Background(), msgs, nil)
+	if err != nil || len(out) != 3 || out[1].Kind != "checkpoint" || out[2].Kind != "turn_context" || out[2].Content != "current state" {
 		t.Fatalf("compacted=%+v err=%v", out, err)
 	}
 }
@@ -110,7 +109,7 @@ func TestFailedCompactionPreservesHistory(t *testing.T) {
 	cfg := &Config{Session: s, CompactHistory: func(context.Context, []llm.Message) (string, llm.Usage, error) {
 		return "", llm.Usage{}, errors.New("provider failed")
 	}}
-	if _, _, err := cfg.compactInLoop(context.Background(), []llm.Message{task}); err == nil {
+	if _, _, err := cfg.compactInLoop(context.Background(), []llm.Message{task}, nil); err == nil {
 		t.Fatal("failed compact succeeded")
 	}
 	saved, err := session.Load(s.ID)
@@ -157,7 +156,7 @@ func TestRunCompactionRetriesTransientFailure(t *testing.T) {
 		t.Fatal("compaction retry was not observable")
 	}
 	saved, err := session.Load(store.ID)
-	if err != nil || len(saved) != 3 || saved[0].Kind != "summary" || saved[1].Content != task.Content {
+	if err != nil || len(saved) != 4 || saved[0].Content != task.Content || saved[1].Kind != "summary" || saved[2].Kind != "checkpoint" {
 		t.Fatalf("recovered checkpoint = %+v, %v", saved, err)
 	}
 }

@@ -122,20 +122,20 @@ func (c *webfetchCache) put(key string, e *webfetchCacheEntry) {
 func (e *Executor) Webfetch(ctx context.Context, a WebfetchArgs) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(a.URL))
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return "", fmt.Errorf("webfetch needs an http(s) URL, got %q", a.URL)
+		return "", &InputError{Err: fmt.Errorf("webfetch needs an http(s) URL, got %q", a.URL)}
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("webfetch refuses non-http(s) URL: %s", u.Scheme)
+		return "", &InputError{Err: fmt.Errorf("webfetch refuses non-http(s) URL: %s", u.Scheme)}
 	}
 	format := strings.ToLower(strings.TrimSpace(a.Format))
 	if format == "" {
 		format = "markdown"
 	}
 	if format != "markdown" && format != "text" {
-		return "", fmt.Errorf("webfetch format must be markdown or text, got %q", a.Format)
+		return "", &InputError{Err: fmt.Errorf("webfetch format must be markdown or text, got %q", a.Format)}
 	}
 	if a.Offset < 0 {
-		return "", fmt.Errorf("webfetch offset must be >= 0, got %d", a.Offset)
+		return "", &InputError{Err: fmt.Errorf("webfetch offset must be >= 0, got %d", a.Offset)}
 	}
 	timeout := DefaultWebfetchTimeout
 	if e.WebfetchTimeout > 0 {

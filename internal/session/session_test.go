@@ -9,7 +9,7 @@ import (
 )
 
 func TestClearDropsEarlierMessagesOnLoad(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	store, err := New("test-clear")
 	if err != nil {
 		t.Fatal(err)
@@ -38,7 +38,7 @@ func TestClearDropsEarlierMessagesOnLoad(t *testing.T) {
 
 // Audit records land in a sidecar file, not in the transcript.
 func TestAuditSidecar(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("audit-test")
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +68,7 @@ func TestAuditSidecar(t *testing.T) {
 }
 
 func TestLoadWithoutClearReturnsAll(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	store, err := New("test-noclear")
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +86,7 @@ func TestLoadWithoutClearReturnsAll(t *testing.T) {
 }
 
 func TestOversizedCheckpointLeavesSessionReadable(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	store, err := New("oversized-checkpoint")
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +109,7 @@ func TestOversizedCheckpointLeavesSessionReadable(t *testing.T) {
 }
 
 func TestOversizedMessageLeavesSessionReadable(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	store, err := New("oversized-message")
 	if err != nil {
 		t.Fatal(err)
@@ -128,7 +128,7 @@ func TestOversizedMessageLeavesSessionReadable(t *testing.T) {
 }
 
 func TestMarkCompactKeepsOnlySummaryOnLoad(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	store, err := New("test-compact")
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +156,7 @@ func TestMarkCompactKeepsOnlySummaryOnLoad(t *testing.T) {
 }
 
 func TestArchiveCopyKeepsOriginal(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	store, err := New("test-archive")
 	if err != nil {
 		t.Fatal(err)
@@ -179,7 +179,7 @@ func TestArchiveCopyKeepsOriginal(t *testing.T) {
 }
 
 func TestClearThenDanglingToolCallRepaired(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	store, err := New("test-clear-dangling")
 	if err != nil {
 		t.Fatal(err)
@@ -198,10 +198,10 @@ func TestClearThenDanglingToolCallRepaired(t *testing.T) {
 	}
 }
 
-// An image message round-trips through the file with its path and
-// media type, but the bytes never land in the file.
-func TestImageMessageStoresPathOnly(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+// An image message stores its immutable reference and metadata in the
+// transcript while its bytes live separately in the blob store.
+func TestImageMessageStoresImmutableReference(t *testing.T) {
+	setTestHome(t, t.TempDir())
 	store, err := New("test-image")
 	if err != nil {
 		t.Fatal(err)
@@ -230,7 +230,7 @@ func TestImageMessageStoresPathOnly(t *testing.T) {
 		t.Fatalf("loaded = %+v", msgs)
 	}
 	img := msgs[0].Images[0]
-	if img.Path != "pic.png" || img.MediaType != "image/png" || img.Data != "" || img.Width != 2 {
+	if img.Path != "pic.png" || img.MediaType != "image/png" || img.Data != "" || img.Width != 2 || !validImageDigest(img.Digest) || img.Bytes != 5 {
 		t.Fatalf("loaded image = %+v", img)
 	}
 }

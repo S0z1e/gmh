@@ -26,8 +26,8 @@ import (
 // known, minor leak: the user-namespace uid mapping still stops the
 // sandboxed process from signalling host processes, and the
 // filesystem boundary is unaffected. The network is not unshared, so
-// curl and friends keep working (and the proxy env vars pass
-// through); each call gets a FRESH /tmp, so nothing persists there
+// curl and friends keep working (proxy env vars require explicit
+// bashEnv opt-in); each call gets a FRESH /tmp, so nothing persists there
 // between calls; and only bash is sandboxed — read/write/edit run
 // in-process and are jailed to the root by the harness itself.
 // Tools installed outside /usr (a Go toolchain in your home
@@ -71,6 +71,7 @@ func ProbeSandbox(bwrap string) error {
 		"--proc", "/proc",
 		"--unshare-user", "--unshare-ipc",
 		"--", "true")
+	cmd.Env = bashEnvironment(nil)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("bwrap cannot create a sandbox here (unprivileged user namespaces may be disabled): %w (%s)", err, strings.TrimSpace(string(out)))
 	}

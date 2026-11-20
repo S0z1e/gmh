@@ -14,8 +14,13 @@ The harness can send images to a model that declares image input
 The model receives the image in its own format: chat gets an
 `image_url` data URI, Responses gets `input_image`, Anthropic gets a
 base64 image block. One image is capped at 10 MiB, ten per message.
-Sessions store the image path, never the bytes; on `--resume` the
-bytes are re-read from disk, so a deleted file leaves only the marker
-text. A model without `"image"` in its `input` refuses the attach
+Sessions store a SHA-256 digest, media type and origin path. Image bytes
+are saved separately in private, immutable blobs under
+`~/.minimal-harness/blobs/sha256/`, shared across sessions by digest.
+Resuming or switching sessions loads those saved bytes; changing or deleting
+the origin file does not change history. Missing or corrupt blobs, and legacy
+path-only attachments, are explicitly marked unavailable. Their origin paths
+are never re-read as a fallback. Back up the blob directory with the sessions.
+A model without `"image"` in its `input` refuses the attach
 with an error that says what to add. The GUI route is the RPC
 `attach_image` request (see [rpc](rpc.md)).

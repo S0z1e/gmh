@@ -20,21 +20,23 @@ import (
 
 func main() {
 	var (
-		root      = flag.String("root", ".", "workspace root")
-		mode      = flag.String("mode", "", "suggest (ask in a y/n dialog) or auto (default config or suggest)")
-		model     = flag.String("model", "", "model id (default OPENAI_MODEL or config defaultModel)")
-		api       = flag.String("api", "", "chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages (default OPENAI_API_MODE or config)")
-		provider  = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
-		config    = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
-		maxSteps  = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
-		resume    = flag.String("resume", "", "resume session id")
-		sessionID = flag.String("session", "", "session id (default: timestamp)")
-		ctxLimit  = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
-		deny      = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1)")
-		sandbox   = flag.Bool("sandbox", false, "run bash calls under bwrap (bubblewrap): the workspace is the only writable directory (also env HARNESS_SANDBOX=1 or config sandbox)")
-		bashTO    = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
-		bgThresh  = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
-		images    stringList
+		root           = flag.String("root", ".", "workspace root")
+		workspaceTrust = flag.String("workspace-trust", "", "save workspace trust: trust or untrust (default: saved decision)")
+		mode           = flag.String("mode", "", "suggest (ask in a y/n dialog) or auto (default config or suggest)")
+		model          = flag.String("model", "", "model id (default OPENAI_MODEL or config defaultModel)")
+		api            = flag.String("api", "", "chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages (default OPENAI_API_MODE or config)")
+		provider       = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
+		config         = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
+		maxSteps       = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
+		resume         = flag.String("resume", "", "resume session id")
+		rebindSession  = flag.Bool("rebind-session", false, "explicitly bind resumed or legacy history to this workspace")
+		sessionID      = flag.String("session", "", "session id (default: timestamp)")
+		ctxLimit       = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
+		deny           = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1)")
+		sandbox        = flag.Bool("sandbox", false, "run bash calls under bwrap (bubblewrap): the workspace is the only writable directory (also env HARNESS_SANDBOX=1 or config sandbox)")
+		bashTO         = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
+		bgThresh       = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
+		images         stringList
 	)
 	flag.Var(&images, "image", "attach an image file to the first turn (repeatable; png, jpg, gif, webp; the model must declare image input)")
 	flag.Parse()
@@ -47,6 +49,7 @@ func main() {
 
 	a, err := app.Setup(app.Params{
 		Root:                       *root,
+		WorkspaceTrust:             *workspaceTrust,
 		Mode:                       *mode,
 		Model:                      *model,
 		API:                        *api,
@@ -55,6 +58,7 @@ func main() {
 		MaxSteps:                   *maxSteps,
 		ContextLimit:               *ctxLimit,
 		Resume:                     *resume,
+		RebindSession:              *rebindSession,
 		SessionID:                  *sessionID,
 		DenyInsteadOfPrompt:        *deny,
 		Sandbox:                    *sandbox,
@@ -65,7 +69,13 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	defer a.Store.Close()
+	defer func() {
+		if err := a.Close(); err != nil {
+			fatal(err)
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Header lines, opencode-mini style: a one-line mark plus the
 	// session meta, both muted apart from the bold name and the plain
@@ -74,6 +84,9 @@ func main() {
 	// live region after every turn. The help line lives in the input
 	// placeholder now, not in the header.
 	info := fmt.Sprintf("▪ harness · %s · %s\nroot %s · session %s · mode %s", a.Cfg.Client.API, a.Cfg.Client.Model, a.Root, a.Store.ID, a.Cfg.Mode)
+	if !a.WorkspaceTrusted {
+		info += "\nWorkspace untrusted: project config and plugins disabled (--workspace-trust trust)."
+	}
 	if a.ResumedMessage != "" {
 		info += "\n" + a.ResumedMessage
 	}
@@ -82,10 +95,19 @@ func main() {
 	// background) or catppuccin-mocha; anything else is the default.
 	// Setup already resolved env > config for this.
 	tui.SetTheme(tui.ThemeByName(a.TUITheme))
-	m := tui.NewModel(info).WithMeta(a.Cfg.Mode, a.Cfg.Client.API, a.Cfg.Client.Model).WithBranch(gitBranch(a.Root))
+	runner := &app.Runner{App: a}
+	if err := runner.RefreshUsage(); err != nil {
+		fatal(err)
+	}
+	m := tui.NewModel(info).WithMeta(a.Cfg.Mode, a.Cfg.Client.API, a.Cfg.Client.Model).WithBranch(gitBranch(a.Root)).WithSessionTotals(runner.SessionUsage.TotalTokens, runner.Turns).WithUsageCoverage(runner.SessionMetering.TokenCountsComplete())
 	// Set OnSubmit BEFORE NewProgram: the program holds its own copy of
 	// the model, so fields set afterwards on this copy would never fire.
-	m.OnSubmit = func(line string) { lines <- line }
+	m.OnSubmit = func(line string) {
+		select {
+		case lines <- line:
+		case <-ctx.Done():
+		}
+	}
 	prog := tea.NewProgram(m)
 
 	// The agent loop runs in a goroutine and feeds events into the
@@ -104,18 +126,26 @@ func main() {
 	// Runner output goes through the program's message queue (PrintMsg),
 	// not prog.Println: direct prints race the model's own tea.Println
 	// of the finished turn and can land above the reply text.
-	runner := &app.Runner{App: a, Print: func(format string, args ...any) {
-		prog.Send(tui.PrintMsg{Text: fmt.Sprintf(format, args...)})
-	}}
+	runner.Print = func(format string, args ...any) { prog.Send(tui.PrintMsg{Text: fmt.Sprintf(format, args...)}) }
 
-	ctx := context.Background()
+	runnerDone := make(chan struct{})
 	go func() {
-		for line := range lines {
+		defer close(runnerDone)
+		for {
+			var line string
+			select {
+			case <-ctx.Done():
+				return
+			case line = <-lines:
+			}
+			if ctx.Err() != nil {
+				return
+			}
 			quit := runner.Handle(ctx, line)
 			// Session totals for the meta line's right side, plus
 			// the current model/api so a /model switch shows up,
 			// and the tool mode so a /plan switch shows its chip.
-			prog.Send(tui.MetaUpdateMsg{Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns, Model: a.Model.ID, API: a.Cfg.Client.API, ToolMode: string(a.ToolMode())})
+			prog.Send(tui.MetaUpdateMsg{UsageIncomplete: !runner.SessionMetering.TokenCountsComplete(), UsageUnavailable: !runner.MeteringAvailable, Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns, Model: a.Model.ID, API: a.Cfg.Client.API, ToolMode: string(a.ToolMode())})
 			if quit {
 				prog.Quit()
 				return
@@ -123,8 +153,17 @@ func main() {
 		}
 	}()
 
-	if _, err := prog.Run(); err != nil {
-		fatal(err)
+	_, runErr := prog.Run()
+	cancel()
+	<-runnerDone
+	if err := a.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "close session jobs: %v\n", err)
+		if runErr == nil {
+			runErr = err
+		}
+	}
+	if runErr != nil {
+		fatal(runErr)
 	}
 }
 

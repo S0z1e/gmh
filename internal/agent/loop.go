@@ -4,20 +4,30 @@
 package agent
 
 import (
-	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"minimalharness/internal/textutil"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"minimalharness/internal/checkpoint"
+	"minimalharness/internal/failureguard"
+	"minimalharness/internal/input"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
+	"minimalharness/internal/toolargs"
 	"minimalharness/internal/tools"
+	"minimalharness/internal/turnbudget"
+	"minimalharness/internal/verification"
 )
+
+var defaultPromptInput = input.New(os.Stdin)
 
 type Config struct {
 	Client         *llm.Client
@@ -30,6 +40,12 @@ type Config struct {
 	OnCompact      func(history []llm.Message, usage llm.Usage, archive string)
 	MaxSteps       int
 	Session        *session.Store
+	Verification   *verification.Policy
+	verifier       *verificationRun
+	TurnBudget     *turnbudget.Policy
+	UsageRates     llm.Rates
+	LastTurnBudget *turnbudget.State
+	resources      *turnResources
 	// OnEvent receives every loop event; the caller renders them.
 	// (There is no OnText: streamed text arrives as TextDelta events.)
 	OnEvent func(Event)
@@ -76,11 +92,16 @@ type Config struct {
 	// LastTerminalReason is why the most recent Run ended, in the
 	// structured form the RPC server reports as agent_settled.reason.
 	LastTerminalReason TerminalReason
+	LastTaskOutcome    TaskOutcome
 
 	// doomLoop is the per-Config guard: its streak and session
 	// allowlist outlive one turn, like Qwen's agent-context guard.
-	doomLoop   *DoomLoopGuard
-	persistErr error
+	doomLoop          *DoomLoopGuard
+	usageAttempts     int64
+	stepID            string
+	persistErr        error
+	persistErrEmitted bool
+	progress          *turnProgress
 }
 
 // DoomLoop returns the Config's guard, creating it on first use.
@@ -92,8 +113,25 @@ func (c *Config) DoomLoop() *DoomLoopGuard {
 }
 
 func (c *Config) emit(e Event) {
+	e.StepID = c.stepID
+	if e.Kind == EventDone || e.Kind == EventError {
+		e = c.budgetTerminal(e)
+		if c.persistErr != nil {
+			// A storage failure takes priority and is published once, even when
+			// it occurred while the budget adapter was saving its outcome.
+			e.Kind, e.Err, e.TerminalReason, e.TaskOutcome = EventError, c.persistErr, TerminalError, OutcomeIncomplete
+			c.LastTerminalReason = TerminalError
+			c.persistErrEmitted = true
+		}
+	}
+	if e.Kind == EventDone || e.Kind == EventError {
+		if e.TaskOutcome == "" {
+			e.TaskOutcome = TaskOutcomeForReason(e.TerminalReason)
+		}
+		c.LastTaskOutcome = e.TaskOutcome
+	}
 	if e.Kind == EventToolEnd || e.Kind == EventToolBackgroundDone {
-		if e.ToolErr != nil {
+		if e.ToolErr != nil && e.ToolStatus != tools.ResultDeferred {
 			e.ToolStatus = tools.ResultError
 		} else if e.ToolStatus == "" {
 			e.ToolStatus = tools.ResultSuccess
@@ -104,21 +142,33 @@ func (c *Config) emit(e Event) {
 	}
 }
 
-func ToolDefs() []llm.ToolDef {
-	return []llm.ToolDef{
-		llm.Tool("read", "Read a file (with 1-based line offset and limit) or list a directory. Image files (png, jpg, gif, webp) are returned as an image you can see, not as text — use read to look at a screenshot or photo.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}`),
-		llm.Tool("write", "Create a file. By default it fails if the file already exists — use edit then. Pass overwrite:true to replace an existing file wholesale; prefer edit for a small change.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["path","content"]}`),
-		llm.Tool("edit", "Replace text in an existing file. Two forms: oldText (replaced exactly once) or startLine/endLine (1-based, inclusive; endLine defaults to startLine) to replace those lines with newText, ignoring oldText. The line form requires a known version from a read or full write in this session. Successful edits update that version only if the file still matched it before editing (and line count is unchanged); otherwise read the target lines again before a line edit.", `{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}},"required":["path","newText"]}`),
-		llm.Tool("bash", "Run a shell command in the workspace root, or pass killJobId to stop a running background job. Each call is a fresh shell; cd does not persist between calls — pass cwd to run in a subdirectory, or prefix the command with `cd <dir> && `. Timeout in seconds, default 120, max 600; a background:true job has no timeout unless one is passed. Pass background:true for a command that will not exit on its own (dev server, watcher): it returns at once with a job id, and its output is delivered at the next step. A never-ending job never blocks the turn from ending: the turn ends after a short drain wait, and you can read its partial output from the output file. Every result header names the directory the call ran in.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"},"background":{"type":"boolean"},"cwd":{"type":"string"},"killJobId":{"type":"string"}}}`),
-		llm.Tool("grep", "Search file contents with a regex. Prefer this over bash grep/rg. Returns file:line matches, capped (truncation is marked).", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"},"exclude":{"type":"string"},"context":{"type":"integer"},"maxMatches":{"type":"integer"}},"required":["pattern"]}`),
-		llm.Tool("glob", "List files matching a glob pattern, e.g. **/*.go. Prefer this over bash find/ls for discovering files.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer"}},"required":["pattern"]}`),
-		llm.Tool("load_skill", "Load the full text of an available skill by name when its guidance is needed for the current task. The skill names and one-line descriptions are in the system prompt. Pass reference (a file name from the skill's references/ footer) to read one reference file instead of the whole skill.", `{"type":"object","properties":{"name":{"type":"string"},"reference":{"type":"string"}},"required":["name"]}`),
-		llm.Tool("webfetch", "Fetch a URL and return its content as Markdown (HTML is converted to Markdown, keeping headings, lists, links, code and tables; scripts and styles are dropped). Use this to read web pages, docs and API responses instead of curl. Returns up to 30000 characters per call; use offset to page through a long page. format=text returns plain text instead of Markdown; timeout is seconds (default 30, max 120). Private, loopback (except localhost) and cloud-metadata addresses are refused, and cross-host redirects are not followed.", `{"type":"object","properties":{"url":{"type":"string"},"format":{"type":"string","enum":["markdown","text"]},"offset":{"type":"integer"},"timeout":{"type":"integer"}},"required":["url"]}`),
-		llm.Tool("ask_user", "Ask the user structured questions when a decision needs their input instead of guessing: 1-4 questions, each with 2-4 options (plus free-text Other). Use it in plan mode to clarify requirements, and anywhere a choice changes what you will do. The user picks options or types their own answer; their answers come back as this call's result.", `{"type":"object","properties":{"questions":{"type":"array","minItems":1,"maxItems":4,"items":{"type":"object","properties":{"question":{"type":"string"},"header":{"type":"string"},"multiSelect":{"type":"boolean"},"options":{"type":"array","minItems":2,"maxItems":4,"items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label"]}}},"required":["question","options"]}}},"required":["questions"]}`),
+func ToolDefs() []llm.ToolDef { return tools.Defs() }
+
+func (c *Config) validateArgs(name, args string) error {
+	for _, def := range c.Tools {
+		if def.Function.Name == name {
+			return toolargs.Validate(def.Function.Parameters, args)
+		}
 	}
+	return fmt.Errorf("tool %s not offered in this turn", name)
 }
 
-func (c *Config) ask(req ApprovalRequest) (bool, error) {
+func (c *Config) invalidArgs(msgs []llm.Message, tc llm.ToolCall, err error) []llm.Message {
+	obs := fmt.Sprintf("Error: invalid %s arguments: %v", tc.Function.Name, err)
+	c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments, ToolCallID: tc.ID})
+	c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, ToolOutput: obs, ToolErr: err})
+	m := llm.Message{Role: "tool", Kind: notExecutedKind, ToolCallID: tc.ID, ToolError: true, Content: obs}
+	if c.Session != nil {
+		c.persist(m)
+	}
+	return append(msgs, m)
+}
+
+func (c *Config) ask(ctx context.Context, req ApprovalRequest) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	req.Context = ctx
 	if c.DenyInsteadOfPrompt {
 		return false, nil
 	}
@@ -126,8 +176,7 @@ func (c *Config) ask(req ApprovalRequest) (bool, error) {
 		return c.Ask(req)
 	}
 	fmt.Printf("%s [y/N] ", req.Prompt())
-	reader := bufio.NewReader(os.Stdin)
-	line, err := reader.ReadString('\n')
+	line, err := defaultPromptInput.Read(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -152,6 +201,7 @@ func (c *Config) checkRepeatedCall(ctx context.Context, toolName, argsJSON strin
 		return argsJSON, false
 	}
 	dec, err := c.ConfirmContinuation(ContinuationRequest{
+		Context:  ctx,
 		ToolName: det.ToolName, RepeatCount: det.RepeatCount,
 		Threshold: det.Threshold, InputPreview: det.InputPreview,
 	})
@@ -161,8 +211,8 @@ func (c *Config) checkRepeatedCall(ctx context.Context, toolName, argsJSON strin
 	key := det.InputKey
 	useArgs := argsJSON
 	if dec.UpdatedArgs != "" {
-		key = CanonicalToolKey(toolName, dec.UpdatedArgs)
-		useArgs = dec.UpdatedArgs
+		useArgs = c.verificationArguments(toolName, dec.UpdatedArgs)
+		key = CanonicalToolKey(toolName, useArgs)
 	}
 	switch dec.Outcome {
 	case ContinuationSession:
@@ -180,22 +230,40 @@ func (c *Config) checkRepeatedCall(ctx context.Context, toolName, argsJSON strin
 // ask them through the AskQuestion seam, and render the answers
 // as the observation. Invalid arguments and a cancelled question
 // are observations, not turn errors, so the model can recover.
-func (c *Config) askUser(ctx context.Context, argsJSON string) (string, error) {
+func (c *Config) askUser(ctx context.Context, argsJSON string) (string, *string, error) {
 	req, err := ParseAskUserArgs(argsJSON)
 	if err != nil {
-		return "", err
+		return "", nil, &tools.InputError{Err: err}
 	}
 	if c.AskQuestion == nil || ctx.Err() != nil {
-		return "No one is available to answer questions right now. Proceed with your best judgement and state the assumptions you made.", nil
+		return "No one is available to answer questions right now. Proceed with your best judgement and state the assumptions you made.", nil, nil
 	}
+	req.Context = ctx
 	ans, err := c.AskQuestion(req)
 	if err != nil {
-		return "The questions were cancelled. Proceed with your best judgement and state the assumptions you made.", nil
+		return "The questions were cancelled. Proceed with your best judgement and state the assumptions you made.", nil, nil
 	}
-	return FormatAnswers(req, ans), nil
+	for _, a := range ans.Answers {
+		if a.Question >= 0 && a.Question < len(req.Questions) && (len(a.Selected) > 0 || strings.TrimSpace(a.Custom) != "") {
+			text := FormatAnswers(req, ans)
+			data, err := json.Marshal(struct {
+				Questions []Question       `json:"questions"`
+				Answers   []QuestionAnswer `json:"answers"`
+			}{req.Questions, ans.Answers})
+			if err != nil {
+				return "", nil, err
+			}
+			source := string(data)
+			return text, &source, nil
+		}
+	}
+	return "No answers were provided. Proceed with your best judgement and state the assumptions you made.", nil, nil
 }
 
 func (c *Config) needsApproval(name, argsJSON string) bool {
+	if name == tools.GitStatusTool && c.Exec != nil && c.Exec.Sandbox {
+		return true // linked metadata may be outside the shell sandbox
+	}
 	if name == "write" || name == "edit" {
 		var target struct {
 			Path string `json:"path"`
@@ -209,7 +277,7 @@ func (c *Config) needsApproval(name, argsJSON string) bool {
 	}
 	// Network and plugin tools can send data or cause side effects.
 	switch name {
-	case "read", "grep", "glob", "load_skill", "ask_user":
+	case "read", "grep", "glob", "load_skill", "ask_user", tools.GuidanceTool:
 		return false
 	}
 	return true
@@ -237,10 +305,10 @@ func toolOffered(tools []llm.ToolDef, name string) bool {
 func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (tools.ToolResult, *tools.Job, error) {
 	var args tools.BashArgs
 	if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-		return tools.ToolResult{}, nil, fmt.Errorf("bad bash args: %w", err)
+		return tools.ToolResult{}, nil, &tools.InputError{Err: fmt.Errorf("bad bash args: %w", err)}
 	}
 	backgrounded := func(job *tools.Job) (tools.ToolResult, *tools.Job, error) {
-		c.emit(Event{Kind: EventToolBackgrounded, ToolName: "bash", ToolArgs: tc.Function.Arguments, JobID: job.ID})
+		c.emit(Event{Kind: EventToolBackgrounded, ToolName: "bash", ToolCallID: tc.ID, InvocationID: job.InvocationID, ToolArgs: tc.Function.Arguments, JobID: job.ID})
 		text := fmt.Sprintf("Command is still running in the background (job %s). Continue with other work; its output will be delivered automatically when it finishes. Do not re-run the command.", job.ID)
 		if job.OutputFile != "" {
 			text += fmt.Sprintf(" Read partial output with read %q.", job.OutputFile)
@@ -250,6 +318,12 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (tools.ToolResul
 	if strings.TrimSpace(args.KillJobID) != "" {
 		res, err := c.Exec.Dispatch(ctx, "bash", tc.Function.Arguments)
 		return res, nil, err
+	}
+	if (args.Background || c.Exec.BackgroundThreshold > 0) && c.resources != nil {
+		if err := c.resources.tracker.CheckJobLaunch(c.Exec.RunningWorkspaceJobs()); err != nil {
+			c.resources.failure = err
+			return tools.ToolResult{}, nil, err
+		}
 	}
 	if args.Background {
 		job, err := c.Exec.BashBackground(ctx, args)
@@ -298,6 +372,7 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (tools.ToolResul
 // It is a user message, never a second tool message for the same
 // call id — the API rejects that with 400.
 func jobResultMessage(job *tools.Job, res tools.JobResult) (string, error) {
+	res.Output = strings.ToValidUTF8(res.Output, "\uFFFD")
 	if res.Err != nil {
 		// A timeout kill is not a failure of the command itself:
 		// say so, and point at the output file (a killed dev
@@ -319,15 +394,28 @@ func jobResultMessage(job *tools.Job, res tools.JobResult) (string, error) {
 // pending for a later step or the turn-end drain.
 func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) ([]llm.Message, []pendingJob) {
 	var done, rest []pendingJob
+	cutoff := time.Now()
+	if c.Exec != nil {
+		for _, job := range c.Exec.Jobs() {
+			if !job.Delivered() && !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == job }) {
+				pending = append(pending, pendingJob{callID: job.ToolCallID, job: job})
+			}
+		}
+	}
 	for _, p := range pending {
-		if _, ok := p.job.Result(); ok {
+		if p.job.Delivered() {
+			continue
+		}
+		if finished, ok := p.job.FinishedAt(); ok && !finished.After(cutoff) {
 			done = append(done, p)
-		} else {
+		} else if !p.job.Reported() {
+			// Already-reported running jobs remain only in the registry:
+			// they must not force another drain or discard a final answer.
 			rest = append(rest, p)
 		}
 	}
 	if len(done) == 0 {
-		return msgs, pending
+		return msgs, rest
 	}
 	sort.Slice(done, func(i, j int) bool {
 		ti, _ := done[i].job.FinishedAt()
@@ -337,14 +425,16 @@ func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) (
 	for _, p := range done {
 		res, _ := p.job.Result()
 		obs, toolErr := jobResultMessage(p.job, res)
-		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID, ToolExitCode: &res.ExitCode, ToolOutputFile: p.job.OutputFile})
-		msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: obs})
+		obs = c.progressJob(p.job, res, obs)
+		msgs = append(msgs, pendingStopCompletion(msgs, p.job, res, obs))
 		if c.Session != nil {
 			c.persist(msgs[len(msgs)-1])
 		}
-		if c.persistErr == nil {
-			p.job.MarkDelivered()
+		if c.persistErr != nil {
+			return msgs, pending
 		}
+		p.job.MarkDelivered()
+		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID, ToolCallID: p.job.ToolCallID, InvocationID: p.job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: p.job.OutputFile})
 	}
 	return msgs, rest
 }
@@ -355,6 +445,37 @@ func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) (
 type pendingJob struct {
 	callID string
 	job    *tools.Job
+}
+
+type jobDelivery struct {
+	job    *tools.Job
+	result tools.JobResult
+	output string
+}
+
+// A stop can finish alongside other jobs. Persist every ready outcome in
+// completion order before the next tool can produce a newer observation.
+func (c *Config) stoppedJobDeliveries() []jobDelivery {
+	var deliveries []jobDelivery
+	cutoff := time.Now()
+	for _, job := range c.Exec.Jobs() {
+		if result, done := job.Result(); done && !job.Delivered() {
+			if finished, _ := job.FinishedAt(); !finished.After(cutoff) {
+				deliveries = append(deliveries, jobDelivery{job: job, result: result})
+			}
+		}
+	}
+	sort.SliceStable(deliveries, func(i, j int) bool {
+		iTime, _ := deliveries[i].job.FinishedAt()
+		jTime, _ := deliveries[j].job.FinishedAt()
+		return iTime.Before(jTime)
+	})
+	for i := range deliveries {
+		d := &deliveries[i]
+		d.output, _ = jobResultMessage(d.job, d.result)
+		d.output = c.progressJob(d.job, d.result, d.output)
+	}
+	return deliveries
 }
 
 // drainTimeout returns the bound for one drainPending wait
@@ -398,37 +519,33 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 	// Jobs already reported still-running in an earlier turn are
 	// never waited on again: the model already knows about them,
 	// so they must not make the next turn pay the bound too.
-	var doneJobs, freshJobs, oldJobs []*tools.Job
+	var freshJobs []*tools.Job
 	for _, job := range jobs {
-		if _, ok := job.Result(); ok {
-			doneJobs = append(doneJobs, job)
-		} else if job.Reported() {
-			oldJobs = append(oldJobs, job)
-		} else {
+		if _, done := job.Result(); !done && !job.Reported() {
 			freshJobs = append(freshJobs, job)
 		}
 	}
-	sort.Slice(doneJobs, func(i, j int) bool {
-		ti, _ := doneJobs[i].FinishedAt()
-		tj, _ := doneJobs[j].FinishedAt()
-		return ti.Before(tj)
-	})
-	for _, job := range doneJobs {
-		res, _ := job.Result()
-		obs, toolErr := jobResultMessage(job, res)
-		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
-		msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: obs})
-		if c.Session != nil {
-			c.persist(msgs[len(msgs)-1])
-		}
-		if c.persistErr == nil {
-			job.MarkDelivered()
+	// Completion callbacks may release another job after a collector's
+	// cutoff. Rescan after each delivery batch before classifying unfinished
+	// work or returning to a provider request. Each pass delivers new jobs.
+	collectReady := func() {
+		for {
+			before := len(msgs)
+			msgs, _ = c.collectFinishedJobs(msgs, pending)
+			if c.persistErr != nil || len(msgs) == before {
+				return
+			}
 		}
 	}
-	if len(freshJobs) == 0 {
+	collectReady()
+	if c.persistErr != nil {
+		return msgs, c.persistErr
+	}
+	freshJobs = slices.DeleteFunc(freshJobs, func(job *tools.Job) bool { return job.Delivered() })
+	if len(freshJobs) == 0 || ctx.Err() != nil {
 		// Nothing new to wait for: the only unfinished jobs are
 		// ones the model was already told about.
-		return msgs, nil
+		return msgs, ctx.Err()
 	}
 	c.emit(Event{Kind: EventBackgroundWait, Text: strings.Join(jobIDs, ", ")})
 	// Deliver in completion order, not submission order: a slow
@@ -453,19 +570,17 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 	remaining := len(freshJobs)
 	for remaining > 0 {
 		select {
-		case job := <-done:
-			res, _ := job.Result()
-			obs, toolErr := jobResultMessage(job, res)
-			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: job.ID, ToolExitCode: &res.ExitCode, ToolOutputFile: job.OutputFile})
-			msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: obs})
-			if c.Session != nil {
-				c.persist(msgs[len(msgs)-1])
-			}
-			if c.persistErr == nil {
-				job.MarkDelivered()
+		case <-done:
+			collectReady()
+			if c.persistErr != nil {
+				return msgs, c.persistErr
 			}
 			remaining--
 		case <-timer.C:
+			collectReady()
+			if c.persistErr != nil {
+				return msgs, c.persistErr
+			}
 			// Bound reached: end the turn with the jobs still
 			// running instead of waiting forever. Report each
 			// one with its output file path so the model can
@@ -473,7 +588,7 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 			// next turn's drain does not wait on them again.
 			var still []*tools.Job
 			for _, job := range freshJobs {
-				if _, ok := job.Result(); !ok {
+				if !job.Delivered() {
 					still = append(still, job)
 				}
 			}
@@ -488,17 +603,25 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 						fmt.Fprintf(&b, "\n- %s (job %s): still running.", job.Command, job.ID)
 					}
 				}
-				msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: b.String()})
+				var snapshots []checkpoint.Job
+				for _, job := range still {
+					snapshots = append(snapshots, snapshotJob(job, false))
+				}
+				msgs = append(msgs, llm.Message{Role: "user", Kind: "job", Content: b.String(), Observation: &llm.ToolObservation{Tool: "bash", Jobs: snapshots}})
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
 			}
-			return msgs, nil
+			return msgs, ctx.Err()
 		case <-ctx.Done():
+			collectReady()
+			if c.persistErr != nil {
+				return msgs, c.persistErr
+			}
 			return msgs, ctx.Err()
 		}
 	}
-	return msgs, nil
+	return msgs, ctx.Err()
 }
 
 // MaxStopBlocks caps consecutive turn-end vetoes by stop hooks,
@@ -507,10 +630,8 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 // model forever.
 const MaxStopBlocks = 8
 
-// MaxFailedFixAttempts is the consecutive all-failed tool steps
-// after which the task is marked blocked instead of looping: the
-// model tried (differently — identical repeats are the doom-loop
-// guard's job) and every attempt failed.
+// MaxFailedFixAttempts bounds failed tool attempts without proven state change
+// or a successful rerun of a previously failing invocation.
 const MaxFailedFixAttempts = 3
 
 // maxLLMAttempts returns the per-step LLM attempt budget.
@@ -565,13 +686,23 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // this step, and onRetry resets the caller's per-attempt state —
 // then the call is replayed from scratch, so the GUI never shows
 // the half-reply followed by the replay.
-func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm.Message, tools []llm.ToolDef, onText func(string), onDone func(llm.Message, llm.Usage), onThinking func(string), onRetry func()) (int, error) {
+func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm.Message, tools []llm.ToolDef, onText func(string), onDone func(llm.Message, llm.Usage), onThinking func(string), onRetry func()) (int, llm.Usage, error) {
+	c.stepID = rand.Text()
 	attempts := c.maxLLMAttempts()
 	var err error
+	var spent llm.Usage
 	for attempt := 1; attempt <= attempts; attempt++ {
-		requestCtx := ctx
-		if c.TraceRequests {
-			requestCtx = llm.WithRequestObserver(ctx, func(trace llm.RequestTrace) {
+		if err := c.budgetRequest(); err != nil {
+			return attempt - 1, spent, err
+		}
+		requestCtx := llm.WithRequestObserver(ctx, func(trace llm.RequestTrace) {
+			if trace.Usage != nil && trace.Usage.Valid() && spent.CanAdd(*trace.Usage) {
+				spent.Add(*trace.Usage)
+			} else if trace.Usage != nil && c.persistErr == nil {
+				c.persistErr = fmt.Errorf("invalid or overflowing provider usage")
+			}
+			c.recordAttempt(operation, attempt, trace)
+			if c.TraceRequests {
 				c.emit(Event{Kind: EventLLMRequest, Request: &trace, Operation: operation, Attempt: attempt})
 				if c.Session != nil {
 					_ = c.Session.Audit(struct {
@@ -581,8 +712,18 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 						Request   llm.RequestTrace `json:"request"`
 					}{"llm_request", operation, attempt, trace})
 				}
-			})
-		}
+			}
+		})
+		requestCtx = llm.WithRequestStart(requestCtx, func(trace llm.RequestTrace) error {
+			if c.Session == nil {
+				return nil
+			}
+			if err := c.Session.BeginUsageAttempt(trace.ID); err != nil {
+				c.persistErr = fmt.Errorf("save pending provider usage attempt: %w", err)
+				return c.persistErr
+			}
+			return nil
+		})
 		outputSeen := false
 		doneSeen := false
 		wrappedText := func(s string) {
@@ -605,13 +746,18 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 			}
 		}
 		err = c.Client.Stream(requestCtx, apiMsgs, tools, wrappedText, wrappedDone, wrappedThinking)
+		if c.persistErr != nil {
+			return attempt, spent, c.persistErr
+		}
+		if budgetErr := c.budgetError(); budgetErr != nil {
+			return attempt, spent, budgetErr
+		}
 		if err == nil {
-			return attempt, nil
+			return attempt, spent, nil
 		}
-		if doneSeen || ctx.Err() != nil || !llm.IsRetryable(err) || attempt == attempts {
-			return attempt, err
-		}
-		if outputSeen {
+		retry := !doneSeen && ctx.Err() == nil && llm.IsRetryable(err) && attempt < attempts
+		var protocolErr *llm.ProtocolError
+		if !doneSeen && outputSeen && (retry || errors.As(err, &protocolErr)) {
 			// The stream was cut off after showing partial output:
 			// discard the partial reply before replaying. The
 			// assistant message and usage need no reset here: they
@@ -619,45 +765,100 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 			// blocks the retry above. Only the caller's thinking
 			// accumulator holds per-attempt state, and onRetry
 			// resets it.
-			c.emit(Event{Kind: EventStepDiscard, Text: fmt.Sprintf("LLM stream cut off after partial output (%v); discarding the partial reply", err), RetryAttempt: attempt + 1})
+			next := 0
+			if retry {
+				next = attempt + 1
+			}
+			c.emit(Event{Kind: EventStepDiscard, Text: fmt.Sprintf("LLM stream cut off after partial output (%v); discarding the partial reply", err), RetryAttempt: next})
 			if onRetry != nil {
 				onRetry()
 			}
 		}
+		if !retry {
+			return attempt, spent, err
+		}
+		if budgetErr := c.budgetRequest(); budgetErr != nil {
+			return attempt, spent, budgetErr
+		}
 		delay := retryDelay(attempt, llm.RetryAfter(err))
 		c.emit(Event{Kind: EventStepRetry, Text: fmt.Sprintf("%s failed (attempt %d/%d): %v; retrying in %s", operation, attempt, attempts, err, delay), RetryAttempt: attempt + 1})
 		if !sleepCtx(ctx, delay) {
-			return attempt, err
+			return attempt, spent, err
 		}
 	}
-	return attempts, err
+	return attempts, spent, err
 }
 
 // Run executes one user turn. It appends messages to the session store
 // and returns the assistant's final text, total tokens used, and error.
 func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, runUsage llm.Usage, runErr error) {
+	c.stepID = ""
 	c.persistErr = nil
+	c.persistErrEmitted = false
+	c.LastTerminalReason = ""
+	c.LastTaskOutcome = ""
+	c.LastTurnBudget = nil
+	c.verifier = nil
+	for _, m := range history {
+		if m.Kind == "checkpoint" {
+			if _, err := checkpoint.Decode([]byte(m.Content)); err != nil {
+				c.LastTerminalReason = TerminalError
+				err = fmt.Errorf("invalid historical checkpoint: %w", err)
+				c.emit(Event{Kind: EventError, Err: err, TerminalReason: TerminalError})
+				return "", llm.Usage{}, err
+			}
+		}
+	}
+	if c.Verification != nil && len(c.Verification.Required) > 0 {
+		if err := c.Verification.Validate(); err != nil {
+			c.LastTerminalReason = TerminalError
+			c.emit(Event{Kind: EventError, Err: err, TerminalReason: TerminalError})
+			return "", llm.Usage{}, err
+		}
+		c.verifier = &verificationRun{policy: c.Verification, latest: map[string]verification.Evidence{}}
+	}
 	defer func() {
 		if c.persistErr != nil {
 			runErr = c.persistErr
 			c.LastTerminalReason = TerminalError
-			c.emit(Event{Kind: EventError, Err: runErr, Text: text, TerminalReason: TerminalError})
+			if !c.persistErrEmitted {
+				c.emit(Event{Kind: EventError, Err: runErr, Text: text, TerminalReason: TerminalError})
+			}
 		}
 	}()
+	budgetCtx, cancelBudget, budgetErr := c.startBudget(ctx)
+	defer cancelBudget()
+	defer c.finishBudget(&text, &runErr)
+	ctx = budgetCtx
+	if budgetErr != nil {
+		c.LastTerminalReason = TerminalError
+		c.emit(Event{Kind: EventError, Err: budgetErr, TerminalReason: TerminalError})
+		return "", llm.Usage{}, budgetErr
+	}
 	steps := c.MaxSteps
 	// MaxSteps <= 0 means unlimited (the mainstream default): the turn
 	// runs until the model stops calling tools, an error ends it, or
 	// the task is blocked. The bounds are then auto-compaction at 70%
-	// of the context window plus the doom-loop / blocked guards. A
+	// of the context window, finite turn resource budgets, and the
+	// doom-loop / blocked guards. A
 	// positive MaxSteps opts into a hard cap with the grace summary.
 	hasCap := steps > 0
-	msgs := append([]llm.Message{{Role: "system", Content: c.System}}, history...)
+	guidanceState := newGuidanceTurn(c.Exec)
+	msgs := append([]llm.Message{{Role: "system", Content: c.System + verificationInstructions(c.Verification)}}, history...)
+	msgs = WithoutHistoricalGuidance(msgs)
 	var total llm.Usage
 	var lastText string
 	// pending background bash jobs, in call order. Their results are
 	// fed back as user messages when the turn would otherwise end
 	// (see drainPending).
 	var pending []pendingJob
+	c.progress = &turnProgress{ctx: ctx, jobs: make(map[string]bool)}
+	defer func() { c.progress = nil }()
+	if err := c.reconcileJobDeliveries(); err != nil {
+		c.LastTerminalReason = TerminalError
+		c.emit(Event{Kind: EventError, Err: err, TerminalReason: TerminalError})
+		return "", total, err
+	}
 	// Re-attach jobs from earlier turns whose results were never
 	// delivered: a job that finished after its turn ended — or
 	// after a bounded drain gave up on it — still owes the model
@@ -670,26 +871,43 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		for _, job := range c.Exec.Jobs() {
 			if !job.Delivered() {
 				pending = append(pending, pendingJob{callID: "", job: job})
+			} else {
+				// This outcome already belongs to an earlier turn.
+				c.progress.jobs[job.ID] = true
 			}
 		}
 	}
-	// stopBlocks counts consecutive turn-end vetoes in this turn;
-	// failedFixes counts consecutive steps whose tool calls all
-	// failed (a step with any success resets it).
 	stopBlocks := 0
-	failedFixes := 0
-	// breaker counts failed tool calls per fingerprint within
-	// this turn (a new breaker per Run: counts never leak into
-	// the next turn). lastErrors keeps the last few failed
-	// observations for the blocked-grace summary.
-	breaker := NewFailureBreaker()
-	var lastErrors []string
+	finishBlocked := func() (string, llm.Usage, error) {
+		blocked := fmt.Errorf("task blocked: %d tool attempts failed without proven state or result progress", MaxFailedFixAttempts)
+		if ctx.Err() == nil {
+			graceText, graceUsage, ok := c.graceCall(ctx, msgs, blockedGracePrompt(blocked, c.progress.lastErrors), guidanceState)
+			c.addObservedUsage(&total, graceUsage)
+			if ok {
+				lastText = graceText
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			c.LastTerminalReason = TerminalAbort
+			c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+			return lastText, total, err
+		}
+		c.LastTerminalReason = TerminalBlocked
+		c.emit(Event{Kind: EventError, Err: blocked, Text: lastText, Usage: total, TerminalReason: TerminalBlocked})
+		return lastText, total, blocked
+	}
 
 	for step := 0; !hasCap || step < steps; step++ {
 		// Finished background jobs report in at the next step,
 		// in completion order — the model sees results as soon
 		// as they are ready, not only when the turn would end.
 		msgs, pending = c.collectFinishedJobs(msgs, pending)
+		if c.persistErr != nil {
+			return lastText, total, c.persistErr
+		}
+		if guidanceState != nil {
+			msgs = guidanceState.refreshRoot(ctx, c, msgs)
+		}
 		if c.persistErr != nil {
 			return lastText, total, c.persistErr
 		}
@@ -703,8 +921,12 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 		// Rendering uses a fixed per-result cap. Old content changes only
 		// at a persisted checkpoint when the context budget is reached.
 		if c.ContextLimit > 0 && c.needsCompact(msgs) {
-			compacted, usage, err := c.compactInLoop(ctx, msgs)
-			total.Add(usage)
+			var prepare *checkpointPreparation
+			if guidanceState != nil {
+				prepare = &checkpointPreparation{guidance: guidanceState}
+			}
+			compacted, usage, err := c.compactInLoop(ctx, msgs, prepare)
+			c.addObservedUsage(&total, usage)
 			c.emit(Event{Kind: EventStepUsage, Usage: usage})
 			if err != nil {
 				c.LastTerminalReason = TerminalError
@@ -725,7 +947,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 		}
 		apiMsgs := c.promptView(msgs)
-		attempts, err := c.streamStep(ctx, "LLM call", apiMsgs, c.Tools, func(s string) {
+		attempts, spent, err := c.streamStep(ctx, "LLM call", apiMsgs, c.Tools, func(s string) {
 			c.emit(Event{Kind: EventTextDelta, Text: s})
 		}, func(m llm.Message, u llm.Usage) {
 			assistant = m
@@ -742,6 +964,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// this step's thinking, and the discard drops it.
 			thinking.Reset()
 		})
+		c.addObservedUsage(&total, spent)
+		c.emit(Event{Kind: EventStepUsage, Usage: spent})
 		if err != nil {
 			wrapped := fmt.Errorf("step %d: %w", step+1, err)
 			if attempts > 1 {
@@ -750,7 +974,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// The turn is over, but a running job's result is still
 			// the user's data: deliver it before reporting the error
 			// so it is not silently lost.
-			if len(pending) > 0 {
+			if len(pending) > 0 && c.budgetError() == nil {
 				_, _ = c.drainPending(ctx, msgs, pending)
 			}
 			// A cancelled context is an abort, not a provider error:
@@ -765,11 +989,23 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			c.emit(Event{Kind: EventError, Err: wrapped, Text: lastText, TerminalReason: c.LastTerminalReason})
 			return lastText, total, wrapped
 		}
+		var offeredGuidance map[llm.GuidanceCursor]bool
+		if guidanceState != nil {
+			guidanceState.unread = nil // the completed request received its result
+			offeredGuidance = guidanceOffers(apiMsgs)
+		}
 		c.LastPromptTokens = usage.PromptTokens
 		c.lastPromptEstimate = estimatePromptTokens(apiMsgs, c.Tools)
-		total.Add(usage)
-		c.emit(Event{Kind: EventStepUsage, Usage: usage})
 		lastText = assistant.Content
+		// A job can finish during any provider response, including a final
+		// answer. Save the outcome before the newer batch; a final answer
+		// that has not seen it needs another model step to account for it.
+		beforeCollection := len(msgs)
+		msgs, pending = c.collectFinishedJobs(msgs, pending)
+		collectedAfterResponse := len(msgs) > beforeCollection
+		if c.persistErr != nil {
+			return lastText, total, c.persistErr
+		}
 		assistantIdx := len(msgs)
 		msgs = append(msgs, assistant)
 		if c.Session != nil {
@@ -785,7 +1021,38 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			return lastText, total, err
 		}
 		if len(assistant.ToolCalls) == 0 {
+			if collectedAfterResponse {
+				if c.progress.failures >= MaxFailedFixAttempts && len(pending) > 0 {
+					var err error
+					msgs, err = c.drainPending(ctx, msgs, pending)
+					msgs, pending = c.collectFinishedJobs(msgs, nil)
+					if c.persistErr != nil {
+						return lastText, total, c.persistErr
+					}
+					if err == nil {
+						err = ctx.Err()
+					}
+					if err != nil {
+						c.LastTerminalReason = TerminalAbort
+						c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+						return lastText, total, err
+					}
+				}
+				if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {
+					return finishBlocked()
+				}
+				followup := llm.Message{Role: "user", Kind: "job", Content: "A background job completed while the preceding answer was generated. Reconsider that answer using the saved outcome above."}
+				msgs = append(msgs, followup)
+				c.persist(followup)
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
+				}
+				continue
+			}
 			if len(pending) == 0 {
+				if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {
+					return finishBlocked()
+				}
 				if assistant.Refusal != "" || assistant.FinishReason == "refusal" || assistant.FinishReason == "content_filter" || strings.TrimSpace(lastText) == "" {
 					message := "model returned an empty answer without tool calls"
 					if assistant.Refusal != "" || assistant.FinishReason == "refusal" || assistant.FinishReason == "content_filter" {
@@ -803,14 +1070,22 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				// hook may veto the end — e.g. a check the final
 				// answer failed. The reason is fed back to the
 				// model as a user message and the turn continues,
-				// up to MaxStopBlocks vetoes; after that the turn
-				// is allowed to end anyway.
-				if ctx.Err() == nil && c.Exec != nil && c.Exec.Plugins != nil && stopBlocks < MaxStopBlocks {
+				// up to MaxStopBlocks feedback rounds. A further veto stops
+				// with an incomplete outcome, never a successful end_turn.
+				if ctx.Err() == nil && c.Exec != nil && c.Exec.Plugins != nil {
+					c.verificationTouch(ctx)
 					sessionID := ""
 					if c.Session != nil {
 						sessionID = c.Session.ID
 					}
 					if reason := c.Exec.Plugins.RunStopHooks(ctx, sessionID, lastText); reason != "" {
+						if stopBlocks >= MaxStopBlocks {
+							err := fmt.Errorf("stop hook veto cap reached (%d); task incomplete: %s", MaxStopBlocks, reason)
+							c.persist(llm.Message{Role: "user", Kind: "task_outcome", Content: "[harness task outcome]\nTask incomplete: the stop hook veto limit was reached. Outstanding issue: " + reason})
+							c.LastTerminalReason = TerminalStopCap
+							c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalStopCap})
+							return lastText, total, err
+						}
 						stopBlocks++
 						c.emit(Event{Kind: EventStopBlocked, Text: reason})
 						blockMsg := llm.Message{Role: "user", Kind: "hook", Content: "A stop hook blocked the turn from ending: " + reason + " Address it before finishing, then answer again."}
@@ -821,8 +1096,29 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 						continue
 					}
 				}
+				outcome, missing := c.verificationGate(ctx)
+				if err := ctx.Err(); err != nil {
+					c.LastTerminalReason = TerminalAbort
+					c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+					return lastText, total, err
+				}
+				if missing != "" {
+					if c.verifier.feedback >= maxVerificationFeedback {
+						err := fmt.Errorf("required verification failed: %s", missing)
+						c.persist(llm.Message{Role: "user", Kind: "task_outcome", Content: "[harness task outcome]\nVerification failed: " + missing})
+						c.LastTerminalReason = TerminalVerificationFailed
+						c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalVerificationFailed, TaskOutcome: OutcomeVerificationFailed})
+						return lastText, total, err
+					}
+					c.verifier.feedback++
+					msg := llm.Message{Role: "user", Kind: "verification", Content: "[harness required verification]\n" + missing}
+					msgs = append(msgs, msg)
+					c.persist(msg)
+					c.emit(Event{Kind: EventStopBlocked, Text: missing})
+					continue
+				}
 				c.LastTerminalReason = TerminalEndTurn
-				c.emit(Event{Kind: EventDone, Text: lastText, Usage: total, TerminalReason: TerminalEndTurn})
+				c.emit(Event{Kind: EventDone, Text: lastText, Usage: total, TerminalReason: TerminalEndTurn, TaskOutcome: outcome})
 				return lastText, total, nil
 			}
 			// The model stopped calling tools but background jobs are
@@ -831,28 +1127,113 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			var err error
 			msgs, err = c.drainPending(ctx, msgs, pending)
 			pending = nil
+			if c.persistErr != nil {
+				return lastText, total, c.persistErr
+			}
 			if err != nil {
+				c.LastTerminalReason = TerminalAbort
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
 				return lastText, total, err
+			}
+			if c.progress.failures >= MaxFailedFixAttempts {
+				return finishBlocked()
 			}
 			continue
 		}
+		if err := c.reserveBudgetTools(assistant.ToolCalls); err != nil {
+			c.rejectBudgetTools(assistant.ToolCalls, err)
+			return lastText, total, err
+		}
+		if c.Exec != nil {
+			if target := pendingStopTarget(c.Exec.Jobs()); target != nil {
+				msgs = append(msgs, c.rejectBudgetTools(assistant.ToolCalls, fmt.Errorf("background job %s is still finalizing; reconsider these calls after its outcome is recorded", target.ID))...)
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
+				}
+				// The batch is settled without execution. Wait once for its
+				// prerequisite instead of spending model steps in a busy loop.
+				c.emit(Event{Kind: EventBackgroundWait, Text: target.ID})
+				timer := time.NewTimer(c.drainTimeout())
+				var waitErr error
+				select {
+				case <-target.Done():
+				case <-timer.C:
+					waitErr = fmt.Errorf("background job %s is still finalizing after %s; resume after its outcome is available", target.ID, c.drainTimeout())
+				case <-ctx.Done():
+					waitErr = ctx.Err()
+				}
+				timer.Stop()
+				msgs, pending = c.collectFinishedJobs(msgs, pending)
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
+				}
+				if ctx.Err() != nil {
+					waitErr = ctx.Err()
+				} else if target.Delivered() {
+					waitErr = nil
+				}
+				if waitErr != nil {
+					c.LastTerminalReason = TerminalError
+					if ctx.Err() != nil {
+						c.LastTerminalReason = TerminalAbort
+					}
+					lastText = "Task incomplete: " + waitErr.Error()
+					c.persist(llm.Message{Role: "user", Kind: "task_outcome", Content: lastText})
+					c.emit(Event{Kind: EventError, Err: waitErr, Text: lastText, Usage: total, TerminalReason: c.LastTerminalReason})
+					return lastText, total, waitErr
+				}
+				if c.progress.failures >= MaxFailedFixAttempts && len(pending) > 0 {
+					var err error
+					msgs, err = c.drainPending(ctx, msgs, pending)
+					msgs, pending = c.collectFinishedJobs(msgs, nil)
+					if c.persistErr != nil {
+						return lastText, total, c.persistErr
+					}
+					if err == nil {
+						err = ctx.Err()
+					}
+					if err != nil {
+						c.LastTerminalReason = TerminalAbort
+						c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+						return lastText, total, err
+					}
+				}
+				if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {
+					return finishBlocked()
+				}
+				continue
+			}
+		}
 		// Execute tool calls in order. (Parallel batches are v0.2; serial
 		// avoids two tools writing the same file at once.)
-		// stepHadExecution / stepAllFailed track this step for the
-		// blocked-after-3-failures rule: refusals count too, so unavailable tools cannot trap an unlimited run.
-		stepHadExecution := false
-		stepAllFailed := true
 		for i := range assistant.ToolCalls {
 			tc := &assistant.ToolCalls[i]
 			if c.persistErr != nil {
 				return lastText, total, c.persistErr
 			}
 			if err := ctx.Err(); err != nil {
+				if c.budgetError() != nil {
+					c.rejectBudgetTools(assistant.ToolCalls[i:], err)
+				}
 				c.LastTerminalReason = TerminalAbort
 				c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: TerminalAbort})
 				return lastText, total, err
 			}
-			c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: tc.Function.Arguments})
+			inv := llm.ToolInvocation{ID: rand.Text(), CallIndex: i, ToolCallID: tc.ID, ToolName: tc.Function.Name, OriginalArguments: tc.Function.Arguments}
+			recordInvocation := func(args string) error {
+				inv.Arguments = args
+				if c.Session != nil {
+					if err := c.Session.RecordInvocation(inv); err != nil {
+						c.persistErr = fmt.Errorf("save tool invocation: %w", err)
+						return c.persistErr
+					}
+				}
+				msgs[assistantIdx].ToolInvocations = append(msgs[assistantIdx].ToolInvocations, inv)
+				return nil
+			}
+			startTool := func(args string) {
+				c.emit(Event{Kind: EventToolStart, ToolName: tc.Function.Name, ToolArgs: args, ToolCallID: tc.ID, InvocationID: inv.ID})
+			}
 			// Plugin tool_call hooks run before approval: a denied
 			// call never prompts the user, and the approval flow
 			// still applies to anything the hooks let through — a
@@ -861,26 +1242,6 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// (approval prompt, audit, dispatch) and updates the
 			// in-memory assistant message so subsequent steps stay in sync.
 			argsJSON := tc.Function.Arguments
-			if c.Exec != nil && c.Exec.Plugins != nil {
-				newArgs, deny := c.Exec.Plugins.RunToolCallHooks(ctx, tc.Function.Name, argsJSON)
-				if deny != "" {
-					stepHadExecution = true
-					recordLastError(&lastErrors, "plugin denied tool call")
-					obs := "Denied by plugin " + deny + ". Do not retry this tool call; explain and propose an alternative."
-					if c.Session != nil {
-						_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: deny})
-					}
-					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: fmt.Errorf("denied by plugin %s", deny)})
-					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: true})
-					if c.Session != nil {
-						c.persist(msgs[len(msgs)-1])
-					}
-					continue
-				}
-				argsJSON = newArgs
-				tc.Function.Arguments = argsJSON
-				msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
-			}
 			// A tool the model was not offered in this turn's list
 			// is refused outright, before approval: the offered
 			// list is the enforcement, not just a hint. Without
@@ -891,18 +1252,65 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// gets an error observation, like a hook denial, and
 			// the refusal is audited.
 			if !toolOffered(c.Tools, tc.Function.Name) {
-				stepHadExecution = true
-				recordLastError(&lastErrors, "tool not offered: "+tc.Function.Name)
+				// No validated invocation exists; only the request ID is durable.
+				inv.ID = ""
+				c.progressFailure(CanonicalToolKey(tc.Function.Name, argsJSON), failureguard.PolicyDenied)
+				recordLastError(&c.progress.lastErrors, "tool not offered: "+tc.Function.Name)
 				obs := fmt.Sprintf("Tool %s is not available in this turn. Do not retry this tool call; explain and propose an alternative.", tc.Function.Name)
 				if c.Session != nil {
-					_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "tool not offered in this turn"})
+					_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "tool not offered in this turn"})
 				}
-				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: fmt.Errorf("tool %s not offered in this turn", tc.Function.Name)})
-				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: true})
+				startTool(argsJSON)
+				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: fmt.Errorf("tool %s not offered in this turn", tc.Function.Name)})
+				msgs = append(msgs, llm.Message{Role: "tool", Kind: notExecutedKind, Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
 				continue
+			}
+			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
+				msgs = c.invalidArgs(msgs, *tc, err)
+				c.progressFailure(CanonicalToolKey(tc.Function.Name, argsJSON), failureguard.InvalidInput)
+				recordLastError(&c.progress.lastErrors, err.Error())
+				continue
+			}
+			c.verificationTouch(ctx)
+			if c.Exec != nil && c.Exec.Plugins != nil {
+				newArgs, deny := c.Exec.Plugins.RunToolCallHooks(ctx, tc.Function.Name, argsJSON)
+				if deny != "" {
+					inv.ID = ""
+					c.progressFailure(CanonicalToolKey(tc.Function.Name, argsJSON), failureguard.PolicyDenied)
+					recordLastError(&c.progress.lastErrors, "plugin denied tool call")
+					obs := "Denied by plugin " + deny + ". Do not retry this tool call; explain and propose an alternative."
+					if c.Session != nil {
+						_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: deny})
+					}
+					startTool(argsJSON)
+					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: fmt.Errorf("denied by plugin %s", deny)})
+					msgs = append(msgs, llm.Message{Role: "tool", Kind: notExecutedKind, Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
+					if c.Session != nil {
+						c.persist(msgs[len(msgs)-1])
+					}
+					continue
+				}
+				if newArgs != argsJSON {
+					inv.Rewrites = append(inv.Rewrites, llm.ArgumentRewrite{Source: "plugin_hook", Arguments: newArgs})
+				}
+				argsJSON = newArgs
+				tc.Function.Arguments = argsJSON
+				msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
+			}
+			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
+				msgs = c.invalidArgs(msgs, *tc, err)
+				c.progressFailure(CanonicalToolKey(tc.Function.Name, argsJSON), failureguard.InvalidInput)
+				recordLastError(&c.progress.lastErrors, err.Error())
+				continue
+			}
+			if bound := c.verificationArguments(tc.Function.Name, argsJSON); bound != argsJSON {
+				inv.Rewrites = append(inv.Rewrites, llm.ArgumentRewrite{Source: "verification_cwd", Arguments: bound})
+				argsJSON = bound
+				tc.Function.Arguments = bound
+				msgs[assistantIdx].ToolCalls[i].Function.Arguments = bound
 			}
 			// Doom-loop guard: an identical call for the fifth
 			// consecutive time asks the user (once / session /
@@ -910,13 +1318,23 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			// not be asked twice about the same call. A denied
 			// call ends the turn with the structured reason.
 			useArgs, allowed := c.checkRepeatedCall(ctx, tc.Function.Name, argsJSON)
+			if err := ctx.Err(); err != nil {
+				c.rejectBudgetTools(assistant.ToolCalls[i:], err)
+				c.LastTerminalReason = TerminalAbort
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+				return lastText, total, err
+			}
 			if !allowed {
+				if err := recordInvocation(argsJSON); err != nil {
+					return lastText, total, err
+				}
 				obs := RepeatedToolCallMessage(tc.Function.Name, RepeatedToolCallThreshold)
 				if c.Session != nil {
-					_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool call denied"})
+					_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool call denied"})
 				}
-				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: ErrRepeatedToolCallDenied})
-				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: true})
+				startTool(argsJSON)
+				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: ErrRepeatedToolCallDenied})
+				msgs = append(msgs, llm.Message{Role: "tool", Kind: notExecutedKind, Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
@@ -928,44 +1346,86 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				c.emit(Event{Kind: EventError, Err: denied, Text: lastText, TerminalReason: TerminalRepeatedToolCallDenied})
 				return lastText, total, denied
 			}
+			if useArgs != argsJSON {
+				inv.Rewrites = append(inv.Rewrites, llm.ArgumentRewrite{Source: "continuation", Arguments: useArgs})
+			}
 			argsJSON = useArgs
+			if err := c.validateArgs(tc.Function.Name, argsJSON); err != nil {
+				msgs = c.invalidArgs(msgs, *tc, err)
+				c.progressFailure(CanonicalToolKey(tc.Function.Name, argsJSON), failureguard.InvalidInput)
+				recordLastError(&c.progress.lastErrors, err.Error())
+				continue
+			}
 			tc.Function.Arguments = argsJSON
 			msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
+			var mutation *tools.Mutation
+			if tc.Function.Name == "write" || tc.Function.Name == "edit" {
+				var target struct {
+					Path string `json:"path"`
+				}
+				_ = json.Unmarshal([]byte(argsJSON), &target)
+				var err error
+				mutation, err = c.Exec.PrepareMutation(target.Path)
+				if err != nil {
+					msgs = c.invalidArgs(msgs, *tc, err)
+					c.progressFailure(CanonicalToolKey(tc.Function.Name, argsJSON), failureguard.Environment)
+					recordLastError(&c.progress.lastErrors, err.Error())
+					continue
+				}
+				inv.TargetPath = mutation.TargetPath
+			}
+			closeMutation := func() {
+				if mutation != nil {
+					_ = mutation.Close()
+				}
+			}
+			if mutation != nil && guidanceState != nil {
+				if update, err := guidanceState.forMutation(ctx, mutation); update != nil || err != nil {
+					closeMutation()
+					msgs = c.deferForGuidance(msgs, assistant.ToolCalls[i:], "", update, err)
+					break
+				}
+			}
+			if err := recordInvocation(argsJSON); err != nil {
+				closeMutation()
+				return lastText, total, err
+			}
+			startTool(argsJSON)
 			callKey := CanonicalToolKey(tc.Function.Name, argsJSON)
-			// Repeat-failure circuit breaker: a call that already
-			// failed FailureDenyAfter times this turn is denied
-			// before it runs — repeating it cannot make progress,
-			// and the turn must not burn steps on it. Unlike the
-			// doom-loop denial, this does not end the turn: the
-			// model gets the denial as a tool error and can try
-			// something else. It counts as a failed fix attempt
-			// for the blocked guard (the model did try to fix
-			// something; the harness refused on evidence of prior
-			// failure), unlike a hook/approval denial, which never
-			// executed. Checked before approval, so the user is
-			// never asked about a call that will be denied.
-			if denied, failures := breaker.Check(callKey); denied {
+			// The guard admits a bounded retry only with proven changed state.
+			// Check before approval, and keep one immutable key for async results.
+			decision := c.progressAdmit(callKey)
+			if err := ctx.Err(); err != nil {
+				closeMutation()
+				c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
+				c.LastTerminalReason = TerminalAbort
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+				return lastText, total, err
+			}
+			if decision.Denied {
+				failures := decision.Failures
 				obs := RepeatedFailureDeniedMessage(tc.Function.Name, failures)
 				if c.Session != nil {
-					_ = c.Session.Audit(tools.AuditEntry{TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool failure denied"})
+					_ = c.Session.Audit(tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "denied", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), Decision: "denied", ExitCode: -1, Error: "repeated tool failure denied"})
 				}
-				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: ErrRepeatedToolFailureDenied})
-				msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: true})
+				c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: ErrRepeatedToolFailureDenied})
+				msgs = append(msgs, llm.Message{Role: "tool", Kind: notExecutedKind, Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
-				stepHadExecution = true
-				recordLastError(&lastErrors, obs)
+				c.progress.failures++
+				recordLastError(&c.progress.lastErrors, obs)
+				closeMutation()
 				continue
 			}
-			if c.needsApproval(tc.Function.Name, tc.Function.Arguments) {
-				req := ApprovalRequest{ToolName: tc.Function.Name, Arguments: tc.Function.Arguments}
-				c.emit(Event{Kind: EventApproval, Text: req.Prompt(), ToolName: req.ToolName, ToolArgs: req.Arguments})
-				ok, err := c.ask(req)
+			if mutation != nil && mutation.Protected || c.needsApproval(tc.Function.Name, tc.Function.Arguments) {
+				req := ApprovalRequest{ToolName: tc.Function.Name, Arguments: tc.Function.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID, TargetPath: inv.TargetPath}
+				c.emit(Event{Kind: EventApproval, Text: req.Prompt(), ToolName: req.ToolName, ToolArgs: req.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID})
+				ok, err := c.ask(ctx, req)
 				// Audit every decision (approved, denied, or errored)
 				// to the session sidecar, for later review.
 				if c.Session != nil {
-					entry := tools.AuditEntry{TS: time.Now(), Kind: "approval", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), ExitCode: -1}
+					entry := tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "approval", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), ExitCode: -1}
 					if err != nil {
 						entry.Error = err.Error()
 					} else if ok {
@@ -976,42 +1436,108 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					_ = c.Session.Audit(entry)
 				}
 				if err != nil {
+					if c.budgetError() != nil {
+						c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
+					}
 					c.LastTerminalReason = TerminalError
 					if ctx.Err() != nil {
 						c.LastTerminalReason = TerminalAbort
 					}
 					c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: c.LastTerminalReason})
+					closeMutation()
 					return lastText, total, err
 				}
 				if !ok {
-					stepHadExecution = true
+					c.progressFailure(callKey, failureguard.PolicyDenied)
 					obs := "User denied this tool call. Do not retry it; explain and propose an alternative."
-					recordLastError(&lastErrors, obs)
-					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: fmt.Errorf("tool call denied by user")})
-					msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: true})
+					recordLastError(&c.progress.lastErrors, obs)
+					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: fmt.Errorf("tool call denied by user")})
+					msgs = append(msgs, llm.Message{Role: "tool", Kind: notExecutedKind, Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 					if c.Session != nil {
 						c.persist(msgs[len(msgs)-1])
 					}
+					closeMutation()
 					continue
 				}
+			}
+			if err := ctx.Err(); err != nil {
+				closeMutation()
+				c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
+				c.LastTerminalReason = TerminalAbort
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+				return lastText, total, err
+			}
+			if mutation != nil && guidanceState != nil {
+				if update, err := guidanceState.forMutation(ctx, mutation); update != nil || err != nil {
+					closeMutation()
+					msgs = c.deferForGuidance(msgs, assistant.ToolCalls[i:], inv.ID, update, err)
+					break
+				}
+			}
+			toolCtx := tools.WithFailureKey(tools.WithInvocation(ctx, inv.ID, tc.ID), callKey)
+			if tc.Function.Name == tools.GuidanceTool {
+				toolCtx = tools.WithGuidanceOffers(toolCtx, func(cursor llm.GuidanceCursor) bool { return offeredGuidance[cursor] })
+			}
+			if mutation != nil {
+				toolCtx = tools.WithMutation(toolCtx, mutation)
+			}
+			attempt := c.verificationStart(toolCtx, tc.Function.Name, argsJSON)
+			if attempt != nil {
+				attempt.invocationID, attempt.toolCallID = inv.ID, tc.ID
+			}
+			if err := ctx.Err(); err != nil {
+				closeMutation()
+				c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
+				c.LastTerminalReason = TerminalAbort
+				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+				return lastText, total, err
 			}
 			var obs string
 			var err error
 			var res tools.ToolResult
 			var job *tools.Job
+			var humanAnswer *string
 			switch tc.Function.Name {
 			case "ask_user":
-				res.Text, err = c.askUser(ctx, argsJSON)
+				res.Text, humanAnswer, err = c.askUser(ctx, argsJSON)
 			case "bash":
-				res, job, err = c.execBash(ctx, *tc)
+				if attempt != nil && attempt.foreground {
+					res, err = c.Exec.Dispatch(toolCtx, "bash", argsJSON)
+				} else {
+					res, job, err = c.execBash(toolCtx, *tc)
+				}
 				if job != nil {
 					pending = append(pending, pendingJob{callID: tc.ID, job: job})
 				}
 			default:
-				res, err = c.Exec.Dispatch(ctx, tc.Function.Name, argsJSON)
+				res, err = c.Exec.Dispatch(toolCtx, tc.Function.Name, argsJSON)
 			}
+			closeMutation()
+			var bashArgs tools.BashArgs
+			isStop := tc.Function.Name == "bash" && json.Unmarshal([]byte(argsJSON), &bashArgs) == nil && bashArgs.KillJobID != ""
+			var stopped *tools.Job
+			if target := res.StoppedJob; target != nil && !target.Delivered() {
+				stopped = target
+				if outcome, done := target.Result(); done {
+					res.Text = fmt.Sprintf("Stopped background job %s (exit %d).", target.ID, outcome.ExitCode)
+					res.ExitCode = &outcome.ExitCode
+				} else if !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == target }) {
+					pending = append(pending, pendingJob{callID: target.ToolCallID, job: target})
+				}
+				if _, done := target.Result(); !done {
+					err = fmt.Errorf("stop requested for %s; completion is not confirmed yet", target.ID)
+					res.Status = tools.ResultDeferred
+				}
+			}
+			var admission *tools.BashAdmissionError
+			notExecuted := errors.As(err, &admission)
 			if err != nil {
-				res.Status = tools.ResultError
+				if res.Status != tools.ResultDeferred {
+					res.Status = tools.ResultError
+				}
+				if notExecuted {
+					res.Status = tools.ResultNotExecuted
+				}
 				obs = fmt.Sprintf("Error: %v\nOutput:\n%s", err, res.Text)
 			} else {
 				obs = res.Text
@@ -1019,35 +1545,98 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					res.Status = tools.ResultSuccess
 				}
 			}
-			if c.Exec != nil && c.Exec.Plugins != nil {
+			if tc.Function.Name != tools.GuidanceTool && c.Exec != nil && c.Exec.Plugins != nil {
 				obs = c.Exec.Plugins.RunToolResultHooks(ctx, tc.Function.Name, argsJSON, obs, err)
 			}
+			if isStop {
+				// Decorations cannot block the original result's persistence.
+				obs = capText(obs, 1024)
+			}
 
-			// A finished (not backgrounded) call whose observation
-			// differs from the previous one for the same call is
-			// making progress: the doom-loop streak clears. A
-			// backgrounded call has no result yet, so neither
-			// guard sees it here — its result surfaces later as a
-			// user message, not a tool result.
 			if job == nil {
 				c.DoomLoop().Observe(callKey, obs)
-				stepHadExecution = true
-				failed := err != nil
-				if failed {
-					failures := breaker.ObserveFailure(callKey)
-					if failures >= FailureWarnAfter {
-						obs += "\n" + FailureNote(tc.Function.Name, failures)
+				if ctx.Err() == nil && c.budgetError() == nil {
+					if err != nil && res.Status != tools.ResultDeferred {
+						failures := c.progressFailure(callKey, failureKind(err, attempt != nil))
+						if failures >= FailureWarnAfter {
+							obs += "\n" + FailureNote(tc.Function.Name, failures)
+						}
+						recordLastError(&c.progress.lastErrors, obs)
+					} else if err == nil {
+						c.progressSuccess(callKey, tc.Function.Name)
 					}
-					recordLastError(&lastErrors, obs)
-				} else {
-					stepAllFailed = false
-					breaker.ObserveSuccess(callKey)
 				}
 			}
-			c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile})
-			msgs = append(msgs, llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, ToolError: err != nil})
-			if c.Session != nil {
-				c.persist(msgs[len(msgs)-1])
+
+			observation := executionObservation(tc.Function.Name, argsJSON, callKey, res.Text, res.OutputFile, err, job)
+			observation.Answer = humanAnswer
+			endEvent := Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: err, ToolDetail: res.Detail, ToolCount: res.Count, ToolTruncated: res.Truncated, ToolCountLowerBound: res.CountLowerBound, ToolStatus: res.Status, ToolExitCode: res.ExitCode, ToolOutputFile: res.OutputFile}
+			if !isStop {
+				c.emit(endEvent)
+			}
+			var deliveries []jobDelivery
+			if stopped != nil {
+				// Persist each ready outcome before the next tool. Its facts
+				// are anchored to this stop independently of provider display.
+				deliveries = c.stoppedJobDeliveries()
+			}
+			result := llm.Message{Role: "tool", Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: err != nil, Observation: observation}
+			if notExecuted {
+				result.Kind = notExecutedKind
+				observation.Failure = nil
+			}
+			if isStop && res.Status == tools.ResultDeferred {
+				result.Kind = stopPendingKind
+				observation.Failure = nil
+				observation.PendingStop = &llm.JobIdentity{ID: stopped.ID, Started: stopped.Started}
+			}
+			if res.Guidance != nil && err == nil {
+				attachGuidanceDelivery(&result, *res.Guidance)
+				if guidanceState != nil {
+					guidanceState.unread = res.Guidance
+				}
+			}
+			msgs = append(msgs, result)
+			deliver := func(deliveries []jobDelivery) {
+				for _, d := range deliveries {
+					delivery := pendingStopCompletion(msgs, d.job, d.result, d.output)
+					if delivery.Observation.BeforeInvocationID == "" {
+						delivery.Observation.BeforeInvocationID = inv.ID
+					}
+					msgs = append(msgs, delivery)
+					c.persist(delivery)
+					if c.persistErr != nil {
+						return
+					}
+					d.job.MarkDelivered()
+					pending = slices.DeleteFunc(pending, func(p pendingJob) bool { return p.job == d.job })
+					c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: d.output, ToolErr: d.result.Err,
+						JobID: d.job.ID, ToolCallID: d.job.ToolCallID, InvocationID: d.job.InvocationID,
+						ToolExitCode: &d.result.ExitCode, ToolOutputFile: d.job.OutputFile})
+				}
+			}
+			deliver(deliveries)
+			// A recorded stop acknowledgement must never outlive a missing
+			// target outcome after a partial batch write or crash. Provider
+			// replay groups tool replies first regardless of disk ordering.
+			c.persist(result)
+			if c.persistErr != nil {
+				return lastText, total, c.persistErr
+			}
+			if isStop {
+				c.emit(endEvent)
+			}
+			if isStop {
+				// The target or a sibling can finish while the stop event is
+				// consumed, even if the first snapshot delivered the target.
+				deliver(c.stoppedJobDeliveries())
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
+				}
+			}
+			for _, evidence := range c.verificationFinish(ctx, attempt, res, err) {
+				msgs = append(msgs, evidence)
+				c.persist(evidence)
 			}
 			// A read image comes back with its bytes: attach them as
 			// a user message right after the tool result, so the next
@@ -1061,41 +1650,37 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					c.persist(imgMsg)
 				}
 			}
-		}
-		// Three consecutive steps whose tool calls all failed mark
-		// the task blocked: the model is trying and failing, and
-		// looping further only burns context. Any success resets
-		// the count.
-		if stepHadExecution {
-			if stepAllFailed {
-				failedFixes++
-			} else {
-				failedFixes = 0
+			if budgetErr := c.budgetError(); budgetErr != nil {
+				c.rejectBudgetTools(assistant.ToolCalls[i+1:], budgetErr)
+				return lastText, total, budgetErr
 			}
-			if failedFixes >= MaxFailedFixAttempts {
-				if len(pending) > 0 {
-					msgs, _ = c.drainPending(ctx, msgs, pending)
+			if stopped != nil && !stopped.Delivered() {
+				msgs = append(msgs, c.rejectBudgetTools(assistant.ToolCalls[i+1:], fmt.Errorf("background job %s is still finalizing; reconsider these calls after its outcome is recorded", stopped.ID))...)
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
 				}
-				blocked := fmt.Errorf("task blocked: %d consecutive steps ended with only failed tool calls; the last error was not fixed by retrying", MaxFailedFixAttempts)
-				// Blocked-grace summary, mirroring the step-cap
-				// grace: a turn that ends blocked otherwise
-				// settles with whatever text the last tool-call
-				// step had — usually nothing — so the GUI gets
-				// no report at all (the bookstore run's verify
-				// turn settled blocked with an empty text). One
-				// tool-less final call asks for a short summary
-				// of what was verified, what failed and what is
-				// left. Only a complete answer is persisted.
-				if ctx.Err() == nil {
-					graceText, graceUsage, ok := c.graceCall(ctx, msgs, blockedGracePrompt(blocked, lastErrors))
-					total.Add(graceUsage)
-					if ok {
-						lastText = graceText
+				break
+			}
+		}
+		if c.progress.failures >= MaxFailedFixAttempts && ctx.Err() == nil {
+			if len(pending) > 0 {
+				var err error
+				msgs, err = c.drainPending(ctx, msgs, pending)
+				if err != nil {
+					c.LastTerminalReason = TerminalAbort
+					c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+					return lastText, total, err
+				}
+				remaining := pending[:0]
+				for _, p := range pending {
+					if !p.job.Delivered() {
+						remaining = append(remaining, p)
 					}
 				}
-				c.LastTerminalReason = TerminalBlocked
-				c.emit(Event{Kind: EventError, Err: blocked, Text: lastText, TerminalReason: TerminalBlocked})
-				return lastText, total, blocked
+				pending = remaining
+			}
+			if c.progress.failures >= MaxFailedFixAttempts {
+				return finishBlocked()
 			}
 		}
 	}
@@ -1107,6 +1692,14 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	if len(pending) > 0 {
 		msgs, _ = c.drainPending(ctx, msgs, pending)
 	}
+	if c.persistErr != nil {
+		return lastText, total, c.persistErr
+	}
+	if err := ctx.Err(); err != nil {
+		c.LastTerminalReason = TerminalAbort
+		c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+		return lastText, total, err
+	}
 	// Step-cap grace period, after Gemini CLI: a hard cut throws
 	// away the turn, so the model gets one final, tool-less call —
 	// bounded by 60 seconds — to deliver its best answer from what
@@ -1117,8 +1710,8 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	// tool-call step's text. A failed final attempt adds no assistant
 	// message; a context checkpoint may already have been committed.
 	if ctx.Err() == nil {
-		graceText, graceUsage, ok := c.graceCall(ctx, msgs, "You have reached the step limit. Give your best final answer now, summarising what was done and what remains unfinished. Do not call any more tools.")
-		total.Add(graceUsage)
+		graceText, graceUsage, ok := c.graceCall(ctx, msgs, "You have reached the step limit. Give your best final answer now, summarising what was done and what remains unfinished. Do not call any more tools.", guidanceState)
+		c.addObservedUsage(&total, graceUsage)
 		if ok {
 			lastText = graceText
 		}
@@ -1135,21 +1728,24 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 // 60-second timeout. The instruction is the caller's: the cap asks
 // for a best final answer, the blocked turn for a summary of what
 // was verified, what failed and what is left.
-func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction string) (string, llm.Usage, bool) {
+func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction string, guidanceState *guidanceTurn) (string, llm.Usage, bool) {
+	if c.persistErr != nil {
+		return "", llm.Usage{}, false
+	}
 	graceCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	graceMsgs := append(append([]llm.Message{}, msgs...),
-		llm.Message{Role: "user", Content: instruction})
+	instructionMsg := llm.Message{Role: "user", Content: instruction}
+	graceMsgs := append(msgs[:len(msgs):len(msgs)], instructionMsg)
 	var total llm.Usage
-	if c.ContextLimit > 0 && c.needsCompact(graceMsgs) {
-		compacted, u, err := c.compactInLoop(graceCtx, msgs)
-		total.Add(u)
+	if c.ContextLimit > 0 && c.contextTokens(c.promptView(graceMsgs), nil) >= c.contextBudget() {
+		compacted, u, err := c.compactInLoop(graceCtx, msgs, &checkpointPreparation{guidance: guidanceState, closing: &instructionMsg})
+		c.addObservedUsage(&total, u)
 		c.emit(Event{Kind: EventStepUsage, Usage: u})
 		if err != nil {
 			return "", total, false
 		}
-		graceMsgs = append(compacted, llm.Message{Role: "user", Content: instruction})
-		if c.needsCompact(graceMsgs) {
+		graceMsgs = append(compacted, instructionMsg)
+		if !c.checkpointContextFits(graceMsgs, nil) {
 			return "", total, false
 		}
 	}
@@ -1157,7 +1753,7 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	var final llm.Message
 	var usage llm.Usage
 	var thinking strings.Builder
-	_, err := c.streamStep(graceCtx, "LLM call", apiMsgs, nil, func(s string) {
+	_, spent, err := c.streamStep(graceCtx, "LLM call", apiMsgs, nil, func(s string) {
 		c.emit(Event{Kind: EventTextDelta, Text: s})
 	}, func(m llm.Message, u llm.Usage) {
 		final = m
@@ -1171,12 +1767,12 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 	}, func() {
 		thinking.Reset()
 	})
-	total.Add(usage)
+	c.addObservedUsage(&total, spent)
 	if usage.PromptTokens > 0 {
 		c.LastPromptTokens = usage.PromptTokens
 		c.lastPromptEstimate = estimatePromptTokens(apiMsgs, nil)
 	}
-	c.emit(Event{Kind: EventStepUsage, Usage: usage})
+	c.emit(Event{Kind: EventStepUsage, Usage: spent})
 	if err != nil || final.Content == "" || len(final.ToolCalls) > 0 || final.FinishReason == "length" || final.FinishReason == "max_tokens" || final.FinishReason == "incomplete" {
 		return "", total, false
 	}
@@ -1237,6 +1833,9 @@ func (c *Config) ResetSessionState() {
 	c.LastPromptTokens = 0
 	c.lastPromptEstimate = 0
 	c.LastTerminalReason = ""
+	c.LastTaskOutcome = ""
+	c.verifier = nil
+	c.LastTurnBudget = nil
 }
 
 // persist latches a storage failure. The loop stops before its next action;

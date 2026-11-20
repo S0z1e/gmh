@@ -8,14 +8,15 @@ import (
 	"strings"
 )
 
-// Root returns an open root and a relative name. The caller closes the root.
-func Root(base, path string) (*os.Root, string, error) {
+// RelativePath applies the lexical path rules shared by workspace tools.
+// It does not inspect the filesystem or follow symbolic links.
+func RelativePath(base, path string) (string, error) {
 	if path == "" {
-		return nil, "", fmt.Errorf("empty path")
+		return "", fmt.Errorf("empty path")
 	}
 	abs, err := filepath.Abs(base)
 	if err != nil {
-		return nil, "", err
+		return "", err
 	}
 	full := filepath.Clean(path)
 	if !filepath.IsAbs(full) {
@@ -23,7 +24,20 @@ func Root(base, path string) (*os.Root, string, error) {
 	}
 	rel, err := filepath.Rel(abs, full)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil, "", fmt.Errorf("path outside workspace root: %s", path)
+		return "", fmt.Errorf("path outside workspace root: %s", path)
+	}
+	return rel, nil
+}
+
+// Root returns an open root and a relative name. The caller closes the root.
+func Root(base, path string) (*os.Root, string, error) {
+	abs, err := filepath.Abs(base)
+	if err != nil {
+		return nil, "", err
+	}
+	rel, err := RelativePath(abs, path)
+	if err != nil {
+		return nil, "", err
 	}
 	r, err := os.OpenRoot(abs)
 	return r, rel, err
@@ -35,7 +49,20 @@ func Open(base, path string) (*os.File, error) {
 		return nil, err
 	}
 	defer r.Close()
-	return r.Open(rel)
+	f, err := r.OpenFile(rel, os.O_RDONLY|nonblockingRead, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() && !info.IsDir() {
+		f.Close()
+		return nil, fmt.Errorf("read requires a regular file or directory")
+	}
+	return f, nil
 }
 
 func ReadFile(base, path string) ([]byte, error) {

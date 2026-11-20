@@ -20,7 +20,7 @@ func writeMsgs(t *testing.T, s *Store, contents ...string) {
 }
 
 func TestListSessions(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	old, err := New("old")
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func TestValidateSessionID(t *testing.T) {
 }
 
 func TestRenameSession(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("orig")
 	if err != nil {
 		t.Fatal(err)
@@ -133,7 +133,7 @@ func TestRenameSession(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(Dir(), "orig.jsonl")); !os.IsNotExist(err) {
 		t.Fatal("old transcript should be gone")
 	}
-	for _, want := range []string{"renamed.jsonl", "renamed-audit.jsonl", "renamed-pre-compact-120000.jsonl"} {
+	for _, want := range []string{"renamed.jsonl", "renamed-audit.jsonl", "orig-pre-compact-120000.jsonl"} {
 		if _, err := os.Stat(filepath.Join(Dir(), want)); err != nil {
 			t.Fatalf("renamed file missing: %s", want)
 		}
@@ -157,7 +157,7 @@ func TestRenameSession(t *testing.T) {
 }
 
 func TestStoreRename(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("live")
 	if err != nil {
 		t.Fatal(err)
@@ -196,7 +196,7 @@ func TestStoreRename(t *testing.T) {
 // DeleteSession removes a session's transcript, audit sidecar and
 // pre-compact archives, and refuses unknown or invalid ids.
 func TestDeleteSession(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("gone")
 	if err != nil {
 		t.Fatal(err)

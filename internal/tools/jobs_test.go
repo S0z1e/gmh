@@ -2,13 +2,10 @@ package tools
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -210,24 +207,6 @@ func TestBashTimeoutKillsGrandchild(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-}
-
-// procDead reports whether the process is gone, or a zombie (dead,
-// unreaped — Kill(pid, 0) still succeeds on a zombie).
-func procDead(pid int) bool {
-	if err := syscall.Kill(pid, 0); err != nil {
-		return errors.Is(err, syscall.ESRCH)
-	}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return true // gone between the two checks
-	}
-	// State is the field after the closing paren of the comm
-	// (the comm itself may contain ')' and spaces).
-	if i := strings.LastIndexByte(string(data), ')'); i >= 0 && i+2 < len(data) {
-		return data[i+2] == 'Z'
-	}
-	return false
 }
 
 // The cwd argument runs the command in that directory (relative

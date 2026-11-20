@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -49,7 +50,9 @@ type Question struct {
 
 // QuestionRequest is the ask_user tool's arguments.
 type QuestionRequest struct {
-	Questions []Question `json:"questions"`
+	// Context bounds the prompt; implementations must stop waiting when it ends.
+	Context   context.Context `json:"-"`
+	Questions []Question      `json:"questions"`
 }
 
 // QuestionAnswer is one question's answer: the selected option

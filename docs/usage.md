@@ -1,7 +1,8 @@
 # Run
 
 - Set a provider's `apiKey` to a literal key or a `$NAME` / `${NAME}`
-  environment reference; with no `apiKey`, `OPENAI_API_KEY` is used.
+  environment reference. Global or explicit config may omit it to use
+  `OPENAI_API_KEY`; project providers must declare the reference explicitly.
 - `OPENAI_BASE_URL` may be given with or without a trailing `/v1`;
   the client normalises it.
 - Three API shapes: `-api chat` (`POST /v1/chat/completions`,
@@ -29,6 +30,69 @@
   streams request `stream_options: {"include_usage": true}` — without
   it a spec-compliant provider sends no usage object at all and the
   turn reports 0 tokens.
+- Turn status: a model ending its response does not establish that the task
+  is complete. A stop hook that keeps vetoing after three feedback rounds stops
+  with an explicit incomplete error, preserved for resume. `-p` returns a
+  nonzero exit status when the turn fails, including a cap or blocked task.
+- Each agent turn defaults to a 1-hour wall deadline, 1,000 requested tool calls,
+  and 8 concurrent background-capable Bash executions across current and retained
+  sessions on the executor. Required foreground verification checks do not consume
+  a background-job slot. Configure global, explicit or trusted project settings:
+
+  ```json
+  {"turnBudget":{"maxDurationSeconds":3600,"maxToolCalls":1000,"maxConcurrentJobs":8,"maxTokens":0,"maxCostUSD":0}}
+  ```
+
+  Omitted fields use these defaults; an explicit zero disables that cap. An omitted
+  policy inherits the global policy; a supplied policy replaces it as a whole.
+  Untrusted projects cannot override global budgets. Requested calls count even
+  when invalid or refused. A batch that exceeds the remaining tool allowance is
+  rejected in full, with durable unexecuted results. A fresh turn gets fresh counters.
+  The deadline includes provider requests, tools, retries, background-result waits
+  and approval/question waits. Custom prompt callbacks must observe the request's
+  `Context`. Detached background jobs retain their existing lifecycle after a stop.
+- Token and dollar caps are opt-in. They use reported usage from every provider
+  attempt, including failed retries, automatic compaction and grace calls. An
+  exact-cap final response is allowed; another provider attempt is blocked. Usage
+  arrives after execution, so an in-flight request can overshoot; actual reported
+  consumption is retained. A dollar cap uses configured-rate estimates, requires
+  all three base `OPENAI_PRICE_*_PER_MTOK` rates (including explicit zeros), and
+  requires cache usage when input/cache rates differ. It supports chat/responses
+  pricing; Anthropic cache-write pricing is currently unavailable. It does not use
+  the model metadata's `cost` fields. Missing required usage/pricing stops with
+  `budget_unavailable`; exhaustion stops with `budget_exceeded`. Both save an
+  `incomplete` task outcome with the budget snapshot and send no extra grace call.
+  Unreported usage is recorded as unknown rather than zero. Ordinary UI usage
+  totals remain separate from this per-attempt budget evidence.
+- Required verification is opt-in in global, explicit or trusted project config:
+
+  ```json
+  {"verification":{"required":[{"name":"tests","command":"go test ./...","cwd":"."}],"exclude":["build","node_modules"]}}
+  ```
+
+  The model runs these exact commands with the normal Bash tool after its final
+  edits, in the foreground and subject to approval, denylist, timeout, sandbox
+  and environment rules. A matching check's cwd is made canonical and recorded
+  in the final arguments before approval, so an alias changing during snapshot
+  capture cannot redirect the approved command. These commands are never
+  launched automatically.
+  Each result records its invocation, canonical cwd, exit code, start/end times
+  and workspace content version in the transcript. A later failed attempt replaces
+  an earlier pass; edits after a pass invalidate it. Checks that modify included
+  files must run again against the final version. All required checks passing at
+  the current version permits `outcome: completed`; missing, failed or stale
+  evidence gets up to three feedback rounds, then `verification_failed` and a
+  nonzero `-p` exit. Unchanged questions, reads and check-only turns make no
+  completion claim or require verification retries.
+  Versions cover workspace files, directories and permissions, excluding `.git`
+  and explicitly listed relative output paths. Exclude only generated inputs
+  that do not need certification. Limits are 50,000 entries, 16 MiB per file and
+  128 MiB total content; unsupported files (including symlinks), concurrent
+  capture changes or missing directory identity fail closed. External files,
+  services, environment changes and the semantic quality of tests are outside
+  this proof. An omitted policy inherits global settings; `{"verification":{"required":[]}}`
+  disables them when supplied by an authorized config. Untrusted project config
+  cannot replace global verification requirements.
 - Modes: `-mode suggest` (default, ask before write/edit/bash, webfetch and plugin tools),
   `-mode auto` (no prompts, use only on a disposable copy).
 - Editing: `edit` takes either `oldText` (must match exactly once —
@@ -48,19 +112,50 @@
 - Skills: put `SKILL.md` files under `.agents/skills/<name>/` in the
   project, or `~/.config/minimal-harness/skills/`. Only name +
   description are loaded at startup; the full text loads on demand
-  three ways: the user types `/skill:<name>`, the task names a skill
-  as a whole word (auto-loaded before the turn), or the model calls
-  the `load_skill` tool when a task matches a skill. A skill's
+  when the user types `/skill:<name>` or the model calls the
+  `load_skill` tool when a task matches a skill. A skill's
   `references/` files are never loaded up front: `load_skill` lists
   them in a footer, and the model loads one with
   `load_skill {name, reference}` (paths are jailed to that skill's
   `references/`).
-- Project context: `AGENTS.md` and `CLAUDE.md` in the workspace root
-  (and ancestors up to `$HOME`) are loaded once at startup into the
-  system prompt, each capped at 8 KiB, with a git snapshot (branch,
-  working-tree status, recent commits) added the same way. Editing a
-  context file mid-session needs a restart.
-- Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`.
+- Project guidance: in a trusted workspace, applicable `AGENTS.md` and
+  `CLAUDE.md` files are read from the allowed ancestors up to home, the
+  workspace root, and directories containing the file being edited. Nearer
+  directories refine earlier instructions; `CLAUDE.md` follows `AGENTS.md`
+  in the same directory. The model sees each source's path, SHA-256 and
+  up to 8 KiB of text (also subject to an overall preview limit). It can
+  request the rest with `read_guidance`. If the applicable instructions
+  change before a write or edit, the harness asks the model to reconsider
+  the operation before executing it. If branch or working tree status is
+  needed, `git_status` reads it on demand in trusted workspaces. It requires
+  approval in suggest mode and whenever the Bash sandbox is enabled, since a
+  linked worktree may keep its Git metadata outside that sandbox.
+  The result covers the selected working tree, without running Git filters,
+  inspecting submodule working trees or reporting upstream tracking status.
+  The working tree scan requires Git 2.32 or later. With older or unrecognized
+  versions the tool reports only the branch or detached commit.
+- Sessions live in `~/.minimal-harness/sessions/<id>.jsonl`. A session has
+  one transcript writer across processes; opening, renaming or deleting another
+  process's active session fails immediately. Closing or crashing releases the
+  lease, including after rollback and rename. Lock files in the `.writers/`
+  subdirectory remain in place; do not remove them while harness processes run.
+  Writable transcripts must be regular files with one hard link.
+  `harness --view-session <id>` reads the replayed history as JSONL without
+  provider credentials or a writer lease, including while a writer is active.
+  A view is a snapshot of completed records at read time.
+  New transcripts start with a versioned metadata record containing the canonical
+  workspace, directory creation identity, optional Git metadata directory identity,
+  and creation time. This record is excluded from model history and preserved by
+  clear, compaction, rollback and rename. Resume and `/resume` require the same
+  workspace and repository; replacing a directory or changing repositories also
+  requires a new binding. Symlink aliases of the same directory are accepted.
+  To adopt an older transcript without metadata or move one deliberately, run
+  `harness --root <project> --resume <id> --rebind-session`. This preserves history
+  and creation time when available; it does not grant workspace trust. Unsupported
+  schema versions are rejected even with this flag. On filesystems without a
+  directory creation identity, each reopen requires explicit rebind; new sessions
+  and the read-only viewer remain available. Repository metadata is discovered
+  from `.git` directories/files without running Git or loading its configuration.
 - REPL commands: `/usage` shows session token totals, `/clear` drops
   the conversation context (a marker is written to the session file;
   `--resume` starts from the clear point, older messages stay in the
@@ -75,8 +170,8 @@
   contextWindow, image input) and history replays through the new
   API on the next turn. The switch lasts for the session only; it
   does not rewrite the config file.
-- Compaction: `/compact` summarises the conversation into a 6-section
-  brief and replaces history with it; the original transcript is
+- Compaction: `/compact` replaces narration with a 6-section brief alongside
+  program-preserved source facts and the latest task; the original transcript is
   saved to `<session>-pre-compact-<time>.jsonl`. It also triggers
   inside the tool loop, before the next model call, when measured
   usage plus new content reaches 70% of the window (`-context-limit`, default: the model's `contextWindow`,
@@ -85,10 +180,21 @@
   Retries are labelled `Compaction` in `step_retry` events. Failed or truncated
   summaries never replace history. If retries are exhausted, the turn stops
   with an explicit failure report rather than an empty answer.
+  Source facts retain original human instructions, assistant statements and user
+  answers, latest verification attempts (including failures), unresolved errors,
+  invocation IDs, job observations and image/output/transcript references.
+  They are historical data: permissions and current verification still use live
+  policy and fresh evidence. A baseline before the latest task lets rollback
+  remove that task's facts; older compressed turns remain in transcript archives.
+  Summary requests have a separate 128 KiB input cap and reserve the configured
+  output limit within the context window. Optional narration uses a bounded
+  recent suffix with explicit omissions and head/tail excerpts. Mandatory source
+  facts are never clipped: exceeding their 256 KiB, 2048-entry, 64 KiB per-text
+  limits, or the next request's context budget, fails without replacing history.
 - Context checkpoints: normal requests use one fixed 32 KiB cap per tool
   result and never prune by age. At the compaction boundary, the harness first
-  tries replacing older tool outputs with a fixed placeholder, keeping the
-  latest tool batch. It commits that view only if it brings estimated/projected
+  tries replacing older successful tool outputs with a fixed placeholder, keeping
+  failed observations and the latest tool batch. It commits that view only if it brings estimated/projected
   input below 60% of the trigger budget; otherwise it generates a summary.
   Both paths archive the full transcript and persist the replacement atomically,
   so resume retains the checkpoint. This trades larger input between checkpoints
@@ -100,7 +206,7 @@
 - Step budget: steps are unlimited by default (like Claude Code,
   Codex, Gemini, Qwen, OpenCode and Pi): a turn runs until the model
   stops calling tools, an error ends it, or the task is blocked
-  (3 consecutive all-failed steps). The bounds are auto-compaction
+  (three failed attempts without proven progress). The bounds are auto-compaction
   at 70% of the window plus the doom-loop guard (5 consecutive
   identical calls) and the stop-hook veto cap (8). Pass
   `-max-steps N` to opt into a hard cap; when a cap hits, the model
@@ -113,21 +219,33 @@
   used to settle with an empty text and no report at all. Grace requests use
   the same context checkpoint guard. A failed final attempt adds no assistant
   message, but any completed checkpoint and reported usage are retained.
-- Repeat-failure circuit breaker (after Qoder's denial circuit
-  breaker, adapted): the doom-loop guard only sees consecutive
-  repeats, so a call that keeps failing with other work in between
-  never trips it. The breaker counts failures per tool call
-  (tool name + canonical arguments) within one turn: the 2nd
-  failure warns in the observation, and the 4th identical attempt
-  is denied before it runs, as a tool error with reason
-  `repeated_tool_failure_denied` — distinct from the doom-loop
-  guard's `repeated_tool_call_denied`, which means the continuation
-  was refused. A success clears the count, and counts reset every
-  turn. A denied call counts as a failed fix attempt for the
-  blocked guard, so three consecutive denied-or-failed steps still
-  end the turn `blocked`. The breaker never touches the LLM retry
-  path (`step_retry`/idle): that counts failed LLM calls, not tool
-  calls, and works independently.
+- Repeat failures are counted by the effective tool name and canonical arguments,
+  within one turn, including asynchronous Bash results. The second failure warns;
+  after three, the same invocation needs proven changed state to run again.
+  At most two changed-state probes are admitted per invocation and eight per turn.
+  Returning to a known failed or previously admitted version cannot open a probe.
+  Invalid input, policy denial, environment, transient and verification failures
+  are distinguished; edits do not repair an unchanged input or policy rejection.
+  Denials carry `repeated_tool_failure_denied`, separately from a user refusing the
+  doom-loop continuation prompt (`repeated_tool_call_denied`).
+- When a tool batch leaves three failed attempts without proven state or result
+  progress, the turn settles `blocked`, with one tool-free grace report. Successful reads, unchanged writes
+  and unrelated commands returning success do not reset this count. A successful
+  rerun of a previously failing invocation, or a proven workspace change after
+  a successful foreground mutating tool, does. Failed commands' own generated output files
+  are included in their post-failure baseline and do not look like a later repair.
+  Completed job failures are accounted before accepting state progress.
+  Background results use the original effective invocation, even when collected
+  by a later turn. Counts reset for each turn; successful probes do not refund
+  that turn's probe allowance. Model request retries remain independent.
+- State evidence uses the bounded workspace capture described under verification,
+  including its `verification.exclude` settings. Unknown, unstable, unsupported
+  or oversized captures cannot prove a repair. Capture is only attempted during
+  failure handling or repair checks, at most 64 times per turn and five seconds
+  per capture; normal successful turns need no snapshots for the failure guard.
+  If evidence is unavailable or the probe allowance is exhausted, report the
+  blocker and start a new turn after choosing a different approach or fixing
+  the capture scope.
 - Timeouts: a model entry may set `timeoutSeconds` (total per-request
   cap, default 600) and `idleTimeoutSeconds` (silence cap while
   streaming, default 60). A stream that produces no SSE line for the

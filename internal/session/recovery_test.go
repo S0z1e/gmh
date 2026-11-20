@@ -6,7 +6,7 @@ import (
 )
 
 func TestLoadRepairsInterruptedBatch(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("repair")
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +29,7 @@ func TestLoadRepairsInterruptedBatch(t *testing.T) {
 	}
 }
 func TestLoadRepairsDanglingCallBeforeNextTurn(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, _ := New("dangling")
 	defer s.Close()
 	s.Append(llm.Message{Role: "user", Content: "task"})

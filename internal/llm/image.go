@@ -5,13 +5,13 @@ import (
 	"strings"
 )
 
-// Image is one attached image. Path + MediaType are the identity: the
-// session file stores only those (plus dimensions), never the bytes,
-// and the bytes are re-read from disk on --resume. Data holds the
-// base64 bytes in memory only (json:"-" keeps them out of the file).
+// Image identifies immutable attachment bytes by digest. Path records their
+// origin. Data holds the base64 bytes in memory only, outside transcript JSON.
 type Image struct {
-	Path string `json:"path"`
-	// Workspace marks images chosen by a tool, which stay jailed on reload.
+	Path        string `json:"path"`
+	Digest      string `json:"digest,omitempty"`
+	Unavailable string `json:"-"`
+	// Workspace records that a tool selected this image inside the workspace.
 	Workspace bool   `json:"workspace,omitempty"`
 	MediaType string `json:"media_type"`
 	Data      string `json:"-"`
@@ -29,6 +29,9 @@ func (img Image) DataURL() string {
 // Describe renders the image for humans: path, dimensions when
 // known, byte size.
 func (img Image) Describe() string {
+	if img.Unavailable != "" {
+		return img.Path + " (image unavailable: " + img.Unavailable + ")"
+	}
 	if img.Width > 0 && img.Height > 0 {
 		return fmt.Sprintf("%s (%dx%d, %d bytes)", img.Path, img.Width, img.Height, img.Bytes)
 	}
@@ -49,8 +52,7 @@ type chatWireMessage struct {
 }
 
 // toChatWireMessage converts one shared Message to its wire form,
-// skipping images that have no bytes (e.g. a session file whose
-// image was deleted before --resume re-read it).
+// reporting unavailable images as text instead of empty image parts.
 func toChatWireMessage(m Message) chatWireMessage {
 	if len(m.Images) == 0 {
 		return chatWireMessage{Role: m.Role, Content: m.Content, ToolCalls: m.ToolCalls, ToolCallID: m.ToolCallID}
@@ -61,6 +63,7 @@ func toChatWireMessage(m Message) chatWireMessage {
 	}
 	for _, img := range m.Images {
 		if img.Data == "" {
+			parts = append(parts, map[string]any{"type": "text", "text": img.UnavailableText()})
 			continue
 		}
 		parts = append(parts, map[string]any{
@@ -72,6 +75,24 @@ func toChatWireMessage(m Message) chatWireMessage {
 		parts = append(parts, map[string]any{"type": "text", "text": m.Content})
 	}
 	return chatWireMessage{Role: m.Role, Content: parts, ToolCalls: m.ToolCalls, ToolCallID: m.ToolCallID}
+}
+
+func (img Image) UnavailableText() string {
+	reason := img.Unavailable
+	if reason == "" {
+		reason = "no saved image data"
+	}
+	return fmt.Sprintf("[Image unavailable: %s (%s)]", img.Path, reason)
+}
+
+func unavailableImageText(m Message) string {
+	var parts []string
+	for _, img := range m.Images {
+		if img.Data == "" {
+			parts = append(parts, img.UnavailableText())
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // toChatWireMessages converts a whole history. Messages without

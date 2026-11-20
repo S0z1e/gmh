@@ -3,9 +3,10 @@
 package session
 
 import (
-	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"minimalharness/internal/privatefile"
 	"os"
 	"path/filepath"
@@ -17,15 +18,22 @@ import (
 )
 
 type Store struct {
-	ID        string
-	Path      string
-	file      *os.File
-	auditFile *os.File // lazily opened sidecar for audit records
+	ID           string
+	Path         string
+	file         *os.File
+	writer       *os.File // lifetime lease, independent of rewritten transcript inode
+	outputWriter *os.File // output identity lease, independent of session name
+	header       *Header
+	auditFile    *os.File // lazily opened sidecar for audit records
 	// mu guards Append and Audit: a background job's completion audit
 	// can land on its own goroutine while the loop appends or audits
 	// on the main one.
-	mu     sync.Mutex
-	closed bool
+	mu               sync.Mutex
+	closed           bool
+	usageWriteFailed bool
+	usageLoaded      bool
+	usageTotals      UsageTotals
+	usageInfo        os.FileInfo
 }
 
 // AuditPath is the sidecar file holding approval/bash audit records
@@ -40,12 +48,27 @@ func (s *Store) AuditPath() string {
 func (s *Store) Audit(v any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := lockManagement()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	if !s.closed && s.file == nil {
+		return ErrOperationPending
+	}
 	if s.closed {
+		release, err := s.lockClosedStore()
+		if err != nil {
+			return err
+		}
+		defer release()
+
 		b, err := json.Marshal(v)
 		if err != nil {
 			return err
 		}
-		f, err := privatefile.Open(s.AuditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY)
+		f, err := openAuditSidecar(s.AuditPath())
 		if err != nil {
 			return err
 		}
@@ -54,7 +77,7 @@ func (s *Store) Audit(v any) error {
 		return err
 	}
 	if s.auditFile == nil {
-		f, err := privatefile.Open(s.AuditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY)
+		f, err := openAuditSidecar(s.AuditPath())
 		if err != nil {
 			return err
 		}
@@ -68,6 +91,70 @@ func (s *Store) Audit(v any) error {
 	return err
 }
 
+// A closed store can service a late audit or archive request while its
+// original owner is still present. The caller holds the management lock.
+func (s *Store) lockClosedStore() (func(), error) {
+	if _, err := recoverOperations(s.ID); err != nil {
+		return nil, err
+	}
+	if s.header != nil {
+		if err := recoverOutputOperations(s.header.OutputID); err != nil {
+			return nil, err
+		}
+	}
+	writer, err := acquireWriter(s.ID)
+	if err != nil {
+		return nil, err
+	}
+	header, err := readArtifactHeader(s.Path)
+	if err != nil {
+		writer.Close()
+		return nil, err
+	}
+	if (s.header == nil) != (header == nil) || header != nil &&
+		(!header.Created.Equal(s.header.Created) || header.OutputID != s.header.OutputID) {
+		writer.Close()
+		return nil, fmt.Errorf("session identity changed")
+	}
+	var output *os.File
+	if header != nil && header.OutputID != "" {
+		output, err = acquireOutputWriter(header, s.ID)
+		if err != nil {
+			writer.Close()
+			return nil, err
+		}
+	}
+	return func() {
+		if output != nil {
+			output.Close()
+		}
+		writer.Close()
+	}, nil
+}
+
+func openAuditSidecar(path string) (*os.File, error) {
+	id := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	if _, err := recoverOperations(id); err != nil {
+		return nil, err
+	}
+	header, err := readArtifactHeader(path)
+	if err == nil && header != nil {
+		return nil, fmt.Errorf("audit path belongs to another session")
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	f, err := privatefile.Open(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|metadataReadFlags)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTranscriptLinks(f); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
 func Dir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -76,50 +163,130 @@ func Dir() string {
 	return filepath.Join(home, ".minimal-harness", "sessions")
 }
 
-func New(id string) (*Store, error) {
-	auto := id == ""
-	if !auto {
+// createAutoStore runs under the management lock. A generated name is
+// available only if both the transcript and prior operation reservations are clear.
+func createAutoStore(dir, base string, preflight func(*os.File, bool) error) (*Store, error) {
+	for suffix := 0; ; suffix++ {
+		id := base
+		if suffix > 0 {
+			id = fmt.Sprintf("%s-%d", base, suffix)
+		}
+		if _, err := recoverOperations(id); err != nil {
+			if errors.Is(err, ErrSessionBusy) {
+				continue
+			}
+			return nil, err
+		}
+		writer, err := acquireWriter(id)
+		if errors.Is(err, ErrSessionBusy) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		path := filepath.Join(dir, id+".jsonl")
+		f, err := privatefile.Open(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_RDWR)
+		if err != nil {
+			writer.Close()
+			if os.IsExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		if preflight != nil {
+			if err := preflight(f, true); err != nil {
+				f.Close()
+				writer.Close()
+				return nil, err
+			}
+		}
+		return &Store{ID: id, Path: path, file: f, writer: writer}, nil
+	}
+}
+
+func newStore(id string, existing bool, preflight func(*os.File, bool) error) (*Store, error) {
+	if id != "" {
 		if err := ValidateSessionID(id); err != nil {
 			return nil, err
 		}
 	}
-	if auto {
-		id = time.Now().Format("20060102-150405")
-	}
 	dir := Dir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, id+".jsonl")
-	if auto {
-		// Two sessions started in the same second (or a new_session
-		// right after startup) must not share one file: suffix
-		// until the path is free. An explicit id is never suffixed:
-		// --resume needs the exact file.
-		for i := 1; ; i++ {
-			f, err := privatefile.Open(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_WRONLY)
-			if err == nil {
-				return &Store{ID: id, Path: path, file: f}, nil
-			}
-			if !os.IsExist(err) {
-				return nil, err
-			}
-			id = fmt.Sprintf("%s-%d", time.Now().Format("20060102-150405"), i)
-			path = filepath.Join(dir, id+".jsonl")
-		}
+	if id == "" {
+		return createAutoStore(dir, time.Now().Format("20060102-150405"), preflight)
 	}
-	f, err := privatefile.Open(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
+	path := filepath.Join(dir, id+".jsonl")
+	writer, err := acquireWriter(id)
 	if err != nil {
 		return nil, err
 	}
-	return &Store{ID: id, Path: path, file: f}, nil
+	keep := false
+	defer func() {
+		if !keep {
+			writer.Close()
+		}
+	}()
+	// Windows append handles cannot truncate, even with O_RDWR. Repair
+	// through a separate read/write handle, then reopen for append-only use.
+	if err := checkTranscriptPath(path); err != nil {
+		return nil, err
+	}
+	_, statErr := os.Stat(path)
+	created := os.IsNotExist(statErr)
+	flags := os.O_RDWR
+	if !existing {
+		flags |= os.O_CREATE
+	}
+	f, err := privatefile.Open(path, flags)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTranscriptLinks(f); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if preflight != nil {
+		if err := preflight(f, created); err != nil {
+			f.Close()
+			return nil, err
+		}
+		if _, err := f.Seek(0, 0); err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+	if err := recoverTail(f); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	f, err = privatefile.Open(path, os.O_APPEND|os.O_RDWR)
+	if err != nil {
+		return nil, err
+	}
+	keep = true
+	return &Store{ID: id, Path: path, file: f, writer: writer}, nil
 }
 
 func (s *Store) Append(m llm.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := lockManagement()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	if s.closed || s.file == nil {
 		return os.ErrClosed
+	}
+	m, err = persistImages(m)
+	if err != nil {
+		return err
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
@@ -128,8 +295,25 @@ func (s *Store) Append(m llm.Message) error {
 	if len(b)+1 >= maxRecordBytes {
 		return fmt.Errorf("session message exceeds the %d-byte record limit", maxRecordBytes)
 	}
-	_, err = s.file.Write(append(b, '\n'))
-	return err
+	if err := s.writeRecord(b); err != nil {
+		return err
+	}
+	s.acknowledgeOutputs(m)
+	return nil
+}
+
+// writeRecord runs under mu. A successful append is synced before the caller
+// may dispatch a side effect depending on that record.
+func (s *Store) writeRecord(b []byte) error {
+	unlock, err := lockTranscript(s.file)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if _, err := s.file.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	return s.file.Sync()
 }
 
 // clearMarkerRole marks a /clear point in the JSONL. Everything before
@@ -158,21 +342,34 @@ func (s *Store) MarkCompact(summary string) error {
 func (s *Store) MarkCompactMessages(msgs []llm.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := lockManagement()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	if s.closed || s.file == nil {
 		return os.ErrClosed
+	}
+	msgs, err = persistMessageImages(msgs)
+	if err != nil {
+		return err
 	}
 	b, err := marshalCheckpoint(msgs)
 	if err != nil {
 		return err
 	}
-	_, err = s.file.Write(append(b, '\n'))
-	return err
+	return s.writeRecord(b)
 }
 
 // CheckpointFits reports whether a replacement can be loaded as one session
 // record. Large raw histories should be summarized instead of pruned.
 func CheckpointFits(msgs []llm.Message) bool {
-	_, err := marshalCheckpoint(msgs)
+	msgs, err := ImageReferences(msgs)
+	if err != nil {
+		return false
+	}
+	_, err = marshalCheckpoint(msgs)
 	return err == nil
 }
 
@@ -194,12 +391,59 @@ func marshalCheckpoint(msgs []llm.Message) ([]byte, error) {
 // directory and returns its path. Used before compaction so the original
 // transcript is kept separately.
 func (s *Store) ArchiveCopy(name string) (string, error) {
-	data, err := os.ReadFile(s.Path)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed && s.file == nil {
+		return "", ErrOperationPending
+	}
+	unlock, err := lockManagement()
 	if err != nil {
 		return "", err
 	}
+	defer unlock()
+	if s.closed {
+		release, err := s.lockClosedStore()
+		if err != nil {
+			return "", err
+		}
+		defer release()
+	}
+	// Archives add a suffix to a valid (up to 128-byte) session ID.
+	if err := validateSessionName(name, 240); err != nil {
+		return "", err
+	}
+	if _, err := recoverOperations(s.ID, name); err != nil {
+		return "", err
+	}
+	writer, err := acquireWriterFile(name)
+	if err != nil {
+		return "", err
+	}
+	defer writer.Close()
+	source, err := os.OpenFile(s.Path, os.O_RDONLY|metadataReadFlags, 0)
+	if err != nil {
+		return "", err
+	}
+	defer source.Close()
+	if st, err := source.Stat(); err != nil || !st.Mode().IsRegular() {
+		return "", fmt.Errorf("archive source must be regular: %v", err)
+	}
 	dst := filepath.Join(Dir(), name+".jsonl")
-	if err := privatefile.Write(dst, data); err != nil {
+	f, err := privatefile.Open(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
+	if err != nil {
+		return "", err
+	}
+	if err := s.registerArchiveLocked(name + ".jsonl"); err != nil {
+		f.Close()
+		return "", errors.Join(err, os.Remove(dst))
+	}
+	_, writeErr := io.Copy(f, source)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+		return "", err
+	}
+	if err := syncRecoveryDirectory(Dir()); err != nil {
 		return "", err
 	}
 	return dst, nil
@@ -207,8 +451,8 @@ func (s *Store) ArchiveCopy(name string) (string, error) {
 
 // IsTurnStart reports whether m starts a user turn: a user message
 // with no images that is not a turn-internal message the loop
-// itself appended. Turn-internal user messages are the auto-loaded
-// skill bodies ("Skill <name>:\n..."), background-job deliveries
+// itself appended. Turn-internal user messages include loaded skill
+// bodies ("Skill <name>:\n..."), background-job deliveries
 // ("Background job ...") and the compact summary ("Previous
 // conversation summary:\n..."). Kind distinguishes new task messages
 // explicitly; prefix checks exist only for older transcripts.
@@ -265,10 +509,28 @@ func Rollback(msgs []llm.Message, n int) ([]llm.Message, int) {
 func (s *Store) Rewrite(msgs []llm.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := lockManagement()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	if s.closed || s.file == nil {
 		return os.ErrClosed
 	}
+	msgs, err = persistMessageImages(msgs)
+	if err != nil {
+		return err
+	}
 	var b strings.Builder
+	if s.header != nil {
+		line, err := json.Marshal(s.header)
+		if err != nil {
+			return err
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+	}
 	for _, m := range msgs {
 		line, err := json.Marshal(m)
 		if err != nil {
@@ -297,10 +559,10 @@ func (s *Store) Rewrite(msgs []llm.Message) error {
 		return err
 	}
 	if err := os.Rename(tmp.Name(), s.Path); err != nil {
-		s.file, _ = privatefile.Open(s.Path, os.O_APPEND|os.O_WRONLY)
+		s.file, _ = privatefile.Open(s.Path, os.O_APPEND|os.O_RDWR)
 		return err
 	}
-	f, err := privatefile.Open(s.Path, os.O_APPEND|os.O_WRONLY)
+	f, err := privatefile.Open(s.Path, os.O_APPEND|os.O_RDWR)
 	if err != nil {
 		return err
 	}
@@ -319,7 +581,31 @@ func (s *Store) Close() error {
 		s.auditFile.Close()
 		s.auditFile = nil
 	}
-	return s.file.Close()
+	var err error
+	if s.file != nil {
+		err = s.file.Close()
+	}
+	if s.writer != nil {
+		err = errors.Join(err, s.writer.Close())
+		s.writer = nil
+	}
+	if s.outputWriter != nil {
+		err = errors.Join(err, s.outputWriter.Close())
+		s.outputWriter = nil
+	}
+	return err
+}
+
+// OutputDir follows the persistent output identity, including for old sessions
+// whose original directory is adopted on first open with this version.
+func (s *Store) OutputDir() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.ID
+	if s.header != nil && s.header.OutputID != "" {
+		id = s.header.OutputID
+	}
+	return filepath.Join(Dir(), id, "bash-output")
 }
 
 // Load replays the active checkpoint and repairs incomplete tool batches
@@ -335,16 +621,25 @@ func Load(id string) ([]llm.Message, error) {
 	}
 	defer f.Close()
 	var msgs []llm.Message
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), maxRecordBytes)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
+	var replayErr error
+	seenRecord := false
+	_, _, _, err = scanRecords(f, func(line []byte, m llm.Message) {
+		if replayErr != nil {
+			return
 		}
-		var m llm.Message
-		if err := json.Unmarshal(line, &m); err != nil {
-			continue
+		first := !seenRecord
+		seenRecord = true
+		if m.Role == headerRole {
+			if !first {
+				replayErr = fmt.Errorf("session header must be the first record")
+				return
+			}
+			_, replayErr = decodeHeader(line)
+			return
+		}
+		if m.Role == invocationMarkerRole {
+			replayErr = applyInvocation(msgs, m.ToolInvocations)
+			return
 		}
 		if m.Role == clearMarkerRole || m.Role == compactMarkerRole {
 			// /clear or /compact point: forget everything before it
@@ -356,7 +651,7 @@ func Load(id string) ([]llm.Message, error) {
 				}
 				if err := json.Unmarshal(line, &checkpoint); err == nil && checkpoint.Messages != nil {
 					msgs = checkpoint.Messages
-					continue
+					return
 				}
 			}
 			if m.Role == compactMarkerRole && m.Content != "" {
@@ -364,12 +659,15 @@ func Load(id string) ([]llm.Message, error) {
 				m.Kind = "summary"
 				msgs = append(msgs, m)
 			}
-			continue
+			return
 		}
 		msgs = append(msgs, m)
-	}
-	if err := sc.Err(); err != nil {
+	})
+	if err != nil {
 		return nil, err
+	}
+	if replayErr != nil {
+		return nil, fmt.Errorf("load session invocation: %w", replayErr)
 	}
 	return RepairToolBatches(msgs), nil
 }
@@ -416,6 +714,14 @@ func RepairToolBatches(msgs []llm.Message) []llm.Message {
 			result, ok := results[call.ID]
 			if !ok {
 				result = llm.Message{Role: "tool", ToolCallID: call.ID, ToolError: true, Kind: "interrupted", Content: "Error: execution was interrupted before this result was recorded. The outcome is unknown; inspect the current state before retrying any action."}
+			}
+			if result.InvocationID == "" {
+				for _, inv := range m.ToolInvocations {
+					if inv.ToolCallID == call.ID {
+						result.InvocationID = inv.ID
+						break
+					}
+				}
 			}
 			out = append(out, result)
 		}

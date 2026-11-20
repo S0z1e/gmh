@@ -2,20 +2,18 @@
 // writes its FULL stdout+stderr to a per-call file under the
 // executor's OutputDir (session-scoped, set by app.Setup), and the
 // observation returned to the model carries only head + tail plus
-// the file's path. The file grows while a background job runs, so
+// the file's path. Per-file and session quotas stop excessive capture. The
+// file grows while a background job runs, so
 // the model can read partial output mid-run with the read tool —
 // the pull affordance every surveyed production agent has (Claude
 // reads an output file, OpenCode a synthetic task message, Codex
-// wait_agent). Without OutputDir the executor falls back to the old
-// in-memory behaviour (CombinedOutput capped at MaxOutBytes).
+// wait_agent). Without OutputDir a temporary capture file backs a bounded
+// inline result.
 package tools
 
 import (
 	"fmt"
-	"io"
-	"minimalharness/internal/privatefile"
 	"minimalharness/internal/textutil"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -40,17 +38,34 @@ const (
 	OutputFileMaxBytes = 64 << 20
 )
 
-// bashOutputSink keeps the first BashOutputHeadLines lines, the
-// last BashOutputTailLines lines, and the line/byte totals for one
-// bash output, so the inline result can be formatted without
-// re-reading the file. It is fed bytes (usually by scanOutputFile,
-// which streams the output file through it) — it is NOT the child's
-// stdout: a custom Writer there would force os/exec to build a pipe,
-// and cmd.Wait() would block until every grandchild holding that
-// pipe closed it (the café deadlock: a dev server started with `&`
-// blocked turn end forever). The child writes straight to the file
-// (an *os.File), and the accounting is re-derived from the file
-// after the child exits. It is safe for concurrent use.
+// BashOutputPreview keeps captured output and its capture notice separate from paths.
+// A missing tail means Head contains the whole (short) output.
+type BashOutputPreview struct {
+	Head, Tail string
+	Notice     string
+}
+
+func bashPreview(head, tail []string, whole bool) BashOutputPreview {
+	// Cuts must see valid UTF-8: a raw continuation byte at the cut can
+	// otherwise move it past valid output at the beginning of the buffer.
+	first := strings.ToValidUTF8(strings.Join(head, "\n"), "\uFFFD")
+	last := strings.ToValidUTF8(strings.Join(tail, "\n"), "\uFFFD")
+	if whole && len(first) <= bashOutputInlineMaxChars {
+		return BashOutputPreview{Head: first}
+	}
+	headLimit := min(len(first), bashOutputInlineMaxChars/2)
+	tailLimit := min(len(last), bashOutputInlineMaxChars/2)
+	remaining := bashOutputInlineMaxChars - headLimit - tailLimit
+	extra := min(remaining, len(first)-headLimit)
+	headLimit += extra
+	tailLimit += min(remaining-extra, len(last)-tailLimit)
+	return BashOutputPreview{Head: textutil.Prefix(first, headLimit), Tail: textutil.Suffix(last, tailLimit)}
+}
+
+// bashOutputSink retains bounded prefixes of the first and last lines while
+// counting all captured bytes. runBashCmd feeds it as output is written, so a
+// giant unterminated line never requires re-reading or buffering the whole file.
+// It is safe for concurrent use.
 type bashOutputSink struct {
 	mu      sync.Mutex
 	pending []byte // bytes of the current, unterminated line
@@ -79,16 +94,23 @@ func (s *bashOutputSink) Write(p []byte) (int, error) {
 		s.capped = true
 	}
 	s.bytes += int64(len(p))
-	s.pending = append(s.pending, p...)
-	for {
-		i := indexByte(s.pending, '\n')
+	written := len(p)
+	for len(p) > 0 {
+		i := indexByte(p, '\n')
+		part := p
+		if i >= 0 {
+			part = p[:i]
+		}
+		keep := min(len(part), bashOutputMaxLineChars+4-len(s.pending))
+		s.pending = append(s.pending, part[:keep]...)
 		if i < 0 {
 			break
 		}
-		s.addLine(string(s.pending[:i]))
-		s.pending = s.pending[i+1:]
+		s.addLine(string(s.pending))
+		s.pending = s.pending[:0]
+		p = p[i+1:]
 	}
-	return len(p), nil
+	return written, nil
 }
 
 func indexByte(b []byte, c byte) int {
@@ -146,30 +168,6 @@ func (s *bashOutputSink) snapshot() (lines int, bytes int64, capped bool, head, 
 	return s.lines, s.bytes, s.capped, head, tail
 }
 
-// scanOutputFile re-derives a finished output file's accounting by
-// streaming it through a fresh sink: line/byte totals plus head and
-// tail. The child writes straight to the file, so the scan runs
-// after Wait returns; a grandchild may still be appending (a dev
-// server's logs), which is fine — the scan is a point-in-time view
-// and the file keeps growing for later reads.
-func scanOutputFile(path string) (lines int, bytes int64, capped bool, head, tail []string, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, 0, false, nil, nil, err
-	}
-	defer f.Close()
-	sink := newBashOutputSink()
-	buf := make([]byte, 32*1024)
-	if _, err := io.CopyBuffer(sink, f, buf); err != nil {
-		return 0, 0, false, nil, nil, err
-	}
-	if err := sink.Close(); err != nil {
-		return 0, 0, false, nil, nil, err
-	}
-	lines, bytes, capped, head, tail = sink.snapshot()
-	return lines, bytes, capped, head, tail, nil
-}
-
 // FormatBashOutput renders the inline result for a finished (or
 // timed-out) bash call: a header line with the totals, the output
 // file's path and the directory the call ran in, then the whole
@@ -211,33 +209,6 @@ func FormatBashOutput(lines int, bytes int64, fileCapped bool, head, tail []stri
 		}
 		tail = tail[1:]
 	}
-}
-
-// nextOutputFile allocates the path for one bash call's output
-// file, creating OutputDir on first use. It returns "" when
-// OutputDir is unset or cannot be created: callers then fall back
-// to the in-memory behaviour. Names carry the pid so two processes
-// resuming the same session never share a file. The file is
-// created (empty) here, so the path exists from the moment a
-// background job starts — a reader polling it mid-run never races
-// the goroutine that fills it.
-func (e *Executor) nextOutputFile() string {
-	if e.OutputDir == "" {
-		return ""
-	}
-	e.outMu.Lock()
-	defer e.outMu.Unlock()
-	if err := os.MkdirAll(e.OutputDir, 0o755); err != nil {
-		return ""
-	}
-	e.outSeq++
-	path := filepath.Join(e.OutputDir, fmt.Sprintf("bash-%d-%d.log", os.Getpid(), e.outSeq))
-	f, err := privatefile.Open(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY)
-	if err != nil {
-		return ""
-	}
-	_ = f.Close()
-	return path
 }
 
 // outputDirBase resolves p for the read tool's narrow exception:

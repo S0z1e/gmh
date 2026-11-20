@@ -4,29 +4,28 @@
 package tools
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"minimalharness/internal/textutil"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"minimalharness/internal/fileguard"
+	"minimalharness/internal/guidance"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/skills"
+	"minimalharness/internal/toolargs"
+	"minimalharness/internal/workdir"
 )
 
 const (
@@ -43,12 +42,18 @@ const (
 )
 
 type Executor struct {
-	Root      string
-	editMu    sync.Mutex
-	snapshots map[string][32]byte
+	// UntrustedWorkspace disables discovery of project guidance and skills.
+	UntrustedWorkspace bool
+	Guidance           *guidance.Resolver
+	Root               string
+	editMu             editMutex
+	snapshots          map[string][32]byte
 	// BashTimeout overrides the default 120s bash timeout (0 = default).
 	// The per-call timeout argument still caps at 600s.
 	BashTimeout time.Duration
+	// BashEnv names the inherited environment variables. nil uses OS basics;
+	// an empty list inherits none. Provider credentials require explicit opt-in.
+	BashEnv []string
 	// BackgroundThreshold is how long a bash call may run before the
 	// loop backgrounds it (0 = never background; DefaultBackgroundThreshold
 	// when Setup leaves it unset).
@@ -80,6 +85,9 @@ type Executor struct {
 	// result). Read allows absolute paths under it even though they
 	// sit outside the workspace root; Write/Edit/Glob/Grep do not.
 	OutputDir string
+	// OutputMaxBytes bounds all retained Bash output for the session. Zero uses
+	// DefaultSessionOutputMaxBytes. A session switch selects a separate budget.
+	OutputMaxBytes int64
 	// Plugins runs plugin-registered tools (nil = no plugins loaded).
 	// The interface keeps this package free of the moejs dependency:
 	// app.Setup sets it to the loaded *plugins.Registry. A plugin
@@ -91,9 +99,11 @@ type Executor struct {
 	jobs        *JobRegistry
 	sessionJobs map[string]*JobRegistry
 	sessionID   string
+	jobsClosed  bool
+	activeBash  map[*bashRun]struct{}
 
-	outMu  sync.Mutex
-	outSeq int
+	outMu         sync.Mutex
+	outputBudgets map[string]*bashOutputBudget
 
 	cacheOnce  sync.Once
 	fetchCache *webfetchCache
@@ -107,7 +117,9 @@ func (e *Executor) webfetchCache() *webfetchCache {
 	return e.fetchCache
 }
 
-func (e *Executor) audit(entry AuditEntry) {
+func (e *Executor) audit(ctx context.Context, entry AuditEntry) {
+	identity := invocationFromContext(ctx)
+	entry.InvocationID, entry.ToolCallID = identity.id, identity.callID
 	if e.Audit != nil {
 		entry.TS = time.Now()
 		e.Audit(entry)
@@ -131,106 +143,6 @@ type ReadArgs struct {
 	Limit  int    `json:"limit,omitempty"`
 }
 
-func (e *Executor) Read(a ReadArgs) (string, error) {
-	e.editMu.Lock()
-	defer e.editMu.Unlock()
-	base := e.Root
-	if dir, ok := e.outputDirBase(a.Path); ok {
-		base = dir
-	}
-	f, err := fileguard.Open(base, a.Path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-	if info.IsDir() {
-		entries, err := f.ReadDir(-1)
-		if err != nil {
-			return "", err
-		}
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-		var names []string
-		for _, en := range entries {
-			n := en.Name()
-			if en.IsDir() {
-				n += "/"
-			}
-			names = append(names, n)
-		}
-		return "directory " + a.Path + ":\n" + strings.Join(names, "\n"), nil
-	}
-	if base == e.Root {
-		// Hash through the open, jailed descriptor; the edit checks this exact version.
-		h := sha256.New()
-		if _, err := io.Copy(h, f); err != nil {
-			return "", err
-		}
-		if _, err := f.Seek(0, 0); err != nil {
-			return "", err
-		}
-		var digest [32]byte
-		copy(digest[:], h.Sum(nil))
-		e.rememberSnapshot(a.Path, digest)
-	}
-	start := max(a.Offset-1, 0)
-	reader := bufio.NewReader(f)
-	var out strings.Builder
-	for line := 0; ; line++ {
-		var data []byte
-		eof := false
-		clipped := false
-		for {
-			part, err := reader.ReadSlice('\n')
-			if line >= start {
-				take := min(len(part), MaxReadBytes-len(data))
-				clipped = clipped || take < len(part)
-				data = append(data, part[:take]...)
-			}
-			if err == bufio.ErrBufferFull {
-				continue
-			}
-			if err != nil && err != io.EOF {
-				return "", err
-			}
-			eof = err == io.EOF
-			break
-		}
-		if line >= start {
-			// A byte cap may end in the middle of a valid final character.
-			for i := 0; clipped && i < utf8.UTFMax-1 && !utf8.Valid(data) && len(data) > 0; i++ {
-				data = data[:len(data)-1]
-			}
-			if bytes.IndexByte(data, 0) >= 0 || !utf8.Valid(data) {
-				return "", fmt.Errorf("read: binary or non-UTF-8 file; use a binary inspection command instead")
-			}
-			for _, b := range data {
-				if b < 0x20 && b != '\n' && b != '\r' && b != '\t' {
-					return "", fmt.Errorf("read: binary control bytes in file; use a binary inspection command instead")
-				}
-			}
-			fmt.Fprintf(&out, "%d\t%s\n", line+1, strings.TrimSuffix(string(data), "\n"))
-			if clipped {
-				out.WriteString("... [line truncated at read byte limit]\n")
-				return out.String(), nil
-			}
-			if (a.Limit > 0 && line-start+1 >= a.Limit) || eof {
-				return out.String(), nil
-			}
-			if out.Len() >= MaxReadBytes {
-				out.WriteString("... [truncated: use offset to continue]\n")
-				return out.String(), nil
-			}
-		}
-		if eof {
-			return out.String(), nil
-		}
-	}
-}
-
 type WriteArgs struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
@@ -241,34 +153,37 @@ type WriteArgs struct {
 	Overwrite bool `json:"overwrite,omitempty"`
 }
 
-func (e *Executor) Write(a WriteArgs) (string, error) {
+func (e *Executor) Write(a WriteArgs) (string, error) { return e.write(a, nil) }
+
+func (e *Executor) write(a WriteArgs, target *fileguard.Target) (string, error) {
 	e.editMu.Lock()
 	defer e.editMu.Unlock()
-	r, rel, err := fileguard.Root(e.Root, a.Path)
-	if err != nil {
+	if target == nil {
+		var err error
+		target, err = fileguard.Prepare(e.Root, a.Path)
+		if err != nil {
+			return "", err
+		}
+		defer target.Close()
+	}
+	if err := target.Check(); err != nil {
 		return "", err
 	}
-	defer r.Close()
-	_, statErr := r.Stat(rel)
-	if statErr == nil && !a.Overwrite {
+	if target.Info != nil && !a.Overwrite {
 		return "", fmt.Errorf("file exists, use edit instead: %s", a.Path)
 	}
-	if statErr != nil && !os.IsNotExist(statErr) {
-		return "", statErr
-	}
-	if err := r.MkdirAll(filepath.Dir(rel), 0755); err != nil {
-		return "", err
-	}
-	if a.Overwrite && statErr == nil {
+	if a.Overwrite && target.Info != nil {
 		e.invalidateSnapshot(a.Path)
-		if err := atomicWriteFile(r, rel, []byte(a.Content)); err != nil {
+		if err := atomicWriteTarget(target, []byte(a.Content)); err != nil {
 			return "", err
 		}
 		e.rememberSnapshot(a.Path, sha256.Sum256([]byte(a.Content)))
 		return "overwrote " + a.Path, nil
 	}
-	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
-	f, err := r.OpenFile(rel, flags, 0644)
+	if err := target.CreateParents(); err != nil {
+		return "", err
+	}
+	f, err := target.Parent.OpenFile(target.Name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		return "", err
 	}
@@ -299,6 +214,16 @@ type EditArgs struct {
 	EndLine   int `json:"endLine,omitempty"`
 }
 
+func (a EditArgs) validateRange() error {
+	if a.StartLine < 0 {
+		return &InputError{Err: fmt.Errorf("startLine must be >= 1, got %d in %s", a.StartLine, a.Path)}
+	}
+	if a.StartLine > 0 && a.EndLine != 0 && a.EndLine < a.StartLine {
+		return &InputError{Err: fmt.Errorf("endLine %d is before startLine %d in %s", a.EndLine, a.StartLine, a.Path)}
+	}
+	return nil
+}
+
 // splitFileLines splits file content into lines without terminators.
 // A trailing newline does not create an extra line: "a\nb\n" is 2
 // lines, and the returned parts keep the trailing "" sentinel so a
@@ -315,14 +240,24 @@ func splitFileLines(s string) ([]string, int) {
 	return parts, n
 }
 
-func (e *Executor) Edit(a EditArgs) (string, error) {
-	e.editMu.Lock()
-	defer e.editMu.Unlock()
-	p, err := e.resolve(a.Path)
-	if err != nil {
+func (e *Executor) Edit(a EditArgs) (string, error) { return e.edit(a, nil) }
+
+func (e *Executor) edit(a EditArgs, target *fileguard.Target) (string, error) {
+	if err := a.validateRange(); err != nil {
 		return "", err
 	}
-	data, err := fileguard.ReadFile(e.Root, p)
+	e.editMu.Lock()
+	defer e.editMu.Unlock()
+	if target == nil {
+		var err error
+		target, err = fileguard.Prepare(e.Root, a.Path)
+		if err != nil {
+			return "", err
+		}
+		defer target.Close()
+	}
+	p := e.snapshotPath(a.Path)
+	data, err := target.ReadFile()
 	if err != nil {
 		return "", err
 	}
@@ -338,10 +273,7 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 		if sha256.Sum256(data) != expected {
 			return "", fmt.Errorf("file changed since last read or write: %s; read the target lines again before editing", a.Path)
 		}
-		return e.editLines(p, raw, s, a, normNew)
-	}
-	if a.StartLine < 0 {
-		return "", fmt.Errorf("startLine must be >= 1, got %d in %s", a.StartLine, a.Path)
+		return e.editLines(target, p, raw, s, a, normNew)
 	}
 	if n := strings.Count(s, normOld); n != 1 {
 		return "", editMatchError(a.Path, s, normOld, n)
@@ -349,7 +281,7 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 	expected, known := e.snapshots[p]
 	known = known && sha256.Sum256(data) == expected && strings.Count(normOld, "\n") == strings.Count(normNew, "\n")
 	start := strings.Index(s, normOld)
-	if err := e.writeExisting(p, replaceNormalizedRange(raw, start, start+len(normOld), normNew), known); err != nil {
+	if err := e.writeExisting(target, p, replaceNormalizedRange(raw, start, start+len(normOld), normNew), known); err != nil {
 		return "", err
 	}
 	return "edited " + a.Path, nil
@@ -358,7 +290,7 @@ func (e *Executor) Edit(a EditArgs) (string, error) {
 // editLines replaces lines StartLine..EndLine (1-based, inclusive)
 // with normNew. The normalized range excludes the final line separator,
 // preserving the file's original separators outside the replacement.
-func (e *Executor) editLines(p, raw, s string, a EditArgs, normNew string) (string, error) {
+func (e *Executor) editLines(target *fileguard.Target, p, raw, s string, a EditArgs, normNew string) (string, error) {
 	parts, n := splitFileLines(s)
 	end := a.EndLine
 	if end == 0 {
@@ -366,9 +298,9 @@ func (e *Executor) editLines(p, raw, s string, a EditArgs, normNew string) (stri
 	}
 	switch {
 	case a.StartLine < 1:
-		return "", fmt.Errorf("startLine must be >= 1, got %d in %s (file has %d lines)", a.StartLine, a.Path, n)
+		return "", &InputError{Err: fmt.Errorf("startLine must be >= 1, got %d in %s (file has %d lines)", a.StartLine, a.Path, n)}
 	case end < a.StartLine:
-		return "", fmt.Errorf("endLine %d is before startLine %d in %s (file has %d lines)", end, a.StartLine, a.Path, n)
+		return "", &InputError{Err: fmt.Errorf("endLine %d is before startLine %d in %s (file has %d lines)", end, a.StartLine, a.Path, n)}
 	case end > n:
 		return "", fmt.Errorf("endLine %d is beyond the last line (%d) in %s", end, n, a.Path)
 	}
@@ -381,7 +313,7 @@ func (e *Executor) editLines(p, raw, s string, a EditArgs, normNew string) (stri
 		endOffset += len(part)
 	}
 	keepSnapshot := strings.Count(normNew, "\n") == end-a.StartLine
-	if err := e.writeExisting(p, replaceNormalizedRange(raw, start, endOffset, normNew), keepSnapshot); err != nil {
+	if err := e.writeExisting(target, p, replaceNormalizedRange(raw, start, endOffset, normNew), keepSnapshot); err != nil {
 		return "", err
 	}
 	return "edited " + a.Path, nil
@@ -561,14 +493,7 @@ type BashArgs struct {
 // shell itself is not jailed outside the sandbox — an approved
 // bash call can cd anywhere — so cwd is validated, not jailed.
 func (e *Executor) bashDir(a BashArgs) (string, error) {
-	dir := e.Root
-	if strings.TrimSpace(a.Cwd) != "" {
-		dir = a.Cwd
-		if !filepath.IsAbs(dir) {
-			dir = filepath.Join(e.Root, dir)
-		}
-		dir = filepath.Clean(dir)
-	}
+	dir := workdir.Resolve(e.Root, a.Cwd)
 	info, err := os.Stat(dir)
 	if err != nil {
 		return "", fmt.Errorf("invalid cwd %q: %v", a.Cwd, err)
@@ -610,22 +535,31 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 	if strings.TrimSpace(a.KillJobID) != "" {
 		return e.killJob(a.KillJobID)
 	}
+	ctx, finish, err := e.beginBashRun(ctx)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	defer finish()
 	if reason := DeniedCommand(a.Command); reason != "" {
-		e.audit(AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
-		return ToolResult{}, fmt.Errorf("denied by policy: %s", reason)
+		e.audit(ctx, AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
+		return ToolResult{}, &PolicyError{Reason: reason}
 	}
 	dir, err := e.bashDir(a)
 	if err != nil {
 		return ToolResult{}, err
 	}
-	path := e.nextOutputFile()
-	out, code, err := e.runBashCmd(ctx, a.Command, e.bashTimeout(a), path, dir)
+	output, err := e.newBashOutput(ctx)
+	if err != nil {
+		e.audit(ctx, AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
+		return ToolResult{Status: ResultNotExecuted}, err
+	}
+	out, code, err := e.runBashCmd(ctx, a.Command, e.bashTimeout(a), output, dir, nil)
 	entry := AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
 	if err != nil {
 		entry.Error = err.Error()
 	}
-	e.audit(entry)
-	return ToolResult{Text: out, ExitCode: &code, OutputFile: path}, err
+	e.audit(ctx, entry)
+	return ToolResult{Text: out, ExitCode: &code, OutputFile: output.publicPath()}, err
 }
 
 // ToolResult is one tool call's observation. Images is set only by
@@ -640,19 +574,25 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 type ResultStatus string
 
 const (
-	ResultSuccess    ResultStatus = "success"
-	ResultError      ResultStatus = "error"
-	ResultBackground ResultStatus = "background"
+	ResultSuccess     ResultStatus = "success"
+	ResultError       ResultStatus = "error"
+	ResultDeferred    ResultStatus = "deferred"
+	ResultNotExecuted ResultStatus = "not_executed"
+	ResultBackground  ResultStatus = "background"
 )
 
 type ToolResult struct {
-	Status     ResultStatus
-	ExitCode   *int
-	OutputFile string
-	Text       string
-	Images     []llm.Image
-	Detail     string
-	Count      int
+	Guidance        *GuidanceDelivery
+	StoppedJob      *Job // Job targeted by a stop request; its outcome is delivered separately.
+	Status          ResultStatus
+	ExitCode        *int
+	OutputFile      string
+	Text            string
+	Images          []llm.Image
+	Detail          string
+	Count           int
+	Truncated       bool // Result omits matches or bytes.
+	CountLowerBound bool // Search ended before its total count was known.
 }
 
 // maxDetailChars caps display-only detail: a huge write must not
@@ -716,17 +656,29 @@ type PluginRunner interface {
 // alongside its marker text instead of the file's bytes as text.
 func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result ToolResult, resultErr error) {
 	defer func() {
-		if resultErr != nil {
+		if resultErr != nil && result.Status != ResultNotExecuted {
 			result.Status = ResultError
 		} else if result.Status == "" {
 			result.Status = ResultSuccess
 		}
 	}()
+	for _, def := range Defs() {
+		if def.Function.Name == name {
+			if err := toolargs.Validate(def.Function.Parameters, argsJSON); err != nil {
+				return ToolResult{}, &InputError{Err: fmt.Errorf("bad %s args: %w", name, err)}
+			}
+			break
+		}
+	}
 	switch name {
+	case GitStatusTool:
+		return e.gitStatus(ctx)
+	case GuidanceTool:
+		return e.readGuidance(ctx, argsJSON)
 	case "read":
 		var a ReadArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad read args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad read args: %w", err)}
 		}
 		if _, ok := MediaTypeForPath(a.Path); ok {
 			// The model chose the path, so the workspace jail
@@ -744,14 +696,18 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 				Images: []llm.Image{img},
 			}, nil
 		}
-		out, err := e.Read(a)
+		out, err := e.ReadContext(ctx, a)
 		return ToolResult{Text: out}, err
 	case "write":
 		var a WriteArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad write args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad write args: %w", err)}
 		}
-		out, err := e.Write(a)
+		target, err := e.mutationTarget(ctx, a.Path)
+		if err != nil {
+			return ToolResult{}, err
+		}
+		out, err := e.write(a, target)
 		if err != nil {
 			return ToolResult{Text: out}, err
 		}
@@ -759,27 +715,39 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 	case "edit":
 		var a EditArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad edit args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad edit args: %w", err)}
+		}
+		if err := a.validateRange(); err != nil {
+			return ToolResult{}, err
+		}
+		target, err := e.mutationTarget(ctx, a.Path)
+		if err != nil {
+			return ToolResult{}, err
+		}
+		if target == nil {
+			target, err = fileguard.Prepare(e.Root, a.Path)
+			if err != nil {
+				return ToolResult{}, err
+			}
+			defer target.Close()
 		}
 		// For a line edit the diff needs the removed lines, which
 		// Edit overwrites: read them first (cheap, local, and the
 		// bounds are re-checked by Edit itself).
 		removed := a.OldText
 		if a.StartLine > 0 {
-			if p, rerr := e.resolve(a.Path); rerr == nil {
-				if data, rerr := fileguard.ReadFile(e.Root, p); rerr == nil {
-					lines, n := splitFileLines(string(data))
-					end := a.EndLine
-					if end == 0 {
-						end = a.StartLine
-					}
-					if a.StartLine >= 1 && end >= a.StartLine && end <= n {
-						removed = strings.Join(lines[a.StartLine-1:end], "\n")
-					}
+			if data, rerr := target.ReadFile(); rerr == nil {
+				lines, n := splitFileLines(string(data))
+				end := a.EndLine
+				if end == 0 {
+					end = a.StartLine
+				}
+				if a.StartLine >= 1 && end >= a.StartLine && end <= n {
+					removed = strings.Join(lines[a.StartLine-1:end], "\n")
 				}
 			}
 		}
-		out, err := e.Edit(a)
+		out, err := e.edit(a, target)
 		if err != nil {
 			return ToolResult{Text: out}, err
 		}
@@ -787,34 +755,32 @@ func (e *Executor) Dispatch(ctx context.Context, name, argsJSON string) (result 
 	case "bash":
 		var a BashArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad bash args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad bash args: %w", err)}
 		}
 		return e.bashResult(ctx, a)
 	case "grep":
 		var a GrepArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad grep args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad grep args: %w", err)}
 		}
-		out, n, err := e.Grep(ctx, a)
-		return ToolResult{Text: out, Count: n}, err
+		return e.grepResult(ctx, a)
 	case "glob":
 		var a GlobArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad glob args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad glob args: %w", err)}
 		}
-		out, n, err := e.Glob(ctx, a)
-		return ToolResult{Text: out, Count: n}, err
+		return e.globResult(ctx, a)
 	case "load_skill":
 		var a LoadSkillArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad load_skill args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad load_skill args: %w", err)}
 		}
 		out, err := e.LoadSkill(a)
 		return ToolResult{Text: out}, err
 	case "webfetch":
 		var a WebfetchArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-			return ToolResult{}, fmt.Errorf("bad webfetch args: %w", err)
+			return ToolResult{}, &InputError{Err: fmt.Errorf("bad webfetch args: %w", err)}
 		}
 		out, err := e.Webfetch(ctx, a)
 		return ToolResult{Text: out}, err
@@ -841,9 +807,9 @@ type LoadSkillArgs struct {
 func (e *Executor) LoadSkill(a LoadSkillArgs) (string, error) {
 	name := strings.TrimSpace(a.Name)
 	if name == "" {
-		return "", fmt.Errorf("load_skill needs a skill name")
+		return "", &InputError{Err: fmt.Errorf("load_skill needs a skill name")}
 	}
-	found := skills.Discover(e.Root)
+	found := skills.DiscoverForTrust(e.Root, !e.UntrustedWorkspace)
 	var match *skills.Skill
 	for i, sk := range found {
 		if sk.Name == name {
@@ -885,22 +851,22 @@ func (e *Executor) killJob(id string) (ToolResult, error) {
 	}
 	res, ok := job.Result()
 	if ok {
-		job.MarkDelivered()
-		return ToolResult{Text: fmt.Sprintf("Stopped background job %s (exit %d).\nOutput:\n%s", job.ID, res.ExitCode, truncate(res.Output, 32*1024)), ExitCode: &res.ExitCode, OutputFile: job.OutputFile}, nil
+		if job.Delivered() {
+			return ToolResult{Text: fmt.Sprintf("Background job %s already finished (exit %d); its result was delivered.", job.ID, res.ExitCode), ExitCode: &res.ExitCode, OutputFile: job.OutputFile}, nil
+		}
+		return ToolResult{Text: fmt.Sprintf("Stopped background job %s (exit %d).\nOutput:\n%s", job.ID, res.ExitCode, truncate(res.Output, 32*1024)), ExitCode: &res.ExitCode, OutputFile: job.OutputFile, StoppedJob: job}, nil
 	}
-	return ToolResult{Text: fmt.Sprintf("Signalled background job %s to stop.", job.ID), OutputFile: job.OutputFile}, nil
+	return ToolResult{Text: fmt.Sprintf("Signalled background job %s to stop.", job.ID), OutputFile: job.OutputFile, StoppedJob: job}, nil
 }
 
 // writeExisting atomically replaces an existing file while preserving its mode.
 // keepSnapshot requires the caller to have validated the original bytes against
 // a known version and preserved line numbers.
-func (e *Executor) writeExisting(path string, data []byte, keepSnapshot bool) error {
-	r, rel, err := fileguard.Root(e.Root, path)
-	if err != nil {
+func (e *Executor) writeExisting(target *fileguard.Target, path string, data []byte, keepSnapshot bool) error {
+	if err := target.Check(); err != nil {
 		return err
 	}
-	defer r.Close()
-	if err := atomicWriteFile(r, rel, data); err != nil {
+	if err := atomicWriteTarget(target, data); err != nil {
 		e.invalidateSnapshot(path)
 		return err
 	}
@@ -915,6 +881,18 @@ func (e *Executor) writeExisting(path string, data []byte, keepSnapshot bool) er
 // IsProtectedWorkspacePath reports whether path points to harness config,
 // plugins, or git internals that should always require explicit approval.
 func IsProtectedWorkspacePath(root, path string) bool {
+	if protectedSpelling(root, path) {
+		return true
+	}
+	target, err := fileguard.Prepare(root, path)
+	if err != nil {
+		return false
+	}
+	defer target.Close()
+	return protectedTarget(root, target)
+}
+
+func protectedSpelling(root, path string) bool {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return false
@@ -927,7 +905,15 @@ func IsProtectedWorkspacePath(root, path string) bool {
 	if err != nil {
 		return false
 	}
-	rel = filepath.ToSlash(filepath.Clean(rel))
+	rel = strings.ToLower(filepath.ToSlash(filepath.Clean(rel)))
+	if runtime.GOOS == "windows" {
+		parts := strings.Split(rel, "/")
+		for i, part := range parts {
+			part, _, _ = strings.Cut(part, ":") // Alternate data streams share the file.
+			parts[i] = strings.TrimRight(part, ". ")
+		}
+		rel = strings.Join(parts, "/")
+	}
 	return rel == ".harness.json" ||
 		rel == ".git" || strings.HasPrefix(rel, ".git/") ||
 		rel == ".agents/plugins" || strings.HasPrefix(rel, ".agents/plugins/")

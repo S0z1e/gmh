@@ -114,6 +114,64 @@ go vet ./...
 go test ./...
 ```
 
-`go build ./...` also builds the TUI binary (`harness-tui`), which
-`harness` re-execs when the TUI is selected, so `-p` and the plain
-CLI never import Bubble Tea.
+`go build ./...` checks that every package compiles. To create the two
+executables that the launcher expects, build both into the same directory:
+
+```bash
+go build -o bin/harness ./cmd/harness
+go build -o bin/harness-tui ./cmd/harness-tui
+```
+
+On Windows use `harness.exe` and `harness-tui.exe`. The TUI is a separate
+process, so `-p` and the plain CLI never import Bubble Tea.
+
+### Release archives
+
+```bash
+go run ./cmd/harness-package -version v1.0.0 -out dist
+# Or build just the current target, for example:
+go run ./cmd/harness-package -targets darwin/arm64 -version dev -out dist
+```
+
+Linux/macOS archives are `.tar.gz`; Windows archives are `.zip`. Each contains
+`harness`, `harness-tui` (with `.exe` on Windows), and `manifest.json` with
+binary SHA-256 hashes. Extract both executables into the same directory and
+keep these names. Published releases also include `SHA256SUMS` for the archives.
+Existing archive paths are never overwritten.
+
+CI runs the full race and subprocess suite on Linux/macOS, including real
+bubblewrap checks on Linux. Windows runs native provider, session, configuration
+and packaging checks. Bash tools on Windows require Bash (for example Git for
+Windows) on PATH; Unix shell fixture tests and bubblewrap are outside that
+Windows support boundary. All five release targets are compiled; native jobs
+extract their own archive and exercise the production TUI sibling launch path.
+
+### Fixed scenario baseline
+
+```bash
+go run ./cmd/harness-eval > /tmp/harness-scenario-baseline.json
+```
+
+Run this from a repository checkout with Go, Bash and Git available. Ten fixed
+scenarios cover small changes, cross-file refactoring, fail/edit/rerun, nested
+instructions, long output, repeated compaction, immutable images, failed
+background builds, cancellation/recovery, and document injection. Their existing
+file, command and transcript assertions are the success oracles. Reports record
+the harness commit, dirty state, scripted fixture model, per-scenario result and
+p50/p95 scenario duration; a missing or skipped selected test fails the run.
+
+The default run uses scripted providers and leaves provider token and cost
+metrics empty. To run the live suite separately with your own provider, use
+an explicit configuration and a pinned model:
+
+```bash
+go run ./cmd/harness-eval -live-config /path/to/config.json -model MODEL_ID \
+  -max-cost-usd 1 -max-tokens 50000 -timeout 20m > /tmp/harness-live-results.json
+```
+
+Live evaluation requires complete metering rates and Chat Completions or
+Responses. It uses temporary workspaces, checks file contents and scope, and
+limits shell commands to the fixture's checks and scripts. It stops dispatch
+when metering is incomplete or the suite budget is exhausted. The last
+in-flight request can exceed the budget because usage arrives with its
+response. CI runs the scripted suite.

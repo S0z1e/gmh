@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // Short output is returned whole, with the header naming the file.
@@ -78,8 +79,7 @@ func TestFormatBashOutputHugeLine(t *testing.T) {
 
 // The sink splits lines correctly across Write boundaries and keeps
 // head + tail while a stream is still open. It no longer writes a
-// file itself (the child writes straight to the file); the file
-// round-trip is covered by TestScanOutputFile below.
+// file itself; runBashCmd owns writing the captured bytes to disk.
 func TestBashOutputSinkSplitWrites(t *testing.T) {
 	sink := newBashOutputSink()
 	// Deliberately split mid-line and mid-word.
@@ -107,23 +107,18 @@ func TestBashOutputSinkSplitWrites(t *testing.T) {
 	}
 }
 
-// scanOutputFile re-derives the accounting from a file the child
-// wrote directly: totals, head and tail, including a trailing
-// partial line; a missing file is an error.
-func TestScanOutputFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "out.log")
+// Streaming accounting retains line totals, head and tail, including a final
+// partial line, without scanning the output file again.
+func TestBashOutputSinkLineAccounting(t *testing.T) {
 	var want strings.Builder
 	for i := 1; i <= 100; i++ {
 		fmt.Fprintf(&want, "line %d\n", i)
 	}
 	want.WriteString("partial")
-	if err := os.WriteFile(path, []byte(want.String()), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	lines, bytes, capped, head, tail, err := scanOutputFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sink := newBashOutputSink()
+	_, _ = sink.Write([]byte(want.String()))
+	_ = sink.Close()
+	lines, bytes, capped, head, tail := sink.snapshot()
 	if lines != 101 {
 		t.Fatalf("lines = %d, want 101", lines)
 	}
@@ -138,9 +133,6 @@ func TestScanOutputFile(t *testing.T) {
 	}
 	if len(tail) != 30 || tail[0] != "line 72" || tail[29] != "partial" {
 		t.Fatalf("tail = %v", tail)
-	}
-	if _, _, _, _, _, err := scanOutputFile(filepath.Join(t.TempDir(), "missing.log")); err == nil {
-		t.Fatal("scanning a missing file should fail")
 	}
 }
 
@@ -321,5 +313,45 @@ func TestBashNoOutputDirLegacy(t *testing.T) {
 	}
 	if strings.Contains(out, "full output in") {
 		t.Fatalf("legacy output should carry no path:\n%s", out)
+	}
+}
+
+func TestBashOutputSinkBoundsUnterminatedLine(t *testing.T) {
+	sink := newBashOutputSink()
+	chunk := []byte(strings.Repeat("x", 32*1024))
+	for range 64 {
+		if _, err := sink.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		if len(sink.pending) > bashOutputMaxLineChars+4 {
+			t.Fatalf("pending line retained %d bytes", len(sink.pending))
+		}
+	}
+	_, _ = sink.Write([]byte("\nlast\n"))
+	_ = sink.Close()
+	lines, bytes, _, head, tail := sink.snapshot()
+	if lines != 2 || bytes != 64*int64(len(chunk))+6 || len(head) != 2 || len(tail) != 2 {
+		t.Fatalf("lines=%d bytes=%d head=%d tail=%d", lines, bytes, len(head), len(tail))
+	}
+	if !strings.HasSuffix(head[0], "… [line truncated]") || tail[1] != "last" {
+		t.Fatalf("head prefix=%q tail=%q", head[0][:20], tail[1])
+	}
+}
+
+func TestBashOutputSinkCapsLineAcrossUTF8Chunks(t *testing.T) {
+	sink := newBashOutputSink()
+	line := strings.Repeat("界", 2000)
+	for i := 0; i < len(line); i += 19 {
+		end := min(i+19, len(line))
+		_, _ = sink.Write([]byte(line[i:end]))
+	}
+	_, _ = sink.Write([]byte("\r\nnext\r\n"))
+	_ = sink.Close()
+	lines, bytes, _, head, _ := sink.snapshot()
+	if lines != 2 || bytes != int64(len(line)+8) {
+		t.Fatalf("lines=%d bytes=%d", lines, bytes)
+	}
+	if !utf8.ValidString(head[0]) || !strings.HasSuffix(head[0], "… [line truncated]") || head[1] != "next" {
+		t.Fatalf("invalid or misplaced line cap: head lengths %d/%d", len(head[0]), len(head[1]))
 	}
 }

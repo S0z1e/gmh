@@ -226,9 +226,9 @@ func setupTestApp(t *testing.T, mode string, steps []fakeStep, writePlugins ...f
 		t.Fatal(err)
 	}
 	// The harness requires a configured provider: point a mock
-	// provider at the fake server. Env still wins for the key.
+	// provider at the fake server, explicitly referencing the test key.
 	// The mock model declares image input so attach_image works.
-	cfg := fmt.Sprintf(`{"providers": {"mock": {"baseUrl": %q, "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}, {"id": "mock2", "api": "openai-responses"}]}}}`, srv.URL+"/v1")
+	cfg := fmt.Sprintf(`{"providers": {"mock": {"apiKey": "$OPENAI_API_KEY", "baseUrl": %q, "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}, {"id": "mock2", "api": "openai-responses"}]}}}`, srv.URL+"/v1")
 	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func setupTestApp(t *testing.T, mode string, steps []fakeStep, writePlugins ...f
 		w(root)
 	}
 	t.Setenv("OPENAI_API_KEY", "test")
-	a, err := app.Setup(app.Params{
+	a, err := app.Setup(app.Params{WorkspaceTrust: "trust",
 		Root: root, Mode: mode, MaxSteps: 10,
 		BackgroundThresholdSeconds: 0, DisableBackground: true,
 	})
@@ -321,6 +321,26 @@ func TestToolEndCarriesDetailAndCount(t *testing.T) {
 	if settled := d.waitFor("agent_settled", 10*time.Second); settled["error"] != nil {
 		t.Fatalf("settled with error: %v", settled["error"])
 	}
+	d.quit(t)
+}
+
+func TestGrepToolEndMarksIncompleteCount(t *testing.T) {
+	a, runner, root := setupTestApp(t, "auto", []fakeStep{
+		{kind: "tool", tool: "grep", args: map[string]any{"pattern": "MATCH", "maxMatches": 10}},
+		{kind: "text", text: "Done."},
+	})
+	if err := os.WriteFile(filepath.Join(root, "many.txt"), []byte(strings.Repeat("MATCH payload\n", 150000)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "find MATCH"})
+	d.waitFor("response", 5*time.Second)
+	ev := d.waitFor("tool_end", 5*time.Second)
+	if ev["error"] != nil || ev["truncated"] != true || ev["count_lower_bound"] != true || ev["count"].(float64) < 10 || !strings.Contains(ev["output"].(string), "at least") {
+		t.Fatalf("incomplete grep count misreported: %v", ev)
+	}
+	d.waitFor("agent_settled", 10*time.Second)
 	d.quit(t)
 }
 
@@ -849,7 +869,7 @@ func TestListRenameResumeSessions(t *testing.T) {
 	d.waitFor("ready", 5*time.Second)
 
 	// A second session on disk, with one message.
-	other, err := session.New("second")
+	other, err := session.Open("second", session.OpenOptions{Workspace: a.Root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -942,7 +962,7 @@ func TestListPlugins(t *testing.T) {
 		write("boom", "boom.js", `throw new Error("kaboom");`)
 		// Disable "off" in the project config (replaces the config
 		// setupTestApp wrote).
-		cfg := `{"providers": {"mock": {"baseUrl": "http://127.0.0.1:1", "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}]}}, "plugins": {"disabled": ["off"]}}`
+		cfg := `{"providers": {"mock": {"apiKey": "$OPENAI_API_KEY", "baseUrl": "http://127.0.0.1:1", "api": "chat", "models": [{"id": "mock", "input": ["text", "image"]}]}}, "plugins": {"disabled": ["off"]}}`
 		if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(cfg), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -1082,8 +1102,8 @@ func TestCompactedEventManual(t *testing.T) {
 
 	d.send(map[string]any{"id": "c1", "type": "compact"})
 	ev := d.waitFor("compacted", 5*time.Second)
-	if ev["messages"] != float64(1) {
-		t.Fatalf("compacted messages = %v, want 1", ev["messages"])
+	if ev["messages"] != float64(3) {
+		t.Fatalf("compacted messages = %v, want 3", ev["messages"])
 	}
 	// The fake's usage is completion 5 for every call, and the
 	// compact call's completion is the summary itself.
@@ -1094,13 +1114,13 @@ func TestCompactedEventManual(t *testing.T) {
 	if resp["id"] != "c1" || resp["type"] != "response" {
 		t.Fatalf("compact response = %v", resp)
 	}
-	// History afterwards is the summary alone.
+	// History retains the current task and source facts beside the summary.
 	data := d.query(t, "h1", "history", nil)
 	msgs, _ := data["messages"].([]any)
-	if len(msgs) != 1 {
-		t.Fatalf("post-compact history = %d messages, want 1", len(msgs))
+	if len(msgs) != 3 {
+		t.Fatalf("post-compact history = %d messages, want 3", len(msgs))
 	}
-	only, _ := msgs[0].(map[string]any)
+	only, _ := msgs[1].(map[string]any)
 	if only["role"] != "user" || !strings.Contains(fmt.Sprintf("%v", only["content"]), "Previous conversation summary:") {
 		t.Fatalf("post-compact message = %v", only)
 	}
@@ -1143,8 +1163,8 @@ func TestCompactedEventAuto(t *testing.T) {
 	d.waitFor("response", 5*time.Second)
 	// doCompact runs inside the turn, before agent_settled.
 	ev := d.waitFor("compacted", 5*time.Second)
-	if ev["messages"] != float64(3) || ev["summary_tokens"] != float64(5) {
-		t.Fatalf("compacted = %v, want messages 3 summary_tokens 5", ev)
+	if ev["messages"] != float64(4) || ev["summary_tokens"] != float64(5) {
+		t.Fatalf("compacted = %v, want messages 4 summary_tokens 5", ev)
 	}
 	d.waitFor("agent_settled", 5*time.Second)
 	d.quit(t)
@@ -1238,7 +1258,7 @@ func TestSetToolModeAndDeleteSession(t *testing.T) {
 	d.waitFor("ready", 5*time.Second)
 
 	// A second session on disk, with one message.
-	other, err := session.New("second")
+	other, err := session.Open("second", session.OpenOptions{Workspace: a.Root})
 	if err != nil {
 		t.Fatal(err)
 	}

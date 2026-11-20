@@ -973,6 +973,26 @@ harness.on("context", (e) => {
 	}
 }
 
+func TestContextHookPreservesDistinctImageVersionsAndUnavailableState(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "echoctx", "", "e.js", `harness.on("context",(e)=>e.messages);`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	orig := []llm.Message{
+		{Role: "user", Images: []llm.Image{{Path: "same.png", Digest: strings.Repeat("a", 64), Data: "first"}}},
+		{Role: "user", Images: []llm.Image{{Path: "same.png", Digest: strings.Repeat("b", 64), Data: "second"}}},
+		{Role: "user", Images: []llm.Image{{Path: "same.png", Digest: strings.Repeat("c", 64), Unavailable: "missing blob"}}},
+	}
+	got := reg.RunContextHooks(context.Background(), "s1", "default", orig)
+	for i := range orig {
+		if len(got[i].Images) != 1 || got[i].Images[0] != orig[i].Images[0] {
+			t.Fatalf("image version changed: %+v", got)
+		}
+	}
+}
+
 func TestSessionBeforeCompactHooks(t *testing.T) {
 	root := t.TempDir()
 	writePlugin(t, root, "aaa", "", "a.js", `harness.on("session_before_compact", (e) => "Keep the plan (session " + e.session + ", " + e.messages + " messages).");`)
@@ -1095,5 +1115,37 @@ harness.registerTool("store_write", "Write.", {type:"object"}, () => {harness.wr
 	}
 	if raw, err := os.ReadFile(filepath.Join(outside, "secret")); err != nil || string(raw) != "safe" {
 		t.Fatalf("outside file = %q, %v", raw, err)
+	}
+}
+
+func TestInvalidPluginArgumentsDoNotRunHandler(t *testing.T) {
+	root := t.TempDir()
+	dir := writePlugin(t, root, "validate", "", "test.js", `harness.registerTool("validate","Validate input",{type:"object",properties:{value:{type:"integer",minimum:1,maximum:3}},required:["value"],additionalProperties:false},args=>{harness.writeFile("marker","ran");return "ok";});`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	for _, args := range []string{`{}`, `null`, `{"value":null}`, `{"value":"1"}`, `{"value":4}`, `{"value":1,"extra":true}`} {
+		if _, err := reg.Call(context.Background(), "validate", args); err == nil {
+			t.Fatalf("invalid plugin args accepted: %s", args)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "data", "marker")); !os.IsNotExist(err) {
+		t.Fatalf("invalid call ran handler: %v", err)
+	}
+	if _, err := reg.Call(context.Background(), "validate", `{"value":1}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "data", "marker")); err != nil {
+		t.Fatalf("valid handler not executed: %v", err)
+	}
+}
+
+func TestUnsupportedPluginSchemaRejectedAtRegistration(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "bad_schema", "", "test.js", `harness.registerTool("bad_schema","Unsupported schema",{type:"object",dependentRequired:{a:["b"]}},args=>"ok");`)
+	reg, errs := Load(root, nil)
+	if len(errs) == 0 || reg.Has("bad_schema") {
+		t.Fatal("unenforced plugin schema was advertised")
 	}
 }

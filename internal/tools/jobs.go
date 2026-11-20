@@ -11,11 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"minimalharness/internal/privatefile"
 	"os"
 	"os/exec"
+	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -39,28 +38,38 @@ type JobResult struct {
 	Output   string
 	Err      error
 	ExitCode int
+	Preview  *BashOutputPreview
 }
 
 // Job is one background bash execution.
 type Job struct {
+	// Invocation identity is immutable from construction.
+	InvocationID string
+	ToolCallID   string
+	failureKey   string
+
 	ID      string
 	Command string
+	Cwd     string
 	// OutputFile is the per-call file holding the full stdout+stderr
 	// ("" when OutputDir was unset); it grows while the job runs.
-	OutputFile string
-	Started    time.Time
-	cancel     context.CancelFunc
-	stopParent func() bool
+	OutputFile  string
+	Started     time.Time
+	cancel      context.CancelFunc
+	closeCancel context.CancelFunc
+	stopParent  func() bool
 
 	mu         sync.Mutex
 	done       chan struct{}
 	result     JobResult
 	finished   bool
 	finishedAt time.Time
-	// delivered is set once the result was fed back to the model
-	// (collectFinishedJobs or drainPending): a job re-attached by a
-	// later turn must not deliver its result twice.
+	registry   *JobRegistry
+	// A later turn must not deliver a recorded result twice.
 	delivered bool
+	// A requested stop remains a delivery barrier even if context compaction
+	// no longer contains its original acknowledgement.
+	stopRequested bool
 	// reported is set once a bounded drain told the model the job is
 	// still running: the next turn's drain must not wait on it again
 	// (the turn would pay the bound on every turn while a server runs).
@@ -69,6 +78,9 @@ type Job struct {
 
 // Done closes when the command finishes (success, failure or timeout).
 func (j *Job) Done() <-chan struct{} { return j.done }
+
+// FailureKey is the immutable effective invocation captured when this job began.
+func (j *Job) FailureKey() string { return j.failureKey }
 
 // FinishedAt reports when the job finished; ok is false while running.
 func (j *Job) FinishedAt() (time.Time, bool) {
@@ -114,7 +126,11 @@ func (j *Job) finish(r JobResult) {
 	j.result = r
 	j.finished = true
 	j.finishedAt = time.Now()
+	registry, delivered := j.registry, j.delivered
 	j.mu.Unlock()
+	if delivered && registry != nil {
+		registry.trimDelivered()
+	}
 	close(j.done)
 }
 
@@ -129,8 +145,18 @@ func (j *Job) Delivered() bool {
 // MarkDelivered records that the result was fed back to the model.
 func (j *Job) MarkDelivered() {
 	j.mu.Lock()
+	if j.delivered {
+		j.mu.Unlock()
+		return
+	}
 	j.delivered = true
+	registry, finished := j.registry, j.finished
 	j.mu.Unlock()
+	// Registry operations lock jobs while holding the registry lock.
+	// Notify the registry only after releasing the job lock.
+	if finished && registry != nil {
+		registry.trimDelivered()
+	}
 }
 
 // Reported reports whether a bounded drain already told the model
@@ -161,20 +187,41 @@ func (r *JobRegistry) add(j *Job) {
 	defer r.mu.Unlock()
 	r.next++
 	j.ID = fmt.Sprintf("bg-%d", r.next)
+	j.mu.Lock()
+	j.registry = r
+	j.mu.Unlock()
 	r.jobs = append(r.jobs, j)
-	// Bound memory: drop the oldest finished jobs past 50.
-	if len(r.jobs) > 50 {
-		kept := r.jobs[:0]
-		dropped := 0
-		for _, old := range r.jobs {
-			if dropped < len(r.jobs)-50 && old.Status() == JobDone {
-				dropped++
-				continue
-			}
-			kept = append(kept, old)
-		}
-		r.jobs = kept
+	r.evictDelivered()
+}
+
+const recentJobsLimit = 50
+
+func (r *JobRegistry) trimDelivered() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evictDelivered()
+}
+
+// evictDelivered runs with the registry locked. A result can be finished
+// without being delivered when the turn ended or another session was selected.
+func (r *JobRegistry) evictDelivered() {
+	remaining := len(r.jobs) - recentJobsLimit
+	if remaining <= 0 {
+		return
 	}
+	r.jobs = slices.DeleteFunc(r.jobs, func(job *Job) bool {
+		if remaining == 0 {
+			return false
+		}
+		job.mu.Lock()
+		defer job.mu.Unlock()
+		if !job.finished || !job.delivered {
+			return false
+		}
+		job.registry = nil
+		remaining--
+		return true
+	})
 }
 
 // List returns a snapshot of all jobs, oldest first.
@@ -206,7 +253,10 @@ func (r *JobRegistry) forget(j *Job) {
 	defer r.mu.Unlock()
 	for i, old := range r.jobs {
 		if old == j {
-			r.jobs = append(r.jobs[:i], r.jobs[i+1:]...)
+			j.mu.Lock()
+			j.registry = nil
+			j.mu.Unlock()
+			r.jobs = slices.Delete(r.jobs, i, i+1)
 			return
 		}
 	}
@@ -223,60 +273,59 @@ func IsTimeout(err error) bool {
 	return errors.As(err, &te)
 }
 
-// passed OutputFileMaxBytes. The old sink stopped recording at the
-// cap but let the command run to its timeout; with the child
-// writing straight to the file there is nothing to stop the writes
-// except killing the runaway, so the cap is now a kill: the file
-// keeps the first ~64 MiB and the call fails instead of filling
-// the disk.
+// outputCapError marks a command stopped at the hard capture byte limit.
 type outputCapError struct{ bytes int64 }
 
 func (e *outputCapError) Error() string {
 	return fmt.Sprintf("bash output exceeded %d bytes", OutputFileMaxBytes)
 }
 
-// runBashCmd runs one bash -c command with the given timeout and
-// returns the inline (head+tail) result, exit code and error. A
-// timeout is reported as a *timeoutError; a non-zero exit as an
-// error wrapped with "exit: ". Shared by Bash and BashBackground so
-// both audit the same outcomes. With Sandbox on, the command runs
-// under bwrap (see sandbox.go); killing the bwrap process kills the
-// sandbox too (--die-with-parent).
-//
-// The child's stdout+stderr go STRAIGHT to the output file (an
-// *os.File, no pipe): giving exec a custom Writer would make it
-// build an os.Pipe, and cmd.Wait() would block until every
-// grandchild holding that pipe closed it — a dev server started
-// with `&` blocked turn end forever (the café deadlock). The
-// accounting (lines, bytes, head/tail) is re-derived from the file
-// after Wait returns (scanOutputFile); a grandchild may still be
-// appending then, which is fine — the scan is a point-in-time view
-// and the file keeps growing for later reads.
-//
-// The child runs in its own process group (Setpgid), and the Cancel
-// hook kills the whole group: a timeout (or an abort) terminates
-// grandchildren too, instead of leaving a vite server orphaned and
-// holding the output open. The group kill applies to the bwrap path
-// as well — the sandbox shares the host pid namespace, so the group
-// is reachable from here.
-//
-// A timeout <= 0 means no deadline (explicit background jobs
-// without a per-call timeout): a dev server must outlive any cap.
-//
-// The output file is watched while the command runs: past
-// OutputFileMaxBytes the process group is killed and the call fails
-// with an *outputCapError, so a spewing command cannot fill the
-// disk. When outPath is "" (no OutputDir), the same file mechanism
-// runs against a temporary file that is deleted afterwards, and the
-// result is the old in-memory behaviour: whole output capped at
-// MaxOutBytes, no path.
-func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration, outPath, dir string) (string, int, error) {
-	runCtx := ctx
-	if timeout > 0 {
-		var cancel context.CancelFunc
-		runCtx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
+// bashOutputCapture owns output writes so the disk limit also applies to a
+// child that outlives its shell. Both streams share one owned pipe copier;
+// the shell exit starts a bounded drain independently of its exit status.
+type bashOutputCapture struct {
+	file    io.Writer
+	summary *bashOutputSink
+	stop    func()
+	bytes   int64
+	capped  bool
+	err     error
+}
+
+func (c *bashOutputCapture) Write(p []byte) (int, error) {
+	keep := min(int64(len(p)), OutputFileMaxBytes-c.bytes)
+	n, err := c.file.Write(p[:keep])
+	if n > 0 {
+		c.bytes += int64(n)
+		_, _ = c.summary.Write(p[:n])
 	}
+	if err != nil {
+		c.err = err
+		c.stop()
+		return n, err
+	}
+	if n < len(p) {
+		c.capped = true
+		c.stop()
+		return n, &outputCapError{bytes: c.bytes}
+	}
+	return n, nil
+}
+
+// The shell and its captured stdout/stderr have separate lifetimes. A short
+// bounded drain captures buffered output without waiting indefinitely for inherited
+// handles; only background:true with a live shell retains captured output.
+func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration, output *bashOutputFile, dir string, preview *BashOutputPreview) (string, int, error) {
+	defer output.Close()
+	outPath := output.path
+	var runCtx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		runCtx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
 	var cmd *exec.Cmd
 	if e.Sandbox {
 		bwrap := e.BwrapPath
@@ -289,109 +338,200 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		cmd = exec.CommandContext(runCtx, "bash", "-c", command)
 		cmd.Dir = dir
 	}
+	cmd.Env = bashEnvironment(e.BashEnv)
 	// Own process group, killed as a whole on timeout/abort (see
 	// Cancel below). Without this, only the direct bash child died
 	// and grandchildren lingered as orphans.
 	configureProcess(cmd)
-	cmd.Cancel = func() error { return killProcessTree(cmd) }
-
-	legacy := outPath == ""
-	filePath := outPath
-	if legacy {
-		tmp, err := os.CreateTemp("", "gmh-bash-*")
-		if err == nil {
-			filePath = tmp.Name()
-			_ = tmp.Close()
-			defer os.Remove(filePath)
+	var stopOnce sync.Once
+	var stopErr error
+	var processContextErr error
+	var processMu sync.Mutex
+	shellExited := false
+	stopProcess := func(cause error) error {
+		stopOnce.Do(func() {
+			processContextErr = cause
+			stopErr = stopBashProcessGroup(cmd)
+		})
+		return stopErr
+	}
+	cmd.Cancel = func() error {
+		processMu.Lock()
+		defer processMu.Unlock()
+		if shellExited {
+			return os.ErrProcessDone
 		}
+		return stopProcess(runCtx.Err())
 	}
-	f, err := privatefile.Open(filePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY)
+
+	legacy := output.legacy
+	f := output.file
+	capture := &bashOutputCapture{file: output, summary: newBashOutputSink(), stop: func() {
+		// Capture errors still stop the inherited process group during
+		// output drain, after the command deadline has been retired.
+		_ = stopProcess(nil)
+		cancel()
+	}}
+	reader, writer, err := os.Pipe()
 	if err != nil {
-		return "", -1, fmt.Errorf("open bash output: %w", err)
+		_ = f.Close()
+		return "", -1, fmt.Errorf("create bash output pipe: %w", err)
 	}
-	cmd.Stdout = f
-	cmd.Stderr = f
+	cmd.Stdout, cmd.Stderr = writer, writer
 	if err := cmd.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
 		_ = f.Close()
 		return "", -1, err
 	}
-	// Watch the output file: past the cap, kill the whole group.
-	// A spewing command must not fill the disk while it runs out
-	// its timeout.
-	var capHit atomicBool
-	stopWatch := make(chan struct{})
+	_ = writer.Close()
+	copied := make(chan error, 1)
 	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopWatch:
-				return
-			case <-ticker.C:
-				if st, err := f.Stat(); err == nil && st.Size() > OutputFileMaxBytes {
-					capHit.set(true)
-					_ = killProcessTree(cmd)
-					return
-				}
+		_, err := io.Copy(capture, reader)
+		copied <- err
+	}()
+	// On supported platforms, observe shell exit without reaping it. Keeping
+	// its PID reserved lets us stop the owned group before it can be reused.
+	ownedGroup, observeErr := waitBashExit(cmd)
+	var runErr error
+	if observeErr != nil {
+		// No Wait has run yet, so the PID is still ours. Fail closed if
+		// exit observation is unavailable rather than abandoning children.
+		_ = stopProcess(nil)
+		ownedGroup = false
+	}
+	if !ownedGroup {
+		runErr = cmd.Wait()
+	}
+	processMu.Lock()
+	shellExited = true
+	processMu.Unlock()
+	// The deadline governs the shell, not the subsequent pipe drain. Its
+	// watcher now returns ErrProcessDone without changing the shell outcome.
+	cancel()
+	timer := time.NewTimer(200 * time.Millisecond)
+	var copyErr error
+	captureClosed := false
+	select {
+	case copyErr = <-copied:
+	case <-timer.C:
+		select {
+		case copyErr = <-copied:
+		default:
+			captureClosed = true
+			_ = reader.Close()
+			copyErr = <-copied
+			if errors.Is(copyErr, os.ErrClosed) {
+				copyErr = nil
 			}
 		}
-	}()
-	runErr := cmd.Wait()
-	close(stopWatch)
-	_ = f.Close()
+	}
+	timer.Stop()
+	var cleanupErr error
+	if ownedGroup {
+		cleanupErr = stopProcess(nil)
+		runErr = cmd.Wait()
+		if cleanupErr != nil && !errors.Is(cleanupErr, os.ErrProcessDone) {
+			runErr = errors.Join(runErr, fmt.Errorf("stop remaining bash processes: %w", cleanupErr))
+		}
+	}
+	if observeErr != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("observe bash exit: %w", observeErr))
+	}
+	_ = reader.Close()
+	_ = capture.summary.Close()
+	closeErr := f.Close()
+	if capture.err != nil {
+		runErr = capture.err
+	} else if copyErr != nil {
+		runErr = copyErr
+	} else if runErr == nil {
+		runErr = closeErr
+	}
 	exitCode := -1
 	if cmd.ProcessState != nil {
 		exitCode = cmd.ProcessState.ExitCode()
 	}
+	closureNotice := "\n[Output capture closed after the shell exited.]"
+	if ownedGroup && (cleanupErr == nil || errors.Is(cleanupErr, os.ErrProcessDone)) {
+		closureNotice = "\n[Output capture closed; remaining processes in the command group were stopped.]"
+	}
+	var quota *OutputQuotaError
+	quotaNotice := ""
+	if errors.As(capture.err, &quota) {
+		quotaNotice = "\n[" + quota.Error() + "; command stopped.]"
+	}
 	if legacy {
-		data, _ := readFileHead(filePath, MaxOutBytes)
+		data, _ := readFileHead(outPath, MaxOutBytes)
 		s := truncate(string(data), MaxOutBytes)
-		if capHit.get() {
+		if preview != nil {
+			*preview = bashPreview([]string{s}, []string{s}, true)
+			if captureClosed {
+				preview.Notice = closureNotice
+			}
+			if quotaNotice != "" {
+				preview.Notice = quotaNotice
+			}
+		}
+		if captureClosed {
+			s += closureNotice
+		}
+		s += quotaNotice
+		if capture.capped {
 			return s, -1, &outputCapError{bytes: int64(len(data))}
 		}
-		if runCtx.Err() == context.DeadlineExceeded {
+		if capture.err != nil {
+			return s, exitCode, fmt.Errorf("capture bash output: %w", capture.err)
+		}
+		if processContextErr == context.DeadlineExceeded {
 			return s, -1, &timeoutError{timeout}
 		}
-		if runCtx.Err() != nil {
-			return s, -1, runCtx.Err()
+		if processContextErr != nil {
+			return s, -1, processContextErr
+		}
+		if ctx.Err() != nil && !errors.Is(context.Cause(ctx), ErrExecutorClosed) {
+			return s, -1, ctx.Err()
 		}
 		if runErr != nil {
 			return s, exitCode, fmt.Errorf("exit: %w", runErr)
 		}
 		return s, exitCode, nil
 	}
-	lines, bytes, fileCapped, head, tail, scanErr := scanOutputFile(filePath)
-	if scanErr != nil {
-		return "", exitCode, scanErr
+	lines, bytes, fileCapped, head, tail := capture.summary.snapshot()
+	if preview != nil {
+		*preview = bashPreview(head, tail, lines <= len(head))
+		if captureClosed {
+			preview.Notice = closureNotice
+		}
+		if quotaNotice != "" {
+			preview.Notice = quotaNotice
+		}
 	}
-	s := FormatBashOutput(lines, bytes, fileCapped, head, tail, outPath, dir)
-	if capHit.get() {
+	s := FormatBashOutput(lines, bytes, fileCapped || capture.capped, head, tail, outPath, dir)
+	if captureClosed {
+		s += closureNotice + "\n[Use background:true with a foreground server command for a long-lived service.]"
+	}
+	s += quotaNotice
+	if capture.capped {
 		return s, -1, &outputCapError{bytes: bytes}
 	}
-	if runCtx.Err() == context.DeadlineExceeded {
+	if capture.err != nil {
+		return s, exitCode, fmt.Errorf("capture bash output: %w", capture.err)
+	}
+	if processContextErr == context.DeadlineExceeded {
 		return s, -1, &timeoutError{timeout}
 	}
-	if runCtx.Err() != nil {
-		return s, -1, runCtx.Err()
+	if processContextErr != nil {
+		return s, -1, processContextErr
+	}
+	if ctx.Err() != nil && !errors.Is(context.Cause(ctx), ErrExecutorClosed) {
+		return s, -1, ctx.Err()
 	}
 	if runErr != nil {
 		return s, exitCode, fmt.Errorf("exit: %w", runErr)
 	}
 	return s, exitCode, nil
 }
-
-// atomicBool is a mutex-free boolean for the cap watcher goroutine.
-type atomicBool struct{ v int32 }
-
-func (b *atomicBool) set(v bool) {
-	if v {
-		atomic.StoreInt32(&b.v, 1)
-	} else {
-		atomic.StoreInt32(&b.v, 0)
-	}
-}
-
-func (b *atomicBool) get() bool { return atomic.LoadInt32(&b.v) != 0 }
 
 // readFileHead returns up to max bytes from the start of the file.
 func readFileHead(path string, max int) ([]byte, error) {
@@ -419,44 +559,79 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	runCtx, cancelCause := context.WithCancelCause(context.Background())
+	cancel := func() { cancelCause(context.Canceled) }
+	commandCtx, finish, err := e.beginBashRun(runCtx)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			finish()
+			cancel()
+		}
+	}()
 	if reason := DeniedCommand(a.Command); reason != "" {
-		e.audit(AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
-		return nil, fmt.Errorf("denied by policy: %s", reason)
+		e.audit(ctx, AuditEntry{Kind: "denied", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: reason})
+		return nil, &PolicyError{Reason: reason}
 	}
 	dir, err := e.bashDir(a)
 	if err != nil {
-		e.audit(AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
+		e.audit(ctx, AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
 		return nil, err
 	}
 	timeout := e.bashTimeout(a)
 	if a.Background && a.Timeout == 0 {
 		timeout = 0
 	}
-	outPath := e.nextOutputFile()
-	runCtx, cancel := context.WithCancel(context.Background())
-	job := &Job{Command: a.Command, OutputFile: outPath, Started: time.Now(), done: make(chan struct{}), cancel: cancel}
+	output, err := e.newBashOutput(commandCtx)
+	if err != nil {
+		e.audit(ctx, AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
+		return nil, err
+	}
+	identity := invocationFromContext(ctx)
+	key, _ := ctx.Value(failureKeyContext{}).(string)
+	job := &Job{InvocationID: identity.id, ToolCallID: identity.callID, failureKey: key, Command: a.Command, Cwd: dir, OutputFile: output.publicPath(), Started: time.Now(), done: make(chan struct{}), cancel: cancel,
+		closeCancel: func() { cancelCause(ErrExecutorClosed) }}
 	if foreground {
 		job.stopParent = context.AfterFunc(ctx, cancel)
 	}
 	// Capture the audit destination: a later session switch must not redirect it.
 	audit := e.Audit
-	e.registry().add(job)
+	e.jobsMu.Lock()
+	if e.jobsClosed {
+		e.jobsMu.Unlock()
+		job.Cancel()
+		job.Detach()
+		output.Close()
+		return nil, ErrExecutorClosed
+	}
+	if e.jobs == nil {
+		e.jobs = &JobRegistry{}
+	}
+	e.jobs.add(job)
+	e.jobsMu.Unlock()
 	// Close the race with an abort that ran its registry snapshot just
 	// before this job was registered.
 	if ctx.Err() != nil {
 		job.Cancel()
 	}
+	transferred = true
 	go func() {
 		defer cancel()
-		out, code, err := e.runBashCmd(runCtx, a.Command, timeout, outPath, dir)
+		defer finish()
+		preview := &BashOutputPreview{}
+		out, code, err := e.runBashCmd(commandCtx, a.Command, timeout, output, dir, preview)
 		if audit != nil {
-			entry := AuditEntry{TS: time.Now(), Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
+			entry := AuditEntry{InvocationID: job.InvocationID, ToolCallID: job.ToolCallID, TS: time.Now(), Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
 			if err != nil {
 				entry.Error = err.Error()
 			}
 			audit(entry)
 		}
-		job.finish(JobResult{Output: out, Err: err, ExitCode: code})
+		job.finish(JobResult{Output: out, Err: err, ExitCode: code, Preview: preview})
 	}()
 	return job, nil
 }
@@ -474,9 +649,17 @@ func (j *Job) Detach() {
 func (j *Job) Cancel() {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	j.stopRequested = true
 	if j.cancel != nil {
 		j.cancel()
 	}
+}
+
+// StopRequested reports whether this live job has been explicitly cancelled.
+func (j *Job) StopRequested() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.stopRequested
 }
 
 // CancelJobs explicitly stops the current session's jobs. Turn cancellation
@@ -498,6 +681,35 @@ func (e *Executor) SessionCanceller() func() {
 
 // Jobs returns a snapshot of all background jobs for this Executor.
 func (e *Executor) Jobs() []*Job { return e.registry().List() }
+
+// HasRunningWorkspaceJobs includes retained sessions sharing this Executor's
+// workspace, without exposing another session's job IDs or output.
+func (e *Executor) HasRunningWorkspaceJobs() bool { return e.RunningWorkspaceJobs() > 0 }
+
+// RunningWorkspaceJobs counts active jobs across current and retained sessions.
+// Launches and session switches are serialized by the agent loop.
+func (e *Executor) RunningWorkspaceJobs() int64 {
+	e.jobsMu.Lock()
+	registries := map[*JobRegistry]bool{}
+	if e.jobs != nil {
+		registries[e.jobs] = true
+	}
+	for _, registry := range e.sessionJobs {
+		if registry != nil {
+			registries[registry] = true
+		}
+	}
+	e.jobsMu.Unlock()
+	var running int64
+	for registry := range registries {
+		for _, job := range registry.List() {
+			if _, done := job.Result(); !done {
+				running++
+			}
+		}
+	}
+	return running
+}
 
 func (e *Executor) registry() *JobRegistry {
 	e.jobsMu.Lock()

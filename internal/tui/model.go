@@ -27,6 +27,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"minimalharness/internal/agent"
+	"minimalharness/internal/tools"
 )
 
 // Palette and styles live in theme.go: one Theme struct, rebuilt by
@@ -135,8 +136,10 @@ type Model struct {
 	metaBranch string
 	// sessionTokens/turnCount accumulate across turns, fed by
 	// MetaUpdateMsg from the runner; shown on the meta line's right.
-	sessionTokens int
-	turnCount     int
+	sessionTokens    int
+	usageUnavailable bool
+	usageIncomplete  bool
+	turnCount        int
 
 	// OnSubmit is called with the submitted line on Enter. The caller
 	// runs the task and feeds agent events back via program.Send.
@@ -157,6 +160,12 @@ func (m Model) WithMeta(mode, api, model string) Model {
 	return m
 }
 
+// WithSessionTotals seeds restored usage before the first input or paint.
+func (m Model) WithSessionTotals(tokens, turns int) Model {
+	m.sessionTokens, m.turnCount = tokens, turns
+	return m
+}
+
 // WithBranch records the workspace's git branch for the meta line.
 // Call it before NewProgram, like WithMeta.
 func (m Model) WithBranch(branch string) Model {
@@ -170,11 +179,13 @@ func (m Model) WithBranch(branch string) Model {
 // unchanged. ToolMode is the loop's tool mode ("default" or "plan");
 // the meta line shows a plan chip while it is "plan".
 type MetaUpdateMsg struct {
-	Tokens   int
-	Turns    int
-	Model    string
-	API      string
-	ToolMode string
+	UsageIncomplete  bool
+	UsageUnavailable bool
+	Tokens           int
+	Turns            int
+	Model            string
+	API              string
+	ToolMode         string
 }
 
 // markWorking starts a turn: working becomes true, and workingSince
@@ -286,6 +297,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case MetaUpdateMsg:
 		m.sessionTokens = msg.Tokens
+		m.usageUnavailable = msg.UsageUnavailable
+		m.usageIncomplete = msg.UsageIncomplete
 		m.turnCount = msg.Turns
 		if msg.Model != "" {
 			m.metaModel = msg.Model
@@ -414,6 +427,9 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		}
 		m.liveTool = ""
 		m.liveToolArgs = ""
+		if ev.ToolStatus == tools.ResultDeferred {
+			return m, tea.Println("   " + styleMuted.Render("… "+toolSummary(name, args)+" (deferred)"))
+		}
 		// A backgrounded bash also gets a ToolEnd, with the
 		// "still running" observation — its notice was already
 		// printed by the ToolBackgrounded event, so print nothing
@@ -421,7 +437,7 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		if name == "bash" && strings.Contains(ev.ToolOutput, "still running in the background") {
 			return m, nil
 		}
-		return m, tea.Println(toolEndBlock(name, args, ev.ToolOutput, ev.ToolDetail, ev.ToolCount, ev.ToolErr))
+		return m, tea.Println(toolEndBlock(name, args, ev.ToolOutput, ev.ToolDetail, ev.ToolCount, ev.ToolCountLowerBound, ev.ToolErr))
 	case agent.EventStepUsage:
 		// Usage lines are printed by the runner via PrintMsg, through
 		// the same queue, so they land after the reply text.
@@ -486,6 +502,7 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.working = false
 		m.workingSince = time.Time{}
 	case agent.EventError:
+		m.approval = nil
 		m.liveTool = ""
 		m.liveToolArgs = ""
 		m.liveThinking = ""
@@ -510,7 +527,7 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 // reports it as an observation starting "User denied") is a muted
 // row with a "(denied)" suffix, never a green tick. All of it sits
 // under the 3-space gutter, like the assistant text.
-func toolEndBlock(name, argsJSON, output, detail string, count int, toolErr error) string {
+func toolEndBlock(name, argsJSON, output, detail string, count int, countLowerBound bool, toolErr error) string {
 	summary := toolSummary(name, argsJSON)
 	if name == "bash" {
 		return indentBlock(bashBlock(summary, output, toolErr != nil))
@@ -535,7 +552,9 @@ func toolEndBlock(name, argsJSON, output, detail string, count int, toolErr erro
 	// grep/glob report how many matches they found — the count
 	// comes from the tool, never invented here.
 	if (name == "grep" || name == "glob") && count >= 0 {
-		if count == 1 {
+		if countLowerBound {
+			summary += fmt.Sprintf(" (at least %d matches)", count)
+		} else if count == 1 {
 			summary += " (1 match)"
 		} else {
 			summary += fmt.Sprintf(" (%d matches)", count)
@@ -838,7 +857,7 @@ func stylePrintLine(l string) string {
 	}
 }
 
-var usageRe = regexp.MustCompile(`^(turn|session): prompt=(\d+) \(cached=(unknown|\d+(?:\+unknown)?)\) completion=(\d+) total=(\d+)`)
+var usageRe = regexp.MustCompile(`^(turn|session|current run): prompt=(\d+) \(cached=(unknown|\d+(?:\+unknown)?)\) completion=(\d+) total=(\d+)`)
 
 // formatUsage restyles one runner usage line:
 // "[usage] turn: prompt=3922 (cached=1920) completion=215 total=4137
@@ -876,6 +895,7 @@ func formatUsage(line string) string {
 	}
 	out := fmt.Sprintf("%s · prompt %s (cached %s) · completion %s · total %s",
 		m[1], nums(m[2]), nums(m[3]), nums(m[4]), nums(m[5]))
+	out += head[len(m[0]):]
 	if tail != "" {
 		out += " · " + tail
 	}
@@ -998,12 +1018,23 @@ func (m Model) metaLine() string {
 	if m.metaBranch != "" {
 		right = styleMuted.Render(m.metaBranch)
 	}
-	if m.turnCount > 0 || m.sessionTokens > 0 {
+	if m.turnCount > 0 || m.sessionTokens > 0 || m.usageUnavailable || m.usageIncomplete {
 		turnWord := "turns"
 		if m.turnCount == 1 {
 			turnWord = "turn"
 		}
-		totals := fmt.Sprintf("%d %s · %s tokens", m.turnCount, turnWord, formatInt(m.sessionTokens))
+		tokens := formatInt(m.sessionTokens)
+		if m.usageIncomplete {
+			if m.sessionTokens == 0 {
+				tokens = "unknown"
+			} else {
+				tokens += "+ unknown"
+			}
+		}
+		if m.usageUnavailable {
+			tokens = "unavailable"
+		}
+		totals := fmt.Sprintf("%d %s · %s tokens", m.turnCount, turnWord, tokens)
 		if right != "" {
 			right += styleMuted.Render(" · ") + styleMuted.Render(totals)
 		} else {
@@ -1072,7 +1103,7 @@ func (m Model) approvalGeometry() (width, textWidth int) {
 func (m Model) approvalDetails() ([]string, int) {
 	_, textWidth := m.approvalGeometry()
 	detail := m.approval.Arguments
-	if m.approval.ToolName == "" {
+	if m.approval.Prompt != "" {
 		detail = m.approval.Prompt
 	}
 	detailLines := strings.Split(ansi.Hardwrap(detail, textWidth, true), "\n")
@@ -1153,3 +1184,5 @@ func wrapText(s string, width int) []string {
 	}
 	return lines
 }
+
+func (m Model) WithUsageCoverage(complete bool) Model { m.usageIncomplete = !complete; return m }

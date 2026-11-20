@@ -3,11 +3,15 @@ package session
 import (
 	"minimalharness/internal/llm"
 	"os"
+	"runtime"
 	"testing"
 )
 
 func TestSessionArtifactsArePrivate(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not available on Windows")
+	}
+	setTestHome(t, t.TempDir())
 	for _, id := range []string{"", "explicit"} {
 		s, err := New(id)
 		if err != nil {
