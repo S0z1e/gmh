@@ -655,33 +655,12 @@ func TestArtifactCannotChainRenameWhilePriorPlanRemains(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	s, _ := artifactFixture(t, "before")
 	workspace := s.header.Workspace.Path
-	m, err := s.Manifest()
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, err := prepareOperation("rename", "before", "after", m)
-	if err != nil {
-		t.Fatal(err)
-	}
-	journal, err := os.ReadFile(operationPath(op))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(operationPath(op)); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Rename("after"); err != nil {
-		t.Fatal(err)
-	}
-	// Recreate the committed plan as if cleanup had failed after the rename.
-	if err := os.WriteFile(operationPath(op), journal, 0600); err != nil {
-		t.Fatal(err)
-	}
+	leaveCommittedRename(t, s, "after")
 	if err := s.Rename("third"); !errors.Is(err, ErrSessionBusy) {
 		t.Fatalf("rename advanced beyond a still-pending plan: %v", err)
 	}
 	s.Close()
-	s, err = Open("after", OpenOptions{Workspace: workspace, Existing: true})
+	s, err := Open("after", OpenOptions{Workspace: workspace, Existing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -723,5 +702,57 @@ func leaveCommittedDelete(t *testing.T, s *Store) {
 		if err := reconcileMove(move, true); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestArtifactAutoIDSkipsReservedRenameSource(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	const base = "20261120-090000"
+	s, _ := artifactFixture(t, base)
+	defer s.Close()
+	leaveCommittedRename(t, s, "target")
+
+	unlock, err := lockManagement()
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated, err := createAutoStore(Dir(), base, nil)
+	unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer generated.Close()
+	if generated.ID != base+"-1" {
+		t.Fatalf("generated ID reused reserved source: %s", generated.ID)
+	}
+	s.Close()
+	if _, err := List(); err != nil {
+		t.Fatalf("generated ID prevented earlier recovery: %v", err)
+	}
+}
+
+func leaveCommittedRename(t *testing.T, s *Store, to string) {
+	t.Helper()
+	m, err := s.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := prepareOperation("rename", s.ID, to, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := os.ReadFile(operationPath(op))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(operationPath(op)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(to); err != nil {
+		t.Fatal(err)
+	}
+	// Recreate the committed plan as if cleanup had failed after the rename.
+	if err := os.WriteFile(operationPath(op), journal, 0600); err != nil {
+		t.Fatal(err)
 	}
 }

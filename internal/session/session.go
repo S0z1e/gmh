@@ -163,50 +163,61 @@ func Dir() string {
 	return filepath.Join(home, ".minimal-harness", "sessions")
 }
 
+// createAutoStore runs under the management lock. A generated name is
+// available only if both the transcript and prior operation reservations are clear.
+func createAutoStore(dir, base string, preflight func(*os.File, bool) error) (*Store, error) {
+	for suffix := 0; ; suffix++ {
+		id := base
+		if suffix > 0 {
+			id = fmt.Sprintf("%s-%d", base, suffix)
+		}
+		if _, err := recoverOperations(id); err != nil {
+			if errors.Is(err, ErrSessionBusy) {
+				continue
+			}
+			return nil, err
+		}
+		writer, err := acquireWriter(id)
+		if errors.Is(err, ErrSessionBusy) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		path := filepath.Join(dir, id+".jsonl")
+		f, err := privatefile.Open(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_RDWR)
+		if err != nil {
+			writer.Close()
+			if os.IsExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		if preflight != nil {
+			if err := preflight(f, true); err != nil {
+				f.Close()
+				writer.Close()
+				return nil, err
+			}
+		}
+		return &Store{ID: id, Path: path, file: f, writer: writer}, nil
+	}
+}
+
 func newStore(id string, existing bool, preflight func(*os.File, bool) error) (*Store, error) {
-	auto := id == ""
-	if !auto {
+	if id != "" {
 		if err := ValidateSessionID(id); err != nil {
 			return nil, err
 		}
 	}
-	if auto {
-		id = time.Now().Format("20060102-150405")
-	}
 	dir := Dir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, id+".jsonl")
-	if auto {
-		// Two sessions started in the same second (or a new_session
-		// right after startup) must not share one file: suffix
-		// until the path is free. An explicit id is never suffixed:
-		// --resume needs the exact file.
-		for i := 1; ; i++ {
-			writer, err := acquireWriter(id)
-			if err == nil {
-				f, openErr := privatefile.Open(path, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_RDWR)
-				if openErr == nil {
-					if preflight != nil {
-						if err := preflight(f, true); err != nil {
-							f.Close()
-							writer.Close()
-							return nil, err
-						}
-					}
-					return &Store{ID: id, Path: path, file: f, writer: writer}, nil
-				}
-				writer.Close()
-				err = openErr
-			}
-			if !os.IsExist(err) && !errors.Is(err, ErrSessionBusy) {
-				return nil, err
-			}
-			id = fmt.Sprintf("%s-%d", time.Now().Format("20060102-150405"), i)
-			path = filepath.Join(dir, id+".jsonl")
-		}
+	if id == "" {
+		return createAutoStore(dir, time.Now().Format("20060102-150405"), preflight)
 	}
+	path := filepath.Join(dir, id+".jsonl")
 	writer, err := acquireWriter(id)
 	if err != nil {
 		return nil, err
