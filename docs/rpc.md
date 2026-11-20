@@ -22,7 +22,7 @@ turn, `origin_turn_id`, `origin_request_id`, and `origin_step_id` identify
 the originating call if it was launched on this connection.
 
 Read stdout continuously. If a write stays blocked for five seconds or
-the queue reaches 1,024 frames or 16 MiB, the server disconnects
+a write would exceed 1,024 queued frames or 16 MiB, the server disconnects
 and cancels active provider calls and control operations. A failed write
 also disconnects. The client should treat the stream as closed and
 reconnect before sending further requests. The server returns an error

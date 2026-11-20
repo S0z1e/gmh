@@ -189,6 +189,7 @@ func Run(a *app.App, runner *app.Runner, in io.Reader, out io.Writer) error {
 }
 
 func (s *Server) run() error {
+	defer handleStdoutBrokenPipe(s.out)()
 	if err := s.runner.RefreshUsage(); err != nil {
 		return err
 	}
