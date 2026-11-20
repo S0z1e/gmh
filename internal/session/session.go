@@ -401,7 +401,7 @@ func (s *Store) ArchiveCopy(name string) (string, error) {
 	if err := validateSessionName(name, 240); err != nil {
 		return "", err
 	}
-	if _, err := recoverOperations(name); err != nil {
+	if _, err := recoverOperations(s.ID, name); err != nil {
 		return "", err
 	}
 	writer, err := acquireWriterFile(name)

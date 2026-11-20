@@ -212,11 +212,9 @@ func RenameSession(oldID, newID string) error {
 	if err != nil {
 		return err
 	}
-	if recovered {
-		if _, err := os.Stat(filepath.Join(Dir(), oldID+".jsonl")); os.IsNotExist(err) {
-			if _, err := os.Stat(filepath.Join(Dir(), newID+".jsonl")); err == nil {
-				return nil
-			}
+	for _, op := range recovered {
+		if op.kind == "rename" && op.from == oldID && op.to == newID {
+			return nil
 		}
 	}
 	old, err := acquireWriter(oldID)
@@ -321,8 +319,8 @@ func DeleteSession(id string) error {
 	if err != nil {
 		return err
 	}
-	if recovered {
-		if _, err := os.Stat(filepath.Join(Dir(), id+".jsonl")); os.IsNotExist(err) {
+	for _, op := range recovered {
+		if op.kind == "delete" && op.from == id {
 			return nil
 		}
 	}
@@ -383,8 +381,8 @@ func (s *Store) Rename(newID string) error {
 	if err := ValidateSessionID(newID); err != nil {
 		return err
 	}
-	if _, err := recoverOperations(newID); err != nil {
-		return err
+	if _, err := recoverOperations(oldID, newID); err != nil {
+		return fmt.Errorf("resolve outstanding rename before changing names: %w", err)
 	}
 	if _, err := os.Stat(filepath.Join(Dir(), newID+".jsonl")); err == nil {
 		return fmt.Errorf("session %q already exists", newID)

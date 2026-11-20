@@ -130,6 +130,22 @@ func prepareOperation(kind, oldID, newID string, m ArtifactManifest) (artifactOp
 	if err := validateOperation(op); err != nil {
 		return op, err
 	}
+	if kind == "rename" {
+		destinations := make(map[string]bool, len(op.Moves))
+		for _, move := range op.Moves {
+			destinations[strings.ToLower(move.To)] = true
+		}
+		if _, err := recoverMatchingOperations(func(other artifactOperation) bool {
+			for _, move := range other.Moves {
+				if destinations[strings.ToLower(move.From)] || destinations[strings.ToLower(move.To)] {
+					return true
+				}
+			}
+			return false
+		}, false); err != nil {
+			return op, err
+		}
+	}
 	for _, move := range op.Moves {
 		if _, err := os.Lstat(filepath.Join(Dir(), move.To)); err == nil {
 			return op, fmt.Errorf("artifact destination %q already exists", move.To)
@@ -396,7 +412,11 @@ func readOperation(path string) (artifactOperation, error) {
 
 // Recovery holds the management lock and acquires the affected lifetime leases.
 // A busy live writer is left untouched; recovery never steals its session.
-func recoverOperations(ids ...string) (bool, error) {
+type completedOperation struct {
+	kind, from, to string
+}
+
+func recoverOperations(ids ...string) ([]completedOperation, error) {
 	return recoverMatchingOperations(func(op artifactOperation) bool {
 		for _, id := range ids {
 			if strings.EqualFold(id, op.OldID) || strings.EqualFold(id, op.NewID) {
@@ -423,17 +443,17 @@ func recoverOutputOperations(outputID string) error {
 	return err
 }
 
-func recoverMatchingOperations(match func(artifactOperation) bool, skipBusy bool) (bool, error) {
+func recoverMatchingOperations(match func(artifactOperation) bool, skipBusy bool) ([]completedOperation, error) {
 	dir := filepath.Join(Dir(), ".operations")
 	if _, err := metadataDirectory(".operations", false); err != nil {
 		if os.IsNotExist(err) {
-			return false, nil
+			return nil, nil
 		}
-		return false, err
+		return nil, err
 	}
 	f, err := os.Open(dir)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	defer f.Close()
 	entries, err := f.ReadDir(maxSessionArtifacts + 1)
@@ -441,15 +461,15 @@ func recoverMatchingOperations(match func(artifactOperation) bool, skipBusy bool
 		err = nil
 	}
 	if os.IsNotExist(err) {
-		return false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if len(entries) > maxSessionArtifacts {
-		return false, fmt.Errorf("too many pending operations")
+		return nil, fmt.Errorf("too many pending operations")
 	}
-	completed := false
+	var completed []completedOperation
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".json") {
 			continue
@@ -497,8 +517,8 @@ func recoverMatchingOperations(match func(artifactOperation) bool, skipBusy bool
 					err = cleanupOperation(op)
 				}
 			}
-			if err == nil {
-				completed = true
+			if err == nil && forward {
+				completed = append(completed, completedOperation{op.Kind, op.OldID, op.NewID})
 			}
 		}
 		if output != nil {

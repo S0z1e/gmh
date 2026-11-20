@@ -631,3 +631,97 @@ func TestArtifactSharedResumeRecoversFamilyBeforeUpdatingRegistry(t *testing.T) 
 		}
 	}
 }
+
+func TestArtifactRenameRecoversAuditDestination(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dest, err := New("target-audit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, _ := artifactFixture(t, "source")
+	defer source.Close()
+	leaveCommittedDelete(t, dest)
+
+	if err := source.Rename("target"); err != nil {
+		t.Fatal(err)
+	}
+	source.Close()
+	if _, err := List(); err != nil {
+		t.Fatalf("rename left an unrecoverable audit destination: %v", err)
+	}
+}
+
+func TestArtifactCannotChainRenameWhilePriorPlanRemains(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s, _ := artifactFixture(t, "before")
+	workspace := s.header.Workspace.Path
+	m, err := s.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := prepareOperation("rename", "before", "after", m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := os.ReadFile(operationPath(op))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(operationPath(op)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename("after"); err != nil {
+		t.Fatal(err)
+	}
+	// Recreate the committed plan as if cleanup had failed after the rename.
+	if err := os.WriteFile(operationPath(op), journal, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename("third"); !errors.Is(err, ErrSessionBusy) {
+		t.Fatalf("rename advanced beyond a still-pending plan: %v", err)
+	}
+	s.Close()
+	s, err = Open("after", OpenOptions{Workspace: workspace, Existing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Rename("third"); err != nil {
+		t.Fatalf("rename still blocked after journal recovery: %v", err)
+	}
+}
+
+func TestArtifactRenameDoesNotAcceptUnrelatedDeleteRecovery(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dest, err := New("destination")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest.Close()
+	source, err := New("deleted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaveCommittedDelete(t, source)
+	if err := RenameSession("deleted", "destination"); err == nil {
+		t.Fatal("rename treated a recovered delete as a successful move")
+	}
+}
+
+func leaveCommittedDelete(t *testing.T, s *Store) {
+	t.Helper()
+	m, err := s.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := prepareOperation("delete", s.ID, "", m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	for _, move := range op.Moves {
+		if err := reconcileMove(move, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
