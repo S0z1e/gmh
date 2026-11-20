@@ -57,6 +57,7 @@ func List() ([]Info, error) {
 		}
 	}
 	archives := map[string]bool{}
+	promoted := map[string]bool{}
 	seen := map[string]bool{}
 	for _, h := range headers {
 		if h == nil || h.OutputID == "" || seen[h.OutputID] {
@@ -66,6 +67,9 @@ func List() ([]Info, error) {
 		r, err := loadArtifactRegistry(h)
 		if err != nil {
 			return nil, err
+		}
+		for _, name := range r.Promoted {
+			promoted[name] = true
 		}
 		for _, name := range r.Archives {
 			ah, exists := headers[name]
@@ -81,7 +85,7 @@ func List() ([]Info, error) {
 			continue
 		}
 		id := strings.TrimSuffix(name, ".jsonl")
-		if strings.HasSuffix(id, "-audit") || strings.Contains(id, "-pre-compact-") || strings.Contains(id, "-pre-rollback-") {
+		if headers[name] == nil && strings.HasSuffix(id, "-audit") || !promoted[name] && legacyArchiveName(id) {
 			continue
 		}
 		info, err := readInfo(filepath.Join(dir, name), id)
@@ -233,6 +237,9 @@ func RenameSession(oldID, newID string) error {
 		return err
 	}
 	if h != nil && h.OutputID != "" {
+		if err := recoverOutputOperations(h.OutputID); err != nil {
+			return err
+		}
 		output, err := acquireOutputWriter(h, oldID)
 		if err != nil {
 			return err
@@ -335,6 +342,9 @@ func DeleteSession(id string) error {
 		return err
 	}
 	if h != nil && h.OutputID != "" {
+		if err := recoverOutputOperations(h.OutputID); err != nil {
+			return err
+		}
 		output, err := acquireOutputWriter(h, id)
 		if err != nil {
 			return err

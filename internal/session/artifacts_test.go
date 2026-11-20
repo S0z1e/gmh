@@ -6,6 +6,7 @@ import (
 	"minimalharness/internal/llm"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -495,4 +496,138 @@ func TestArtifactActiveRenameRecoversDestinationOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	reopened.Close()
+}
+
+func TestArtifactResumePromotesArchiveToWritableSession(t *testing.T) {
+	for _, name := range []string{"recoverable", "original-pre-rollback-1"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			root := t.TempDir()
+			original, err := Open("original", OpenOptions{Workspace: root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := original.ArchiveCopy(name); err != nil {
+				t.Fatal(err)
+			}
+			original.Close()
+			resumed, err := Open(name, OpenOptions{Workspace: root, Existing: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := resumed.Append(llm.Message{Role: "user", Content: "new work"}); err != nil {
+				t.Fatal(err)
+			}
+			resumed.Close()
+			list, err := List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.ContainsFunc(list, func(info Info) bool { return info.ID == name }) {
+				t.Fatalf("resumed session missing from list: %+v", list)
+			}
+			if err := DeleteSession("original"); err != nil {
+				t.Fatal(err)
+			}
+			messages, err := Load(name)
+			if err != nil || len(messages) != 1 || messages[0].Content != "new work" {
+				t.Fatalf("original owner's deletion affected new work: %+v %v", messages, err)
+			}
+			if err := RenameSession(name, "recovered"); err != nil {
+				t.Fatal(err)
+			}
+			if err := DeleteSession("recovered"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestArtifactCopyRecoversDestinationOperation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dst, _ := artifactFixture(t, "destination")
+	source, err := New("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	m, err := dst.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := prepareOperation("delete", "destination", "", m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst.Close()
+	for _, move := range op.Moves {
+		if err := reconcileMove(move, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	archive, err := source.ArchiveCopy("destination")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(operationPath(op)); !os.IsNotExist(err) {
+		t.Fatalf("archive poisoned destination recovery: %v", err)
+	}
+	if _, err := os.Stat(archive); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestArtifactSharedResumeRecoversFamilyBeforeUpdatingRegistry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s, _ := artifactFixture(t, "original")
+	workspace := s.header.Workspace.Path
+	output := filepath.Dir(s.OutputDir())
+	data, err := os.ReadFile(s.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(Dir(), "copy.jsonl"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := prepareOperation("rename", "original", "renamed", m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	for _, move := range op.Moves {
+		if err := reconcileMove(move, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	copy, err := Open("copy", OpenOptions{Workspace: workspace, Existing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive, err := copy.ArchiveCopy("copy-pre-rollback-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := copy.Rename("copy-renamed"); err != nil {
+		t.Fatal(err)
+	}
+	copy.Close()
+	renamed, err := Open("renamed", OpenOptions{Workspace: workspace, Existing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renamed.Close()
+	for _, id := range []string{"renamed", "copy-renamed"} {
+		if err := DeleteSession(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{archive, output} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("final deletion missed %s: %v", path, err)
+		}
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 )
 
 var ErrOperationPending = errors.New("session operation needs recovery; close its writer and retry")
@@ -84,6 +85,14 @@ func prepareOperation(kind, oldID, newID string, m ArtifactManifest) (artifactOp
 		// Keep the path embedded in checkpoints and previous rollback
 		// responses. Register legacy archive names before their owner moves.
 		op.After.Archives = m.archives
+		if kind == "rename" && slices.Contains(op.Before.Promoted, oldID+".jsonl") {
+			op.After.Promoted = append([]string(nil), op.Before.Promoted...)
+			op.After.Promoted = slices.DeleteFunc(op.After.Promoted, func(name string) bool {
+				return name == oldID+".jsonl" || name == newID+".jsonl"
+			})
+			op.After.Promoted = append(op.After.Promoted, newID+".jsonl")
+			slices.Sort(op.After.Promoted)
+		}
 	}
 	rename := func(name string) string {
 		if len(name) <= len(oldID) || !strings.EqualFold(name[:len(oldID)], oldID) {
@@ -184,13 +193,12 @@ func validateOperation(op artifactOperation) error {
 	}
 	archives := map[string]bool{}
 	for _, r := range []artifactRegistry{op.Before, op.After} {
-		if r.Version != 1 || len(r.Archives) > maxSessionArtifacts || op.Header != nil && !r.Created.Equal(op.Header.Created) {
-			return fmt.Errorf("invalid operation archive owner")
+		owner := time.Time{}
+		if op.Header != nil {
+			owner = op.Header.Created
 		}
-		for _, name := range r.Archives {
-			if !strings.HasSuffix(name, ".jsonl") || validateSessionName(strings.TrimSuffix(name, ".jsonl"), 240) != nil {
-				return fmt.Errorf("invalid operation archive name")
-			}
+		if err := validateArtifactRegistry(r, owner); err != nil {
+			return err
 		}
 	}
 	for _, name := range op.Before.Archives {
@@ -389,6 +397,33 @@ func readOperation(path string) (artifactOperation, error) {
 // Recovery holds the management lock and acquires the affected lifetime leases.
 // A busy live writer is left untouched; recovery never steals its session.
 func recoverOperations(ids ...string) (bool, error) {
+	return recoverMatchingOperations(func(op artifactOperation) bool {
+		for _, id := range ids {
+			if strings.EqualFold(id, op.OldID) || strings.EqualFold(id, op.NewID) {
+				return true
+			}
+			name := id + ".jsonl"
+			for _, move := range op.Moves {
+				if strings.EqualFold(name, move.From) || strings.EqualFold(name, move.To) {
+					return true
+				}
+			}
+		}
+		return len(ids) == 0
+	}, len(ids) == 0)
+}
+
+func recoverOutputOperations(outputID string) error {
+	if outputID == "" {
+		return nil
+	}
+	_, err := recoverMatchingOperations(func(op artifactOperation) bool {
+		return op.Header != nil && strings.EqualFold(outputID, op.Header.OutputID)
+	}, false)
+	return err
+}
+
+func recoverMatchingOperations(match func(artifactOperation) bool, skipBusy bool) (bool, error) {
 	dir := filepath.Join(Dir(), ".operations")
 	if _, err := metadataDirectory(".operations", false); err != nil {
 		if os.IsNotExist(err) {
@@ -423,16 +458,12 @@ func recoverOperations(ids ...string) (bool, error) {
 		if err != nil {
 			return completed, err
 		}
-		relevant := len(ids) == 0
-		for _, id := range ids {
-			relevant = relevant || strings.EqualFold(id, op.OldID) || strings.EqualFold(id, op.NewID)
-		}
-		if !relevant {
+		if !match(op) {
 			continue
 		}
 		old, err := acquireWriter(op.OldID)
 		if err != nil {
-			if len(ids) == 0 && errors.Is(err, ErrSessionBusy) {
+			if skipBusy && errors.Is(err, ErrSessionBusy) {
 				continue
 			}
 			return completed, err
@@ -443,7 +474,7 @@ func recoverOperations(ids ...string) (bool, error) {
 		}
 		if err != nil {
 			old.Close()
-			if len(ids) == 0 && errors.Is(err, ErrSessionBusy) {
+			if skipBusy && errors.Is(err, ErrSessionBusy) {
 				continue
 			}
 			return completed, err
@@ -478,7 +509,7 @@ func recoverOperations(ids ...string) (bool, error) {
 		}
 		old.Close()
 		if err != nil {
-			if len(ids) == 0 && errors.Is(err, ErrSessionBusy) {
+			if skipBusy && errors.Is(err, ErrSessionBusy) {
 				continue
 			}
 			return completed, errors.Join(err, ErrOperationPending)

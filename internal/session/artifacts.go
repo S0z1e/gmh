@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -33,6 +34,7 @@ type artifactRegistry struct {
 	Version  int       `json:"version"`
 	Created  time.Time `json:"created"`
 	Archives []string  `json:"archives"`
+	Promoted []string  `json:"promoted,omitempty"`
 }
 
 func readArtifactHeader(path string) (*Header, error) {
@@ -95,20 +97,31 @@ func loadArtifactRegistry(h *Header) (artifactRegistry, error) {
 	if err := json.Unmarshal(data, &r); err != nil {
 		return r, err
 	}
-	if r.Version != 1 || !r.Created.Equal(h.Created) || len(r.Archives) > maxSessionArtifacts {
-		return r, fmt.Errorf("artifact registry owner/version invalid")
+	return r, validateArtifactRegistry(r, h.Created)
+}
+
+func validateArtifactRegistry(r artifactRegistry, created time.Time) error {
+	if r.Version != 1 || !r.Created.Equal(created) || len(r.Archives)+len(r.Promoted) > maxSessionArtifacts {
+		return fmt.Errorf("artifact registry owner/version invalid")
 	}
-	for _, name := range r.Archives {
-		if err := validateSessionName(strings.TrimSuffix(name, ".jsonl"), 240); err != nil || !strings.HasSuffix(name, ".jsonl") {
-			return r, fmt.Errorf("invalid archive registry path")
+	names := make(map[string]bool, len(r.Archives)+len(r.Promoted))
+	for _, entries := range [][]string{r.Archives, r.Promoted} {
+		for _, name := range entries {
+			if !strings.HasSuffix(name, ".jsonl") || validateSessionName(strings.TrimSuffix(name, ".jsonl"), 240) != nil || names[name] {
+				return fmt.Errorf("invalid or duplicate archive registry path")
+			}
+			names[name] = true
 		}
 	}
-	return r, nil
+	return nil
 }
 
 func saveArtifactRegistry(h *Header, r artifactRegistry) error {
 	if h == nil || h.OutputID == "" {
 		return fmt.Errorf("artifact registration requires a bound session")
+	}
+	if err := validateArtifactRegistry(r, h.Created); err != nil {
+		return err
 	}
 	data, err := json.Marshal(r)
 	if err != nil {
@@ -130,12 +143,34 @@ func (s *Store) registerArchiveLocked(name string) error {
 			return nil
 		}
 	}
-	if len(r.Archives) >= maxSessionArtifacts {
-		return fmt.Errorf("session archive limit reached")
-	}
+	r.Promoted = slices.DeleteFunc(r.Promoted, func(entry string) bool { return entry == name })
 	r.Archives = append(r.Archives, name)
 	sort.Strings(r.Archives)
 	return saveArtifactRegistry(s.header, r)
+}
+
+// A writable resume turns an immutable archive into a session that still
+// shares the artifact family. Record the promotion before accepting work.
+func (s *Store) promoteArchive() error {
+	r, err := loadArtifactRegistry(s.header)
+	if err != nil {
+		return err
+	}
+	name := s.ID + ".jsonl"
+	if slices.Contains(r.Promoted, name) {
+		return nil
+	}
+	if !slices.Contains(r.Archives, name) && !legacyArchiveName(s.ID) {
+		return nil
+	}
+	r.Archives = slices.DeleteFunc(r.Archives, func(entry string) bool { return entry == name })
+	r.Promoted = append(r.Promoted, name)
+	sort.Strings(r.Promoted)
+	return saveArtifactRegistry(s.header, r)
+}
+
+func legacyArchiveName(id string) bool {
+	return strings.Contains(id, "-pre-compact-") || strings.Contains(id, "-pre-rollback-")
 }
 
 // Manifest identifies the entire owned family. Stable output identity keeps
@@ -211,7 +246,8 @@ func sessionManifest(id string) (ArtifactManifest, error) {
 	// sessions, even when their names happen to share an archive prefix.
 	for _, entry := range entries {
 		name := entry.Name()
-		if strings.HasSuffix(name, ".jsonl") && (strings.HasPrefix(name, id+"-pre-compact-") || strings.HasPrefix(name, id+"-pre-rollback-")) {
+		if strings.HasSuffix(name, ".jsonl") && !slices.Contains(r.Promoted, name) &&
+			(strings.HasPrefix(name, id+"-pre-compact-") || strings.HasPrefix(name, id+"-pre-rollback-")) {
 			ah, err := readArtifactHeader(filepath.Join(Dir(), name))
 			if err != nil {
 				return m, err

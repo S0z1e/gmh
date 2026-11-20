@@ -58,23 +58,11 @@ func (s *Store) Audit(v any) error {
 		return ErrOperationPending
 	}
 	if s.closed {
-		if _, err := recoverOperations(s.ID); err != nil {
-			return err
-		}
-		// Late job diagnostics may arrive after Close. Never recreate a deleted
-		// family or append them to an independent session that reused its name.
-		writer, err := acquireWriter(s.ID)
+		release, err := s.lockClosedStore()
 		if err != nil {
 			return err
 		}
-		defer writer.Close()
-		h, err := readArtifactHeader(s.Path)
-		if err != nil {
-			return err
-		}
-		if (s.header == nil) != (h == nil) || h != nil && (!h.Created.Equal(s.header.Created) || h.OutputID != s.header.OutputID) {
-			return fmt.Errorf("audit session identity changed")
-		}
+		defer release()
 
 		b, err := json.Marshal(v)
 		if err != nil {
@@ -103,7 +91,52 @@ func (s *Store) Audit(v any) error {
 	return err
 }
 
+// A closed store can service a late audit or archive request while its
+// original owner is still present. The caller holds the management lock.
+func (s *Store) lockClosedStore() (func(), error) {
+	if _, err := recoverOperations(s.ID); err != nil {
+		return nil, err
+	}
+	if s.header != nil {
+		if err := recoverOutputOperations(s.header.OutputID); err != nil {
+			return nil, err
+		}
+	}
+	writer, err := acquireWriter(s.ID)
+	if err != nil {
+		return nil, err
+	}
+	header, err := readArtifactHeader(s.Path)
+	if err != nil {
+		writer.Close()
+		return nil, err
+	}
+	if (s.header == nil) != (header == nil) || header != nil &&
+		(!header.Created.Equal(s.header.Created) || header.OutputID != s.header.OutputID) {
+		writer.Close()
+		return nil, fmt.Errorf("session identity changed")
+	}
+	var output *os.File
+	if header != nil && header.OutputID != "" {
+		output, err = acquireOutputWriter(header, s.ID)
+		if err != nil {
+			writer.Close()
+			return nil, err
+		}
+	}
+	return func() {
+		if output != nil {
+			output.Close()
+		}
+		writer.Close()
+	}, nil
+}
+
 func openAuditSidecar(path string) (*os.File, error) {
+	id := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	if _, err := recoverOperations(id); err != nil {
+		return nil, err
+	}
 	header, err := readArtifactHeader(path)
 	if err == nil && header != nil {
 		return nil, fmt.Errorf("audit path belongs to another session")
@@ -349,16 +382,26 @@ func marshalCheckpoint(msgs []llm.Message) ([]byte, error) {
 func (s *Store) ArchiveCopy(name string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.file == nil {
-		return "", os.ErrClosed
+	if !s.closed && s.file == nil {
+		return "", ErrOperationPending
 	}
 	unlock, err := lockManagement()
 	if err != nil {
 		return "", err
 	}
 	defer unlock()
+	if s.closed {
+		release, err := s.lockClosedStore()
+		if err != nil {
+			return "", err
+		}
+		defer release()
+	}
 	// Archives add a suffix to a valid (up to 128-byte) session ID.
 	if err := validateSessionName(name, 240); err != nil {
+		return "", err
+	}
+	if _, err := recoverOperations(name); err != nil {
 		return "", err
 	}
 	writer, err := acquireWriterFile(name)

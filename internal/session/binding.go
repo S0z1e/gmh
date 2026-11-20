@@ -74,6 +74,17 @@ func Open(id string, opts OpenOptions) (*Store, error) {
 			return nil, err
 		}
 	}
+	if id != "" {
+		header, err := readArtifactHeader(filepath.Join(Dir(), id+".jsonl"))
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+		if header != nil {
+			if err := recoverOutputOperations(header.OutputID); err != nil {
+				return nil, fmt.Errorf("recover artifact family: %w", err)
+			}
+		}
+	}
 	identity, err := workspace.Identify(opts.Workspace)
 	if err != nil {
 		return nil, err
@@ -157,6 +168,12 @@ func Open(id string, opts OpenOptions) (*Store, error) {
 	if _, err := s.UsageTotals(); err != nil {
 		s.Close()
 		return nil, fmt.Errorf("load session usage: %w", err)
+	}
+	if !fresh {
+		if err := s.promoteArchive(); err != nil {
+			s.Close()
+			return nil, fmt.Errorf("promote resumed archive: %w", err)
+		}
 	}
 	return s, nil
 }
