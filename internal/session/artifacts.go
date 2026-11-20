@@ -15,8 +15,9 @@ const maxSessionArtifacts = 8192
 const maxArtifactScan = 100000
 
 type Artifact struct {
-	Path string `json:"path"` // relative to the sessions directory
-	Kind string `json:"kind"`
+	Path            string `json:"path"` // relative to the sessions directory
+	Kind            string `json:"kind"`
+	archiveRecovery bool
 }
 
 type ArtifactManifest struct {
@@ -25,6 +26,7 @@ type ArtifactManifest struct {
 	OutputID  string     `json:"output_id,omitempty"`
 	Shared    bool       `json:"shared"`
 	Artifacts []Artifact `json:"artifacts"`
+	archives  []string   // Validated family archives, including shared files.
 }
 
 type artifactRegistry struct {
@@ -152,6 +154,16 @@ func (s *Store) Manifest() (ArtifactManifest, error) {
 	return sessionManifest(s.ID)
 }
 
+// Earlier bound archives may predate the output claim. Their creation time
+// still has to match, and an explicit conflicting output ID is never adopted.
+func matchesArchive(owner, archive *Header) bool {
+	if archive == nil {
+		return true
+	}
+	return owner != nil && owner.Created.Equal(archive.Created) &&
+		(archive.OutputID == "" || owner.OutputID == archive.OutputID)
+}
+
 func sessionManifest(id string) (ArtifactManifest, error) {
 	m := ArtifactManifest{Version: 1, ID: id}
 	h, err := readArtifactHeader(filepath.Join(Dir(), id+".jsonl"))
@@ -189,7 +201,7 @@ func sessionManifest(id string) (ArtifactManifest, error) {
 		if err != nil {
 			return m, err
 		}
-		if h != nil && ah != nil && (!h.Created.Equal(ah.Created) || h.OutputID != ah.OutputID) {
+		if !matchesArchive(h, ah) {
 			continue
 		}
 		owned[name] = "archive"
@@ -204,7 +216,7 @@ func sessionManifest(id string) (ArtifactManifest, error) {
 			if err != nil {
 				return m, err
 			}
-			if h != nil && ah != nil && (!h.Created.Equal(ah.Created) || h.OutputID != ah.OutputID) {
+			if !matchesArchive(h, ah) {
 				continue
 			}
 			owned[name] = "archive"
@@ -215,7 +227,7 @@ func sessionManifest(id string) (ArtifactManifest, error) {
 	if h != nil && h.OutputID != "" {
 		for _, entry := range entries {
 			name := entry.Name()
-			if entry.IsDir() || !strings.HasSuffix(name, ".jsonl") || owned[name] != "" || strings.HasSuffix(name, "-audit.jsonl") {
+			if entry.IsDir() || !strings.HasSuffix(name, ".jsonl") || owned[name] != "" {
 				continue
 			}
 			other, err := readArtifactHeader(filepath.Join(Dir(), name))
@@ -228,13 +240,16 @@ func sessionManifest(id string) (ArtifactManifest, error) {
 			}
 		}
 	}
-	if m.Shared {
-		for name, kind := range owned {
-			if kind == "archive" {
+	for name, kind := range owned {
+		if kind == "archive" {
+			m.archives = append(m.archives, name)
+			if m.Shared {
 				delete(owned, name)
 			}
 		}
 	}
+	sort.Strings(m.archives)
+	archiveRecovery := map[string]bool{}
 	for _, entry := range entries {
 		name := entry.Name()
 		marker := strings.LastIndex(name, ".jsonl-torn-")
@@ -268,6 +283,7 @@ func sessionManifest(id string) (ArtifactManifest, error) {
 		}
 		if ownerKind != "" && validBackupID(nonce) {
 			owned[name] = "recovery"
+			archiveRecovery[name] = ownerKind == "archive"
 		}
 	}
 	if h != nil && h.OutputID != "" && !m.Shared {
@@ -288,7 +304,7 @@ func sessionManifest(id string) (ArtifactManifest, error) {
 		if kind != "output_family" && !st.Mode().IsRegular() {
 			return m, fmt.Errorf("session artifact %q must be a regular file", path)
 		}
-		m.Artifacts = append(m.Artifacts, Artifact{Path: path, Kind: kind})
+		m.Artifacts = append(m.Artifacts, Artifact{Path: path, Kind: kind, archiveRecovery: archiveRecovery[path]})
 	}
 	sort.Slice(m.Artifacts, func(i, j int) bool { return m.Artifacts[i].Path < m.Artifacts[j].Path })
 	if len(m.Artifacts) > maxSessionArtifacts {

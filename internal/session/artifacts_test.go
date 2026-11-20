@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"errors"
 	"minimalharness/internal/llm"
 	"os"
@@ -63,7 +64,7 @@ func TestArtifactDeleteIncludesFullFamily(t *testing.T) {
 	}
 }
 
-func TestArtifactRenameMovesRollbackAndCustomArchives(t *testing.T) {
+func TestArtifactRenamePreservesArchivePaths(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	s, paths := artifactFixture(t, "family")
 	root := filepath.Dir(s.OutputDir())
@@ -85,13 +86,18 @@ func TestArtifactRenameMovesRollbackAndCustomArchives(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	for _, path := range paths[2:5] {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("rename invalidated a saved archive path: %v", err)
+		}
+	}
 	s.Close()
 	if err := DeleteSession("renamed"); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"renamed-pre-rollback-2.jsonl", "renamed-custom-archive.jsonl"} {
-		if _, err := os.Stat(filepath.Join(Dir(), name)); !os.IsNotExist(err) {
-			t.Fatalf("left %s", name)
+	for _, path := range paths[2:] {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("left %s", path)
 		}
 	}
 }
@@ -194,10 +200,10 @@ func TestArtifactSharedOutputAndArchiveNameIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Close()
-	if err := os.WriteFile(filepath.Join(Dir(), "copy.jsonl"), data, 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(Dir(), "copy-audit.jsonl"), data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	copy, err := Open("copy", OpenOptions{Workspace: workspace})
+	copy, err := Open("copy-audit", OpenOptions{Workspace: workspace})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,6 +211,10 @@ func TestArtifactSharedOutputAndArchiveNameIsolation(t *testing.T) {
 		t.Fatalf("active shared output not protected: %v", err)
 	}
 	copy.Close()
+	legacyArchive := filepath.Join(Dir(), "source-pre-compact-legacy.jsonl")
+	if err := os.WriteFile(legacyArchive, data, 0600); err != nil {
+		t.Fatal(err)
+	}
 	other, err := Open("source-pre-rollback-99", OpenOptions{Workspace: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
@@ -219,8 +229,11 @@ func TestArtifactSharedOutputAndArchiveNameIsolation(t *testing.T) {
 	if _, err := os.Stat(other.Path); err != nil {
 		t.Fatalf("independent session removed: %v", err)
 	}
-	if err := DeleteSession("copy"); err != nil {
+	if err := DeleteSession("copy-audit"); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := os.Stat(legacyArchive); !os.IsNotExist(err) {
+		t.Fatalf("last owner left an unregistered archive: %v", err)
 	}
 	if _, err := os.Stat(root); !os.IsNotExist(err) {
 		t.Fatalf("final owner output remains: %v", err)
@@ -341,4 +354,145 @@ func TestArtifactRecoveryRejectsInvalidPlanWithoutMutation(t *testing.T) {
 	if _, err := os.Stat(s.Path); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestArtifactKeepsLegacyArchiveAfterOutputAdoption(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	s, err := Open("legacy", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := *s.header
+	header.OutputID = ""
+	line, err := json.Marshal(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	archive := filepath.Join(Dir(), "legacy-pre-compact-1.jsonl")
+	for _, path := range []string{s.Path, archive} {
+		if err := os.WriteFile(path, append(line, '\n'), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backup := archive + "-torn-ABCDEF2.bak"
+	if err := os.WriteFile(backup, []byte("torn"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open("legacy", OpenOptions{Workspace: root, Existing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename("renamed"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{archive, backup} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("rename lost old archive path %s: %v", path, err)
+		}
+	}
+	s.Close()
+	if err := DeleteSession("renamed"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{archive, backup} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("delete missed %s: %v", path, err)
+		}
+	}
+}
+
+func TestArtifactPendingRollbackRejectsLateAudit(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s, _ := artifactFixture(t, "before")
+	root := s.header.Workspace.Path
+	manifest, err := s.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := prepareOperation("rename", "before", "after", manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.auditFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s.auditFile = nil
+	if err := s.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s.file = nil // Same frozen state as a failed rollback in Rename.
+	for _, move := range op.Moves {
+		if move.Kind == "audit" {
+			if err := reconcileMove(move, true); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := s.Audit(map[string]string{"kind": "late"}); !errors.Is(err, ErrOperationPending) {
+		t.Fatalf("audit wrote into pending rename: %v", err)
+	}
+	s.Close()
+	reopened, err := Open("before", OpenOptions{Workspace: root, Existing: true})
+	if err != nil {
+		t.Fatalf("late audit prevented recovery: %v", err)
+	}
+	reopened.Close()
+}
+
+func TestArtifactUnboundOwnerLeavesBoundRollbackName(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	other, err := New("source-pre-rollback-99")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	path := filepath.Join(Dir(), "source.jsonl")
+	if err := os.WriteFile(path, []byte("{\"role\":\"user\",\"content\":\"legacy\"}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteSession("source"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(other.Path); err != nil {
+		t.Fatalf("independent session was removed: %v", err)
+	}
+}
+
+func TestArtifactActiveRenameRecoversDestinationOperation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dst, _ := artifactFixture(t, "destination")
+	source, err := New("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	root := source.header.Workspace.Path
+	m, err := dst.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := prepareOperation("delete", "destination", "", m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst.Close()
+	for _, move := range op.Moves {
+		if err := reconcileMove(move, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := source.Rename("destination"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(operationPath(op)); !os.IsNotExist(err) {
+		t.Fatalf("rename left a stale destination journal: %v", err)
+	}
+	source.Close()
+	reopened, err := Open("destination", OpenOptions{Workspace: root, Existing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened.Close()
 }

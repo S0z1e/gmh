@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -79,25 +80,25 @@ func prepareOperation(kind, oldID, newID string, m ArtifactManifest) (artifactOp
 		return op, err
 	}
 	op.After = op.Before
-	op.After.Archives = append([]string(nil), op.Before.Archives...)
+	if op.Header != nil && op.Header.OutputID != "" {
+		// Keep the path embedded in checkpoints and previous rollback
+		// responses. Register legacy archive names before their owner moves.
+		op.After.Archives = m.archives
+	}
 	rename := func(name string) string {
-		if len(name) > len(oldID) && strings.EqualFold(name[:len(oldID)], oldID) && strings.HasPrefix(name[len(oldID):], ".jsonl-torn-") {
-			return newID + name[len(oldID):]
+		if len(name) <= len(oldID) || !strings.EqualFold(name[:len(oldID)], oldID) {
+			return name
 		}
-		if len(name) > len(oldID) && strings.EqualFold(name[:len(oldID)], oldID) && strings.HasPrefix(name[len(oldID):], "-") {
-			return newID + name[len(oldID):]
+		suffix := name[len(oldID):]
+		if strings.HasPrefix(suffix, ".jsonl-torn-") || strings.HasPrefix(suffix, "-") {
+			return newID + suffix
 		}
 		return name
 	}
-	for i, name := range op.After.Archives {
-		op.After.Archives[i] = rename(name)
-	}
-	if m.Shared {
-		op.After = op.Before
-	}
 	var transcript artifactMove
 	for _, a := range m.Artifacts {
-		if kind == "rename" && a.Kind == "output_family" {
+		if kind == "rename" && (a.Kind == "output_family" ||
+			op.Header != nil && op.Header.OutputID != "" && (a.Kind == "archive" || a.archiveRecovery)) {
 			continue
 		}
 		to := rename(a.Path)
@@ -124,6 +125,11 @@ func prepareOperation(kind, oldID, newID string, m ArtifactManifest) (artifactOp
 		if _, err := os.Lstat(filepath.Join(Dir(), move.To)); err == nil {
 			return op, fmt.Errorf("artifact destination %q already exists", move.To)
 		} else if !os.IsNotExist(err) {
+			return op, err
+		}
+	}
+	if kind == "delete" && m.Shared && !slices.Equal(op.Before.Archives, op.After.Archives) {
+		if err := saveArtifactRegistry(op.Header, op.After); err != nil {
 			return op, err
 		}
 	}
@@ -188,7 +194,7 @@ func validateOperation(op artifactOperation) error {
 		}
 	}
 	for _, name := range op.Before.Archives {
-		archives[name] = true
+		archives[strings.ToLower(name)] = true
 	}
 	sources, targets := map[string]bool{}, map[string]bool{}
 	for i, m := range op.Moves {
@@ -207,7 +213,7 @@ func validateOperation(op artifactOperation) error {
 				return fmt.Errorf("invalid audit owner")
 			}
 		case "archive":
-			if !archives[m.From] && !(strings.HasSuffix(m.From, ".jsonl") && (strings.HasPrefix(m.From, op.OldID+"-pre-compact-") || strings.HasPrefix(m.From, op.OldID+"-pre-rollback-"))) {
+			if !archives[strings.ToLower(m.From)] && !(strings.HasSuffix(m.From, ".jsonl") && (strings.HasPrefix(m.From, op.OldID+"-pre-compact-") || strings.HasPrefix(m.From, op.OldID+"-pre-rollback-"))) {
 				return fmt.Errorf("invalid archive owner")
 			}
 		case "recovery":
@@ -216,7 +222,7 @@ func validateOperation(op artifactOperation) error {
 				return fmt.Errorf("invalid recovery name")
 			}
 			owner := m.From[:marker+len(".jsonl")]
-			if !strings.EqualFold(owner, op.OldID+".jsonl") && !archives[owner] && !(strings.HasPrefix(owner, op.OldID+"-pre-compact-") || strings.HasPrefix(owner, op.OldID+"-pre-rollback-")) {
+			if !strings.EqualFold(owner, op.OldID+".jsonl") && !strings.EqualFold(owner, op.OldID+"-audit.jsonl") && !archives[strings.ToLower(owner)] && !(strings.HasPrefix(owner, op.OldID+"-pre-compact-") || strings.HasPrefix(owner, op.OldID+"-pre-rollback-")) {
 				return fmt.Errorf("invalid recovery owner")
 			}
 		case "output_family":

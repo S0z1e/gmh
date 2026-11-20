@@ -69,7 +69,7 @@ func List() ([]Info, error) {
 		}
 		for _, name := range r.Archives {
 			ah, exists := headers[name]
-			if exists && (ah == nil || ah.OutputID == h.OutputID && ah.Created.Equal(h.Created)) {
+			if exists && (matchesArchive(h, ah)) {
 				archives[name] = true
 			}
 		}
@@ -371,6 +371,9 @@ func (s *Store) Rename(newID string) error {
 	// Validate/existence checks before taking the destination lease also avoid
 	// treating a case-only rename of the active file as a competing writer.
 	if err := ValidateSessionID(newID); err != nil {
+		return err
+	}
+	if _, err := recoverOperations(newID); err != nil {
 		return err
 	}
 	if _, err := os.Stat(filepath.Join(Dir(), newID+".jsonl")); err == nil {

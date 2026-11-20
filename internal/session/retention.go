@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"minimalharness/internal/checkpoint"
 	"minimalharness/internal/llm"
 	"os"
 	"path/filepath"
@@ -18,6 +19,38 @@ const maxRetentionScanBytes = 512 << 20
 type PruneReport struct {
 	DeletedBlobs   int   `json:"deleted_blobs"`
 	ReclaimedBytes int64 `json:"reclaimed_bytes"`
+}
+
+// Checkpoints store structured facts in a JSON string. Compaction can
+// embed several checkpoint messages in one physical transcript record.
+func collectCheckpointImageRefs(line []byte, msg llm.Message, add func(string) error) error {
+	messages := []llm.Message{msg}
+	if msg.Role == compactMarkerRole {
+		var compact struct {
+			Messages []llm.Message `json:"messages"`
+		}
+		if err := json.Unmarshal(line, &compact); err != nil {
+			return err
+		}
+		messages = compact.Messages
+	}
+	for _, message := range messages {
+		if message.Kind != "checkpoint" {
+			continue
+		}
+		state, err := checkpoint.Decode([]byte(message.Content))
+		if err != nil {
+			return fmt.Errorf("cannot scan checkpoint image references: %w", err)
+		}
+		for _, artifact := range state.Artifacts {
+			if artifact.Kind == "image" && artifact.SHA256 != "" {
+				if err := add(artifact.SHA256); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // PruneArtifacts explicitly reclaims old image blobs only after a complete
@@ -64,6 +97,13 @@ func PruneArtifacts(ctx context.Context, now time.Time) (PruneReport, error) {
 		return report, err
 	}
 	refs := map[string]bool{}
+	add := func(digest string) error {
+		refs[digest] = true
+		if len(refs) > maxArtifactScan {
+			return fmt.Errorf("too many image references")
+		}
+		return nil
+	}
 	var scanned int64
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
@@ -94,7 +134,7 @@ func PruneArtifacts(ctx context.Context, now time.Time) (PruneReport, error) {
 		}
 		remaining := int64(maxRetentionScanBytes) - scanned
 		var visitErr error
-		end, _, torn, scanErr := scanRecords(io.LimitReader(f, remaining+1), func(line []byte, _ llm.Message) {
+		end, _, torn, scanErr := scanRecords(io.LimitReader(f, remaining+1), func(line []byte, msg llm.Message) {
 			if visitErr != nil {
 				return
 			}
@@ -110,16 +150,15 @@ func PruneArtifacts(ctx context.Context, now time.Time) (PruneReport, error) {
 				}
 				if err != nil {
 					visitErr = err
-					break
+					return
 				}
 				if digest, ok := tok.(string); ok && validImageDigest(digest) {
-					refs[digest] = true
-					if len(refs) > maxArtifactScan {
-						visitErr = fmt.Errorf("too many image references")
-						break
+					if visitErr = add(digest); visitErr != nil {
+						return
 					}
 				}
 			}
+			visitErr = collectCheckpointImageRefs(line, msg, add)
 		})
 		f.Close()
 		scanned += end

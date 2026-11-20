@@ -133,7 +133,7 @@ func TestRenameSession(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(Dir(), "orig.jsonl")); !os.IsNotExist(err) {
 		t.Fatal("old transcript should be gone")
 	}
-	for _, want := range []string{"renamed.jsonl", "renamed-audit.jsonl", "renamed-pre-compact-120000.jsonl"} {
+	for _, want := range []string{"renamed.jsonl", "renamed-audit.jsonl", "orig-pre-compact-120000.jsonl"} {
 		if _, err := os.Stat(filepath.Join(Dir(), want)); err != nil {
 			t.Fatalf("renamed file missing: %s", want)
 		}

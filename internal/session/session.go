@@ -54,7 +54,13 @@ func (s *Store) Audit(v any) error {
 	}
 	defer unlock()
 
+	if !s.closed && s.file == nil {
+		return ErrOperationPending
+	}
 	if s.closed {
+		if _, err := recoverOperations(s.ID); err != nil {
+			return err
+		}
 		// Late job diagnostics may arrive after Close. Never recreate a deleted
 		// family or append them to an independent session that reused its name.
 		writer, err := acquireWriter(s.ID)
@@ -74,7 +80,7 @@ func (s *Store) Audit(v any) error {
 		if err != nil {
 			return err
 		}
-		f, err := privatefile.Open(s.AuditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY)
+		f, err := openAuditSidecar(s.AuditPath())
 		if err != nil {
 			return err
 		}
@@ -83,7 +89,7 @@ func (s *Store) Audit(v any) error {
 		return err
 	}
 	if s.auditFile == nil {
-		f, err := privatefile.Open(s.AuditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY)
+		f, err := openAuditSidecar(s.AuditPath())
 		if err != nil {
 			return err
 		}
@@ -95,6 +101,25 @@ func (s *Store) Audit(v any) error {
 	}
 	_, err = s.auditFile.Write(append(b, '\n'))
 	return err
+}
+
+func openAuditSidecar(path string) (*os.File, error) {
+	header, err := readArtifactHeader(path)
+	if err == nil && header != nil {
+		return nil, fmt.Errorf("audit path belongs to another session")
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	f, err := privatefile.Open(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|metadataReadFlags)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTranscriptLinks(f); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 func Dir() string {
@@ -324,6 +349,9 @@ func marshalCheckpoint(msgs []llm.Message) ([]byte, error) {
 func (s *Store) ArchiveCopy(name string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed || s.file == nil {
+		return "", os.ErrClosed
+	}
 	unlock, err := lockManagement()
 	if err != nil {
 		return "", err

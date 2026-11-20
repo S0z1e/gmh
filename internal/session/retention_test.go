@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/base64"
+	"minimalharness/internal/checkpoint"
 	"minimalharness/internal/llm"
 	"os"
 	"path/filepath"
@@ -143,6 +144,54 @@ func TestArtifactRetentionCheckpointAndConcurrentPublication(t *testing.T) {
 		}
 	}
 	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestArtifactRetentionPreservesCheckpointOnlyImageReference(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s, err := New("checkpoint-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	image := llm.Image{Data: base64.StdEncoding.EncodeToString([]byte("checkpoint image")), MediaType: "image/png"}
+	if err := s.Append(llm.Message{Role: "user", Images: []llm.Image{image}}); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := Load(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := messages[0].Images[0].Digest
+	state, err := checkpoint.Merge(checkpoint.State{}, checkpoint.Delta{Artifacts: []checkpoint.Artifact{{
+		Kind: "image", Path: "example.png", Source: "test", SHA256: digest, MediaType: "image/png",
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := checkpoint.Encode(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rewrite(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkCompactMessages([]llm.Message{{Role: "user", Kind: "checkpoint", Content: string(facts)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	old := now.Add(-8 * 24 * time.Hour)
+	blob := filepath.Join(imageBlobDir(), digest)
+	if err := os.Chtimes(blob, old, old); err != nil {
+		t.Fatal(err)
+	}
+	report, err := PruneArtifacts(context.Background(), now)
+	if err != nil || report.DeletedBlobs != 0 {
+		t.Fatalf("checkpoint reference was lost: %+v %v", report, err)
+	}
+	if _, err := os.Stat(blob); err != nil {
 		t.Fatal(err)
 	}
 }
