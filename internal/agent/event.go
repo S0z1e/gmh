@@ -98,7 +98,8 @@ const (
 )
 
 type Event struct {
-	Kind EventKind
+	StepID string
+	Kind   EventKind
 	// Text is a streamed delta for TextDelta, the final answer for Done.
 	// For Error it carries the turn's last text — the grace summary
 	// on a step cap, the model's last message otherwise — so a

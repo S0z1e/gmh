@@ -67,9 +67,9 @@ func TestContinuationCancellationRemovesRegisteredWaiter(t *testing.T) {
 	go func() { _, err := s.confirmContinuation(agent.ContinuationRequest{ToolName: "read"}); done <- err }()
 	deadline := time.Now().Add(time.Second)
 	for {
-		s.mu.Lock()
+		s.writeMu.Lock()
 		emitted := output.Len() > 0
-		s.mu.Unlock()
+		s.writeMu.Unlock()
 		if emitted {
 			break
 		}

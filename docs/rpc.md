@@ -11,12 +11,27 @@ with `--rpc`; `--ui` is ignored.
 harness --rpc -root /path/to/project -mode suggest
 ```
 
-Startup: the first line on stdout is a `ready` event:
+The first line on stdout is a `ready` event:
 `{"type":"ready","protocol":1,"session":"<id>","model":"...","api":"chat","mode":"suggest","root":"...","resumed":false,"messages":0}`.
+
+All responses and events carry a strictly increasing `sequence` for the
+connection. Events carry `connection_id` and, when applicable, `session`,
+`turn_id`, `step_id`, and `request_id`. Tool events retain `invocation_id`
+for their start/result pair. When a background result arrives in a later
+turn, `origin_turn_id`, `origin_request_id`, and `origin_step_id` identify
+the originating call if it was launched on this connection.
+
+Read stdout continuously. If a write stays blocked for five seconds or
+the queue reaches 1,024 frames or 16 MiB, the server disconnects
+and cancels active provider calls and control operations. A failed write
+also disconnects. The client should treat the stream as closed and
+reconnect before sending further requests. The server returns an error
+for output failure and for input frames over 4 MiB. Individual output
+frames are limited to 8 MiB.
 
 Requests (each `{"id":"<req>","type":"..."}`; `id` is optional and
 echoed in the response):
-- `prompt` `{"message":"..."}` → `{"disposition":"started"|"queued"}`.
+- `prompt` `{"message":"..."}` → `{"disposition":"started"|"queued","turn_id":"<turn>"}`.
   The response only means accepted; the turn ends with
   `agent_settled`. A second prompt while a turn runs is queued (cap
   64; beyond that an error). A known slash line (`/usage`, `/jobs`,
@@ -54,13 +69,16 @@ echoed in the response):
   `abort` alone lets queued prompts continue after the turn ends.
 - `get_state` → session/model/api/mode/root, `tool_mode`
   (`"default"` or `"plan"`), `streaming`, `queued`, `messages`,
-  `turns`, `total_tokens`, `context_window` and `max_tokens` (the
+  `turns`, `total_tokens`, `metering_available`, `session_usage_complete`,
+  `current_run_usage_complete`, `context_window` and `max_tokens` (the
   effective window and output cap for the current model — the values
   Setup resolved, so a GUI can meter context against the limit the
   compact trigger uses).
-- `usage` → session usage object, `cost_usd` (null when no rates are
-  configured), `fee` (a note that the price is unverified against the
-  provider's actual prices), `turns`.
+- `usage` returns lifetime `session` and `current_run` usage. Treat counts
+  as subtotals when their corresponding completeness flag is false.
+  `metering_available` indicates whether lifetime metering can be read.
+  `cost_usd` and `current_run_cost_usd` are present only when the respective
+  provider usage has complete pricing evidence.
 - `jobs` → background bash jobs (id, status, elapsed seconds,
   command, exit code once done).
 - `new_session` → `{"session":"<new id>"}`. Starts a fresh session
@@ -82,7 +100,7 @@ echoed in the response):
   only path/media type/dimensions). Defaults to the current session;
   `{"session":"<id>"}` fetches another session's transcript (an
   unknown id is an error). The full history, no truncation — the GUI
-  asked for it. After a `/clear` or a compact the file only holds
+  asked for it, subject to the output frame limit. After a `/clear` or a compact the active view only holds
   what the model still sees, so history matches the live context.
   `user` messages with `kind:"turn_context"` are harness mode/plugin snapshots,
   appended after each task. They are turn-internal records, not additional user
@@ -97,7 +115,8 @@ echoed in the response):
   output references and job snapshots; provider wire adapters omit that metadata.
 - `rename_session` `{"name":"old","new":"new"}` → `{"renamed":true,"from":"old","to":"new"}`. Same rename as `/rename` in the REPL.
 - `resume_session` `{"session":"..."}` → `{"session":"...","messages":N}`. Same switch as `/resume` in the REPL; `get_state` reports the new session at once.
-- `delete_session` `{"session":"..."}` → `{"deleted":true,"session":"..."}`. Removes another session's transcript, audit sidecar and pre-compact archives. The current session cannot be deleted (resume or start another one first); an unknown id is an error.
+- `prune_artifacts` → `{"deleted_blobs":N,"reclaimed_bytes":N}`. Reclaims unreferenced image blobs older than seven days after scanning session history, archives and recovery records.
+- `delete_session` `{"session":"..."}` → `{"deleted":true,"session":"..."}`. Removes another session's owned transcript, archives, audit, recovery records and unshared output family. The current session cannot be deleted (resume or start another one first); an unknown id is an error.
 - `set_tool_mode` `{"mode":"plan"|"default"}` → `{"tool_mode":"plan"}`. First-class switch of the loop's tool set (read-only plan mode, or back to the full default set): the same effect as the plan plugin's `/plan` / `/execute`, but it works even when the project has no plan plugin. An unknown or missing mode is an error; switching to the current mode is a no-op. `get_state` and `agent_settled` report the new mode at once. The mode is session-only: a new or resumed session resets it to default.
 - `command` `{"name":"plan","message":""}` → `{"ok":true,"output":"..."}`. Runs a plugin command by name (`message` is the raw args string, the text after `/name`); same as typing `/name` in the REPL. A `/name ...` prompt line behaves the same way.
 - `quit` → `{"ok":true}`, then the process exits 0. It waits for the

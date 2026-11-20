@@ -20,7 +20,9 @@ import (
 // Request is one line from the GUI. ID is echoed in the response when
 // present; a request without one still gets a response, without an id.
 type Request struct {
-	ID string `json:"id,omitempty"`
+	turnID   string
+	accepted <-chan struct{}
+	ID       string `json:"id,omitempty"`
 	// Type is one of: prompt, approval_response, continuation_response,
 	// question_response, abort, clear_queue, get_state, new_session,
 	// clear, compact, usage, jobs, skill, quit, attach_image,
@@ -76,10 +78,11 @@ type Request struct {
 // Response is the reply to one request, correlated by ID. Exactly one
 // of Data and Error is set: Type is "response" or "error".
 type Response struct {
-	ID    string `json:"id,omitempty"`
-	Type  string `json:"type"`
-	Data  any    `json:"data,omitempty"`
-	Error string `json:"error,omitempty"`
+	Sequence uint64 `json:"sequence,omitempty"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type"`
+	Data     any    `json:"data,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 // UsageJSON is one usage object: prompt/cached/completion/total tokens.
@@ -103,10 +106,18 @@ type UsageJSON struct {
 // tool_backgrounded, background_wait, tool_background_done,
 // approval_request, agent_settled, compacted, error.
 type Event struct {
-	Request   *llm.RequestTrace `json:"request,omitempty"`
-	Operation string            `json:"operation,omitempty"`
-	Attempt   int               `json:"attempt,omitempty"`
-	Type      string            `json:"type"`
+	OriginTurnID    string            `json:"origin_turn_id,omitempty"`
+	OriginRequestID string            `json:"origin_request_id,omitempty"`
+	OriginStepID    string            `json:"origin_step_id,omitempty"`
+	Sequence        uint64            `json:"sequence,omitempty"`
+	ConnectionID    string            `json:"connection_id,omitempty"`
+	TurnID          string            `json:"turn_id,omitempty"`
+	RequestID       string            `json:"request_id,omitempty"`
+	StepID          string            `json:"step_id,omitempty"`
+	Request         *llm.RequestTrace `json:"request,omitempty"`
+	Operation       string            `json:"operation,omitempty"`
+	Attempt         int               `json:"attempt,omitempty"`
+	Type            string            `json:"type"`
 	// ready: protocol version and session identity.
 	Protocol int    `json:"protocol,omitempty"`
 	Session  string `json:"session,omitempty"`

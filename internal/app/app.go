@@ -1410,6 +1410,7 @@ func (r *Runner) Rollback(n int) (dropped int, archive string, err error) {
 // doCompact summarises history, saves the original transcript to a
 // separate file, and replaces history with the summary.
 func (r *Runner) doCompact(ctx context.Context) {
+	r.LastErr = nil
 	if len(r.App.History) == 0 {
 		r.Print("[compact] nothing to compact.")
 		return
@@ -1419,6 +1420,7 @@ func (r *Runner) doCompact(ctx context.Context) {
 	_, usage, err := r.App.Cfg.Compact(ctx, r.App.History)
 	r.accountRun(usage, previousCost)
 	if err != nil {
+		r.LastErr = err
 		r.Print("[compact] failed: %v (history unchanged)", err)
 		return
 	}

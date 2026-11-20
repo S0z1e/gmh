@@ -18,6 +18,7 @@ package rpc
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,6 +72,8 @@ type serverState struct {
 	toolMode string
 }
 
+type eventOrigin struct{ turnID, requestID, stepID string }
+
 type turnOutcome struct {
 	text    string
 	usage   llm.Usage
@@ -110,8 +113,13 @@ type Server struct {
 	in     io.Reader
 	out    io.Writer
 
-	mu    sync.Mutex // guards out + state
-	state serverState
+	mu           sync.Mutex // guards state, never output I/O
+	writeMu      sync.Mutex // orders frames, independent from state
+	output       *protocolOutput
+	sequence     uint64
+	connectionID string
+	inputErr     error
+	state        serverState
 
 	// outstanding counts prompts the reader has enqueued but the
 	// agent has not settled yet (running or still queued). The reader
@@ -147,16 +155,20 @@ type Server struct {
 	questionsMu sync.Mutex
 	questSeq    int
 
-	turnMu      sync.Mutex
-	turnCtx     context.Context
-	turnCancel  context.CancelFunc
-	turnAborted bool
+	turnMu        sync.Mutex
+	turnCtx       context.Context
+	turnCancel    context.CancelFunc
+	turnAborted   bool
+	turnID        string
+	turnRequestID string
+	stepID        string
 
 	// turnUsage / turnOutcome are agent-goroutine-only: the loop emits
 	// events synchronously on the Run goroutine, and runTurn reads them
 	// on the same goroutine after Handle returns.
-	turnUsage   llm.Usage
-	turnOutcome *turnOutcome
+	turnUsage         llm.Usage
+	turnOutcome       *turnOutcome
+	backgroundOrigins map[string]eventOrigin
 }
 
 // Run serves RPC on in/out until the GUI quits or closes stdin. It
@@ -180,6 +192,13 @@ func (s *Server) run() error {
 	if err := s.runner.RefreshUsage(); err != nil {
 		return err
 	}
+	s.connectionID = rand.Text()
+	s.output = newProtocolOutput(s.out, func() {
+		s.shutdown()
+		if c, ok := s.in.(io.Closer); ok {
+			_ = c.Close()
+		}
+	})
 	s.app.Cfg.OnEvent = s.onEvent
 	s.app.Cfg.Ask = s.ask
 	s.app.Cfg.ConfirmContinuation = s.confirmContinuation
@@ -201,23 +220,34 @@ func (s *Server) run() error {
 	})
 	go s.readLoop()
 	s.agentLoop()
-	return s.app.Close()
+	if c, ok := s.in.(io.Closer); ok {
+		_ = c.Close()
+	}
+	closeErr := s.app.Close()
+	outputErr := s.output.finish()
+	s.mu.Lock()
+	inputErr := s.inputErr
+	s.mu.Unlock()
+	return errors.Join(closeErr, outputErr, inputErr)
 }
 
 // readLoop decodes stdin lines (LF only) until EOF, then shuts down.
 func (s *Server) readLoop() {
-	br := bufio.NewReader(s.in)
-	for {
-		line, err := br.ReadString('\n')
-		if line != "" {
-			s.handleLine(line)
-		}
-		if err != nil {
-			// EOF or read error: orderly shutdown.
-			s.shutdown()
+	sc := bufio.NewScanner(s.in)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	for sc.Scan() {
+		if s.isDone() {
 			return
 		}
+		s.handleLine(sc.Text())
 	}
+	if err := sc.Err(); err != nil && !s.isDone() {
+		s.mu.Lock()
+		s.inputErr = fmt.Errorf("read rpc request: %w", err)
+		s.mu.Unlock()
+		s.writeEvent(Event{Type: "error", Error: "rpc request exceeds the size limit or input failed"})
+	}
+	s.shutdown()
 }
 
 func (s *Server) handleLine(line string) {
@@ -318,10 +348,13 @@ func (s *Server) handlePrompt(req Request) {
 	// yet (this prompt reads "queued") or may already have (it reads
 	// "started" for a turn that did start at once).
 	disposition := s.disposition()
+	req.turnID = rand.Text()
+	accepted := make(chan struct{})
+	req.accepted = accepted
 	if s.enqueue(req, workPrompt) {
-		s.addOutstanding(1)
-		s.respond(req, map[string]any{"disposition": disposition}, nil)
+		s.respond(req, map[string]any{"disposition": disposition, "turn_id": req.turnID}, nil)
 	}
+	close(accepted)
 }
 
 // slashRequest maps a REPL slash line to the RPC request type it
@@ -388,15 +421,23 @@ func (s *Server) addOutstanding(delta int) {
 // disposition response is still owed.
 func (s *Server) enqueue(req Request, kind workKind) bool {
 	s.workMu.Lock()
-	defer s.workMu.Unlock()
 	if s.closed {
+		s.workMu.Unlock()
 		s.respond(req, nil, errShutdown)
 		return false
 	}
+	if kind == workPrompt {
+		s.addOutstanding(1)
+	}
 	select {
 	case s.work <- workItem{kind: kind, req: req}:
+		s.workMu.Unlock()
 		return true
 	default:
+		if kind == workPrompt {
+			s.addOutstanding(-1)
+		}
+		s.workMu.Unlock()
 		s.respond(req, nil, errors.New("prompt queue is full"))
 		return false
 	}
@@ -840,6 +881,10 @@ func (s *Server) failContinuations(err error) {
 // on the agent goroutine (emit is synchronous in Run), so turnUsage
 // and turnOutcome need no locking.
 func (s *Server) onEvent(ev agent.Event) {
+	s.turnMu.Lock()
+	s.stepID = ev.StepID
+	s.turnMu.Unlock()
+
 	switch ev.Kind {
 	case agent.EventTextDelta:
 		s.writeEvent(Event{Type: "text_delta", Text: ev.Text})
@@ -870,12 +915,21 @@ func (s *Server) onEvent(ev agent.Event) {
 		}
 		s.writeEvent(e)
 	case agent.EventToolBackgrounded:
+		if s.backgroundOrigins == nil {
+			s.backgroundOrigins = map[string]eventOrigin{}
+		}
+		s.turnMu.Lock()
+		origin := eventOrigin{s.turnID, s.turnRequestID, ev.StepID}
+		s.turnMu.Unlock()
+		s.backgroundOrigins[ev.InvocationID] = origin
 		s.writeEvent(Event{Type: "tool_backgrounded", Tool: ev.ToolName, ToolCallID: ev.ToolCallID, InvocationID: ev.InvocationID, Args: parseToolArgs(ev.ToolArgs), Job: ev.JobID})
 	case agent.EventBackgroundWait:
 		s.writeEvent(Event{Type: "background_wait", Jobs: ev.Text})
 	case agent.EventToolBackgroundDone:
+		origin := s.backgroundOrigins[ev.InvocationID]
+		delete(s.backgroundOrigins, ev.InvocationID)
 		out, trunc := capOutput(ev.ToolOutput, maxToolOutputChars)
-		e := Event{Type: "tool_background_done", Job: ev.JobID, ToolCallID: ev.ToolCallID, InvocationID: ev.InvocationID, Output: out, Truncated: trunc, Status: string(ev.ToolStatus), ExitCode: ev.ToolExitCode, OutputFile: ev.ToolOutputFile}
+		e := Event{OriginTurnID: origin.turnID, OriginRequestID: origin.requestID, OriginStepID: origin.stepID, Type: "tool_background_done", Job: ev.JobID, ToolCallID: ev.ToolCallID, InvocationID: ev.InvocationID, Output: out, Truncated: trunc, Status: string(ev.ToolStatus), ExitCode: ev.ToolExitCode, OutputFile: ev.ToolOutputFile}
 		if ev.ToolErr != nil {
 			e.Error = ev.ToolErr.Error()
 		}
@@ -904,6 +958,10 @@ func (s *Server) onEvent(ev agent.Event) {
 // work is dropped once shutdown starts.
 func (s *Server) agentLoop() {
 	for item := range s.work {
+		if item.req.accepted != nil {
+			// Publish the acceptance frame before events for this turn.
+			<-item.req.accepted
+		}
 		if s.isDone() {
 			// A prompt dropped at shutdown never settles, so it
 			// leaves the outstanding count here instead.
@@ -959,9 +1017,18 @@ func (s *Server) runTurn(req Request) {
 	s.turnOutcome = nil
 	s.turnMu.Lock()
 	s.turnAborted = false
+	s.turnID = req.turnID
+	if s.turnID == "" {
+		s.turnID = rand.Text()
+	}
+	s.turnRequestID = req.ID
+	s.stepID = ""
 	ctx, cancel := context.WithCancel(context.Background())
 	s.turnCtx = ctx
 	s.turnCancel = cancel
+	if s.isDone() {
+		cancel()
+	}
 	s.turnMu.Unlock()
 	s.writeEvent(Event{Type: "turn_started", Text: truncateRunes(req.Message, 200)})
 	previousCost := s.runner.SessionCost
@@ -1046,11 +1113,33 @@ func (s *Server) runTurn(req Request) {
 	}
 	s.addOutstanding(-1)
 	s.writeEvent(settled)
+	s.turnMu.Lock()
+	s.turnID = ""
+	s.turnRequestID = ""
+	s.stepID = ""
+	s.turnMu.Unlock()
 }
 
 // doControl runs one control request on the agent goroutine.
 func (s *Server) doControl(req Request) {
-	ctx := context.Background()
+	s.turnMu.Lock()
+	s.turnID = rand.Text()
+	s.turnRequestID = req.ID
+	s.stepID = ""
+	s.turnAborted = false
+	ctx, cancel := context.WithCancel(context.Background())
+	s.turnCtx, s.turnCancel = ctx, cancel
+	if s.isDone() {
+		cancel()
+	}
+	s.turnMu.Unlock()
+	defer func() {
+		cancel()
+		s.turnMu.Lock()
+		s.turnID, s.turnRequestID, s.stepID = "", "", ""
+		s.turnCtx, s.turnCancel = nil, nil
+		s.turnMu.Unlock()
+	}()
 	switch req.Type {
 	case "prune_artifacts":
 		report, err := session.PruneArtifacts(ctx, time.Now())
@@ -1062,6 +1151,10 @@ func (s *Server) doControl(req Request) {
 	case "compact":
 		s.runner.Handle(ctx, "/compact")
 		s.refreshState()
+		if s.runner.LastErr != nil {
+			s.respond(req, nil, s.runner.LastErr)
+			return
+		}
 		s.respond(req, map[string]any{"ok": true}, nil)
 	case "rollback":
 		n := req.Count
@@ -1263,7 +1356,28 @@ func truncateRunes(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-func (s *Server) writeEvent(ev Event) { s.writeJSON(ev) }
+func (s *Server) writeEvent(ev Event) {
+	if ev.Session == "" {
+		s.mu.Lock()
+		ev.Session = s.state.sessionID
+		s.mu.Unlock()
+	}
+	if ev.Type != "ready" && ev.Type != "error" {
+		s.turnMu.Lock()
+		if ev.TurnID == "" {
+			ev.TurnID = s.turnID
+		}
+		if ev.RequestID == "" {
+			ev.RequestID = s.turnRequestID
+		}
+		if ev.StepID == "" {
+			ev.StepID = s.stepID
+		}
+		s.turnMu.Unlock()
+	}
+	ev.ConnectionID = s.connectionID
+	s.writeJSON(ev)
+}
 
 func (s *Server) respond(req Request, data map[string]any, err error) {
 	resp := Response{ID: req.ID, Type: "response", Data: data}
@@ -1275,16 +1389,31 @@ func (s *Server) respond(req Request, data map[string]any, err error) {
 	s.writeJSON(resp)
 }
 
-// writeJSON writes one JSON line to stdout, serialised: events come
-// from the agent goroutine and responses from either goroutine, and
-// two writers must never interleave mid-line. Write errors (a GUI
-// that went away) are swallowed: the server exits on shutdown anyway.
+// writeJSON serializes frames without holding the read-only state lock.
 func (s *Server) writeJSON(v any) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.sequence++
+	switch value := v.(type) {
+	case Event:
+		value.Sequence = s.sequence
+		v = value
+	case Response:
+		value.Sequence = s.sequence
+		v = value
+	}
 	b, err := encodeLine(v)
 	if err != nil {
+		if s.output != nil {
+			s.output.fail(fmt.Errorf("encode rpc output: %w", err))
+		}
 		return
 	}
-	s.mu.Lock()
+	if s.output != nil {
+		s.output.enqueue(b)
+		return
+	}
+	// Direct, synchronous helper use in package tests. Run always installs the
+	// bounded writer before starting either producer goroutine.
 	_, _ = s.out.Write(b)
-	s.mu.Unlock()
 }

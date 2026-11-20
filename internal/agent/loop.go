@@ -98,6 +98,7 @@ type Config struct {
 	// allowlist outlive one turn, like Qwen's agent-context guard.
 	doomLoop          *DoomLoopGuard
 	usageAttempts     int64
+	stepID            string
 	persistErr        error
 	persistErrEmitted bool
 	progress          *turnProgress
@@ -112,6 +113,7 @@ func (c *Config) DoomLoop() *DoomLoopGuard {
 }
 
 func (c *Config) emit(e Event) {
+	e.StepID = c.stepID
 	if e.Kind == EventDone || e.Kind == EventError {
 		e = c.budgetTerminal(e)
 		if c.persistErr != nil {
@@ -685,6 +687,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // then the call is replayed from scratch, so the GUI never shows
 // the half-reply followed by the replay.
 func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm.Message, tools []llm.ToolDef, onText func(string), onDone func(llm.Message, llm.Usage), onThinking func(string), onRetry func()) (int, llm.Usage, error) {
+	c.stepID = rand.Text()
 	attempts := c.maxLLMAttempts()
 	var err error
 	var spent llm.Usage
@@ -789,6 +792,7 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 // Run executes one user turn. It appends messages to the session store
 // and returns the assistant's final text, total tokens used, and error.
 func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, runUsage llm.Usage, runErr error) {
+	c.stepID = ""
 	c.persistErr = nil
 	c.persistErrEmitted = false
 	c.LastTerminalReason = ""

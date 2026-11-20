@@ -424,6 +424,7 @@ func (c *Config) pruneCheckpoint(msgs []llm.Message, defs []llm.ToolDef) ([]llm.
 // Compact manually replaces narration, retaining the same source facts and
 // rollback boundary as automatic compaction.
 func (c *Config) Compact(ctx context.Context, history []llm.Message) ([]llm.Message, llm.Usage, error) {
+	c.stepID = ""
 	c.persistErr, c.persistErrEmitted = nil, false
 	return c.compactMessages(ctx, history, false)
 }
