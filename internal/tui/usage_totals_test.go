@@ -35,3 +35,13 @@ func TestUsageCoverageDistinguishesUnknownFromExplicitZero(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestUsageScrollbackKeepsCoverageWarning(t *testing.T) {
+	for _, scope := range []string{"session", "current run"} {
+		line := "[usage] " + scope + ": prompt=1000 (cached=unknown) completion=2 total=1002 (recorded subtotal; usage incomplete) | fee: unverified"
+		want := scope + " · prompt 1,000 (cached unknown) · completion 2 · total 1,002 (recorded subtotal; usage incomplete) · fee: unverified"
+		if got := formatUsage(line); got != want {
+			t.Fatalf("formatUsage(%q) = %q; want %q", line, got, want)
+		}
+	}
+}

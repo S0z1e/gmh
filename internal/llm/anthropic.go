@@ -464,7 +464,7 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 		var envelope struct {
 			Type string `json:"type"`
 		}
-		if err := decodeStreamJSON("anthropic", data, &envelope); err != nil {
+		if err := decodeStreamJSON(ctx, "anthropic", data, &envelope); err != nil {
 			return err
 		}
 		if envelope.Type == "" {
@@ -476,7 +476,7 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 			continue
 		}
 		var ev anthropicEvent
-		if err := decodeStreamJSON("anthropic", data, &ev); err != nil {
+		if err := decodeStreamJSON(ctx, "anthropic", data, &ev); err != nil {
 			return err
 		}
 		if ev.Type == "" {

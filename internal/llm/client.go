@@ -706,7 +706,7 @@ func (c *Client) streamChat(ctx context.Context, messages []Message, tools []Too
 			return err
 		}
 		var chunk streamChunk
-		if err := decodeStreamJSON("chat", data, &chunk); err != nil {
+		if err := decodeStreamJSON(ctx, "chat", data, &chunk); err != nil {
 			return err
 		}
 		if chunk.Usage != nil {
@@ -944,7 +944,7 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 		var envelope struct {
 			Type string `json:"type"`
 		}
-		if err := decodeStreamJSON("responses", data, &envelope); err != nil {
+		if err := decodeStreamJSON(ctx, "responses", data, &envelope); err != nil {
 			return err
 		}
 		if envelope.Type == "" {
@@ -956,7 +956,7 @@ func (c *Client) streamResponses(ctx context.Context, messages []Message, tools 
 			continue
 		}
 		var ev responsesEvent
-		if err := decodeStreamJSON("responses", data, &ev); err != nil {
+		if err := decodeStreamJSON(ctx, "responses", data, &ev); err != nil {
 			return err
 		}
 		if ev.Type == "" {

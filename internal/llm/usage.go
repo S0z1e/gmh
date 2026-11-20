@@ -7,13 +7,17 @@ import (
 	"math"
 )
 
+type usageDecodeError struct{ error }
+
+func (e *usageDecodeError) Unwrap() error { return e.error }
+
 // UnmarshalJSON preserves explicit zero separately from absent/null cache
 // counters. It also accepts our own serialized Usage without losing unknowns.
 func (u *Usage) UnmarshalJSON(data []byte) error {
 	type plain Usage
 	var decoded plain
 	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
+		return &usageDecodeError{err}
 	}
 	*u = Usage(decoded)
 	u.Invalid = u.Invalid || !u.Valid()
@@ -26,7 +30,7 @@ func (u *Usage) UnmarshalJSON(data []byte) error {
 		Reported *bool `json:"cache_usage_reported"`
 	}
 	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
+		return &usageDecodeError{err}
 	}
 	if fields.Reported == nil {
 		u.CachedTokens = 0
@@ -52,7 +56,7 @@ func (u *responsesUsage) UnmarshalJSON(data []byte) error {
 	type plain responsesUsage
 	var decoded plain
 	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
+		return &usageDecodeError{err}
 	}
 	*u = responsesUsage(decoded)
 	var fields struct {
@@ -61,7 +65,7 @@ func (u *responsesUsage) UnmarshalJSON(data []byte) error {
 		} `json:"input_tokens_details"`
 	}
 	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
+		return &usageDecodeError{err}
 	}
 	u.CacheUsageReported = fields.Details.Cached != nil
 	u.invalid = !validTokenSum(u.InputTokens, u.OutputTokens) || u.TotalTokens < 0 || u.InputTokensDetails.CachedTokens < 0 || u.OutputTokensDetails.ReasoningTokens < 0
@@ -84,7 +88,7 @@ func (u *anthropicUsage) UnmarshalJSON(data []byte) error {
 	type plain anthropicUsage
 	var decoded plain
 	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
+		return &usageDecodeError{err}
 	}
 	*u = anthropicUsage(decoded)
 	var fields struct {
@@ -94,7 +98,7 @@ func (u *anthropicUsage) UnmarshalJSON(data []byte) error {
 		Creation *int `json:"cache_creation_input_tokens"`
 	}
 	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
+		return &usageDecodeError{err}
 	}
 	u.CacheUsageReported = fields.Cached != nil
 	u.hasInput = fields.Input != nil

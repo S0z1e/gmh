@@ -3,6 +3,7 @@ package llm
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,11 +23,15 @@ func protocolError(api, format string, args ...any) error {
 	return &ProtocolError{API: api, Detail: fmt.Sprintf(format, args...)}
 }
 
-func decodeStreamJSON(api, data string, dst any) error {
+func decodeStreamJSON(ctx context.Context, api, data string, dst any) error {
 	if !strings.HasPrefix(strings.TrimSpace(data), "{") {
 		return protocolError(api, "SSE data must be a JSON object")
 	}
 	if err := json.Unmarshal([]byte(data), dst); err != nil {
+		var usageErr *usageDecodeError
+		if errors.As(err, &usageErr) {
+			traceUsage(ctx, Usage{Invalid: true}, false, false)
+		}
 		return protocolError(api, "invalid SSE JSON: %v", err)
 	}
 	return nil

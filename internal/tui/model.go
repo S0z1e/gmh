@@ -857,7 +857,7 @@ func stylePrintLine(l string) string {
 	}
 }
 
-var usageRe = regexp.MustCompile(`^(turn|session): prompt=(\d+) \(cached=(unknown|\d+(?:\+unknown)?)\) completion=(\d+) total=(\d+)`)
+var usageRe = regexp.MustCompile(`^(turn|session|current run): prompt=(\d+) \(cached=(unknown|\d+(?:\+unknown)?)\) completion=(\d+) total=(\d+)`)
 
 // formatUsage restyles one runner usage line:
 // "[usage] turn: prompt=3922 (cached=1920) completion=215 total=4137
@@ -895,6 +895,7 @@ func formatUsage(line string) string {
 	}
 	out := fmt.Sprintf("%s · prompt %s (cached %s) · completion %s · total %s",
 		m[1], nums(m[2]), nums(m[3]), nums(m[4]), nums(m[5]))
+	out += head[len(m[0]):]
 	if tail != "" {
 		out += " · " + tail
 	}
