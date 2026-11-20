@@ -13,7 +13,7 @@ import (
 )
 
 func TestArtifactRetentionPreservesArchiveReferences(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	workspace := t.TempDir()
 	s, err := Open("images", OpenOptions{Workspace: workspace})
 	if err != nil {
@@ -62,7 +62,7 @@ func TestArtifactRetentionPreservesArchiveReferences(t *testing.T) {
 }
 
 func TestArtifactRetentionGracePeriodAndUncertainScan(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("safe")
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +111,7 @@ func TestArtifactRetentionGracePeriodAndUncertainScan(t *testing.T) {
 }
 
 func TestArtifactRetentionCheckpointAndConcurrentPublication(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("checkpoint")
 	if err != nil {
 		t.Fatal(err)
@@ -149,7 +149,7 @@ func TestArtifactRetentionCheckpointAndConcurrentPublication(t *testing.T) {
 }
 
 func TestArtifactRetentionPreservesCheckpointOnlyImageReference(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("checkpoint-only")
 	if err != nil {
 		t.Fatal(err)

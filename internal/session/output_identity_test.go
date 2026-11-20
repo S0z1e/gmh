@@ -10,7 +10,7 @@ import (
 )
 
 func TestOutputIdentitySurvivesRenameResumeAndNameReuse(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := Open("original", OpenOptions{Workspace: root})
 	if err != nil {
@@ -59,7 +59,7 @@ func TestOutputIdentitySurvivesRenameResumeAndNameReuse(t *testing.T) {
 }
 
 func TestOutputIdentityAdoptsLegacyDirectory(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := Open("old", OpenOptions{Workspace: root})
 	if err != nil {

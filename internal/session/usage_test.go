@@ -10,7 +10,7 @@ import (
 )
 
 func TestUsageLedgerSurvivesRewriteRenameResume(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := Open("usage", OpenOptions{Workspace: root})
 	if err != nil {
@@ -60,7 +60,7 @@ func TestUsageLedgerSurvivesRewriteRenameResume(t *testing.T) {
 }
 
 func TestUsageLedgerRecoversTornTailAndFlagsLegacyHistory(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := Open("usage", OpenOptions{Workspace: root})
 	if err != nil {
@@ -120,7 +120,7 @@ func TestUsageLedgerRecoversTornTailAndFlagsLegacyHistory(t *testing.T) {
 }
 
 func TestUsageLedgerRejectsAliasedJournal(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := Open("usage", OpenOptions{Workspace: root})
 	if err != nil {
@@ -151,7 +151,7 @@ func TestUsageInvalidCountersAndCostCannotCorruptReopen(t *testing.T) {
 		{name: "cost", cost: func() *float64 { v := -1.0; return &v }()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			root := t.TempDir()
 			s, err := Open("invalid", OpenOptions{Workspace: root})
 			if err != nil {
@@ -179,7 +179,7 @@ func TestUsageInvalidCountersAndCostCannotCorruptReopen(t *testing.T) {
 }
 
 func TestUsageAggregateOverflowRecordedAsUnknown(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := Open("overflow", OpenOptions{Workspace: root})
 	if err != nil {
@@ -206,7 +206,7 @@ func TestUsageAggregateOverflowRecordedAsUnknown(t *testing.T) {
 }
 
 func TestUsageRecoveryRetainsDurableCoverageGap(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := Open("gap", OpenOptions{Workspace: root})
 	if err != nil {

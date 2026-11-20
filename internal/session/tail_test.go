@@ -36,7 +36,7 @@ func TestRecordReadFailureIsNotCrashDamage(t *testing.T) {
 }
 
 func TestResumeRepairsTornRecordAtEveryByte(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	before := []byte("{\"role\":\"user\",\"content\":\"before\"}\n")
 	record := []byte("{\"role\":\"assistant\",\"content\":\"answer 世界\"}\n")
 	for cut := 0; cut <= len(record); cut++ {
@@ -102,7 +102,7 @@ func TestResumeRepairsTornRecordAtEveryByte(t *testing.T) {
 }
 
 func TestCorruptCompleteRecordIsNeverSilentlyDropped(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	if err := os.MkdirAll(Dir(), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestCorruptCompleteRecordIsNeverSilentlyDropped(t *testing.T) {
 }
 
 func TestConcurrentRecoveryKeepsSuccessfulAppends(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	if err := os.MkdirAll(Dir(), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestConcurrentRecoveryKeepsSuccessfulAppends(t *testing.T) {
 }
 
 func TestDeleteRemovesTornBackup(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	if err := os.MkdirAll(Dir(), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestDeleteRemovesTornBackup(t *testing.T) {
 }
 
 func TestRenameMovesTornBackups(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	if err := os.MkdirAll(Dir(), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +247,7 @@ func TestRenameMovesTornBackups(t *testing.T) {
 func TestBackupLifecycleWithLiteralGlobCharacters(t *testing.T) {
 	for _, action := range []string{"rename", "delete"} {
 		t.Run(action, func(t *testing.T) {
-			t.Setenv("HOME", filepath.Join(t.TempDir(), "home[1]["))
+			setTestHome(t, filepath.Join(t.TempDir(), "home[1]["))
 			if err := os.MkdirAll(Dir(), 0700); err != nil {
 				t.Fatal(err)
 			}
@@ -282,7 +282,7 @@ func TestBackupLifecycleWithLiteralGlobCharacters(t *testing.T) {
 }
 
 func TestBackupCleanupPreservesSimilarlyNamedSession(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := newLegacyFixture("old")
 	if err != nil {
 		t.Fatal(err)
@@ -308,7 +308,7 @@ func TestBackupCleanupPreservesSimilarlyNamedSession(t *testing.T) {
 func TestBackupLifecyclePreservesOtherSessionsBackups(t *testing.T) {
 	for _, action := range []string{"rename", "delete"} {
 		t.Run(action, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			if err := os.MkdirAll(Dir(), 0700); err != nil {
 				t.Fatal(err)
 			}
@@ -351,7 +351,7 @@ func TestBackupLifecyclePreservesOtherSessionsBackups(t *testing.T) {
 func TestBackupLifecycleRecognizesCaseAliases(t *testing.T) {
 	for _, action := range []string{"rename", "delete"} {
 		t.Run(action, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			if err := os.MkdirAll(Dir(), 0700); err != nil {
 				t.Fatal(err)
 			}
@@ -389,7 +389,7 @@ func TestBackupLifecycleRecognizesCaseAliases(t *testing.T) {
 }
 
 func TestBackupLifecyclePreservesCaseDistinctSession(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	if err := os.MkdirAll(Dir(), 0700); err != nil {
 		t.Fatal(err)
 	}

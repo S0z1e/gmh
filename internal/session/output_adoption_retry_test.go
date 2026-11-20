@@ -8,7 +8,7 @@ import (
 )
 
 func TestHeaderlessAdoptionRetryKeepsOriginalOutput(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	id := "headerless-retry"
 	want := filepath.Join(Dir(), id, "bash-output")
@@ -63,7 +63,7 @@ func TestHeaderlessAdoptionRetryKeepsOriginalOutput(t *testing.T) {
 }
 
 func TestPendingOutputClaimResumesStableAdoption(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := Open("pending", OpenOptions{Workspace: root})
 	if err != nil {

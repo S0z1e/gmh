@@ -73,9 +73,9 @@ func main() {
 		if uiMode == "tui" {
 			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *sandbox, images, *workspaceTrust, *rebindSession); err != nil {
 				fmt.Fprintf(os.Stderr, "harness: TUI unavailable (%v); continuing in plain mode.\n", err)
+			} else {
+				return // Windows waits for the child rather than replacing this process.
 			}
-			// execTUI replaces this process on success; reaching here
-			// means it failed and we fall back to plain mode.
 		} else if *ui == "tui" {
 			fmt.Fprintln(os.Stderr, "harness: --ui tui needs a terminal; using plain mode.")
 		}
@@ -310,16 +310,11 @@ func askQuestionFromScanner(scanner *input.Lines) func(agent.QuestionRequest) (a
 }
 
 // execTUI replaces this process with the sibling harness-tui binary,
-// passing the same flags through. It returns only if the sibling cannot
-// be started (then the caller falls back to plain mode).
+// passing the same flags through. Windows waits for that process to finish.
 func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images []string, workspaceTrust string, rebindSession bool) error {
-	self, err := os.Executable()
+	sibling, err := tuiSibling()
 	if err != nil {
 		return err
-	}
-	sibling := filepath.Join(filepath.Dir(self), tuiBinaryName)
-	if _, err := os.Stat(sibling); err != nil {
-		return fmt.Errorf("no harness-tui next to %s (build it with: go build -o <dir>/harness-tui ./cmd/harness-tui)", self)
 	}
 	return runTUIProcess(sibling, tuiArgs(sibling, root, mode, model, api, provider, config, maxSteps, resume, sessionID, ctxLimit, deny, bashTO, bgThresh, sandbox, images, workspaceTrust, rebindSession))
 }
@@ -377,4 +372,17 @@ func viewSession(w io.Writer, id string) error {
 		}
 	}
 	return nil
+}
+
+func tuiSibling() (string, error) {
+	self, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	sibling := filepath.Join(filepath.Dir(self), tuiBinaryName)
+	st, err := os.Stat(sibling)
+	if err != nil || !st.Mode().IsRegular() {
+		return "", fmt.Errorf("no harness-tui next to %s (install both binaries from the same release archive)", self)
+	}
+	return sibling, nil
 }

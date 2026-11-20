@@ -10,7 +10,7 @@ import (
 func TestUsageJournalDiscontinuityCannotRebaseCachedTotals(t *testing.T) {
 	for _, change := range []string{"delete", "truncate", "replace"} {
 		t.Run(change, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			root := t.TempDir()
 			s, err := Open("changed", OpenOptions{Workspace: root})
 			if err != nil {

@@ -51,7 +51,7 @@ func artifactFixture(t *testing.T, id string) (*Store, []string) {
 }
 
 func TestArtifactDeleteIncludesFullFamily(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, paths := artifactFixture(t, "family")
 	root := filepath.Dir(s.OutputDir())
 	s.Close()
@@ -66,7 +66,7 @@ func TestArtifactDeleteIncludesFullFamily(t *testing.T) {
 }
 
 func TestArtifactRenamePreservesArchivePaths(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, paths := artifactFixture(t, "family")
 	root := filepath.Dir(s.OutputDir())
 	if err := s.Rename("renamed"); err != nil {
@@ -106,7 +106,7 @@ func TestArtifactRenamePreservesArchivePaths(t *testing.T) {
 func TestArtifactRecoveryAtEveryRenameBoundary(t *testing.T) {
 	for step := 0; step <= 9; step++ {
 		t.Run(string(rune('A'+step)), func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			s, _ := artifactFixture(t, "before")
 			workspace := s.header.Workspace.Path
 			m, err := s.Manifest()
@@ -152,7 +152,7 @@ func TestArtifactRecoveryAtEveryRenameBoundary(t *testing.T) {
 func TestArtifactRecoveryAtEveryDeleteBoundary(t *testing.T) {
 	for step := 0; step <= 10; step++ {
 		t.Run(string(rune('A'+step)), func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			s, _ := artifactFixture(t, "before")
 			workspace := s.header.Workspace.Path
 			m, err := s.Manifest()
@@ -192,7 +192,7 @@ func TestArtifactRecoveryAtEveryDeleteBoundary(t *testing.T) {
 }
 
 func TestArtifactSharedOutputAndArchiveNameIsolation(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, _ := artifactFixture(t, "source")
 	root := filepath.Dir(s.OutputDir())
 	workspace := s.header.Workspace.Path
@@ -242,7 +242,7 @@ func TestArtifactSharedOutputAndArchiveNameIsolation(t *testing.T) {
 }
 
 func TestArtifactCustomArchiveIsNotListedAsSession(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("source")
 	if err != nil {
 		t.Fatal(err)
@@ -260,7 +260,7 @@ func TestArtifactCustomArchiveIsNotListedAsSession(t *testing.T) {
 	}
 }
 func TestArtifactIndependentAuditNameIsNotDeleted(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	a, err := New("source")
 	if err != nil {
 		t.Fatal(err)
@@ -279,7 +279,7 @@ func TestArtifactIndependentAuditNameIsNotDeleted(t *testing.T) {
 	}
 }
 func TestArtifactMetadataRejectsSymlinkFamilies(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("source")
 	if err != nil {
 		t.Fatal(err)
@@ -302,7 +302,7 @@ func TestArtifactMetadataRejectsSymlinkFamilies(t *testing.T) {
 }
 
 func TestArtifactLateAuditCannotResurrectDeletedSession(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("gone")
 	if err != nil {
 		t.Fatal(err)
@@ -328,7 +328,7 @@ func TestArtifactLateAuditCannotResurrectDeletedSession(t *testing.T) {
 }
 
 func TestArtifactRecoveryRejectsInvalidPlanWithoutMutation(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, _ := artifactFixture(t, "source")
 	defer s.Close()
 	m, err := s.Manifest()
@@ -358,7 +358,7 @@ func TestArtifactRecoveryRejectsInvalidPlanWithoutMutation(t *testing.T) {
 }
 
 func TestArtifactKeepsLegacyArchiveAfterOutputAdoption(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := Open("legacy", OpenOptions{Workspace: root})
 	if err != nil {
@@ -405,7 +405,7 @@ func TestArtifactKeepsLegacyArchiveAfterOutputAdoption(t *testing.T) {
 }
 
 func TestArtifactPendingRollbackRejectsLateAudit(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, _ := artifactFixture(t, "before")
 	root := s.header.Workspace.Path
 	manifest, err := s.Manifest()
@@ -443,7 +443,7 @@ func TestArtifactPendingRollbackRejectsLateAudit(t *testing.T) {
 }
 
 func TestArtifactUnboundOwnerLeavesBoundRollbackName(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	other, err := New("source-pre-rollback-99")
 	if err != nil {
 		t.Fatal(err)
@@ -462,7 +462,7 @@ func TestArtifactUnboundOwnerLeavesBoundRollbackName(t *testing.T) {
 }
 
 func TestArtifactActiveRenameRecoversDestinationOperation(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	dst, _ := artifactFixture(t, "destination")
 	source, err := New("source")
 	if err != nil {
@@ -501,7 +501,7 @@ func TestArtifactActiveRenameRecoversDestinationOperation(t *testing.T) {
 func TestArtifactResumePromotesArchiveToWritableSession(t *testing.T) {
 	for _, name := range []string{"recoverable", "original-pre-rollback-1"} {
 		t.Run(name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			root := t.TempDir()
 			original, err := Open("original", OpenOptions{Workspace: root})
 			if err != nil {
@@ -544,7 +544,7 @@ func TestArtifactResumePromotesArchiveToWritableSession(t *testing.T) {
 }
 
 func TestArtifactCopyRecoversDestinationOperation(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	dst, _ := artifactFixture(t, "destination")
 	source, err := New("source")
 	if err != nil {
@@ -578,7 +578,7 @@ func TestArtifactCopyRecoversDestinationOperation(t *testing.T) {
 }
 
 func TestArtifactSharedResumeRecoversFamilyBeforeUpdatingRegistry(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, _ := artifactFixture(t, "original")
 	workspace := s.header.Workspace.Path
 	output := filepath.Dir(s.OutputDir())
@@ -633,7 +633,7 @@ func TestArtifactSharedResumeRecoversFamilyBeforeUpdatingRegistry(t *testing.T) 
 }
 
 func TestArtifactRenameRecoversAuditDestination(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	dest, err := New("target-audit")
 	if err != nil {
 		t.Fatal(err)
@@ -652,7 +652,7 @@ func TestArtifactRenameRecoversAuditDestination(t *testing.T) {
 }
 
 func TestArtifactCannotChainRenameWhilePriorPlanRemains(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, _ := artifactFixture(t, "before")
 	workspace := s.header.Workspace.Path
 	leaveCommittedRename(t, s, "after")
@@ -671,7 +671,7 @@ func TestArtifactCannotChainRenameWhilePriorPlanRemains(t *testing.T) {
 }
 
 func TestArtifactRenameDoesNotAcceptUnrelatedDeleteRecovery(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	dest, err := New("destination")
 	if err != nil {
 		t.Fatal(err)
@@ -706,7 +706,7 @@ func leaveCommittedDelete(t *testing.T, s *Store) {
 }
 
 func TestArtifactAutoIDSkipsReservedRenameSource(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	const base = "20261120-090000"
 	s, _ := artifactFixture(t, base)
 	defer s.Close()

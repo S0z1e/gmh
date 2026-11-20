@@ -9,7 +9,7 @@ import (
 )
 
 func TestUsagePendingSurvivesColdReopen(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := Open("pending", OpenOptions{Workspace: root})
 	if err != nil {
@@ -31,7 +31,7 @@ func TestUsagePendingSurvivesColdReopen(t *testing.T) {
 	}
 }
 func TestUsagePendingCompletionReconcilesCommittedRecord(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := Open("pending", OpenOptions{Workspace: root})
 	if err != nil {

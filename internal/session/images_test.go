@@ -15,7 +15,7 @@ import (
 func TestImageBlobsSurviveEveryTranscriptWriter(t *testing.T) {
 	for _, writer := range []string{"append", "checkpoint", "rewrite"} {
 		t.Run(writer, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			s, err := New("images")
 			if err != nil {
 				t.Fatal(err)
@@ -93,7 +93,7 @@ func TestImageBlobsSurviveEveryTranscriptWriter(t *testing.T) {
 }
 
 func TestImageBlobFailureCannotCommitReference(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("failed-image")
 	if err != nil {
 		t.Fatal(err)
@@ -116,7 +116,7 @@ func TestImageBlobFailureCannotCommitReference(t *testing.T) {
 }
 
 func TestConcurrentImageBlobPublication(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
@@ -136,7 +136,7 @@ func TestConcurrentImageBlobPublication(t *testing.T) {
 }
 
 func TestImageBlobReferencesNeverFollowOriginOrEscapeStore(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	origin := filepath.Join(t.TempDir(), "source.png")
 	if err := os.WriteFile(origin, []byte("new contents"), 0600); err != nil {
 		t.Fatal(err)

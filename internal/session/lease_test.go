@@ -13,7 +13,7 @@ import (
 )
 
 func TestWriterLeaseSurvivesRewriteRenameAndClose(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("owned")
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +74,7 @@ func TestWriterLeaseSurvivesRewriteRenameAndClose(t *testing.T) {
 }
 
 func TestWriterLeaseCaseAliases(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("lower")
 	if err != nil {
 		t.Fatal(err)
@@ -122,7 +122,7 @@ func TestWriterLeaseProcessHelper(t *testing.T) {
 }
 
 func TestWriterLeaseAcrossProcessesAndCrash(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -173,7 +173,7 @@ func TestWriterLeaseAcrossProcessesAndCrash(t *testing.T) {
 func TestWriterLeaseRejectsTranscriptLinks(t *testing.T) {
 	for _, kind := range []string{"symlink", "hardlink"} {
 		t.Run(kind, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			s, err := New("shared")
 			if err != nil {
 				t.Fatal(err)
@@ -198,7 +198,7 @@ func TestWriterLeaseRejectsTranscriptLinks(t *testing.T) {
 }
 
 func TestArchiveCannotOverwriteAnotherWriter(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("source")
 	if err != nil {
 		t.Fatal(err)
@@ -226,7 +226,7 @@ func TestArchiveCannotOverwriteAnotherWriter(t *testing.T) {
 }
 
 func TestArchiveSupportsMaximumSessionID(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New(strings.Repeat("s", 128))
 	if err != nil {
 		t.Fatal(err)

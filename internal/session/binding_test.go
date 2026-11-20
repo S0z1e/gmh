@@ -13,7 +13,7 @@ import (
 )
 
 func TestBindingHeaderPersistsWithoutEnteringHistory(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, ".git"), 0700); err != nil {
 		t.Fatal(err)
@@ -60,7 +60,7 @@ func TestBindingHeaderPersistsWithoutEnteringHistory(t *testing.T) {
 }
 
 func TestBindingLegacyRequiresExplicitAdoptionAndKeepsRecords(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := newStore("legacy", false, nil)
 	if err != nil {
@@ -98,7 +98,7 @@ func TestBindingLegacyRequiresExplicitAdoptionAndKeepsRecords(t *testing.T) {
 }
 
 func TestBindingWrongWorkspaceRejectsBeforeTailRepair(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	a, b := t.TempDir(), t.TempDir()
 	s, err := Open("bound", OpenOptions{Workspace: a})
 	if err != nil {
@@ -147,7 +147,7 @@ func TestBindingWrongWorkspaceRejectsBeforeTailRepair(t *testing.T) {
 func TestBindingRejectsUnknownVersionEvenWithRebind(t *testing.T) {
 	for _, change := range []string{"version", "created", "workspace"} {
 		t.Run(change, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			root := t.TempDir()
 			s, err := Open("bound", OpenOptions{Workspace: root})
 			if err != nil {
@@ -190,7 +190,7 @@ func TestBindingRejectsUnknownVersionEvenWithRebind(t *testing.T) {
 }
 
 func TestBindingAliasesReplacementAndRepository(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	parent := t.TempDir()
 	root := filepath.Join(parent, "project")
 	if err := os.Mkdir(root, 0700); err != nil {
@@ -261,7 +261,7 @@ func TestRepositoryIdentityReadsGitFileWithoutExecutingGit(t *testing.T) {
 }
 
 func TestBindingCanExplicitlyImportAnotherOSPath(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	s, err := Open("copied", OpenOptions{Workspace: root})
 	if err != nil {
@@ -288,7 +288,7 @@ func TestBindingCanExplicitlyImportAnotherOSPath(t *testing.T) {
 }
 
 func TestRepositoryGitdirWhitespaceChangesIdentity(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	root := t.TempDir()
 	parent := t.TempDir()
 	first := filepath.Join(parent, "meta")
@@ -330,7 +330,7 @@ func TestRepositoryGitdirWhitespaceChangesIdentity(t *testing.T) {
 func TestRepositorySymlinkChangeRequiresRebind(t *testing.T) {
 	for _, kind := range []string{"directory", "gitfile"} {
 		t.Run(kind, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			root := t.TempDir()
 			first, second := t.TempDir(), t.TempDir()
 			marker := filepath.Join(root, ".git")

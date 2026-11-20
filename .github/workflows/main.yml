@@ -11,71 +11,105 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27'
           cache: true
-
-      - name: Check formatting
+      - name: Install Linux integration dependencies
+        if: runner.os == 'Linux'
         run: |
-          if [ -n "$(gofmt -l .)" ]; then
-            echo "Unformatted files:"
-            gofmt -l .
-            exit 1
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap ripgrep
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
       - name: Vet
         run: go vet ./...
-
-      - name: Test
-        run: go test ./...
-
-      - name: Test (race)
-        run: go test -race -p 2 ./...
-
-      - name: Build and cross-compile
+      - name: Full native race suite
+        run: go test -race -p 2 ./... -timeout=300s
+      - name: Real Linux sandbox
+        if: runner.os == 'Linux'
+        run: go test ./internal/tools -run '^(TestProbeSandbox|TestBashSandboxReal)$' -count=1 -v
+      - name: Fixed scenario baseline
+        run: go run ./cmd/harness-eval > "$RUNNER_TEMP/scenario-baseline.json"
+      - name: Build and launch native archive
         run: |
-          mkdir -p dist
-          for target in linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64; do
-            goos=${target%/*}
-            goarch=${target#*/}
-            ext=""
-            [ "$goos" = windows ] && ext=".exe"
-            GOOS=$goos GOARCH=$goarch go build -ldflags "-s -w" -o "dist/harness-$goos-$goarch$ext" ./cmd/harness
-            GOOS=$goos GOARCH=$goarch go build -ldflags "-s -w" -o "dist/harness-tui-$goos-$goarch$ext" ./cmd/harness-tui
-          done
-          ls -la dist/
+          go run ./cmd/harness-package -targets "$(go env GOOS)/$(go env GOARCH)" -version ci -out "$RUNNER_TEMP/release"
+          mkdir -p "$RUNNER_TEMP/extracted"
+          tar -xzf "$RUNNER_TEMP"/release/*.tar.gz -C "$RUNNER_TEMP/extracted"
+          HARNESS_PACKAGED_DIR="$RUNNER_TEMP/extracted" go test ./cmd/harness -run '^TestPackagedSibling$' -count=1 -timeout=60s
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scenario-${{ runner.os }}
+          path: ${{ runner.temp }}/scenario-baseline.json
 
-      - name: Smoke test (linux/amd64)
-        run: ./dist/harness-linux-amd64 -h
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+      # Shell/process integration is covered by Linux/macOS. Windows supports
+      # native file/session/provider paths; bash requires a separate installation.
+      - name: Portable native race suite
+        run: go test -race ./internal/llm ./internal/config ./internal/session ./internal/toolargs ./internal/turnbudget ./internal/uimode ./internal/textutil ./internal/release -timeout=180s
+      - name: Build and launch native archive
+        shell: pwsh
+        run: |
+          go run ./cmd/harness-package -targets windows/amd64 -version ci -out "$env:RUNNER_TEMP/release"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Expand-Archive "$env:RUNNER_TEMP/release/harness-ci-windows-amd64.zip" "$env:RUNNER_TEMP/extracted"
+          $env:HARNESS_PACKAGED_DIR = "$env:RUNNER_TEMP/extracted"
+          go test ./cmd/harness -run '^TestPackagedSibling$' -count=1 -timeout=60s
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+  archives:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+      - name: Build release archives
+        env:
+          RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+        run: |
+          go run ./cmd/harness-package -version "$RELEASE_VERSION" -out dist
+          (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
-          name: harness-binaries
+          name: harness-archives
           path: dist/
           retention-days: 30
 
   release:
-    needs: build
+    needs: [native, windows, archives]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
-          name: harness-binaries
+          name: harness-archives
           path: dist
-
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "${{ github.ref_name }}" dist/* --title "${{ github.ref_name }}" --generate-notes
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --title "$RELEASE_TAG" --generate-notes

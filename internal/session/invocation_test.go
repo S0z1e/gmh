@@ -10,7 +10,7 @@ import (
 )
 
 func TestInvocationReplayScopesIDsToTheirAssistantBatch(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("invocations")
 	if err != nil {
 		t.Fatal(err)
@@ -53,7 +53,7 @@ func TestInvocationReplayScopesIDsToTheirAssistantBatch(t *testing.T) {
 func TestInvocationReplayRejectsUnboundRecords(t *testing.T) {
 	for _, change := range []string{"missing", "index", "call_id", "name", "original", "json", "duplicate"} {
 		t.Run(change, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			s, err := New("invalid")
 			if err != nil {
 				t.Fatal(err)
@@ -93,7 +93,7 @@ func TestInvocationReplayRejectsUnboundRecords(t *testing.T) {
 }
 
 func TestInvocationMarkerKeepsOriginalRecordOnDisk(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("original")
 	if err != nil {
 		t.Fatal(err)

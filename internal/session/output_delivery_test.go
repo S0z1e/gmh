@@ -12,7 +12,7 @@ import (
 )
 
 func TestOutputDeliveryOnlyAcknowledgesDurableCompletedResults(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := Open("receipts", OpenOptions{Workspace: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)

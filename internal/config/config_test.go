@@ -357,6 +357,7 @@ func TestLoadRejectsBadValues(t *testing.T) {
 func TestLoadForProjectOverridesGlobal(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	globalDir := filepath.Join(home, ".minimal-harness")
 	if err := os.MkdirAll(globalDir, 0o755); err != nil {
 		t.Fatal(err)

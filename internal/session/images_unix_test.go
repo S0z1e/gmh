@@ -14,7 +14,7 @@ import (
 )
 
 func TestNonRegularImageBlobsDoNotBlockHydration(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	if err := os.MkdirAll(imageBlobDir(), 0700); err != nil {
 		t.Fatal(err)
 	}

@@ -7,7 +7,7 @@ import (
 )
 
 func TestSessionArtifactsArePrivate(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	for _, id := range []string{"", "explicit"} {
 		s, err := New(id)
 		if err != nil {

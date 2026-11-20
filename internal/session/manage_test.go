@@ -20,7 +20,7 @@ func writeMsgs(t *testing.T, s *Store, contents ...string) {
 }
 
 func TestListSessions(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	old, err := New("old")
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func TestValidateSessionID(t *testing.T) {
 }
 
 func TestRenameSession(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("orig")
 	if err != nil {
 		t.Fatal(err)
@@ -157,7 +157,7 @@ func TestRenameSession(t *testing.T) {
 }
 
 func TestStoreRename(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("live")
 	if err != nil {
 		t.Fatal(err)
@@ -196,7 +196,7 @@ func TestStoreRename(t *testing.T) {
 // DeleteSession removes a session's transcript, audit sidecar and
 // pre-compact archives, and refuses unknown or invalid ids.
 func TestDeleteSession(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	s, err := New("gone")
 	if err != nil {
 		t.Fatal(err)
