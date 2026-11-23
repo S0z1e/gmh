@@ -27,7 +27,7 @@ type Request struct {
 	// question_response, abort, clear_queue, get_state, new_session,
 	// clear, compact, usage, jobs, skill, quit, attach_image, attach_file, list_pending_files,
 	// set_model, list_sessions, rename_session, resume_session,
-	// delete_session, set_tool_mode, rollback, list_plugins,
+	// delete_session, set_tool_mode, set_approval_mode, rollback, list_plugins,
 	// list_models, list_skills, history, command.
 	Type string `json:"type"`
 	// Message is the task for prompt, and the raw args string for
@@ -47,7 +47,7 @@ type Request struct {
 	Session string `json:"session,omitempty"`
 	// New is the new id for rename_session (Name holds the old one).
 	New string `json:"new,omitempty"`
-	// Mode is the tool mode for set_tool_mode ("default" or "plan").
+	// Mode selects a tool mode or an approval mode for the corresponding request.
 	Mode string `json:"mode,omitempty"`
 	// ApprovalID names the approval_request being answered, for
 	// approval_response. It is separate from ID, which correlates
@@ -169,6 +169,8 @@ type Event struct {
 	// approval_request.
 	ID     string `json:"id,omitempty"`
 	Prompt string `json:"prompt,omitempty"`
+	// approval_review.
+	Decision string `json:"decision,omitempty"`
 	// agent_settled.
 	Aborted bool `json:"aborted,omitempty"`
 	// agent_settled: structured terminal reason — "end_turn",

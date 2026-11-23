@@ -1,11 +1,25 @@
-# Safety (suggest mode) — what it can and cannot promise
+# Approval and tool safety
 
-Approval is a policy boundary, **not a sandbox**. In `-mode suggest`,
-write/edit/bash, webfetch and plugin tools ask first (stdin in plain mode, a y/n dialog in the
-TUI); read, grep, glob and `load_skill` never ask. `-p` print mode
-and `--deny-instead-of-prompt` (also `OPENAI_DENY_INSTEAD_OF_PROMPT=1`)
-refuse every approval without asking — they only ever deny, never
-approve, and the turn continues with the denial as an observation.
+In `ask-for-approval` mode, write, edit, Bash, webfetch and plugin calls
+ask first. Plain mode reads the answer from stdin, the TUI shows a dialog,
+and RPC waits for its client. Read, grep, glob and `load_skill` are
+exempt. Print mode (`-p`) refuses any call that would ask the user.
+
+In `approve-for-me` mode, the configured model receives the original task,
+the user's answers to questions in the same turn, and the effective tool
+arguments in a separate, tool-free request. Bash reviews include the
+resolved working directory. The executor checks its identity before launch
+and refuses the command if the directory has changed. The reviewer has
+45 seconds per call. Failure, timeout or an invalid response refuses the
+call. Decisions use the same provider credentials and count toward
+metering and turn budgets.
+
+In `full-access` mode, the approval gate is disabled, including for
+protected writes and host Git status. Tool validation, path restrictions,
+the denylist and a configured Bash sandbox still apply.
+`--deny-instead-of-prompt`, `OPENAI_DENY_INSTEAD_OF_PROMPT=1` or the config
+field `denyInsteadOfPrompt` refuses any call that still needs approval
+without asking the user or reviewer.
 
 What is enforced:
 - read/write/edit/grep/glob paths are jailed to the workspace root
@@ -20,9 +34,8 @@ What is enforced:
   `rm -rf /` (or `~`), `mkfs` with a device, `dd` to a device,
   writes into `~/.ssh` / `~/.aws` / `~/.config/gcloud` / `~/.kube` /
   `~/.docker`, and anything touching the Docker socket.
-- Every approval decision, every bash run (with exit code), and every
-  denial is written to `<session>-audit.jsonl` next to the session
-  transcript, for later review.
+- Every approval decision records its source in `<session>-audit.jsonl`.
+  The same file records Bash runs and tool-policy denials.
 - webfetch refuses private, loopback (except localhost, kept for the
   user's own dev servers), link-local and cloud-metadata addresses
   before any network use, and never follows a redirect to another
@@ -45,8 +58,9 @@ What is enforced:
   disabled). read/write/edit run in-process and are jailed by the
   harness itself, not by bwrap.
   The fixed `git_status` lookup in a trusted workspace also runs on the host
-  so linked worktrees can read their Git metadata. It always asks for approval
-  when the Bash sandbox is enabled and takes no caller-supplied arguments.
+  so linked worktrees can read their Git metadata. With the Bash sandbox
+  enabled, the approval gate covers this lookup except in `full-access`
+  mode. The tool takes no caller-supplied arguments.
 
 What is NOT promised (residual risk — run on disposable copies or in
 a container):

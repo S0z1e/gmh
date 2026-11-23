@@ -5,9 +5,8 @@ loop, tools, sessions, config, RPC) is stdlib-only; the TUI binary
 adds Bubble Tea v2 + lipgloss v2. Eight tools: read, write, edit,
 bash, grep, glob, `load_skill`, `webfetch`.
 
-It stays small on purpose: a lightweight system prompt, no
-sub-agents, no built-in permission popups. It also has suggest mode
-(approval before write/edit/bash, webfetch and plugin tools), background bash jobs, JavaScript
+It stays small on purpose, with a lightweight system prompt. It supports
+manual and automatic tool approval, background Bash jobs, JavaScript
 plugins, plan mode via a plugin, and an RPC mode (JSONL over stdio)
 for driving it from a GUI — see [rpc](docs/rpc.md).
 
@@ -79,11 +78,15 @@ Without rates, no estimate is shown.
 
 ## Safety
 
-Approval is a policy boundary, **not a sandbox**. In `-mode suggest`
-(the default), write/edit/bash, webfetch and plugin tools ask first; read, grep, glob and
-`load_skill` never ask. `-mode auto` never prompts — use it only on a
-disposable copy. `-p` print mode refuses every approval without
-asking.
+Choose an approval mode with `-mode` at startup or `/permissions <mode>`
+between turns.
+
+- `ask-for-approval` (default) asks before write, edit, Bash, webfetch
+  and plugin calls.
+- `approve-for-me` uses a separate request to the configured model to
+  approve or deny each gated operation.
+- `full-access` skips tool approval prompts. Tool checks and the optional
+  Bash sandbox still apply.
 
 Paths are jailed to the workspace root, bash has a timeout and a
 64 KiB output cap, and a denylist refuses the obvious catastrophes
@@ -99,7 +102,7 @@ Full details, including what is *not* promised, are in
 | --- | --- |
 | [configuration](docs/configuration.md) | Providers, models, APIs, effort, cost rates, merge rules |
 | [usage](docs/usage.md) | Modes, skills, sessions, compaction, commands, the TUI |
-| [safety](docs/safety.md) | What suggest mode enforces, and what it does not promise |
+| [safety](docs/safety.md) | Approval modes and tool restrictions |
 | [background-bash](docs/background-bash.md) | Long bash calls as background jobs |
 | [images](docs/images.md) | Sending images to a model that accepts them |
 | [file attachments](docs/attachments.md) | Attach logs and other UTF-8 text files to a turn |

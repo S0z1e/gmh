@@ -275,7 +275,7 @@ func (s *Server) handleLine(line string) {
 		s.handlePrompt(req)
 	case "clear_queue":
 		s.handleClearQueue(req)
-	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "attach_file", "list_pending_files", "set_model", "rename_session", "resume_session", "delete_session", "set_tool_mode", "rollback", "prune_artifacts", "command":
+	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "attach_file", "list_pending_files", "set_model", "rename_session", "resume_session", "delete_session", "set_tool_mode", "set_approval_mode", "rollback", "prune_artifacts", "command":
 		s.enqueue(req, workControl)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown request type %q", req.Type))
@@ -302,6 +302,9 @@ func (s *Server) handlePrompt(req Request) {
 			prov, mdl := app.SplitModelArg(arg)
 			ctrl = Request{ID: req.ID, Type: typ, Provider: prov, Model: mdl}
 		}
+		if typ == "set_approval_mode" {
+			ctrl.Mode = arg
+		}
 		if typ == "resume_session" {
 			ctrl = Request{ID: req.ID, Type: typ, Session: arg}
 		}
@@ -323,7 +326,7 @@ func (s *Server) handlePrompt(req Request) {
 				ctrl = Request{ID: req.ID, Type: typ, Name: parts[0], New: parts[1]}
 			}
 		}
-		if typ == "usage" || typ == "jobs" || typ == "list_sessions" || typ == "list_plugins" {
+		if typ == "usage" || typ == "jobs" || typ == "list_sessions" || typ == "list_plugins" || typ == "get_state" {
 			// Read-only: answer at once, like the request of the same name.
 			s.handleQuery(ctrl)
 			return
@@ -384,6 +387,10 @@ func slashRequest(line string) (typ, arg string) {
 		return "attach_file", strings.TrimSpace(strings.TrimPrefix(line, "/attach"))
 	case line == "/model" || strings.HasPrefix(line, "/model "):
 		return "set_model", strings.TrimSpace(strings.TrimPrefix(line, "/model"))
+	case line == "/permissions":
+		return "get_state", ""
+	case strings.HasPrefix(line, "/permissions "):
+		return "set_approval_mode", strings.TrimSpace(strings.TrimPrefix(line, "/permissions"))
 	case line == "/sessions":
 		return "list_sessions", ""
 	case line == "/plugins":
@@ -941,6 +948,8 @@ func (s *Server) onEvent(ev agent.Event) {
 		s.writeEvent(e)
 	case agent.EventApproval:
 		// Ignored: ask() emits approval_request itself, with the id.
+	case agent.EventApprovalReview:
+		s.writeEvent(Event{Type: "approval_review", Tool: ev.ToolName, ToolCallID: ev.ToolCallID, InvocationID: ev.InvocationID, Decision: ev.Decision, Text: ev.Text})
 	case agent.EventDone:
 		s.turnOutcome = &turnOutcome{text: ev.Text, usage: ev.Usage, reason: ev.TerminalReason, outcome: ev.TaskOutcome}
 	case agent.EventError:
@@ -1271,6 +1280,13 @@ func (s *Server) doControl(req Request) {
 		}
 		s.refreshState()
 		s.respond(req, map[string]any{"tool_mode": string(s.app.ToolMode())}, nil)
+	case "set_approval_mode":
+		if err := s.app.SetApprovalMode(req.Mode); err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		s.refreshState()
+		s.respond(req, map[string]any{"mode": s.app.Cfg.Mode}, nil)
 	case "quit":
 		if err := s.app.Close(); err != nil {
 			s.respond(req, nil, err)

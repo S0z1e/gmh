@@ -5,7 +5,7 @@ import (
 )
 
 // ToolMode is the loop's active tool set. It is NOT Config.Mode, the
-// approval mode ("suggest" / "auto"): a tool mode says which tools
+// approval mode: a tool mode says which tools
 // the model is offered, an approval mode says whether write/edit/bash
 // ask first. The two are independent — plan mode still asks, in the
 // modes where anything needs asking at all.

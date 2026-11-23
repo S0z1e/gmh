@@ -15,6 +15,8 @@ type AuditEntry struct {
 	Tool     string    `json:"tool"`
 	Args     string    `json:"args,omitempty"`
 	Decision string    `json:"decision,omitempty"` // "approved" | "denied"
+	Approver string    `json:"approver,omitempty"`
+	Reason   string    `json:"reason,omitempty"`
 	ExitCode int       `json:"exit_code"`
 	Error    string    `json:"error,omitempty"`
 

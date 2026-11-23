@@ -494,20 +494,25 @@ type BashArgs struct {
 // bash call can cd anywhere — so cwd is validated, not jailed.
 func (e *Executor) bashDir(a BashArgs) (string, error) {
 	dir := workdir.Resolve(e.Root, a.Cwd)
+	_, err := e.validateBashDirectory(a.Cwd, dir)
+	return dir, err
+}
+
+func (e *Executor) validateBashDirectory(cwd, dir string) (os.FileInfo, error) {
 	info, err := os.Stat(dir)
 	if err != nil {
-		return "", fmt.Errorf("invalid cwd %q: %v", a.Cwd, err)
+		return nil, fmt.Errorf("invalid cwd %q: %w", cwd, err)
 	}
 	if !info.IsDir() {
-		return "", fmt.Errorf("invalid cwd %q: not a directory", a.Cwd)
+		return nil, fmt.Errorf("invalid cwd %q: not a directory", cwd)
 	}
 	if e.Sandbox {
 		rel, err := filepath.Rel(e.Root, dir)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("invalid cwd %q: outside workspace root (sandbox)", a.Cwd)
+			return nil, fmt.Errorf("invalid cwd %q: outside workspace root (sandbox)", cwd)
 		}
 	}
-	return dir, nil
+	return info, nil
 }
 
 // bashTimeout resolves the effective timeout for one bash call:
@@ -553,7 +558,7 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 		e.audit(ctx, AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
 		return ToolResult{Status: ResultNotExecuted}, err
 	}
-	out, code, err := e.runBashCmd(ctx, a.Command, e.bashTimeout(a), output, dir, nil)
+	out, code, err := e.runBashCmd(ctx, a.Command, e.bashTimeout(a), bashOutputDrainTimeout, output, dir, nil)
 	entry := AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
 	if err != nil {
 		entry.Error = err.Error()

@@ -277,7 +277,7 @@ func TestRunDenyInsteadOfPrompt(t *testing.T) {
 			return
 		}
 		body, _ := io.ReadAll(r.Body)
-		if !strings.Contains(string(body), "User denied this tool call") {
+		if !strings.Contains(string(body), "The configured approval policy denied this tool call") {
 			t.Errorf("second request should carry the denial observation: %s", body)
 		}
 		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"understood, I will not write it\"}}]}\n\n")

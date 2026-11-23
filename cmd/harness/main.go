@@ -15,6 +15,7 @@ import (
 
 	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
+	"minimalharness/internal/approvalmode"
 	"minimalharness/internal/input"
 	"minimalharness/internal/rpc"
 	"minimalharness/internal/session"
@@ -26,7 +27,7 @@ func main() {
 		printMode      = flag.String("p", "", "print mode: run one task and exit")
 		root           = flag.String("root", ".", "workspace root")
 		workspaceTrust = flag.String("workspace-trust", "", "save workspace trust: trust or untrust (default: saved decision)")
-		mode           = flag.String("mode", "", "suggest (ask) or auto (default config or suggest)")
+		mode           = flag.String("mode", "", approvalmode.Choices+" (default ask-for-approval; legacy: suggest or auto)")
 		model          = flag.String("model", "", "model id (default OPENAI_MODEL or config defaultModel)")
 		api            = flag.String("api", "", "chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages (default OPENAI_API_MODE or config)")
 		provider       = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
@@ -38,7 +39,7 @@ func main() {
 		sessionID      = flag.String("session", "", "session id (default: timestamp)")
 		ctxLimit       = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
 		ui             = flag.String("ui", "auto", "ui: auto, plain or tui (ignored by -p, which is always plain)")
-		deny           = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1; -p always denies)")
+		deny           = flag.Bool("deny-instead-of-prompt", false, "refuse tool calls that need approval (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1)")
 		sandbox        = flag.Bool("sandbox", false, "run bash calls under bwrap (bubblewrap): the workspace is the only writable directory (also env HARNESS_SANDBOX=1 or config sandbox)")
 		bashTO         = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
 		bgThresh       = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
@@ -96,7 +97,8 @@ func main() {
 		Resume:                     *resume,
 		RebindSession:              *rebindSession,
 		SessionID:                  *sessionID,
-		DenyInsteadOfPrompt:        *deny || *printMode != "",
+		DenyInsteadOfPrompt:        *deny,
+		Headless:                   *printMode != "",
 		Sandbox:                    *sandbox,
 		BashTimeoutSeconds:         *bashTO,
 		BackgroundThresholdSeconds: *bgThresh,
@@ -158,6 +160,8 @@ func main() {
 			textPending = false
 		}
 		switch ev.Kind {
+		case agent.EventApprovalReview:
+			fmt.Printf("[approval] %s: %s\n", ev.ToolName, ev.Text)
 		case agent.EventStopBlocked:
 			fmt.Printf("stop hook blocked the turn end: %s\n", ev.Text)
 		case agent.EventStepRetry:
@@ -192,14 +196,14 @@ func main() {
 	}
 
 	// REPL
-	fmt.Println("Type a task, /attach <path> to attach a text file, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /prune-artifacts to remove unreferenced images older than seven days, /clear to drop context, /compact to summarise context, /rollback [N] to drop the last N turns, or /quit to exit.")
+	fmt.Println("Type a task, /attach <path> to attach a text file, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /permissions [mode] to view or change approval mode, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /prune-artifacts to remove unreferenced images older than seven days, /clear to drop context, /compact to summarise context, /rollback [N] to drop the last N turns, or /quit to exit.")
 	scanner := input.New(os.Stdin)
 	defer scanner.Close()
 	// The approval prompt shares the REPL's scanner: the scanner
 	// buffers piped stdin ahead, so a fresh reader on os.Stdin in
 	// the loop's default ask would see EOF after the first task
 	// line. (The TUI and RPC paths set their own Ask and never
-	// reach this code; -p denies without asking.)
+	// reach this code; -p has no manual approval prompt.)
 	a.Cfg.Ask = askFromScanner(scanner)
 	// Doom-loop continuation prompt, on the same scanner (see above):
 	// once / always this session / stop. Editing the input is a GUI

@@ -126,8 +126,10 @@ provider's models. Values are validated on the merged result, not
 per file. Unknown fields are rejected, so a typo fails fast. A
 `"$schema"` key is accepted and ignored. The top-level `baseUrl` /
 `api` / `model` fields are a shorthand for a single provider without
-the `providers` map. Other top-level knobs: `mode`
-(`suggest|auto`), `bashTimeoutSeconds`, `bgThresholdSeconds` (`0`
+the `providers` map. The `mode` field accepts `ask-for-approval`,
+`approve-for-me`, `full-access`, and the legacy values `suggest` and
+`auto`. The `-mode` flag takes precedence. Other top-level knobs include
+`bashTimeoutSeconds`, `bgThresholdSeconds` (`0`
 disables backgrounding), `denyInsteadOfPrompt`, `contextLimit`,
 `anthropicMaxTokens`, `tuiTheme`
 (`default|terminal|catppuccin-mocha`). Precedence is flag >

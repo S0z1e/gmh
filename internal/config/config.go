@@ -60,6 +60,7 @@ import (
 	"regexp"
 	"strings"
 
+	"minimalharness/internal/approvalmode"
 	"minimalharness/internal/turnbudget"
 	"minimalharness/internal/verification"
 	"minimalharness/internal/workspace"
@@ -615,8 +616,10 @@ func Validate(f *File) error {
 	if err := validateProvider("default", Provider{BaseURL: f.BaseURL, API: f.API, Model: f.Model}); err != nil {
 		return err
 	}
-	if f.Mode != "" && f.Mode != "suggest" && f.Mode != "auto" {
-		return fmt.Errorf("mode %q: use suggest or auto", f.Mode)
+	if f.Mode != "" {
+		if err := approvalmode.Validate(f.Mode); err != nil {
+			return err
+		}
 	}
 	if f.BashTimeoutSeconds != nil && *f.BashTimeoutSeconds <= 0 {
 		return fmt.Errorf("bashTimeoutSeconds must be > 0")

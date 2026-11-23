@@ -34,6 +34,8 @@ const (
 	// Text carries the approval prompt. The answer itself is visible
 	// in the following ToolEnd (denied) or ToolStart/ToolEnd (approved).
 	EventApproval EventKind = "approval"
+	// EventApprovalReview reports an automatic decision for one invocation.
+	EventApprovalReview EventKind = "approval_review"
 	// EventToolBackgrounded fires when a bash call runs past the
 	// background threshold and keeps running as a job. JobID names it;
 	// the tool result delivered to the model says the same.
@@ -114,6 +116,8 @@ type Event struct {
 	// InvocationID identifies validated effective args. Early rejections
 	// carry only ToolCallID, since no invocation was committed.
 	InvocationID string
+	// Decision is "approved" or "denied" for EventApprovalReview.
+	Decision string
 	// ToolOutput is the observation for ToolEnd (including the "Error:"
 	// prefix when ToolErr is set).
 	ToolOutput     string

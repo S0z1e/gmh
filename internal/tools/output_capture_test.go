@@ -71,9 +71,28 @@ func TestBashFailedShellReportsInheritedCaptureClosure(t *testing.T) {
 }
 
 func TestBashOutputCapKillsGroupAfterLeaderExit(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("post-exit process group cleanup requires Linux or macOS")
+	}
 	e := &Executor{Root: t.TempDir(), OutputDir: t.TempDir()}
-	command := `(dd if=/dev/zero bs=1048576 count=63 2>/dev/null; : > first-written; while ! test -f leader-exiting; do sleep .001; done; sleep .05; dd if=/dev/zero bs=1048576 count=2 2>/dev/null; : > survived-cap) & while ! test -f first-written; do sleep .001; done; : > leader-exiting; exit`
-	_, err := e.Bash(context.Background(), BashArgs{Command: command})
+	ctx := context.Background()
+	output, err := e.newBashOutput(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The child waits for EOF on the FIFO. Only the leader holds its write
+	// end, so the second burst starts when the leader closes its descriptors.
+	command := `
+mkfifo leader-exit || exit 1
+(
+	dd if=/dev/zero bs=1048576 count=63 2>/dev/null
+	read -r line < leader-exit
+	dd if=/dev/zero bs=1048576 count=2 2>/dev/null
+	: > survived-cap
+) &
+exec 3> leader-exit
+exit`
+	_, _, err = e.runBashCmd(ctx, command, 15*time.Second, 4*time.Second, output, e.Root, nil)
 	var capped *outputCapError
 	if !errors.As(err, &capped) {
 		t.Fatalf("expected cap after leader exit, got %v", err)

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"minimalharness/internal/agent"
+	"minimalharness/internal/approvalmode"
 	"minimalharness/internal/config"
 	"minimalharness/internal/guidance"
 	"minimalharness/internal/llm"
@@ -30,7 +31,7 @@ type Params struct {
 	// to use the saved decision. It never comes from a project config.
 	WorkspaceTrust string
 	Root           string
-	Mode           string // suggest (ask) or auto
+	Mode           string // approval mode, separate from the active tool set
 	Model          string
 	API            string // chat, responses or anthropic
 	MaxSteps       int
@@ -45,9 +46,10 @@ type Params struct {
 	// auto-discover: ~/.minimal-harness/config.json, then
 	// <root>/.harness.json on top of it.
 	ConfigPath string
-	// DenyInsteadOfPrompt refuses approvals without asking. -p print
-	// mode sets it; the flag and OPENAI_DENY_INSTEAD_OF_PROMPT do too.
+	// DenyInsteadOfPrompt refuses requests that need approval.
 	DenyInsteadOfPrompt bool
+	// Headless disables interactive approval prompts in -p mode.
+	Headless bool
 	// Sandbox runs bash calls under bwrap (opt-in): the workspace
 	// root is the only writable directory. The flag, HARNESS_SANDBOX
 	// or the config sandbox field turn it on; Setup fails fast when
@@ -224,7 +226,10 @@ func Setup(p Params) (*App, error) {
 		mode = cfg.Mode
 	}
 	if mode == "" {
-		mode = "suggest"
+		mode = approvalmode.Suggest
+	}
+	if err := approvalmode.Validate(mode); err != nil {
+		return nil, err
 	}
 
 	id := p.SessionID
@@ -406,6 +411,7 @@ func Setup(p Params) (*App, error) {
 		Verification:        cfg.Verification,
 		TurnBudget:          cfg.TurnBudget,
 		DenyInsteadOfPrompt: deny,
+		Headless:            p.Headless,
 	}
 
 	contextLimit := p.ContextLimit
@@ -649,14 +655,17 @@ func modelIDs(p config.Provider) string {
 	return strings.Join(ids, ", ")
 }
 
-// NewSession closes the current session store and starts a fresh one,
-// resetting history. The executor's audit closure is re-pointed at
-// the new store; a background job finishing mid-swap can still audit
-// to the old session's sidecar. The runner's totals are reset by
-// ResetSession, not here.
+// SetApprovalMode changes the approval policy between turns.
+func (a *App) SetApprovalMode(mode string) error {
+	if err := approvalmode.Validate(mode); err != nil {
+		return err
+	}
+	a.Cfg.Mode = mode
+	return nil
+}
+
 // ToolMode returns the loop's active tool set (agent.ToolModeDefault
-// or ToolModePlan). This is the tool mode, not Cfg.Mode (the approval
-// mode "suggest"/"auto").
+// or ToolModePlan). Cfg.Mode independently selects the approval policy.
 func (a *App) ToolMode() agent.ToolMode {
 	if a.toolMode == "" {
 		return agent.ToolModeDefault
@@ -721,6 +730,7 @@ func (a *App) fireSessionEvents(oldID, newID string) {
 	}
 }
 
+// NewSession starts a fresh transcript while retaining stores with outstanding jobs.
 func (a *App) NewSession() (*session.Store, error) {
 	return a.newSession(true)
 }
@@ -1087,6 +1097,17 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 		r.Print("Switched to %s/%s (%s). Context window %d tokens; history replays through the new API.", provName, modelID, api, r.App.ContextLimit)
 		return false
 	}
+	if line == "/permissions" || strings.HasPrefix(line, "/permissions ") {
+		mode := strings.TrimSpace(strings.TrimPrefix(line, "/permissions"))
+		if mode == "" {
+			r.Print("Approval mode is %s. Use /permissions with %s.", r.App.Cfg.Mode, approvalmode.Choices)
+		} else if err := r.App.SetApprovalMode(mode); err != nil {
+			r.Print("[error] %v", err)
+		} else {
+			r.Print("Approval mode set to %s.", mode)
+		}
+		return false
+	}
 	switch line {
 	case "/quit", "/exit":
 		if err := r.App.Close(); err != nil {
@@ -1349,7 +1370,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	r.configureCompaction()
 	previousCost := r.SessionCost
 	previousMetering := r.SessionMetering
-	text, usage, err := r.App.Cfg.Run(ctx, history)
+	text, usage, err := r.App.Cfg.RunTask(ctx, history, userMsg.Content)
 	r.LastErr = err
 	if err != nil {
 		r.Print("\n[error] %v", err)

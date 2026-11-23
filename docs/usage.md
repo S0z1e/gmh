@@ -93,8 +93,21 @@
   this proof. An omitted policy inherits global settings; `{"verification":{"required":[]}}`
   disables them when supplied by an authorized config. Untrusted project config
   cannot replace global verification requirements.
-- Modes: `-mode suggest` (default, ask before write/edit/bash, webfetch and plugin tools),
-  `-mode auto` (no prompts, use only on a disposable copy).
+- Select an approval mode with `-mode` or JSON `mode`. In the CLI and TUI,
+  `/permissions` shows the active mode and `/permissions <mode>` changes
+  it for the current process between turns.
+  - `ask-for-approval` (default) asks before write, edit, Bash, webfetch
+    and plugin calls. In `-p` print mode, those calls are refused.
+  - `approve-for-me` reviews each gated call using the active model in a
+    separate request without tools. The request includes the original task,
+    the user's answers in the current turn, and the complete effective
+    invocation, including Bash's resolved working directory. Reviewer usage counts
+    toward turn budgets. This mode also works in `-p` print mode.
+  - `full-access` skips approval for all tool calls. Tool-level restrictions
+    and any configured Bash sandbox still apply.
+  - Existing `suggest` and `auto` settings are accepted. `suggest` has
+    the same policy as `ask-for-approval`. `auto` skips routine prompts and
+    still asks for protected writes and host Git status under `--sandbox`.
 - Editing: `edit` takes either `oldText` (must match exactly once —
   a failed match names the closest lines, so the call can be fixed
   instead of re-reading the file) or `startLine`/`endLine` (1-based,
@@ -128,8 +141,9 @@
   change before a write or edit, the harness asks the model to reconsider
   the operation before executing it. If branch or working tree status is
   needed, `git_status` reads it on demand in trusted workspaces. It requires
-  approval in suggest mode and whenever the Bash sandbox is enabled, since a
-  linked worktree may keep its Git metadata outside that sandbox.
+  approval in `ask-for-approval`, `suggest` and `approve-for-me`, and in
+  legacy `auto` with the Bash sandbox enabled. A linked worktree may keep
+  its Git metadata outside that sandbox.
   The result covers the selected working tree, without running Git filters,
   inspecting submodule working trees or reporting upstream tracking status.
   The working tree scan requires Git 2.32 or later. With older or unrecognized
