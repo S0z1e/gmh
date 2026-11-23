@@ -555,6 +555,11 @@ func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message
 		for i := len(history) - 1; i >= 0; i-- {
 			if history[i].Kind == "turn_context" {
 				replacement = append(replacement, history[i])
+				for _, msg := range history[i+1:] {
+					if msg.Kind == "steering" {
+						replacement = append(replacement, msg)
+					}
+				}
 				break
 			}
 		}

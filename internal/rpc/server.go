@@ -3,14 +3,9 @@
 // Concurrency is deliberately boring: a reader goroutine decodes stdin
 // and answers read-only queries (get_state, usage, jobs) immediately;
 // everything that touches history or the session goes through one work
-// queue, and a single agent goroutine runs the items in order — the
-// same shape as the TUI's lines channel. Approvals, aborts and
-// clear_queue are the only things the reader handles out of band:
-// the agent goroutine blocks in Config.Ask, and the reader resolves
-// it when the GUI answers; abort cancels the turn's context and
-// fails any pending approval, so a turn waiting on a dialog can
-// still be stopped; clear_queue drops queued prompts at once, which
-// it could not do as a work item (a queued prompt would run first).
+// queue, and a single agent goroutine runs one item at a time. The
+// reader resolves dialogs, cancels turns, and handles queue edits
+// immediately, even while the agent goroutine is busy.
 //
 // stdout carries protocol data only; diagnostics go to stderr.
 package rpc
@@ -24,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -121,18 +117,14 @@ type Server struct {
 	inputErr     error
 	state        serverState
 
-	// outstanding counts prompts the reader has enqueued but the
-	// agent has not settled yet (running or still queued). The reader
-	// increments it on a successful prompt enqueue and the agent
-	// decrements it when the turn settles, when clear_queue drops the
-	// prompt, or when shutdown drops it. disposition() reads it, so a
-	// prompt's started/queued answer never depends on the agent
-	// goroutine having been scheduled yet (see handlePrompt).
-	outstanding int
-
-	work   chan workItem
-	workMu sync.Mutex // serialises enqueue vs close(work)
-	closed bool
+	workMu        sync.Mutex // guards the work queue and its state
+	work          []workItem
+	workReady     *sync.Cond
+	promptRunning bool // from dequeue until the turn settles
+	closed        bool
+	steeringTurn  string
+	steeringQueue []string // selected prompt IDs, in selection order
+	steeringClaim string   // currently being saved to the active turn
 
 	done     chan struct{}
 	doneOnce sync.Once
@@ -179,12 +171,12 @@ func Run(a *app.App, runner *app.Runner, in io.Reader, out io.Writer) error {
 		runner:        runner,
 		in:            in,
 		out:           out,
-		work:          make(chan workItem, maxQueue),
 		done:          make(chan struct{}),
 		approvals:     map[string]chan approvalAnswer{},
 		continuations: map[string]chan agent.ContinuationDecision{},
 		questions:     map[string]chan questionAnswer{},
 	}
+	s.workReady = sync.NewCond(&s.workMu)
 	return s.run()
 }
 
@@ -204,6 +196,7 @@ func (s *Server) run() error {
 	s.app.Cfg.Ask = s.ask
 	s.app.Cfg.ConfirmContinuation = s.confirmContinuation
 	s.app.Cfg.AskQuestion = s.askQuestion
+	s.app.Cfg.ReceiveSteering = s.receiveSteering
 	// A successful compaction (manual or automatic) is reported on
 	// stdout so the GUI learns the history was replaced by a
 	// summary; the CLI and TUI leave OnCompact nil and keep their
@@ -275,6 +268,8 @@ func (s *Server) handleLine(line string) {
 		s.handlePrompt(req)
 	case "clear_queue":
 		s.handleClearQueue(req)
+	case "steer_prompt":
+		s.handleSteerPrompt(req)
 	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "attach_file", "list_pending_files", "set_model", "rename_session", "resume_session", "delete_session", "set_tool_mode", "set_approval_mode", "rollback", "prune_artifacts", "command":
 		s.enqueue(req, workControl)
 	default:
@@ -341,23 +336,10 @@ func (s *Server) handlePrompt(req Request) {
 		s.enqueue(Request{ID: req.ID, Type: "command", Name: name, Message: args}, workControl)
 		return
 	}
-	// Snapshot the disposition before enqueueing, then count this
-	// prompt as outstanding on a successful enqueue. The snapshot is
-	// exact because outstanding already counts every prompt enqueued
-	// ahead of this one: the reader maintains it synchronously, so it
-	// never depends on the agent goroutine having been scheduled to
-	// pick the previous prompt up (a turn already running is counted
-	// even before its turn_started event). Snapshot after the enqueue
-	// would be wrong both ways: the agent may not have set streaming
-	// yet (this prompt reads "queued") or may already have (it reads
-	// "started" for a turn that did start at once).
-	disposition := s.disposition()
-	req.turnID = rand.Text()
+	req.TurnID = rand.Text()
 	accepted := make(chan struct{})
 	req.accepted = accepted
-	if s.enqueue(req, workPrompt) {
-		s.respond(req, map[string]any{"disposition": disposition, "turn_id": req.turnID}, nil)
-	}
+	s.enqueue(req, workPrompt)
 	close(accepted)
 }
 
@@ -406,52 +388,29 @@ func slashRequest(line string) (typ, arg string) {
 	}
 }
 
-func (s *Server) disposition() string {
-	s.mu.Lock()
-	outstanding := s.outstanding
-	s.mu.Unlock()
-	if outstanding > 0 || len(s.work) > 0 {
-		return "queued"
-	}
-	return "started"
-}
-
-// addOutstanding adjusts the count of prompts enqueued but not yet
-// settled. Called by the reader (+1 on a successful prompt enqueue)
-// and by the agent (-1 when a turn settles or a queued prompt is
-// dropped, -cleared when clear_queue drains prompts).
-func (s *Server) addOutstanding(delta int) {
-	s.mu.Lock()
-	s.outstanding += delta
-	s.mu.Unlock()
-}
-
-// enqueue puts a work item on the agent goroutine's queue. It
-// answers the request itself when the item cannot be queued (the
-// server is shutting down, or the queue is full), and reports
-// whether the item was queued, so the caller knows whether a
-// disposition response is still owed.
-func (s *Server) enqueue(req Request, kind workKind) bool {
+// enqueue acknowledges prompts immediately. Control requests receive their
+// response from the agent goroutine, after the control has run.
+func (s *Server) enqueue(req Request, kind workKind) {
 	s.workMu.Lock()
 	if s.closed {
 		s.workMu.Unlock()
 		s.respond(req, nil, errShutdown)
-		return false
+		return
 	}
-	if kind == workPrompt {
-		s.addOutstanding(1)
-	}
-	select {
-	case s.work <- workItem{kind: kind, req: req}:
-		s.workMu.Unlock()
-		return true
-	default:
-		if kind == workPrompt {
-			s.addOutstanding(-1)
-		}
+	if len(s.work) == maxQueue {
 		s.workMu.Unlock()
 		s.respond(req, nil, errors.New("prompt queue is full"))
-		return false
+		return
+	}
+	disposition := "started"
+	if s.promptRunning || len(s.work) > 0 {
+		disposition = "queued"
+	}
+	s.work = append(s.work, workItem{kind: kind, req: req})
+	s.workReady.Signal()
+	s.workMu.Unlock()
+	if kind == workPrompt {
+		s.respond(req, map[string]any{"disposition": disposition, "turn_id": req.TurnID}, nil)
 	}
 }
 
@@ -481,6 +440,7 @@ func (s *Server) handleAbort(req Request) {
 	cancel := s.turnCancel
 	if cancel != nil {
 		s.turnAborted = true
+		s.closeSteering()
 		cancel()
 	}
 	s.failApprovals(errAborted)
@@ -496,13 +456,17 @@ func (s *Server) handleAbort(req Request) {
 // goroutine. It must run here, not as a work item: a queued control
 // item would run first if clear_queue itself waited in the FIFO,
 // and by then the queued prompt it was meant to drop has already
-// started. Drained prompts never settle, so they leave the
-// outstanding count here instead of in runTurn. The running turn
-// is untouched: only abort cancels it (send
+// started. The running turn is unaffected (send
 // clear_queue first, then abort).
 func (s *Server) handleClearQueue(req Request) {
-	cleared := s.drainPrompts()
-	s.addOutstanding(-cleared)
+	s.workMu.Lock()
+	before := len(s.work)
+	// Steering already in progress has its own copy. Remove its queued copy
+	// too so a failed delivery can't start another turn after clear_queue.
+	s.work = slices.DeleteFunc(s.work, func(item workItem) bool { return item.kind == workPrompt })
+	s.steeringQueue = nil
+	cleared := before - len(s.work)
+	s.workMu.Unlock()
 	s.respond(req, map[string]any{"cleared": cleared}, nil)
 }
 
@@ -525,11 +489,14 @@ func (s *Server) handleQuery(req Request) {
 	s.mu.Unlock()
 	switch req.Type {
 	case "get_state":
+		s.workMu.Lock()
+		queued := len(s.work)
+		s.workMu.Unlock()
 		data := map[string]any{
 			"session": st.sessionID, "model": st.model, "api": st.api,
 			"mode": st.mode, "tool_mode": st.toolMode, "root": st.root, "streaming": st.streaming,
 			"workspace_trusted": st.workspaceTrusted,
-			"queued":            len(s.work), "messages": st.messages, "turns": st.turns,
+			"queued":            queued, "messages": st.messages, "turns": st.turns,
 			"metering_available":         st.meteringAvailable,
 			"session_usage_complete":     st.sessionUsageComplete,
 			"current_run_usage_complete": st.runUsageComplete,
@@ -968,21 +935,19 @@ func (s *Server) onEvent(ev agent.Event) {
 	}
 }
 
-// agentLoop runs work items in order until the queue closes. Queued
-// work is dropped once shutdown starts.
+// agentLoop runs one work item at a time until shutdown.
 func (s *Server) agentLoop() {
-	for item := range s.work {
+	for {
+		item, ok := s.takeWork()
+		if !ok {
+			return
+		}
 		if item.req.accepted != nil {
 			// Publish the acceptance frame before events for this turn.
 			<-item.req.accepted
 		}
 		if s.isDone() {
-			// A prompt dropped at shutdown never settles, so it
-			// leaves the outstanding count here instead.
-			if item.kind == workPrompt {
-				s.addOutstanding(-1)
-			}
-			continue
+			return
 		}
 		switch item.kind {
 		case workPrompt:
@@ -992,6 +957,27 @@ func (s *Server) agentLoop() {
 		}
 		s.refreshState()
 	}
+}
+
+func (s *Server) takeWork() (workItem, bool) {
+	s.workMu.Lock()
+	defer s.workMu.Unlock()
+	for len(s.work) == 0 && !s.closed {
+		s.workReady.Wait()
+	}
+	if s.closed {
+		return workItem{}, false
+	}
+	item := s.work[0]
+	s.work = slices.Delete(s.work, 0, 1)
+	s.promptRunning = item.kind == workPrompt
+	return item, true
+}
+
+func (s *Server) finishPrompt() {
+	s.workMu.Lock()
+	s.promptRunning = false
+	s.workMu.Unlock()
 }
 
 func (s *Server) refreshState() {
@@ -1031,7 +1017,7 @@ func (s *Server) runTurn(req Request) {
 	s.turnOutcome = nil
 	s.turnMu.Lock()
 	s.turnAborted = false
-	s.turnID = req.turnID
+	s.turnID = req.TurnID
 	if s.turnID == "" {
 		s.turnID = rand.Text()
 	}
@@ -1040,15 +1026,20 @@ func (s *Server) runTurn(req Request) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.turnCtx = ctx
 	s.turnCancel = cancel
+	s.workMu.Lock()
 	if s.isDone() {
 		cancel()
+	} else {
+		s.steeringTurn = s.turnID
 	}
+	s.workMu.Unlock()
 	s.turnMu.Unlock()
 	s.writeEvent(Event{Type: "turn_started", Text: truncateRunes(req.Message, 200)})
 	previousCost := s.runner.SessionCost
 	previousMetering := s.runner.SessionMetering
 	s.runner.Handle(ctx, req.Message)
 	s.turnMu.Lock()
+	s.closeSteering()
 	s.turnCancel = nil
 	s.turnCtx = nil
 	aborted := s.turnAborted
@@ -1125,7 +1116,7 @@ func (s *Server) runTurn(req Request) {
 	if err != nil {
 		settled.Error = err.Error()
 	}
-	s.addOutstanding(-1)
+	s.finishPrompt()
 	s.writeEvent(settled)
 	s.turnMu.Lock()
 	s.turnID = ""
@@ -1321,43 +1312,15 @@ func (s *Server) findSkill(name string) (string, bool) {
 	return "", false
 }
 
-// drainPrompts drops queued prompt items, keeping control items in
-// order. It runs on the reader goroutine (clear_queue is answered
-// immediately, not queued); workMu keeps the reader from enqueueing
-// mid-drain, and the agent goroutine only receives from the channel,
-// so an item is taken by exactly one of them — a prompt the agent
-// already picked up counts as running and is never dropped here.
-func (s *Server) drainPrompts() int {
-	s.workMu.Lock()
-	defer s.workMu.Unlock()
-	var keep []workItem
-	cleared := 0
-	for {
-		select {
-		case item, ok := <-s.work:
-			if !ok {
-				return cleared
-			}
-			if item.kind == workPrompt {
-				cleared++
-			} else {
-				keep = append(keep, item)
-			}
-		default:
-			for _, item := range keep {
-				s.work <- item
-			}
-			return cleared
-		}
-	}
-}
-
 func (s *Server) shutdown() {
 	s.doneOnce.Do(func() { close(s.done) })
 	s.workMu.Lock()
 	if !s.closed {
 		s.closed = true
-		close(s.work)
+		s.work = nil
+		s.steeringTurn = ""
+		s.steeringQueue = nil
+		s.workReady.Signal()
 	}
 	s.workMu.Unlock()
 	s.turnMu.Lock()

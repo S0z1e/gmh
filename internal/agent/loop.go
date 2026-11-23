@@ -46,6 +46,9 @@ type Config struct {
 	// OnEvent receives every loop event; the caller renders them.
 	// (There is no OnText: streamed text arrives as TextDelta events.)
 	OnEvent func(Event)
+	// ReceiveSteering delivers user follow-ups at model or tool boundaries.
+	// When finishing is true and nothing is delivered, it closes intake.
+	ReceiveSteering func(finishing bool, deliver func(string) bool)
 	// TraceRequests emits content-free request diagnostics and audits each attempt.
 	TraceRequests bool
 	Ask           func(ApprovalRequest) (bool, error) // nil = use stdin prompt
@@ -811,6 +814,32 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 	reviewIntent := approvalIntent{Task: task}
 	msgs := append([]llm.Message{{Role: "system", Content: c.System + verificationInstructions(c.Verification)}}, history...)
 	msgs = WithoutHistoricalGuidance(msgs)
+	receiveSteering := func(finishing bool, remainingCalls []llm.ToolCall, startedInvocation ...string) bool {
+		if c.ReceiveSteering == nil || ctx.Err() != nil {
+			return false
+		}
+		received := false
+		c.ReceiveSteering(finishing, func(text string) bool {
+			if ctx.Err() != nil || !c.canRequestForSteering() {
+				return false
+			}
+			if len(remainingCalls) > 0 {
+				results := c.rejectBudgetTools(remainingCalls, errors.New("the user updated the task before these calls ran"), startedInvocation...)
+				msgs = append(msgs, results...)
+				remainingCalls = nil
+			}
+			msg := llm.Message{Role: "user", Kind: "steering", Content: text}
+			c.persist(msg)
+			if c.persistErr != nil {
+				return false
+			}
+			msgs = append(msgs, msg)
+			reviewIntent.Updates = append(reviewIntent.Updates, text)
+			received = true
+			return true
+		})
+		return received
+	}
 	var total llm.Usage
 	var lastText string
 	// pending background bash jobs, in call order. Their results are
@@ -863,6 +892,8 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 	}
 
 	for step := 0; !hasCap || step < steps; step++ {
+		canContinue := !hasCap || step+1 < steps
+		receiveSteering(false, nil)
 		// Finished background jobs report in at the next step,
 		// in completion order — the model sees results as soon
 		// as they are ready, not only when the turn would end.
@@ -985,6 +1016,12 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 			c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: TerminalOutputLimit})
 			return lastText, total, err
 		}
+		if canContinue && receiveSteering(false, assistant.ToolCalls) {
+			continue
+		}
+		if c.persistErr != nil {
+			return lastText, total, c.persistErr
+		}
 		if len(assistant.ToolCalls) == 0 {
 			if collectedAfterResponse {
 				if c.progress.failures >= MaxFailedFixAttempts && len(pending) > 0 {
@@ -1082,6 +1119,12 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 					c.emit(Event{Kind: EventStopBlocked, Text: missing})
 					continue
 				}
+				if canContinue && receiveSteering(true, nil) {
+					continue
+				}
+				if c.persistErr != nil {
+					return lastText, total, c.persistErr
+				}
 				c.LastTerminalReason = TerminalEndTurn
 				c.emit(Event{Kind: EventDone, Text: lastText, Usage: total, TerminalReason: TerminalEndTurn, TaskOutcome: outcome})
 				return lastText, total, nil
@@ -1172,6 +1215,9 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 		// Execute tool calls in order. (Parallel batches are v0.2; serial
 		// avoids two tools writing the same file at once.)
 		for i := range assistant.ToolCalls {
+			if canContinue && receiveSteering(false, assistant.ToolCalls[i:]) {
+				break
+			}
 			tc := &assistant.ToolCalls[i]
 			if c.persistErr != nil {
 				return lastText, total, c.persistErr
@@ -1477,6 +1523,16 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 				c.LastTerminalReason = TerminalAbort
 				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
 				return lastText, total, err
+			}
+			// Approval and preparation can outlast the user's original direction.
+			steered := canContinue && receiveSteering(false, assistant.ToolCalls[i:], inv.ID)
+			if c.persistErr != nil {
+				closeMutation()
+				return lastText, total, c.persistErr
+			}
+			if steered {
+				closeMutation()
+				break
 			}
 			var obs string
 			var err error

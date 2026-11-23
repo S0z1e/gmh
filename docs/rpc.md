@@ -67,6 +67,19 @@ echoed in the response):
 - `clear_queue` → `{"cleared":N}`. Drops queued prompts, keeps
   control items. Send it before `abort`:
   `abort` alone lets queued prompts continue after the turn ends.
+- `steer_prompt` `{"turn_id":"<queued>","active_turn_id":"<running>"}` →
+  `{"turn_id":"<queued>","active_turn_id":"<running>"}`. Use the ID from
+  the queued `prompt` response and the ID from the active `turn_started`
+  event. The request schedules the queued text as a user message in the
+  running turn. An in-flight model request or tool can finish. At the
+  next boundary, the agent skips any remaining calls from the previous
+  model response and sends the updated conversation to the model. A
+  `prompt_steered` event confirms the message was saved and removed from
+  the queue. If the turn ends before the message can be applied, for
+  example when its model request budget is exhausted, the prompt stays
+  queued for normal execution. Pending attachments
+  are consumed by the next standalone prompt. A missing or stale turn
+  ID returns an error.
 - `get_state` → session/model/api/mode/root, `tool_mode`
   (`"default"` or `"plan"`), `streaming`, `queued`, `messages`,
   `turns`, `total_tokens`, `metering_available`, `session_usage_complete`,
@@ -133,6 +146,10 @@ echoed in the response):
 
 Events (stdout):
 - `turn_started` `{"text":"<first 200 runes of the task>"}`.
+- `prompt_steered` carries the active turn in `turn_id` and the consumed
+  queued prompt in `origin_turn_id` and `origin_request_id`. The saved
+  message has `role:"user"` and `kind:"steering"` in history and belongs
+  to the active turn for rollback.
 - `text_delta` `{"text":"..."}` — streamed assistant text.
 - `thinking_delta` `{"text":"..."}` — one streamed thinking
   fragment (the model's reasoning, not the answer). Deltas only, like

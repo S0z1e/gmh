@@ -20,11 +20,10 @@ import (
 // Request is one line from the GUI. ID is echoed in the response when
 // present; a request without one still gets a response, without an id.
 type Request struct {
-	turnID   string
 	accepted <-chan struct{}
 	ID       string `json:"id,omitempty"`
 	// Type is one of: prompt, approval_response, continuation_response,
-	// question_response, abort, clear_queue, get_state, new_session,
+	// question_response, abort, clear_queue, steer_prompt, get_state, new_session,
 	// clear, compact, usage, jobs, skill, quit, attach_image, attach_file, list_pending_files,
 	// set_model, list_sessions, rename_session, resume_session,
 	// delete_session, set_tool_mode, set_approval_mode, rollback, list_plugins,
@@ -33,6 +32,11 @@ type Request struct {
 	// Message is the task for prompt, and the raw args string for
 	// command (the text after "/name", unparsed).
 	Message string `json:"message,omitempty"`
+	// TurnID selects a pending prompt for steer_prompt. For a new
+	// prompt, the server assigns its own ID at acceptance.
+	TurnID string `json:"turn_id,omitempty"`
+	// ActiveTurnID is the running turn that steer_prompt should update.
+	ActiveTurnID string `json:"active_turn_id,omitempty"`
 	// Name is the skill name for skill, and the command name for
 	// command (without the leading "/").
 	Name string `json:"name,omitempty"`
@@ -104,7 +108,7 @@ type UsageJSON struct {
 // the rest are omitted. Types: ready, turn_started, text_delta,
 // thinking_delta, thinking_end, step_usage, tool_start, tool_end,
 // tool_backgrounded, background_wait, tool_background_done,
-// approval_request, agent_settled, compacted, error.
+// approval_request, prompt_steered, agent_settled, compacted, error.
 type Event struct {
 	OriginTurnID    string            `json:"origin_turn_id,omitempty"`
 	OriginRequestID string            `json:"origin_request_id,omitempty"`
