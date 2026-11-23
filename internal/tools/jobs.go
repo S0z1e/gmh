@@ -378,7 +378,13 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 		return "", -1, fmt.Errorf("create bash output pipe: %w", err)
 	}
 	cmd.Stdout, cmd.Stderr = writer, writer
-	if err := cmd.Start(); err != nil {
+	if reviewed := bashDirectoryFromContext(ctx); reviewed != nil {
+		err = reviewed.check(dir)
+	}
+	if err == nil {
+		err = cmd.Start()
+	}
+	if err != nil {
 		_ = reader.Close()
 		_ = writer.Close()
 		_ = f.Close()
@@ -565,6 +571,9 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	if err != nil {
 		cancel()
 		return nil, err
+	}
+	if reviewed := bashDirectoryFromContext(ctx); reviewed != nil {
+		commandCtx = WithBashDirectory(commandCtx, reviewed)
 	}
 	transferred := false
 	defer func() {

@@ -477,6 +477,43 @@ func TestApprovalApproveAndDeny(t *testing.T) {
 	}
 }
 
+func TestRPCSwitchesToAutomaticApproval(t *testing.T) {
+	a, runner, root := setupTestApp(t, "ask-for-approval", []fakeStep{
+		{kind: "tool", tool: "write", args: map[string]any{"path": "reviewed.txt", "content": "approved"}},
+		{kind: "text", text: "APPROVE"},
+		{kind: "text", text: "Done."},
+	})
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	d.send(map[string]any{"id": "set", "type": "set_approval_mode", "mode": "approve-for-me"})
+	resp := d.waitForResponse("set", 5*time.Second)
+	if data, ok := resp["data"].(map[string]any); !ok || data["mode"] != "approve-for-me" {
+		t.Fatalf("mode switch = %v", resp)
+	}
+	d.send(map[string]any{"id": "state", "type": "prompt", "message": "/permissions"})
+	resp = d.waitForResponse("state", 5*time.Second)
+	if data, ok := resp["data"].(map[string]any); !ok || data["mode"] != "approve-for-me" {
+		t.Fatalf("permissions state = %v", resp)
+	}
+	d.send(map[string]any{"id": "p", "type": "prompt", "message": "Write reviewed.txt"})
+	d.waitForResponse("p", 5*time.Second)
+	review := d.waitFor("approval_review", 5*time.Second)
+	if review["decision"] != "approved" || review["tool"] != "write" || review["invocation_id"] == "" {
+		t.Fatalf("review = %v", review)
+	}
+	d.waitFor("agent_settled", 5*time.Second)
+	for _, ev := range d.pending {
+		if ev["type"] == "approval_request" {
+			t.Fatalf("automatic review opened a manual approval: %v", ev)
+		}
+	}
+	got, err := os.ReadFile(filepath.Join(root, "reviewed.txt"))
+	if err != nil || string(got) != "approved" {
+		t.Fatalf("approved write = %q, err=%v", got, err)
+	}
+	d.quit(t)
+}
+
 func TestTwoApprovalsInOneTurn(t *testing.T) {
 	a, runner, root := setupTestApp(t, "suggest", []fakeStep{
 		{kind: "tool", tool: "write", args: map[string]any{"path": "u.txt", "content": "hello"}},

@@ -69,18 +69,22 @@ func (c *Config) verificationArguments(name, args string) string {
 		if err != nil || wanted != actual {
 			continue
 		}
-		if a.Cwd == actual {
-			return args
-		}
-		var fields map[string]json.RawMessage
-		if json.Unmarshal([]byte(args), &fields) != nil {
-			return args
-		}
-		fields["cwd"], _ = json.Marshal(actual)
-		data, _ := json.Marshal(fields)
-		return string(data)
+		return withBashCwd(args, a.Cwd, actual)
 	}
 	return args
+}
+
+func withBashCwd(args, original, canonical string) string {
+	if original == canonical {
+		return args
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal([]byte(args), &fields) != nil || fields == nil {
+		return args
+	}
+	fields["cwd"], _ = json.Marshal(canonical)
+	data, _ := json.Marshal(fields)
+	return string(data)
 }
 
 func (c *Config) verificationStart(ctx context.Context, name, args string) *verificationAttempt {

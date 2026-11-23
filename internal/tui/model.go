@@ -186,6 +186,7 @@ type MetaUpdateMsg struct {
 	Model            string
 	API              string
 	ToolMode         string
+	ApprovalMode     string
 }
 
 // markWorking starts a turn: working becomes true, and workingSince
@@ -309,6 +310,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.ToolMode != "" {
 			m.metaToolMode = msg.ToolMode
 		}
+		if msg.ApprovalMode != "" {
+			m.metaMode = msg.ApprovalMode
+		}
 		return m, nil
 	}
 	return m, nil
@@ -420,6 +424,8 @@ func (m Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		m.liveTool = ev.ToolName
 		m.liveToolArgs = ev.ToolArgs
 		m.markWorking()
+	case agent.EventApprovalReview:
+		return m, tea.Println("   " + styleMuted.Render(ev.Text))
 	case agent.EventToolEnd:
 		name, args := m.liveTool, m.liveToolArgs
 		if name == "" {

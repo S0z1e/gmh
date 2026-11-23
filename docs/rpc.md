@@ -118,6 +118,11 @@ echoed in the response):
 - `prune_artifacts` → `{"deleted_blobs":N,"reclaimed_bytes":N}`. Reclaims unreferenced image blobs older than seven days after scanning session history, archives and recovery records.
 - `delete_session` `{"session":"..."}` → `{"deleted":true,"session":"..."}`. Removes another session's owned transcript, archives, audit, recovery records and unshared output family. The current session cannot be deleted (resume or start another one first); an unknown id is an error.
 - `set_tool_mode` `{"mode":"plan"|"default"}` → `{"tool_mode":"plan"}`. First-class switch of the loop's tool set (read-only plan mode, or back to the full default set): the same effect as the plan plugin's `/plan` / `/execute`, but it works even when the project has no plan plugin. An unknown or missing mode is an error; switching to the current mode is a no-op. `get_state` and `agent_settled` report the new mode at once. The mode is session-only: a new or resumed session resets it to default.
+- `set_approval_mode` `{"mode":"ask-for-approval"|"approve-for-me"|"full-access"}`
+  → `{"mode":"..."}`. Applies between turns, for the lifetime of the
+  server process. `suggest` and `auto` are also accepted. The
+  `/permissions <mode>` prompt maps to this method, and `/permissions`
+  returns `get_state`.
 - `command` `{"name":"plan","message":""}` → `{"ok":true,"output":"..."}`. Runs a plugin command by name (`message` is the raw args string, the text after `/name`); same as typing `/name` in the REPL. A `/name ...` prompt line behaves the same way.
 - `quit` → `{"ok":true}`, then the process exits 0. It waits for the
   current turn; send `abort` first to quit at once. Closing stdin
@@ -170,9 +175,14 @@ Events (stdout):
   notices.
 - `approval_request` `{"id":"appr-1","tool":"write","args":{...},"prompt":"Run write ...?"}` — `args` contains the complete invocation, without a preview cap; render it in a scrollable or expandable view. Emitted by the approval bridge (not
   by the loop's `approval` event, which the server ignores to avoid
-  sending it twice). The agent blocks until the GUI answers; in
-  `-mode auto` or with `--deny-instead-of-prompt` no request is ever
-  sent.
+  sending it twice). The agent blocks until the GUI answers. Manual
+  requests can come from `ask-for-approval`/`suggest` and from the
+  protected operations still gated in legacy `auto`. Deny-without-prompt
+  suppresses them.
+- `approval_review` carries `tool`, `tool_call_id`, `invocation_id`,
+  `decision` (`approved` or `denied`), and a display `text`.
+  The server emits it when automatic review finishes. The GUI sends no
+  reply for this event.
 - `continuation_request` `{"id":"cont-1","tool":"read","prompt":"<canonical args>","repeat_count":5,"threshold":5}` — the doom-loop guard: the same tool call (tool name + canonical arguments) was requested five consecutive times. A different file, command or error breaks the streak, and a tool result that differs from the previous one for the same call does too (the call is making progress). The agent blocks until the GUI answers with `continuation_response`.
 - `question_request` `{"id":"quest-1","questions":[{"question":"Which database?","header":"DB","options":[{"label":"Postgres","description":"..."}],"multi_select":false}]}` — the model's `ask_user` tool: up to 4 questions, 2–4 options each. The agent blocks until the GUI answers with `question_response`. The answers reach the model as a tool observation; in a headless run there is nobody to ask, so the model gets an observation telling it to proceed with its best judgement and state its assumptions. The TUI does not ask either (same headless observation).
 - `stop_blocked` `{"text":"go test failed"}` — a plugin `stop` hook vetoed the turn end (see `docs/plugins.md`). The turn continues; the GUI should show the reason as a notice, not as a failure. After 8 consecutive vetoes the turn is allowed to end anyway.

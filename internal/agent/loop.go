@@ -9,32 +9,29 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"minimalharness/internal/textutil"
-	"os"
 	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"minimalharness/internal/approvalmode"
 	"minimalharness/internal/checkpoint"
 	"minimalharness/internal/failureguard"
-	"minimalharness/internal/input"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
+	"minimalharness/internal/textutil"
 	"minimalharness/internal/toolargs"
 	"minimalharness/internal/tools"
 	"minimalharness/internal/turnbudget"
 	"minimalharness/internal/verification"
 )
 
-var defaultPromptInput = input.New(os.Stdin)
-
 type Config struct {
 	Client         *llm.Client
 	Exec           *tools.Executor
 	Tools          []llm.ToolDef
 	System         string
-	Mode           string // "suggest" (ask) or "auto" (no ask)
+	Mode           string // see internal/approvalmode
 	ContextLimit   int
 	CompactHistory func(context.Context, []llm.Message) (string, llm.Usage, error)
 	OnCompact      func(history []llm.Message, usage llm.Usage, archive string)
@@ -78,11 +75,10 @@ type Config struct {
 	// their answers. Nil means nobody can be asked (headless): the
 	// loop tells the model to proceed on its best judgement.
 	AskQuestion func(req QuestionRequest) (QuestionAnswers, error)
-	// DenyInsteadOfPrompt refuses every approval without asking (copy of
-	// Claude Code's permissions.denyInsteadOfPrompting). -p print mode
-	// sets it: an unattended run must never block waiting for a human.
-	// It only ever denies, never approves.
+	// DenyInsteadOfPrompt refuses any tool call that needs approval.
 	DenyInsteadOfPrompt bool
+	// Headless means there is no interactive approval prompt.
+	Headless bool
 
 	// LastPromptTokens is the prompt-token count of the most recent LLM
 	// call in the last Run: the current context size, since history is
@@ -164,26 +160,6 @@ func (c *Config) invalidArgs(msgs []llm.Message, tc llm.ToolCall, err error) []l
 	return append(msgs, m)
 }
 
-func (c *Config) ask(ctx context.Context, req ApprovalRequest) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	req.Context = ctx
-	if c.DenyInsteadOfPrompt {
-		return false, nil
-	}
-	if c.Ask != nil {
-		return c.Ask(req)
-	}
-	fmt.Printf("%s [y/N] ", req.Prompt())
-	line, err := defaultPromptInput.Read(ctx)
-	if err != nil {
-		return false, err
-	}
-	ans := strings.ToLower(strings.TrimSpace(line))
-	return ans == "y" || ans == "yes", nil
-}
-
 // checkRepeatedCall runs the doom-loop guard for one requested
 // call. It returns the arguments to execute (possibly the user's
 // edited version) and whether the call may run. A denied call must
@@ -261,6 +237,9 @@ func (c *Config) askUser(ctx context.Context, argsJSON string) (string, *string,
 }
 
 func (c *Config) needsApproval(name, argsJSON string) bool {
+	if c.Mode == approvalmode.FullAccess {
+		return false
+	}
 	if name == tools.GitStatusTool && c.Exec != nil && c.Exec.Sandbox {
 		return true // linked metadata may be outside the shell sandbox
 	}
@@ -272,7 +251,7 @@ func (c *Config) needsApproval(name, argsJSON string) bool {
 			return true
 		}
 	}
-	if c.Mode == "auto" {
+	if c.Mode == approvalmode.Auto {
 		return false
 	}
 	// Network and plugin tools can send data or cause side effects.
@@ -695,35 +674,7 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 		if err := c.budgetRequest(); err != nil {
 			return attempt - 1, spent, err
 		}
-		requestCtx := llm.WithRequestObserver(ctx, func(trace llm.RequestTrace) {
-			if trace.Usage != nil && trace.Usage.Valid() && spent.CanAdd(*trace.Usage) {
-				spent.Add(*trace.Usage)
-			} else if trace.Usage != nil && c.persistErr == nil {
-				c.persistErr = fmt.Errorf("invalid or overflowing provider usage")
-			}
-			c.recordAttempt(operation, attempt, trace)
-			if c.TraceRequests {
-				c.emit(Event{Kind: EventLLMRequest, Request: &trace, Operation: operation, Attempt: attempt})
-				if c.Session != nil {
-					_ = c.Session.Audit(struct {
-						Kind      string           `json:"kind"`
-						Operation string           `json:"operation"`
-						Attempt   int              `json:"attempt"`
-						Request   llm.RequestTrace `json:"request"`
-					}{"llm_request", operation, attempt, trace})
-				}
-			}
-		})
-		requestCtx = llm.WithRequestStart(requestCtx, func(trace llm.RequestTrace) error {
-			if c.Session == nil {
-				return nil
-			}
-			if err := c.Session.BeginUsageAttempt(trace.ID); err != nil {
-				c.persistErr = fmt.Errorf("save pending provider usage attempt: %w", err)
-				return c.persistErr
-			}
-			return nil
-		})
+		requestCtx := c.requestContext(ctx, operation, attempt, &spent)
 		outputSeen := false
 		doneSeen := false
 		wrappedText := func(s string) {
@@ -791,7 +742,20 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 
 // Run executes one user turn. It appends messages to the session store
 // and returns the assistant's final text, total tokens used, and error.
-func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, runUsage llm.Usage, runErr error) {
+func (c *Config) Run(ctx context.Context, history []llm.Message) (string, llm.Usage, error) {
+	var task string
+	for i := len(history) - 1; i >= 0; i-- {
+		if m := history[i]; m.Role == "user" && (m.Kind == "task" || m.Kind == "") {
+			task = m.Content
+			break
+		}
+	}
+	return c.RunTask(ctx, history, task)
+}
+
+// RunTask takes the user's original task separately from agent history so
+// context hooks and compaction cannot change the authority used by the reviewer.
+func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string) (text string, runUsage llm.Usage, runErr error) {
 	c.stepID = ""
 	c.persistErr = nil
 	c.persistErrEmitted = false
@@ -844,6 +808,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 	// positive MaxSteps opts into a hard cap with the grace summary.
 	hasCap := steps > 0
 	guidanceState := newGuidanceTurn(c.Exec)
+	reviewIntent := approvalIntent{Task: task}
 	msgs := append([]llm.Message{{Role: "system", Content: c.System + verificationInstructions(c.Verification)}}, history...)
 	msgs = WithoutHistoricalGuidance(msgs)
 	var total llm.Usage
@@ -1356,6 +1321,21 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				recordLastError(&c.progress.lastErrors, err.Error())
 				continue
 			}
+			guardArgs := argsJSON
+			var bashDir *tools.BashDirectory
+			if tc.Function.Name == "bash" && c.Mode == approvalmode.ApproveForMe && !c.DenyInsteadOfPrompt {
+				var err error
+				argsJSON, bashDir, err = c.bindBashReview(guardArgs)
+				if err != nil {
+					msgs = c.invalidArgs(msgs, *tc, err)
+					c.progressFailure(CanonicalToolKey(tc.Function.Name, guardArgs), failureguard.Environment)
+					recordLastError(&c.progress.lastErrors, err.Error())
+					continue
+				}
+				if argsJSON != guardArgs {
+					inv.Rewrites = append(inv.Rewrites, llm.ArgumentRewrite{Source: "approval_cwd", Arguments: argsJSON})
+				}
+			}
 			tc.Function.Arguments = argsJSON
 			msgs[assistantIdx].ToolCalls[i].Function.Arguments = argsJSON
 			var mutation *tools.Mutation
@@ -1418,14 +1398,14 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				closeMutation()
 				continue
 			}
-			if mutation != nil && mutation.Protected || c.needsApproval(tc.Function.Name, tc.Function.Arguments) {
+			protected := mutation != nil && mutation.Protected
+			if (protected && c.Mode != approvalmode.FullAccess) || c.needsApproval(tc.Function.Name, tc.Function.Arguments) {
 				req := ApprovalRequest{ToolName: tc.Function.Name, Arguments: tc.Function.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID, TargetPath: inv.TargetPath}
-				c.emit(Event{Kind: EventApproval, Text: req.Prompt(), ToolName: req.ToolName, ToolArgs: req.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID})
-				ok, err := c.ask(ctx, req)
+				ok, approver, approvalNote, err := c.approve(ctx, req, reviewIntent, protected, &total)
 				// Audit every decision (approved, denied, or errored)
 				// to the session sidecar, for later review.
 				if c.Session != nil {
-					entry := tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "approval", Tool: tc.Function.Name, Args: truncate(tc.Function.Arguments, 500), ExitCode: -1}
+					entry := tools.AuditEntry{ToolCallID: tc.ID, InvocationID: inv.ID, TS: time.Now(), Kind: "approval", Tool: req.ToolName, Args: truncate(req.Arguments, 500), ExitCode: -1, Approver: approver, Reason: approvalNote}
 					if err != nil {
 						entry.Error = err.Error()
 					} else if ok {
@@ -1436,7 +1416,7 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 					_ = c.Session.Audit(entry)
 				}
 				if err != nil {
-					if c.budgetError() != nil {
+					if approver == "reviewer" || c.budgetError() != nil {
 						c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
 					}
 					c.LastTerminalReason = TerminalError
@@ -1450,8 +1430,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 				if !ok {
 					c.progressFailure(callKey, failureguard.PolicyDenied)
 					obs := "User denied this tool call. Do not retry it; explain and propose an alternative."
+					if approvalNote != "" {
+						obs = approvalNote + " Do not retry this tool call; explain and propose an alternative."
+					}
 					recordLastError(&c.progress.lastErrors, obs)
-					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: fmt.Errorf("tool call denied by user")})
+					c.emit(Event{Kind: EventToolEnd, ToolName: tc.Function.Name, ToolCallID: tc.ID, InvocationID: inv.ID, ToolOutput: obs, ToolErr: fmt.Errorf("tool call denied by %s", approver)})
 					msgs = append(msgs, llm.Message{Role: "tool", Kind: notExecutedKind, Content: obs, ToolCallID: tc.ID, InvocationID: inv.ID, ToolError: true})
 					if c.Session != nil {
 						c.persist(msgs[len(msgs)-1])
@@ -1481,6 +1464,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			if mutation != nil {
 				toolCtx = tools.WithMutation(toolCtx, mutation)
 			}
+			if bashDir != nil {
+				toolCtx = tools.WithBashDirectory(toolCtx, bashDir)
+			}
 			attempt := c.verificationStart(toolCtx, tc.Function.Name, argsJSON)
 			if attempt != nil {
 				attempt.invocationID, attempt.toolCallID = inv.ID, tc.ID
@@ -1500,6 +1486,9 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			switch tc.Function.Name {
 			case "ask_user":
 				res.Text, humanAnswer, err = c.askUser(ctx, argsJSON)
+				if humanAnswer != nil && c.Mode == approvalmode.ApproveForMe {
+					reviewIntent.Answers = append(reviewIntent.Answers, json.RawMessage(*humanAnswer))
+				}
 			case "bash":
 				if attempt != nil && attempt.foreground {
 					res, err = c.Exec.Dispatch(toolCtx, "bash", argsJSON)
@@ -1554,7 +1543,11 @@ func (c *Config) Run(ctx context.Context, history []llm.Message) (text string, r
 			}
 
 			if job == nil {
-				c.DoomLoop().Observe(callKey, obs)
+				guardKey := callKey
+				if guardArgs != argsJSON {
+					guardKey = CanonicalToolKey(tc.Function.Name, guardArgs)
+				}
+				c.DoomLoop().Observe(guardKey, obs)
 				if ctx.Err() == nil && c.budgetError() == nil {
 					if err != nil && res.Status != tools.ResultDeferred {
 						failures := c.progressFailure(callKey, failureKind(err, attempt != nil))

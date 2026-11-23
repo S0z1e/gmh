@@ -14,6 +14,7 @@ import (
 
 	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
+	"minimalharness/internal/approvalmode"
 	"minimalharness/internal/tui"
 	"minimalharness/internal/uimode"
 )
@@ -22,7 +23,7 @@ func main() {
 	var (
 		root           = flag.String("root", ".", "workspace root")
 		workspaceTrust = flag.String("workspace-trust", "", "save workspace trust: trust or untrust (default: saved decision)")
-		mode           = flag.String("mode", "", "suggest (ask in a y/n dialog) or auto (default config or suggest)")
+		mode           = flag.String("mode", "", approvalmode.Choices+" (default ask-for-approval; legacy: suggest or auto)")
 		model          = flag.String("model", "", "model id (default OPENAI_MODEL or config defaultModel)")
 		api            = flag.String("api", "", "chat/openai-completions, responses/openai-responses or anthropic/anthropic-messages (default OPENAI_API_MODE or config)")
 		provider       = flag.String("provider", "", "provider from the config file (default config defaultProvider)")
@@ -32,7 +33,7 @@ func main() {
 		rebindSession  = flag.Bool("rebind-session", false, "explicitly bind resumed or legacy history to this workspace")
 		sessionID      = flag.String("session", "", "session id (default: timestamp)")
 		ctxLimit       = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
-		deny           = flag.Bool("deny-instead-of-prompt", false, "refuse approvals without asking (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1)")
+		deny           = flag.Bool("deny-instead-of-prompt", false, "refuse tool calls that need approval (also env OPENAI_DENY_INSTEAD_OF_PROMPT=1)")
 		sandbox        = flag.Bool("sandbox", false, "run bash calls under bwrap (bubblewrap): the workspace is the only writable directory (also env HARNESS_SANDBOX=1 or config sandbox)")
 		bashTO         = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
 		bgThresh       = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
@@ -115,13 +116,10 @@ func main() {
 	a.Cfg.OnEvent = func(ev agent.Event) {
 		prog.Send(tui.EventMsg{Event: ev})
 	}
-	// In suggest mode, approvals go through the TUI dialog: the agent
-	// blocks on a reply channel, the model answers it from a y/n key.
-	if a.Cfg.Mode == "suggest" {
-		approver := tui.NewApprover(prog)
-		a.Cfg.Ask = approver.Ask
-		a.Cfg.ConfirmContinuation = approver.ConfirmContinuation
-	}
+	// Keep the dialog available when /permissions changes the approval mode.
+	approver := tui.NewApprover(prog)
+	a.Cfg.Ask = approver.Ask
+	a.Cfg.ConfirmContinuation = approver.ConfirmContinuation
 
 	// Runner output goes through the program's message queue (PrintMsg),
 	// not prog.Println: direct prints race the model's own tea.Println
@@ -145,7 +143,7 @@ func main() {
 			// Session totals for the meta line's right side, plus
 			// the current model/api so a /model switch shows up,
 			// and the tool mode so a /plan switch shows its chip.
-			prog.Send(tui.MetaUpdateMsg{UsageIncomplete: !runner.SessionMetering.TokenCountsComplete(), UsageUnavailable: !runner.MeteringAvailable, Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns, Model: a.Model.ID, API: a.Cfg.Client.API, ToolMode: string(a.ToolMode())})
+			prog.Send(tui.MetaUpdateMsg{UsageIncomplete: !runner.SessionMetering.TokenCountsComplete(), UsageUnavailable: !runner.MeteringAvailable, Tokens: runner.SessionUsage.TotalTokens, Turns: runner.Turns, Model: a.Model.ID, API: a.Cfg.Client.API, ToolMode: string(a.ToolMode()), ApprovalMode: a.Cfg.Mode})
 			if quit {
 				prog.Quit()
 				return

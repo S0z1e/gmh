@@ -1,7 +1,7 @@
 # Layout
 
 ```
-cmd/harness/main.go      // CLI: -p print mode, REPL, --resume, -mode suggest/auto
+cmd/harness/main.go      // CLI: -p print mode, REPL, --resume, approval mode
 internal/llm/client.go   // OpenAI-compatible client, streaming, tool-call accumulation
 internal/llm/image.go    // Image type + wire parts for chat/anthropic/responses
 internal/tools/image.go  // LoadImage: workspace jail, type/size caps, dimensions

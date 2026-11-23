@@ -3,9 +3,14 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 
+	"minimalharness/internal/input"
 	"minimalharness/internal/tools"
 )
+
+var defaultPromptInput = input.New(os.Stdin)
 
 // ApprovalRequest carries the exact invocation the user is approving. Renderers
 // may paginate it, but must not recover arguments from a truncated preview.
@@ -28,4 +33,21 @@ func (r ApprovalRequest) Prompt() string {
 		prompt += "\nResolved file target: " + r.TargetPath
 	}
 	return prompt
+}
+
+func (c *Config) ask(ctx context.Context, req ApprovalRequest) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	req.Context = ctx
+	if c.Ask != nil {
+		return c.Ask(req)
+	}
+	fmt.Printf("%s [y/N] ", req.Prompt())
+	line, err := defaultPromptInput.Read(ctx)
+	if err != nil {
+		return false, err
+	}
+	ans := strings.ToLower(strings.TrimSpace(line))
+	return ans == "y" || ans == "yes", nil
 }

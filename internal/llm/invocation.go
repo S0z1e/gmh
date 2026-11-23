@@ -16,6 +16,6 @@ type ToolInvocation struct {
 }
 
 type ArgumentRewrite struct {
-	Source    string `json:"source"` // plugin_hook or continuation
+	Source    string `json:"source"` // plugin_hook, continuation, verification_cwd or approval_cwd
 	Arguments string `json:"arguments"`
 }
