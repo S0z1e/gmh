@@ -73,6 +73,16 @@ func (c *Config) budgetRequest() error {
 	return nil
 }
 
+// canRequestForSteering checks whether a follow-up can reach the model. A
+// failed check leaves the queued prompt and the original turn outcome intact.
+func (c *Config) canRequestForSteering() bool {
+	r := c.resources
+	if r == nil {
+		return true
+	}
+	return r.failure == nil && (r.tracker == nil || r.tracker.CheckRequest(time.Now()) == nil)
+}
+
 func (c *Config) recordBudgetUsage(usage *llm.Usage, started time.Time, tokensComplete, priceCountsComplete bool) {
 	r := c.resources
 	if r == nil || r.tracker == nil {

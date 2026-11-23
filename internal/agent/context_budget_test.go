@@ -75,13 +75,19 @@ func TestContextBudgetIncludesNewResults(t *testing.T) {
 	}
 }
 
-func TestAutomaticCompactionRetainsCurrentTurnSnapshot(t *testing.T) {
+func TestAutomaticCompactionRetainsCurrentTurnSnapshotAndSteering(t *testing.T) {
 	task := llm.Message{Role: "user", Kind: "task", Content: "current task"}
 	snapshot := llm.Message{Role: "user", Kind: "turn_context", Content: "current plugin state"}
-	msgs := []llm.Message{{Role: "user", Kind: "task", Content: "old task"}, {Role: "user", Kind: "turn_context", Content: "old state"}, task, snapshot}
+	update := llm.Message{Role: "user", Kind: "steering", Content: "current follow-up"}
+	msgs := []llm.Message{
+		{Role: "user", Kind: "task", Content: "old task"},
+		{Role: "user", Kind: "turn_context", Content: "old state"},
+		{Role: "user", Kind: "steering", Content: "old follow-up"},
+		task, snapshot, update,
+	}
 	cfg := &Config{CompactHistory: func(context.Context, []llm.Message) (string, llm.Usage, error) { return "summary", llm.Usage{}, nil }}
 	out, _, err := cfg.compactInLoop(context.Background(), msgs, nil)
-	if err != nil || len(out) != 5 || out[0].Kind != "checkpoint" || out[1].Content != task.Content || out[3].Kind != "checkpoint" || out[4].Kind != "turn_context" || out[4].Content != snapshot.Content {
+	if err != nil || len(out) != 6 || out[0].Kind != "checkpoint" || out[1].Content != task.Content || out[3].Kind != "checkpoint" || out[4].Kind != "turn_context" || out[4].Content != snapshot.Content || out[5].Kind != "steering" || out[5].Content != update.Content {
 		t.Fatalf("compacted=%+v err=%v", out, err)
 	}
 }

@@ -14,7 +14,7 @@ import (
 
 func TestConcurrentQueriesUsePublishedState(t *testing.T) {
 	a, runner, _ := setupTestApp(t, "auto", []fakeStep{{kind: "text", text: "ok"}})
-	s := &Server{app: a, runner: runner, out: io.Discard, work: make(chan workItem, 1)}
+	s := &Server{app: a, runner: runner, out: io.Discard}
 	s.refreshState()
 	done := make(chan struct{})
 	go func() {
