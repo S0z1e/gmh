@@ -852,6 +852,158 @@ func TestAttachImage(t *testing.T) {
 	d.quit(t)
 }
 
+func TestAttachFileSendsSavedText(t *testing.T) {
+	steps := []fakeStep{{kind: "text", text: "Done."}}
+	a, runner, root := setupTestApp(t, "auto", steps)
+	a.Cfg.Exec.ImageInput = false
+	type message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	requests := make(chan []message, 1)
+	reply := fakeHandler(t, steps)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+		}
+		select {
+		case requests <- req.Messages:
+		default:
+			t.Error("unexpected extra provider request")
+		}
+		reply(w, r)
+	}))
+	defer provider.Close()
+	a.Cfg.Client.BaseURL = provider.URL + "/v1"
+	const snapshot = "ERROR: 連線失敗\r\nretrying\n"
+	logPath := filepath.Join(root, "server log.log")
+	if err := os.WriteFile(logPath, []byte(snapshot), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	d.send(map[string]any{"id": "empty", "type": "attach_file"})
+	if resp := d.waitFor("error", 5*time.Second); resp["id"] != "empty" {
+		t.Fatalf("empty path response = %v", resp)
+	}
+	d.send(map[string]any{"id": "missing", "type": "attach_file", "path": "missing.log"})
+	if resp := d.waitFor("error", 5*time.Second); resp["id"] != "missing" {
+		t.Fatalf("missing file response = %v", resp)
+	}
+	d.send(map[string]any{"id": "file", "type": "attach_file", "path": "server log.log"})
+	resp := d.waitForResponse("file", 5*time.Second)
+	data := resp["data"].(map[string]any)
+	if data["attached"] != true || data["media_type"] != "text/plain" || data["path"] != "server log.log" || data["bytes"] != float64(len(snapshot)) || data["content"] != nil {
+		t.Fatalf("attach response = %v", resp)
+	}
+	d.send(map[string]any{"id": "slash", "type": "prompt", "message": "/attach t.txt"})
+	if resp := d.waitForResponse("slash", 5*time.Second); resp["data"].(map[string]any)["attached"] != true {
+		t.Fatalf("slash response = %v", resp)
+	}
+	d.send(map[string]any{"id": "list", "type": "prompt", "message": "/attach"})
+	listed := d.waitForResponse("list", 5*time.Second)["data"].(map[string]any)["files"].([]any)
+	if len(listed) != 2 {
+		t.Fatalf("pending files = %v, want two", listed)
+	}
+	first := listed[0].(map[string]any)
+	second := listed[1].(map[string]any)
+	if first["path"] != "server log.log" || first["bytes"] != float64(len(snapshot)) || first["content"] != nil || second["path"] != "t.txt" {
+		t.Fatalf("pending file metadata = %v", listed)
+	}
+	if err := os.Remove(logPath); err != nil {
+		t.Fatal(err)
+	}
+	const task = "Explain the error"
+	d.send(map[string]any{"id": "task", "type": "prompt", "message": task})
+	d.waitForResponse("task", 5*time.Second)
+	if settled := d.waitFor("agent_settled", 10*time.Second); settled["error"] != nil {
+		t.Fatalf("turn failed: %v", settled)
+	}
+	d.send(map[string]any{"id": "list-after", "type": "list_pending_files"})
+	if files, ok := d.waitForResponse("list-after", 5*time.Second)["data"].(map[string]any)["files"].([]any); !ok || len(files) != 0 {
+		t.Fatalf("pending files after turn = %v, want an empty list", files)
+	}
+	d.quit(t)
+	select {
+	case sent := <-requests:
+		var found bool
+		for _, msg := range sent {
+			found = found || msg.Role == "user" && strings.HasPrefix(msg.Content, task) && strings.Contains(msg.Content, snapshot) && strings.Contains(msg.Content, "theta\n")
+		}
+		if !found {
+			t.Fatalf("provider requests did not include both snapshots on the task: %v", sent)
+		}
+	default:
+		t.Fatal("provider did not receive a request")
+	}
+	if len(a.PendingFiles) != 0 {
+		t.Fatal("attachments should clear after the turn")
+	}
+	history, err := session.Load(a.Store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range history {
+		if msg.Kind == "task" && msg.Content == task && len(msg.Files) == 2 && msg.Files[0].Content == snapshot {
+			return
+		}
+	}
+	t.Fatalf("saved history has no task with the attached snapshot: %+v", history)
+}
+
+func TestAttachFileChecksModelBudgetBeforeQueueAndTurn(t *testing.T) {
+	t.Setenv("OPENAI_CONTEXT_LIMIT", "")
+	t.Setenv("ANTHROPIC_MAX_TOKENS", "")
+	a, runner, root := setupTestApp(t, "auto", []fakeStep{{kind: "text", text: "Done."}})
+	smallContext := 32768
+	a.Config.Providers["mock"].Models[1].ContextWindow = &smallContext
+	if err := os.WriteFile(filepath.Join(root, "large.log"), []byte(strings.Repeat("log entry\n", 6553)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	setModel := func(id, model string) {
+		d.send(map[string]any{"id": id, "type": "set_model", "model": model})
+		d.waitForResponse(id, 5*time.Second)
+	}
+	attach := func(id string) {
+		d.send(map[string]any{"id": id, "type": "attach_file", "path": "large.log"})
+	}
+	setModel("small", "mock2")
+	attach("too-large")
+	if res := d.waitFor("error", 5*time.Second); res["id"] != "too-large" || !strings.Contains(fmt.Sprint(res["error"]), "model's input budget") {
+		t.Fatalf("attachment rejection = %v", res)
+	}
+	setModel("large", "mock")
+	attach("fits")
+	d.waitForResponse("fits", 5*time.Second)
+	setModel("small-again", "mock2")
+	d.send(map[string]any{"id": "recheck", "type": "prompt", "message": "Summarize the log"})
+	d.waitForResponse("recheck", 5*time.Second)
+	if settled := d.waitFor("agent_settled", 10*time.Second); !strings.Contains(fmt.Sprint(settled["error"]), "text attachments and task exceed") {
+		t.Fatalf("expected budget rejection after switching models: %v", settled)
+	}
+	d.send(map[string]any{"id": "history", "type": "history"})
+	if history := d.waitForResponse("history", 5*time.Second)["data"].(map[string]any)["messages"].([]any); len(history) != 0 {
+		t.Fatalf("failed task entered history with %d messages", len(history))
+	}
+	d.send(map[string]any{"id": "pending", "type": "list_pending_files"})
+	if files := d.waitForResponse("pending", 5*time.Second)["data"].(map[string]any)["files"].([]any); len(files) != 1 {
+		t.Fatalf("expected successful attachment to remain queued: %v", files)
+	}
+	setModel("large-again", "mock")
+	d.send(map[string]any{"id": "retry", "type": "prompt", "message": "Summarize the log"})
+	d.waitForResponse("retry", 5*time.Second)
+	if settled := d.waitFor("agent_settled", 10*time.Second); settled["error"] != nil {
+		t.Fatalf("retry with larger context failed: %v", settled)
+	}
+	d.quit(t)
+}
+
 // set_model switches the model mid-session: the response names the
 // new provider/model/api, get_state shows it at once, the "/model"
 // slash form works the same, and a turn still runs afterwards.

@@ -38,8 +38,10 @@ func main() {
 		bashTO         = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
 		bgThresh       = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
 		images         stringList
+		files          stringList
 	)
 	flag.Var(&images, "image", "attach an image file to the first turn (repeatable; png, jpg, gif, webp; the model must declare image input)")
+	flag.Var(&files, "attach", "attach a UTF-8 text file to the first turn (repeatable)")
 	flag.Parse()
 
 	// The TUI needs a real terminal. When stdout is piped, say so
@@ -66,6 +68,7 @@ func main() {
 		BashTimeoutSeconds:         *bashTO,
 		BackgroundThresholdSeconds: *bgThresh,
 		Images:                     images,
+		Files:                      files,
 	})
 	if err != nil {
 		fatal(err)
@@ -187,7 +190,7 @@ func fatal(err error) {
 	os.Exit(1)
 }
 
-// stringList is a repeatable -image flag: each occurrence appends one path.
+// stringList appends one path per occurrence of a repeatable flag.
 type stringList []string
 
 func (s *stringList) String() string { return strings.Join(*s, ",") }

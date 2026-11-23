@@ -105,6 +105,7 @@ Full details, including what is *not* promised, are in
 | [safety](docs/safety.md) | Approval modes and tool restrictions |
 | [background-bash](docs/background-bash.md) | Long bash calls as background jobs |
 | [images](docs/images.md) | Sending images to a model that accepts them |
+| [file attachments](docs/attachments.md) | Attach logs and other UTF-8 text files to a turn |
 | [plugins](docs/plugins.md) | JavaScript plugins: tools, commands, hooks, plan mode |
 | [architecture](docs/architecture.md) | Source layout |
 | [rpc](docs/rpc.md) | `--rpc`: JSONL over stdio for a GUI |

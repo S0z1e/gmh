@@ -65,6 +65,32 @@ func Open(base, path string) (*os.File, error) {
 	return f, nil
 }
 
+// OpenRegular opens an explicitly chosen regular file, following symlinks.
+// Use Open instead for paths that must stay inside a workspace.
+func OpenRegular(path string) (*os.File, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("attachment requires a regular file: %q", path)
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|nonblockingRead, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err = f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("attachment requires a regular file: %q", path)
+	}
+	return f, nil
+}
+
 func ReadFile(base, path string) ([]byte, error) {
 	r, rel, err := Root(base, path)
 	if err != nil {

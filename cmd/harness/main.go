@@ -45,12 +45,14 @@ func main() {
 		bgThresh       = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
 		rpcMode        = flag.Bool("rpc", false, "RPC mode: JSONL over stdin/stdout for a GUI (see README); stdout carries protocol data only")
 		images         stringList
+		files          stringList
 	)
 	flag.Var(&images, "image", "attach an image file to the first turn (repeatable; png, jpg, gif, webp; the model must declare image input)")
+	flag.Var(&files, "attach", "attach a UTF-8 text file to the first turn (repeatable)")
 	flag.Parse()
 	if *viewSessionID != "" {
-		if *rpcMode || *printMode != "" || *resume != "" || *sessionID != "" || *rebindSession {
-			fatal(fmt.Errorf("--view-session conflicts with --rpc, -p, --resume and --session"))
+		if *rpcMode || *printMode != "" || *resume != "" || *sessionID != "" || *rebindSession || len(files) > 0 {
+			fatal(fmt.Errorf("--view-session conflicts with --rpc, -p, --resume, --session and -attach"))
 		}
 		if err := viewSession(os.Stdout, *viewSessionID); err != nil {
 			fatal(err)
@@ -72,7 +74,7 @@ func main() {
 			fatal(err)
 		}
 		if uiMode == "tui" {
-			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *sandbox, images, *workspaceTrust, *rebindSession); err != nil {
+			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *sandbox, images, files, *workspaceTrust, *rebindSession); err != nil {
 				fmt.Fprintf(os.Stderr, "harness: TUI unavailable (%v); continuing in plain mode.\n", err)
 			} else {
 				return // Windows waits for the child rather than replacing this process.
@@ -102,6 +104,7 @@ func main() {
 		BackgroundThresholdSeconds: *bgThresh,
 		DisableBackground:          *printMode != "",
 		Images:                     images,
+		Files:                      files,
 	})
 	if err != nil {
 		fatal(err)
@@ -193,7 +196,7 @@ func main() {
 	}
 
 	// REPL
-	fmt.Println("Type a task, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /permissions [mode] to view or change approval mode, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /prune-artifacts to remove unreferenced images older than seven days, /clear to drop context, /compact to summarise context, /rollback [N] to drop the last N turns, or /quit to exit.")
+	fmt.Println("Type a task, /attach <path> to attach a text file, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /permissions [mode] to view or change approval mode, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /prune-artifacts to remove unreferenced images older than seven days, /clear to drop context, /compact to summarise context, /rollback [N] to drop the last N turns, or /quit to exit.")
 	scanner := input.New(os.Stdin)
 	defer scanner.Close()
 	// The approval prompt shares the REPL's scanner: the scanner
@@ -315,15 +318,15 @@ func askQuestionFromScanner(scanner *input.Lines) func(agent.QuestionRequest) (a
 
 // execTUI replaces this process with the sibling harness-tui binary,
 // passing the same flags through. Windows waits for that process to finish.
-func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images []string, workspaceTrust string, rebindSession bool) error {
+func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images, files []string, workspaceTrust string, rebindSession bool) error {
 	sibling, err := tuiSibling()
 	if err != nil {
 		return err
 	}
-	return runTUIProcess(sibling, tuiArgs(sibling, root, mode, model, api, provider, config, maxSteps, resume, sessionID, ctxLimit, deny, bashTO, bgThresh, sandbox, images, workspaceTrust, rebindSession))
+	return runTUIProcess(sibling, tuiArgs(sibling, root, mode, model, api, provider, config, maxSteps, resume, sessionID, ctxLimit, deny, bashTO, bgThresh, sandbox, images, files, workspaceTrust, rebindSession))
 }
 
-func tuiArgs(sibling, root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images []string, workspaceTrust string, rebindSession bool) []string {
+func tuiArgs(sibling, root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images, files []string, workspaceTrust string, rebindSession bool) []string {
 	args := []string{
 		sibling,
 		"-root", root,
@@ -346,10 +349,13 @@ func tuiArgs(sibling, root, mode, model, api, provider, config string, maxSteps 
 	for _, img := range images {
 		args = append(args, "-image", img)
 	}
+	for _, path := range files {
+		args = append(args, "-attach", path)
+	}
 	return args
 }
 
-// stringList is a repeatable -image flag: each occurrence appends one path.
+// stringList appends one path per occurrence of a repeatable flag.
 type stringList []string
 
 func (s *stringList) String() string { return strings.Join(*s, ",") }

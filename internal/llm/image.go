@@ -40,9 +40,8 @@ func (img Image) Describe() string {
 
 // --- Chat Completions wire shape ---
 //
-// A message with images sends content as parts (text + image_url);
-// without images the content stays a plain string, exactly as
-// before, so existing requests are byte-identical.
+// A message with images sends content as parts (text + image_url).
+// Without images, use a plain string for compatibility with chat providers.
 
 type chatWireMessage struct {
 	Role       string     `json:"role"`
@@ -55,11 +54,27 @@ type chatWireMessage struct {
 // reporting unavailable images as text instead of empty image parts.
 func toChatWireMessage(m Message) chatWireMessage {
 	if len(m.Images) == 0 {
-		return chatWireMessage{Role: m.Role, Content: m.Content, ToolCalls: m.ToolCalls, ToolCallID: m.ToolCallID}
+		content := m.Content
+		if m.Role == "user" && len(m.Files) > 0 {
+			var texts []string
+			if content != "" {
+				texts = append(texts, content)
+			}
+			for _, file := range m.Files {
+				texts = append(texts, file.PromptText())
+			}
+			content = strings.Join(texts, "\n\n")
+		}
+		return chatWireMessage{Role: m.Role, Content: content, ToolCalls: m.ToolCalls, ToolCallID: m.ToolCallID}
 	}
 	var parts []any
 	if m.Content != "" {
 		parts = append(parts, map[string]any{"type": "text", "text": m.Content})
+	}
+	if m.Role == "user" {
+		for _, f := range m.Files {
+			parts = append(parts, map[string]any{"type": "text", "text": f.PromptText()})
+		}
 	}
 	for _, img := range m.Images {
 		if img.Data == "" {
@@ -95,8 +110,7 @@ func unavailableImageText(m Message) string {
 	return strings.Join(parts, "\n")
 }
 
-// toChatWireMessages converts a whole history. Messages without
-// images keep their plain-string content.
+// toChatWireMessages converts a whole history.
 func toChatWireMessages(messages []Message) []chatWireMessage {
 	out := make([]chatWireMessage, 0, len(messages))
 	for _, m := range messages {

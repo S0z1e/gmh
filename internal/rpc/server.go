@@ -275,7 +275,7 @@ func (s *Server) handleLine(line string) {
 		s.handlePrompt(req)
 	case "clear_queue":
 		s.handleClearQueue(req)
-	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "set_model", "rename_session", "resume_session", "delete_session", "set_tool_mode", "set_approval_mode", "rollback", "prune_artifacts", "command":
+	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "attach_file", "list_pending_files", "set_model", "rename_session", "resume_session", "delete_session", "set_tool_mode", "set_approval_mode", "rollback", "prune_artifacts", "command":
 		s.enqueue(req, workControl)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown request type %q", req.Type))
@@ -295,7 +295,7 @@ func (s *Server) handlePrompt(req Request) {
 	}
 	if typ, arg := slashRequest(req.Message); typ != "" {
 		ctrl := Request{ID: req.ID, Type: typ, Name: arg}
-		if typ == "attach_image" {
+		if typ == "attach_image" || typ == "attach_file" {
 			ctrl = Request{ID: req.ID, Type: typ, Path: arg}
 		}
 		if typ == "set_model" {
@@ -381,6 +381,10 @@ func slashRequest(line string) (typ, arg string) {
 		return "skill", strings.TrimPrefix(line, "/skill:")
 	case line == "/image" || strings.HasPrefix(line, "/image "):
 		return "attach_image", strings.TrimSpace(strings.TrimPrefix(line, "/image"))
+	case line == "/attach":
+		return "list_pending_files", ""
+	case strings.HasPrefix(line, "/attach "):
+		return "attach_file", strings.TrimSpace(strings.TrimPrefix(line, "/attach"))
 	case line == "/model" || strings.HasPrefix(line, "/model "):
 		return "set_model", strings.TrimSpace(strings.TrimPrefix(line, "/model"))
 	case line == "/permissions":
@@ -1130,6 +1134,10 @@ func (s *Server) runTurn(req Request) {
 	s.turnMu.Unlock()
 }
 
+func textAttachmentMetadata(file llm.TextAttachment) map[string]any {
+	return map[string]any{"path": file.Path, "media_type": "text/plain", "bytes": len(file.Content)}
+}
+
 // doControl runs one control request on the agent goroutine.
 func (s *Server) doControl(req Request) {
 	s.turnMu.Lock()
@@ -1204,6 +1212,21 @@ func (s *Server) doControl(req Request) {
 			"attached": true, "path": img.Path, "media_type": img.MediaType,
 			"bytes": img.Bytes, "width": img.Width, "height": img.Height,
 		}, nil)
+	case "attach_file":
+		file, err := s.app.AttachFile(req.Path)
+		if err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		data := textAttachmentMetadata(file)
+		data["attached"] = true
+		s.respond(req, data, nil)
+	case "list_pending_files":
+		files := make([]map[string]any, 0, len(s.app.PendingFiles))
+		for _, file := range s.app.PendingFiles {
+			files = append(files, textAttachmentMetadata(file))
+		}
+		s.respond(req, map[string]any{"files": files}, nil)
 	case "set_model":
 		provName, modelID, api, err := s.app.SwitchModel(req.Provider, req.Model)
 		if err != nil {

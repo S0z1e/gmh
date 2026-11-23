@@ -36,7 +36,7 @@ echoed in the response):
   `agent_settled`. A second prompt while a turn runs is queued (cap
   64; beyond that an error). A known slash line (`/usage`, `/jobs`,
   `/clear`, `/compact`, `/skill:<name>`, `/sessions`, `/resume <id>`,
-  `/rename <old> <new>`, `/plugins`, `/quit`) behaves as the
+  `/rename <old> <new>`, `/plugins`, `/attach [path]`, `/quit`) behaves as the
   matching control request, exactly like the REPL; any other line,
   including an unknown `/foo`, is a task for the model.
 - `approval_response` `{"approval_id":"appr-1","approved":true}` →
@@ -89,6 +89,8 @@ echoed in the response):
 - `rollback` `{"count":N}` → `{"rolled_back":N,"dropped":M,"messages":K,"archive":"..."}`. Drops the last N turns (default 1) from the session — Codex's `thread/rollback`, the GUI's undo. A turn is one user task plus its replies; the pre-rollback transcript is archived first (like compaction), then the session file is rewritten to the kept prefix. Rolling back more turns than exist drops everything; rolling back an empty session is an error. Session usage totals are not rewound.
 - `skill` `{"name":"..."}` → `{"loaded":true,"bytes":N}`.
 - `attach_image` `{"path":"..."}` → `{"attached":true,"path":"...","media_type":"...","bytes":N,"width":W,"height":H}`. Queues the image for the next turn, like `/image` in the REPL (same caps, same model-input check).
+- `attach_file` `{"path":"server.log"}` → `{"attached":true,"path":"server.log","media_type":"text/plain","bytes":N}`. Snapshots a [UTF-8 text file](attachments.md) for the next turn. Relative paths resolve against the workspace. Up to ten files totaling 64 KiB can be queued per turn, subject to the model's input budget.
+- `list_pending_files` → `{"files":[{"path":"server.log","media_type":"text/plain","bytes":N}]}`. Lists queued text attachments in order, like `/attach` without a path.
 - `set_model` `{"provider":"...","model":"..."}` (either may be omitted: no provider keeps the current one, no model takes the provider default; a bare `model` searches the current provider first, then the rest) → `{"provider":"...","model":"...","api":"..."}`. Same switch as `/model` in the REPL; `get_state` reports the new model and api at once.
 - `list_sessions` → `{"sessions":[{"id":"...","messages":N,"modified":"...","preview":"...","current":true}]}` (newest first; audit sidecars and pre-compact archives are not sessions).
 - `list_plugins` → `{"plugins":[{"name":"...","version":"...","description":"...","tools":["..."],"state":"loaded"|"disabled"|"skipped","error":"..."}]}` (directory order; `error` only for a skipped plugin, with the load failure as the reason; a disabled plugin's tools list is empty).
@@ -96,8 +98,9 @@ echoed in the response):
 - `list_skills` → `{"skills":[{"name":"...","description":"..."}]}` (the discovered skills, the same listing the system prompt carries).
 - `history` → `{"session":"<id>","messages":[...]}`. The session
   transcript in the session-file JSON shape (`role`/`content`/
-  `tool_calls`/`tool_call_id`/`images`; image bytes are never in it,
-  only path/media type/dimensions). Defaults to the current session;
+  `tool_calls`/`tool_call_id`/`images`/`files`). The `files` list on a task
+  contains `{ "path": "...", "content": "..." }` snapshots of attached text
+  files. Image entries contain metadata and a digest. Defaults to the current session;
   `{"session":"<id>"}` fetches another session's transcript (an
   unknown id is an error). The full history, no truncation — the GUI
   asked for it, subject to the output frame limit. After a `/clear` or a compact the active view only holds

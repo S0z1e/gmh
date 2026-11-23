@@ -40,7 +40,7 @@ func (p *Plugin) nativeGetSession(_ *moejs.Realm, _ moejs.Value, _ []moejs.Value
 // the leading "/"): a plugin may not register one, or the user's
 // "/model" would stop switching models.
 var builtinCommands = map[string]bool{
-	"image": true, "sessions": true, "plugins": true, "resume": true,
+	"attach": true, "image": true, "sessions": true, "plugins": true, "resume": true,
 	"rename": true, "model": true, "quit": true, "exit": true,
 	"usage": true, "jobs": true, "clear": true, "compact": true,
 	"skill": true,

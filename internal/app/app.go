@@ -69,6 +69,8 @@ type Params struct {
 	// repeatable). They are loaded in Setup and fail the run when a
 	// file is missing, too big, or the model has no image input.
 	Images []string
+	// Files are UTF-8 text files attached to the first turn (-attach flag).
+	Files []string
 }
 
 type App struct {
@@ -100,6 +102,7 @@ type App struct {
 	// message and clears the list; the images then live in history
 	// and are resent on later calls, like any message.
 	PendingImages []llm.Image
+	PendingFiles  []llm.TextAttachment
 	// Plugins is the loaded plugin registry (nil = none loaded).
 	// Kept so later commands can list plugins; the executor holds
 	// the same registry for dispatch.
@@ -452,6 +455,12 @@ func Setup(p Params) (*App, error) {
 			return nil, fmt.Errorf("-image %s: %w", p, err)
 		}
 	}
+	for _, path := range p.Files {
+		if _, err := a.AttachFile(path); err != nil {
+			store.Close()
+			return nil, fmt.Errorf("-attach %q: %w", path, err)
+		}
+	}
 	setupComplete = true
 	return a, nil
 }
@@ -743,6 +752,7 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 	a.Store = store
 	a.History = nil
 	a.PendingImages = nil
+	a.PendingFiles = nil
 	a.resetToolMode()
 	if a.Cfg != nil {
 		a.Cfg.Session = store
@@ -815,6 +825,7 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	a.hydrateImages(history)
 	a.History = history
 	a.PendingImages = nil
+	a.PendingFiles = nil
 	a.ResumedMessage = fmt.Sprintf("Resumed session %s (%d messages).", id, len(history))
 	a.resetToolMode()
 	if a.Cfg != nil {
@@ -989,6 +1000,10 @@ func (r *Runner) RunCommand(ctx context.Context, name, args string) (string, err
 func (r *Runner) Handle(ctx context.Context, line string) bool {
 	line = strings.TrimSpace(line)
 	if line == "" {
+		return false
+	}
+	if line == "/attach" || strings.HasPrefix(line, "/attach ") {
+		r.handleAttach(strings.TrimSpace(strings.TrimPrefix(line, "/attach")))
 		return false
 	}
 	if line == "/image" || strings.HasPrefix(line, "/image ") {
@@ -1312,20 +1327,23 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		r.Print("Unknown skill: %s", name)
 		return
 	}
-	userMsg := llm.Message{Role: "user", Content: task, Kind: "task"}
-	// Images attached for this turn (-image, /image, RPC) ride on
-	// the task message itself, then clear: they live in history
-	// from here and are resent on later calls like any message.
-	if len(r.App.PendingImages) > 0 {
-		userMsg.Images = r.App.PendingImages
-		r.App.PendingImages = nil
+	userMsg := llm.Message{
+		Role: "user", Kind: "task", Content: task,
+		Images: r.App.PendingImages, Files: r.App.PendingFiles,
 	}
-	r.App.History = append(r.App.History, userMsg)
+	if err := r.App.checkAttachmentContext(userMsg); err != nil {
+		r.LastErr = err
+		r.Print("[error] %v", err)
+		return
+	}
 	if err := r.App.Store.Append(userMsg); err != nil {
 		r.LastErr = fmt.Errorf("save session: %w", err)
 		r.Print("[error] %v", r.LastErr)
 		return
 	}
+	r.App.PendingImages = nil
+	r.App.PendingFiles = nil
+	r.App.History = append(r.App.History, userMsg)
 	r.Turns++
 	// Context hooks retain their explicit, transient rewrite semantics.
 	// The harness snapshot is appended afterwards, so mode and plugin state
@@ -1340,14 +1358,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	}
 	// Hooks may switch the tool mode. Capture both the final mode and its
 	// queued reminder only after all before-agent-start hooks have finished.
-	parts := []string{fmt.Sprintf("[harness turn context]\nState at the start of this user task. Tool mode: %s. Earlier snapshots are historical. Later tool results and conversation summaries may update this state.", r.App.ToolMode())}
-	if r.App.pendingReminder != "" {
-		parts = append(parts, r.App.pendingReminder)
-	}
-	if contrib != "" {
-		parts = append(parts, contrib)
-	}
-	turnContext := llm.Message{Role: "user", Kind: "turn_context", Content: strings.Join(parts, "\n")}
+	turnContext := r.App.turnContext(contrib)
 	if err := r.App.Store.Append(turnContext); err != nil {
 		r.LastErr = fmt.Errorf("save turn context: %w", err)
 		r.Print("[error] %v", r.LastErr)
@@ -1394,6 +1405,17 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 		return
 	}
 	r.Print("\n%s\n[usage] session: %s | %s", turnLine, r.sessionUsageLine(), r.sessionCostLine())
+}
+
+func (a *App) turnContext(contrib string) llm.Message {
+	parts := []string{fmt.Sprintf("[harness turn context]\nState at the start of this user task. Tool mode: %s. Earlier snapshots are historical. Later tool results and conversation summaries may update this state.", a.ToolMode())}
+	if a.pendingReminder != "" {
+		parts = append(parts, a.pendingReminder)
+	}
+	if contrib != "" {
+		parts = append(parts, contrib)
+	}
+	return llm.Message{Role: "user", Kind: "turn_context", Content: strings.Join(parts, "\n")}
 }
 
 // Rollback drops the last n turns from the session — Codex's

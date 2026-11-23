@@ -25,7 +25,7 @@ type Request struct {
 	ID       string `json:"id,omitempty"`
 	// Type is one of: prompt, approval_response, continuation_response,
 	// question_response, abort, clear_queue, get_state, new_session,
-	// clear, compact, usage, jobs, skill, quit, attach_image,
+	// clear, compact, usage, jobs, skill, quit, attach_image, attach_file, list_pending_files,
 	// set_model, list_sessions, rename_session, resume_session,
 	// delete_session, set_tool_mode, set_approval_mode, rollback, list_plugins,
 	// list_models, list_skills, history, command.
@@ -36,7 +36,7 @@ type Request struct {
 	// Name is the skill name for skill, and the command name for
 	// command (without the leading "/").
 	Name string `json:"name,omitempty"`
-	// Path is the image file for attach_image.
+	// Path is the user-selected file for attach_image or attach_file.
 	Path string `json:"path,omitempty"`
 	// Model and Provider select a model for set_model: "provider/model"
 	// arrives split (see slashRequest); a bare model id searches the
