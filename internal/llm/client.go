@@ -49,7 +49,8 @@ type Message struct {
 	// Images are attached images (user messages only). The session
 	// file stores their path and media type, never the bytes; the
 	// bytes are re-read from disk on --resume.
-	Images []Image `json:"images,omitempty"`
+	Images []Image          `json:"images,omitempty"`
+	Files  []TextAttachment `json:"files,omitempty"`
 	// AnthropicContent preserves provider blocks and signatures for exact replay.
 	AnthropicContent []AnthropicContentBlock `json:"anthropic_content,omitempty"`
 }
@@ -807,6 +808,9 @@ func toResponsesInput(messages []Message) (string, []any) {
 				parts = append(parts, map[string]any{
 					"type": "input_text", "text": m.Content,
 				})
+			}
+			for _, f := range m.Files {
+				parts = append(parts, map[string]any{"type": "input_text", "text": f.PromptText()})
 			}
 			if text := unavailableImageText(m); text != "" {
 				parts = append(parts, map[string]any{"type": "input_text", "text": text})

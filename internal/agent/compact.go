@@ -166,6 +166,14 @@ func summaryEntry(m llm.Message, limit int, preserveText bool) (string, error) {
 		}
 		fmt.Fprintf(&b, "[image reference] %s sha256=%s media=%s\n", truncateForSummary(img.Path, 256), truncateForSummary(img.Digest, 64), truncateForSummary(img.MediaType, 64))
 	}
+	for _, file := range m.Files {
+		remaining := limit - b.Len()
+		if remaining < 128 {
+			break
+		}
+		b.WriteString(truncateForSummary(file.PromptText(), min(2048, remaining-1)))
+		b.WriteByte('\n')
+	}
 	if preserveText && m.Role != "tool" && b.Len() > limit {
 		return "", fmt.Errorf("summary source message exceeds input budget")
 	}
@@ -248,6 +256,9 @@ func estimatePromptTokens(msgs []llm.Message, defs []llm.ToolDef) int {
 	bytes, images := len(schemas), 0
 	for _, m := range msgs {
 		bytes += len(m.Content) + len(m.Role) + len(m.ToolCallID) + 24
+		for _, file := range m.Files {
+			bytes += len(file.Content) + len(file.Path) + 64
+		}
 		if len(m.AnthropicContent) > 0 {
 			// Text and tool input are already counted through shared fields.
 			for _, block := range m.AnthropicContent {
@@ -568,6 +579,12 @@ func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message
 		}
 	}
 	return c.commitCheckpointNamed(candidate, usage, archiveName, defs)
+}
+
+// FreshTurnFits checks whether a task and its turn context fit with the
+// current system prompt and tools, before adding any conversation history.
+func (c *Config) FreshTurnFits(task, turnContext llm.Message) bool {
+	return c.checkpointContextFits([]llm.Message{task, turnContext}, c.Tools)
 }
 
 func (c *Config) checkpointContextFits(msgs []llm.Message, defs []llm.ToolDef) bool {

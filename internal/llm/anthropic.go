@@ -232,6 +232,9 @@ func toAnthropicMessages(messages []Message) (string, []anthropicMessage) {
 			if m.Content != "" {
 				appendBlock("user", AnthropicContentBlock{Type: "text", Text: m.Content})
 			}
+			for _, f := range m.Files {
+				appendBlock("user", AnthropicContentBlock{Type: "text", Text: f.PromptText()})
+			}
 			if text := unavailableImageText(m); text != "" {
 				appendBlock("user", AnthropicContentBlock{Type: "text", Text: text})
 			}
