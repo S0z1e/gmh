@@ -312,10 +312,12 @@ func (c *bashOutputCapture) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+const bashOutputDrainTimeout = 200 * time.Millisecond
+
 // The shell and its captured stdout/stderr have separate lifetimes. A short
 // bounded drain captures buffered output without waiting indefinitely for inherited
 // handles; only background:true with a live shell retains captured output.
-func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.Duration, output *bashOutputFile, dir string, preview *BashOutputPreview) (string, int, error) {
+func (e *Executor) runBashCmd(ctx context.Context, command string, timeout, drainTimeout time.Duration, output *bashOutputFile, dir string, preview *BashOutputPreview) (string, int, error) {
 	defer output.Close()
 	outPath := output.path
 	var runCtx context.Context
@@ -415,7 +417,7 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout time.
 	// The deadline governs the shell, not the subsequent pipe drain. Its
 	// watcher now returns ErrProcessDone without changing the shell outcome.
 	cancel()
-	timer := time.NewTimer(200 * time.Millisecond)
+	timer := time.NewTimer(drainTimeout)
 	var copyErr error
 	captureClosed := false
 	select {
@@ -632,7 +634,7 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		defer cancel()
 		defer finish()
 		preview := &BashOutputPreview{}
-		out, code, err := e.runBashCmd(commandCtx, a.Command, timeout, output, dir, preview)
+		out, code, err := e.runBashCmd(commandCtx, a.Command, timeout, bashOutputDrainTimeout, output, dir, preview)
 		if audit != nil {
 			entry := AuditEntry{InvocationID: job.InvocationID, ToolCallID: job.ToolCallID, TS: time.Now(), Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
 			if err != nil {

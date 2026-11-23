@@ -558,7 +558,7 @@ func (e *Executor) bashResult(ctx context.Context, a BashArgs) (ToolResult, erro
 		e.audit(ctx, AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: -1, Error: err.Error()})
 		return ToolResult{Status: ResultNotExecuted}, err
 	}
-	out, code, err := e.runBashCmd(ctx, a.Command, e.bashTimeout(a), output, dir, nil)
+	out, code, err := e.runBashCmd(ctx, a.Command, e.bashTimeout(a), bashOutputDrainTimeout, output, dir, nil)
 	entry := AuditEntry{Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
 	if err != nil {
 		entry.Error = err.Error()
