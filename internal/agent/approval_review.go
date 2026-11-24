@@ -26,12 +26,12 @@ type approvalIntent struct {
 	Updates []string          `json:"user_updates,omitempty"`
 }
 
-func (c *Config) approve(ctx context.Context, req ApprovalRequest, intent approvalIntent, protected bool, total *llm.Usage) (ok bool, approver, note string, err error) {
+func (c *Config) approve(ctx context.Context, mode string, req ApprovalRequest, intent approvalIntent, total *llm.Usage) (ok bool, approver, note string, err error) {
 	ev := Event{ToolName: req.ToolName, ToolArgs: req.Arguments, ToolCallID: req.ToolCallID, InvocationID: req.InvocationID}
 	if c.DenyInsteadOfPrompt {
 		return false, "policy", "The configured approval policy denied this tool call.", ctx.Err()
 	}
-	if c.Mode != approvalmode.ApproveForMe {
+	if mode != approvalmode.ApproveForMe {
 		if c.Headless {
 			return false, "policy", "Manual approval is unavailable in print mode.", ctx.Err()
 		}
@@ -41,7 +41,7 @@ func (c *Config) approve(ctx context.Context, req ApprovalRequest, intent approv
 		return ok, "user", "", err
 	}
 
-	ok, note, err = c.reviewApproval(ctx, req, intent, protected, total)
+	ok, note, err = c.reviewApproval(ctx, req, intent, total)
 	if err == nil {
 		ev.Kind, ev.Text, ev.Decision = EventApprovalReview, note, "denied"
 		if ok {
@@ -52,7 +52,7 @@ func (c *Config) approve(ctx context.Context, req ApprovalRequest, intent approv
 	return ok, "reviewer", note, err
 }
 
-func (c *Config) reviewApproval(ctx context.Context, req ApprovalRequest, intent approvalIntent, protected bool, total *llm.Usage) (bool, string, error) {
+func (c *Config) reviewApproval(ctx context.Context, req ApprovalRequest, intent approvalIntent, total *llm.Usage) (bool, string, error) {
 	if strings.TrimSpace(intent.Task) == "" {
 		return false, "Automatic review denied this call because the user task is missing.", nil
 	}
@@ -67,7 +67,7 @@ func (c *Config) reviewApproval(ctx context.Context, req ApprovalRequest, intent
 		Target      string `json:"resolved_target,omitempty"`
 		Protected   bool   `json:"protected_target,omitempty"`
 		BashSandbox bool   `json:"bash_sandbox"`
-	}{approvalIntent: intent, Tool: req.ToolName, Arguments: req.Arguments, Target: req.TargetPath, Protected: protected}
+	}{approvalIntent: intent, Tool: req.ToolName, Arguments: req.Arguments, Target: req.TargetPath, Protected: req.Protected}
 	if c.Exec != nil {
 		input.Workspace, input.BashSandbox = c.Exec.Root, c.Exec.Sandbox
 	}

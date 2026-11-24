@@ -53,6 +53,10 @@ func (p *protocolOutput) fail(err error) {
 		}
 	})
 }
+func (p *protocolOutput) pendingFrames() int {
+	return len(p.queue)
+}
+
 func (p *protocolOutput) enqueue(b []byte) {
 	p.mu.Lock()
 	if p.closed || p.err != nil {

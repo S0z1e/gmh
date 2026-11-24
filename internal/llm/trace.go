@@ -46,6 +46,22 @@ type RequestTrace struct {
 }
 
 type observerKey struct{}
+
+// RejectedBeforeInference identifies documented HTTP rejections with no usage.
+// Transport failures and gateway errors can occur after inference began.
+func (t RequestTrace) RejectedBeforeInference() bool {
+	if t.Usage != nil || t.Outcome == "complete" {
+		return false
+	}
+	switch t.StatusCode {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden,
+		http.StatusNotFound, http.StatusRequestEntityTooLarge,
+		http.StatusUnprocessableEntity, http.StatusTooManyRequests:
+		return true
+	}
+	return false
+}
+
 type requestStartKey struct{}
 type traceKey struct{}
 type requestObservation struct {

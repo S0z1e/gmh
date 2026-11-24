@@ -68,6 +68,58 @@ func TestLoadDiscoversPlugin(t *testing.T) {
 	}
 }
 
+func TestRuntimeRebuildRejectsChangedRegistrations(t *testing.T) {
+	reg, root := loadEcho(t)
+	p := reg.Plugins()[0]
+	entry := filepath.Join(root, ".agents", "plugins", "echo", "echo.js")
+	if err := os.WriteFile(entry, []byte(strings.Replace(echoPlugin, "echo:", "reloaded:", 1)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	reloaded := p.tryRestartLocked(t.Context())
+	p.mu.Unlock()
+	if !reloaded {
+		t.Fatal("identical registrations could not be reloaded")
+	}
+	if err := os.WriteFile(entry, []byte(`harness.registerCommand("other", "different command", () => "other");`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	reloaded = p.tryRestartLocked(t.Context())
+	p.mu.Unlock()
+	if reloaded {
+		t.Fatal("installed a runtime with missing registered handlers")
+	}
+	if out, err := reg.Call(t.Context(), "echo", `{"msg":"hi"}`); err != nil || out != "reloaded:hi" {
+		t.Fatalf("previous registration is no longer callable: %q, %v", out, err)
+	}
+}
+
+func TestRuntimeRebuildRespectsContextDuringInitialization(t *testing.T) {
+	reg, root := loadEcho(t)
+	entry := filepath.Join(root, ".agents", "plugins", "echo", "echo.js")
+	if err := os.WriteFile(entry, []byte(`while (true) {}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := reg.Plugins()[0]
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan bool, 1)
+	go func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		done <- p.tryRestartLocked(ctx)
+	}()
+	select {
+	case reloaded := <-done:
+		if reloaded || ctx.Err() != context.DeadlineExceeded {
+			t.Fatalf("runaway initialization returned reloaded=%t, context=%v", reloaded, ctx.Err())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime rebuild did not return when its context expired")
+	}
+}
+
 func TestLoadRejectsBadManifest(t *testing.T) {
 	cases := []struct {
 		name     string

@@ -51,16 +51,20 @@
   The deadline includes provider requests, tools, retries, background-result waits
   and approval/question waits. Custom prompt callbacks must observe the request's
   `Context`. Detached background jobs retain their existing lifecycle after a stop.
-- Token and dollar caps are opt-in. They use reported usage from every provider
-  attempt, including failed retries, automatic compaction and grace calls. An
-  exact-cap final response is allowed; another provider attempt is blocked. Usage
-  arrives after execution, so an in-flight request can overshoot; actual reported
-  consumption is retained. A dollar cap uses configured-rate estimates, requires
-  all three base `OPENAI_PRICE_*_PER_MTOK` rates (including explicit zeros), and
-  requires cache usage when input/cache rates differ. It supports chat/responses
-  pricing; Anthropic cache-write pricing is currently unavailable. It does not use
-  the model metadata's `cost` fields. Missing required usage/pricing stops with
-  `budget_unavailable`; exhaustion stops with `budget_exceeded`. Both save an
+- Token and dollar caps are opt-in. `maxSessionTokens` and `maxSessionCostUSD`
+  limit cumulative usage across turns, manual compaction and `--resume`.
+  Caps use reported usage from provider attempts, including failed retries,
+  automatic compaction and grace calls. Requests rejected before inference
+  can be retried without a usage report. A final response can use the exact
+  allowance, after which another provider attempt is blocked. Usage arrives
+  after execution, so an in-flight request can overshoot. Its reported usage
+  is retained. Dollar caps use configured rate estimates and require cache
+  usage when input and cache-read rates differ. Environment pricing requires
+  all three base `OPENAI_PRICE_*_PER_MTOK` rates, including explicit zeros.
+  Anthropic also requires a cache-write rate. With no environment rates, the
+  harness uses the model's complete configured `cost` schedule if available.
+  Missing required usage or pricing stops with `budget_unavailable`. Exhaustion
+  stops with `budget_exceeded`. Both save an
   `incomplete` task outcome with the budget snapshot and send no extra grace call.
   Unreported usage is recorded as unknown rather than zero. Ordinary UI usage
   totals remain separate from this per-attempt budget evidence.
@@ -202,9 +206,10 @@
   remove that task's facts; older compressed turns remain in transcript archives.
   Summary requests have a separate 128 KiB input cap and reserve the configured
   output limit within the context window. Optional narration uses a bounded
-  recent suffix with explicit omissions and head/tail excerpts. Mandatory source
-  facts are never clipped: exceeding their 256 KiB, 2048-entry, 64 KiB per-text
-  limits, or the next request's context budget, fails without replacing history.
+  recent suffix with explicit omissions and head/tail excerpts. The summary
+  can omit older optional facts to fit its input budget. Mandatory facts,
+  including unresolved failures, are preserved. If they exceed the byte,
+  entry, or context limits, compaction fails without replacing history.
 - Context checkpoints: normal requests use one fixed 32 KiB cap per tool
   result and never prune by age. At the compaction boundary, the harness first
   tries replacing older successful tool outputs with a fixed placeholder, keeping

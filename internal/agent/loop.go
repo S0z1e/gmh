@@ -12,6 +12,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"minimalharness/internal/approvalmode"
@@ -31,6 +32,7 @@ type Config struct {
 	Exec           *tools.Executor
 	Tools          []llm.ToolDef
 	System         string
+	modeMu         sync.RWMutex
 	Mode           string // see internal/approvalmode
 	ContextLimit   int
 	CompactHistory func(context.Context, []llm.Message) (string, llm.Usage, error)
@@ -101,6 +103,21 @@ type Config struct {
 	persistErr        error
 	persistErrEmitted bool
 	progress          *turnProgress
+}
+
+// ApprovalMode returns the current approval policy safely across goroutines.
+func (c *Config) ApprovalMode() string {
+	c.modeMu.RLock()
+	m := c.Mode
+	c.modeMu.RUnlock()
+	return m
+}
+
+// SetApprovalMode updates the approval policy safely across goroutines.
+func (c *Config) SetApprovalMode(mode string) {
+	c.modeMu.Lock()
+	c.Mode = mode
+	c.modeMu.Unlock()
 }
 
 // DoomLoop returns the Config's guard, creating it on first use.
@@ -239,10 +256,15 @@ func (c *Config) askUser(ctx context.Context, argsJSON string) (string, *string,
 	return "No answers were provided. Proceed with your best judgement and state the assumptions you made.", nil, nil
 }
 
-func (c *Config) needsApproval(name, argsJSON string) bool {
-	if c.Mode == approvalmode.FullAccess {
+// ApprovalRequired applies the tool policy to an invocation under the given mode.
+func (c *Config) ApprovalRequired(mode string, req ApprovalRequest) bool {
+	if mode == approvalmode.FullAccess {
 		return false
 	}
+	if req.Protected {
+		return true
+	}
+	name := req.ToolName
 	if name == tools.GitStatusTool && c.Exec != nil && c.Exec.Sandbox {
 		return true // linked metadata may be outside the shell sandbox
 	}
@@ -250,11 +272,11 @@ func (c *Config) needsApproval(name, argsJSON string) bool {
 		var target struct {
 			Path string `json:"path"`
 		}
-		if json.Unmarshal([]byte(argsJSON), &target) == nil && c.Exec != nil && tools.IsProtectedWorkspacePath(c.Exec.Root, target.Path) {
+		if json.Unmarshal([]byte(req.Arguments), &target) == nil && c.Exec != nil && tools.IsProtectedWorkspacePath(c.Exec.Root, target.Path) {
 			return true
 		}
 	}
-	if c.Mode == approvalmode.Auto {
+	if mode == approvalmode.Auto {
 		return false
 	}
 	// Network and plugin tools can send data or cause side effects.
@@ -709,9 +731,10 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 		if err == nil {
 			return attempt, spent, nil
 		}
-		retry := !doneSeen && ctx.Err() == nil && llm.IsRetryable(err) && attempt < attempts
+		contextOverflow := llm.IsContextLengthExceeded(err)
+		retry := !doneSeen && !contextOverflow && ctx.Err() == nil && llm.IsRetryable(err) && attempt < attempts
 		var protocolErr *llm.ProtocolError
-		if !doneSeen && outputSeen && (retry || errors.As(err, &protocolErr)) {
+		if !doneSeen && outputSeen && (retry || contextOverflow || errors.As(err, &protocolErr)) {
 			// The stream was cut off after showing partial output:
 			// discard the partial reply before replaying. The
 			// assistant message and usage need no reset here: they
@@ -872,6 +895,7 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 		}
 	}
 	stopBlocks := 0
+	warnOnDoomLoop := c.Headless && (c.ConfirmContinuation == nil || c.DenyInsteadOfPrompt)
 	finishBlocked := func() (string, llm.Usage, error) {
 		blocked := fmt.Errorf("task blocked: %d tool attempts failed without proven state or result progress", MaxFailedFixAttempts)
 		if ctx.Err() == nil {
@@ -907,13 +931,6 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 		if c.persistErr != nil {
 			return lastText, total, c.persistErr
 		}
-		var assistant llm.Message
-		var usage llm.Usage
-		// thinking accumulates this step's thinking text. It is
-		// display-only: it never enters the assistant message or
-		// the session, and thinking_end fires only when it is
-		// non-empty.
-		var thinking strings.Builder
 		// Rendering uses a fixed per-result cap. Old content changes only
 		// at a persisted checkpoint when the context budget is reached.
 		if c.ContextLimit > 0 && c.needsCompact(msgs) {
@@ -942,26 +959,9 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 				return lastText, total, err
 			}
 		}
-		apiMsgs := c.promptView(msgs)
-		attempts, spent, err := c.streamStep(ctx, "LLM call", apiMsgs, c.Tools, func(s string) {
-			c.emit(Event{Kind: EventTextDelta, Text: s})
-		}, func(m llm.Message, u llm.Usage) {
-			assistant = m
-			usage = u
-			if thinking.Len() > 0 {
-				c.emit(Event{Kind: EventThinkingEnd, Text: thinking.String()})
-			}
-		}, func(s string) {
-			thinking.WriteString(s)
-			c.emit(Event{Kind: EventThinkingDelta, Text: s})
-		}, func() {
-			// A discarded attempt's thinking must not leak into
-			// the replay's ThinkingEnd: the builder holds only
-			// this step's thinking, and the discard drops it.
-			thinking.Reset()
-		})
-		c.addObservedUsage(&total, spent)
-		c.emit(Event{Kind: EventStepUsage, Usage: spent})
+		result, apiMsgs, msgsAfterStep, err := c.streamTurnStep(ctx, msgs, guidanceState, &total)
+		msgs = msgsAfterStep
+		assistant, usage, attempts := result.assistant, result.usage, result.attempts
 		if err != nil {
 			wrapped := fmt.Errorf("step %d: %w", step+1, err)
 			if attempts > 1 {
@@ -1161,12 +1161,13 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 				// The batch is settled without execution. Wait once for its
 				// prerequisite instead of spending model steps in a busy loop.
 				c.emit(Event{Kind: EventBackgroundWait, Text: target.ID})
-				timer := time.NewTimer(c.drainTimeout())
+				stopWait := min(c.drainTimeout(), 5*time.Second)
+				timer := time.NewTimer(stopWait)
 				var waitErr error
 				select {
 				case <-target.Done():
 				case <-timer.C:
-					waitErr = fmt.Errorf("background job %s is still finalizing after %s; resume after its outcome is available", target.ID, c.drainTimeout())
+					waitErr = fmt.Errorf("background job %s is still finalizing after %s; resume after its outcome is available", target.ID, stopWait)
 				case <-ctx.Done():
 					waitErr = ctx.Err()
 				}
@@ -1349,6 +1350,13 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 				if c.Session != nil {
 					c.persist(msgs[len(msgs)-1])
 				}
+				// In headless mode, give the model one soft tool-error chance to
+				// change approach or summarize progress before terminating the turn.
+				if warnOnDoomLoop && ctx.Err() == nil {
+					warnOnDoomLoop = false
+					c.DoomLoop().clearStreak()
+					continue
+				}
 				if len(pending) > 0 {
 					_, _ = c.drainPending(ctx, msgs, pending)
 				}
@@ -1368,8 +1376,9 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 				continue
 			}
 			guardArgs := argsJSON
+			mode := c.ApprovalMode()
 			var bashDir *tools.BashDirectory
-			if tc.Function.Name == "bash" && c.Mode == approvalmode.ApproveForMe && !c.DenyInsteadOfPrompt {
+			if tc.Function.Name == "bash" && mode == approvalmode.ApproveForMe && !c.DenyInsteadOfPrompt {
 				var err error
 				argsJSON, bashDir, err = c.bindBashReview(guardArgs)
 				if err != nil {
@@ -1444,10 +1453,9 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 				closeMutation()
 				continue
 			}
-			protected := mutation != nil && mutation.Protected
-			if (protected && c.Mode != approvalmode.FullAccess) || c.needsApproval(tc.Function.Name, tc.Function.Arguments) {
-				req := ApprovalRequest{ToolName: tc.Function.Name, Arguments: tc.Function.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID, TargetPath: inv.TargetPath}
-				ok, approver, approvalNote, err := c.approve(ctx, req, reviewIntent, protected, &total)
+			req := ApprovalRequest{ToolName: tc.Function.Name, Arguments: tc.Function.Arguments, ToolCallID: tc.ID, InvocationID: inv.ID, TargetPath: inv.TargetPath, Protected: mutation != nil && mutation.Protected}
+			if c.ApprovalRequired(mode, req) {
+				ok, approver, approvalNote, err := c.approve(ctx, mode, req, reviewIntent, &total)
 				// Audit every decision (approved, denied, or errored)
 				// to the session sidecar, for later review.
 				if c.Session != nil {
@@ -1542,7 +1550,7 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 			switch tc.Function.Name {
 			case "ask_user":
 				res.Text, humanAnswer, err = c.askUser(ctx, argsJSON)
-				if humanAnswer != nil && c.Mode == approvalmode.ApproveForMe {
+				if humanAnswer != nil {
 					reviewIntent.Answers = append(reviewIntent.Answers, json.RawMessage(*humanAnswer))
 				}
 			case "bash":
@@ -1778,9 +1786,13 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 // for a best final answer, the blocked turn for a summary of what
 // was verified, what failed and what is left.
 func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction string, guidanceState *guidanceTurn) (string, llm.Usage, bool) {
-	if c.persistErr != nil {
+	if c.persistErr != nil || c.budgetRequest() != nil {
 		return "", llm.Usage{}, false
 	}
+	// Bound grace calls to a single attempt (no retry amplification during wrap-up).
+	prevAttempts := c.MaxLLMAttempts
+	c.MaxLLMAttempts = 1
+	defer func() { c.MaxLLMAttempts = prevAttempts }()
 	graceCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	instructionMsg := llm.Message{Role: "user", Content: instruction}
@@ -1799,23 +1811,8 @@ func (c *Config) graceCall(ctx context.Context, msgs []llm.Message, instruction 
 		}
 	}
 	apiMsgs := c.promptView(graceMsgs)
-	var final llm.Message
-	var usage llm.Usage
-	var thinking strings.Builder
-	_, spent, err := c.streamStep(graceCtx, "LLM call", apiMsgs, nil, func(s string) {
-		c.emit(Event{Kind: EventTextDelta, Text: s})
-	}, func(m llm.Message, u llm.Usage) {
-		final = m
-		usage = u
-		if thinking.Len() > 0 {
-			c.emit(Event{Kind: EventThinkingEnd, Text: thinking.String()})
-		}
-	}, func(s string) {
-		thinking.WriteString(s)
-		c.emit(Event{Kind: EventThinkingDelta, Text: s})
-	}, func() {
-		thinking.Reset()
-	})
+	result, err := c.streamVisibleStep(graceCtx, apiMsgs, nil)
+	final, usage, spent := result.assistant, result.usage, result.spent
 	c.addObservedUsage(&total, spent)
 	if usage.PromptTokens > 0 {
 		c.LastPromptTokens = usage.PromptTokens

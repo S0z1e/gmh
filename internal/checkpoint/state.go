@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -143,9 +144,29 @@ type Delta struct {
 // Merge owns its result and leaves both inputs unchanged, including on errors.
 // Bounds fail closed instead of evicting old instructions or unresolved work.
 func Merge(previous State, d Delta) (State, error) {
-	if err := d.validate(); err != nil {
+	if err := d.validate(true); err != nil {
 		return State{}, err
 	}
+	return mergeValidated(previous, d, false)
+}
+
+// MergeWithEviction behaves like Merge, but when the combined state exceeds
+// MaxEntries or MaxBytes it deterministically evicts the oldest lowest-priority
+// historical records (artifacts, delivered jobs, finished/unknown jobs,
+// decisions) while preserving ActiveTask, Constraints, Pending, Verification,
+// unresolved Failures, and Running jobs. If the preserved records still exceed
+// the limits, it fails closed with the encode error.
+func MergeWithEviction(previous State, d Delta) (State, error) {
+	if out, err := Merge(previous, d); err == nil {
+		return out, nil
+	}
+	if err := d.validate(false); err != nil {
+		return State{}, err
+	}
+	return mergeValidated(previous, d, true)
+}
+
+func mergeValidated(previous State, d Delta, allowEviction bool) (State, error) {
 	if previous.Version == 0 {
 		if previous.ActiveTask != nil || len(previous.Constraints)+len(previous.Decisions)+len(previous.Verification)+len(previous.Failures)+len(previous.Pending)+len(previous.Jobs)+len(previous.Artifacts) != 0 {
 			return State{}, fmt.Errorf("unversioned checkpoint contains state")
@@ -201,21 +222,76 @@ func Merge(previous State, d Delta) (State, error) {
 	}
 	out.Jobs = upsert(out.Jobs, d.Jobs, jobKey)
 	out.Artifacts = upsert(out.Artifacts, d.Artifacts, func(a Artifact) string { b, _ := json.Marshal(a); return string(b) })
-	encoded, err = Encode(out)
+	if allowEviction {
+		encoded, err = encodeWithEviction(&out, MaxBytes)
+	} else {
+		encoded, err = Encode(out)
+	}
 	if err != nil {
 		return State{}, err
 	}
 	return Decode(encoded) // Detach incoming slices and pointer fields too.
 }
 
+// EncodeForSummary encodes an independent view of the checkpoint within the
+// summary's available bytes, retaining the full state for persistence.
+func EncodeForSummary(s State, maxBytes int) ([]byte, error) {
+	// Eviction may move job entries in place.
+	s.Jobs = slices.Clone(s.Jobs)
+	return encodeWithEviction(&s, maxBytes)
+}
+
+func encodeWithEviction(s *State, maxBytes int) ([]byte, error) {
+	for {
+		encoded, err := Encode(*s)
+		if err == nil {
+			if len(encoded) <= maxBytes {
+				return encoded, nil
+			}
+			err = fmt.Errorf("checkpoint exceeds %d bytes", maxBytes)
+		}
+		if !evictOneOldest(s) {
+			return nil, err
+		}
+	}
+}
+
+// evictOneOldest drops one oldest low-priority historical entry so compaction
+// can degrade gracefully instead of aborting long turns. ActiveTask,
+// Constraints, Pending, Verification, unresolved Failures, and Running jobs
+// are never evicted.
+func evictOneOldest(s *State) bool {
+	if len(s.Artifacts) > 0 {
+		s.Artifacts = s.Artifacts[1:]
+		return true
+	}
+	for i, j := range s.Jobs {
+		if j.Status == Done && j.Delivered {
+			s.Jobs = append(s.Jobs[:i], s.Jobs[i+1:]...)
+			return true
+		}
+	}
+	for i, j := range s.Jobs {
+		if j.Status == Done || j.Status == Unknown {
+			s.Jobs = append(s.Jobs[:i], s.Jobs[i+1:]...)
+			return true
+		}
+	}
+	if len(s.Decisions) > 0 {
+		s.Decisions = s.Decisions[1:]
+		return true
+	}
+	return false
+}
+
 // Check incoming facts before upsert/removal can hide an invalid record behind
 // a later observation. The limit covers all inputs, including resolutions.
-func (d Delta) validate() error {
+func (d Delta) validate(enforceEntryLimit bool) error {
 	entries := len(d.Constraints) + len(d.Decisions) + len(d.Verification) + len(d.Failures) + len(d.Pending) + len(d.Jobs) + len(d.Artifacts) + len(d.ResolvedCalls) + len(d.ResolvedFailures)
 	if d.ActiveTask != nil {
 		entries++
 	}
-	if entries > MaxEntries {
+	if enforceEntryLimit && entries > MaxEntries {
 		return fmt.Errorf("checkpoint delta exceeds %d entries", MaxEntries)
 	}
 	check := func(s State) error { s.Version = Version; _, err := Encode(s); return err }

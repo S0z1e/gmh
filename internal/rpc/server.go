@@ -27,6 +27,7 @@ import (
 
 	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
+	"minimalharness/internal/approvalmode"
 	"minimalharness/internal/config"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
@@ -83,6 +84,11 @@ type approvalAnswer struct {
 	err      error
 }
 
+type pendingApproval struct {
+	ch  chan approvalAnswer
+	req agent.ApprovalRequest
+}
+
 // questionAnswer is one question_request's reply, or the abort that
 // cancelled it.
 type questionAnswer struct {
@@ -117,6 +123,12 @@ type Server struct {
 	inputErr     error
 	state        serverState
 
+	// Coalesce high-frequency streaming deltas only when output is under backpressure.
+	deltaPending bool
+	deltaEvent   Event
+	deltaBuf     strings.Builder
+	deltaTimer   *time.Timer
+
 	workMu        sync.Mutex // guards the work queue and its state
 	work          []workItem
 	workReady     *sync.Cond
@@ -129,9 +141,10 @@ type Server struct {
 	done     chan struct{}
 	doneOnce sync.Once
 
-	approvals   map[string]chan approvalAnswer
-	approvalsMu sync.Mutex
-	apprSeq     int
+	approvals       map[string]pendingApproval
+	approvalsMu     sync.Mutex
+	apprSeq         int
+	approvalTimeout time.Duration
 
 	// continuations are the doom-loop guard's pending prompts, by
 	// id, like approvals but on a separate channel: the question is
@@ -172,7 +185,7 @@ func Run(a *app.App, runner *app.Runner, in io.Reader, out io.Writer) error {
 		in:            in,
 		out:           out,
 		done:          make(chan struct{}),
-		approvals:     map[string]chan approvalAnswer{},
+		approvals:     map[string]pendingApproval{},
 		continuations: map[string]chan agent.ContinuationDecision{},
 		questions:     map[string]chan questionAnswer{},
 	}
@@ -184,6 +197,11 @@ func (s *Server) run() error {
 	defer handleStdoutBrokenPipe(s.out)()
 	if err := s.runner.RefreshUsage(); err != nil {
 		return err
+	}
+	if raw := strings.TrimSpace(os.Getenv("HARNESS_APPROVAL_TIMEOUT_SECONDS")); raw != "" {
+		if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
+			s.approvalTimeout = time.Duration(secs) * time.Second
+		}
 	}
 	s.connectionID = rand.Text()
 	s.output = newProtocolOutput(s.out, func() {
@@ -209,7 +227,7 @@ func (s *Server) run() error {
 	s.writeEvent(Event{
 		Type: "ready", Protocol: protocolVersion,
 		Session: s.app.Store.ID, Model: s.app.Cfg.Client.Model, API: s.app.Cfg.Client.API,
-		Mode: s.app.Cfg.Mode, Root: s.app.Root,
+		Mode: s.app.Cfg.ApprovalMode(), Root: s.app.Root,
 		Resumed: s.app.ResumedMessage != "", Messages: len(s.app.History),
 	})
 	go s.readLoop()
@@ -218,6 +236,7 @@ func (s *Server) run() error {
 		_ = c.Close()
 	}
 	closeErr := s.app.Close()
+	s.flushDelta()
 	outputErr := s.output.finish()
 	s.mu.Lock()
 	inputErr := s.inputErr
@@ -270,7 +289,9 @@ func (s *Server) handleLine(line string) {
 		s.handleClearQueue(req)
 	case "steer_prompt":
 		s.handleSteerPrompt(req)
-	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "attach_file", "list_pending_files", "set_model", "rename_session", "resume_session", "delete_session", "set_tool_mode", "set_approval_mode", "rollback", "prune_artifacts", "command":
+	case "set_approval_mode":
+		s.handleSetApprovalMode(req)
+	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "attach_file", "list_pending_files", "set_model", "rename_session", "resume_session", "delete_session", "set_tool_mode", "rollback", "prune_artifacts", "command":
 		s.enqueue(req, workControl)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown request type %q", req.Type))
@@ -324,6 +345,10 @@ func (s *Server) handlePrompt(req Request) {
 		if typ == "usage" || typ == "jobs" || typ == "list_sessions" || typ == "list_plugins" || typ == "get_state" {
 			// Read-only: answer at once, like the request of the same name.
 			s.handleQuery(ctrl)
+			return
+		}
+		if typ == "set_approval_mode" {
+			s.handleSetApprovalMode(ctrl)
 			return
 		}
 		s.enqueue(ctrl, workControl)
@@ -416,7 +441,7 @@ func (s *Server) enqueue(req Request, kind workKind) {
 
 func (s *Server) handleApprovalResponse(req Request) {
 	s.approvalsMu.Lock()
-	ch, ok := s.approvals[req.ApprovalID]
+	pending, ok := s.approvals[req.ApprovalID]
 	if ok {
 		delete(s.approvals, req.ApprovalID)
 	}
@@ -426,10 +451,37 @@ func (s *Server) handleApprovalResponse(req Request) {
 		return
 	}
 	select {
-	case ch <- approvalAnswer{approved: req.Approved}:
+	case pending.ch <- approvalAnswer{approved: req.Approved}:
 	default:
 	}
 	s.respond(req, map[string]any{"ok": true}, nil)
+}
+
+// handleSetApprovalMode runs on the reader goroutine so mode switches take
+// effect immediately without waiting behind a running turn or blocked dialog.
+func (s *Server) handleSetApprovalMode(req Request) {
+	s.approvalsMu.Lock()
+	if err := s.app.SetApprovalMode(req.Mode); err != nil {
+		s.approvalsMu.Unlock()
+		s.respond(req, nil, err)
+		return
+	}
+	s.mu.Lock()
+	s.state.mode = req.Mode
+	s.mu.Unlock()
+	if req.Mode == approvalmode.FullAccess || req.Mode == approvalmode.Auto {
+		for id, pending := range s.approvals {
+			if !s.app.Cfg.ApprovalRequired(req.Mode, pending.req) {
+				delete(s.approvals, id)
+				select {
+				case pending.ch <- approvalAnswer{approved: true}:
+				default:
+				}
+			}
+		}
+	}
+	s.approvalsMu.Unlock()
+	s.respond(req, map[string]any{"mode": req.Mode}, nil)
 }
 
 // handleAbort cancels the running turn (if any) and fails approvals
@@ -473,11 +525,11 @@ func (s *Server) handleClearQueue(req Request) {
 func (s *Server) failApprovals(err error) {
 	s.approvalsMu.Lock()
 	pending := s.approvals
-	s.approvals = map[string]chan approvalAnswer{}
+	s.approvals = map[string]pendingApproval{}
 	s.approvalsMu.Unlock()
-	for _, ch := range pending {
+	for _, item := range pending {
 		select {
-		case ch <- approvalAnswer{err: err}:
+		case item.ch <- approvalAnswer{err: err}:
 		default:
 		}
 	}
@@ -528,7 +580,7 @@ func (s *Server) handleQuery(req Request) {
 		if st.runCostKnown {
 			data["current_run_cost_usd"] = st.runCost
 		}
-		if st.meteringAvailable && st.metering.Attempts == st.metering.PricedAttempts && !st.metering.LegacyHistory && !st.metering.RecoveryGap && (st.metering.Attempts > 0 || st.ratesConfigured) {
+		if st.meteringAvailable && st.metering.UnpricedAttempts() == 0 && !st.metering.LegacyHistory && !st.metering.RecoveryGap && (st.metering.Attempts > 0 || st.ratesConfigured) {
 			c := st.sessionCost
 			data["cost_usd"] = &c
 		}
@@ -689,21 +741,35 @@ func (s *Server) jobsList() []map[string]any {
 // before calling ask; onEvent deliberately ignores that event, or the
 // request would go out twice.
 func (s *Server) ask(req agent.ApprovalRequest) (bool, error) {
-	s.approvalsMu.Lock()
-	s.apprSeq++
-	id := fmt.Sprintf("appr-%d", s.apprSeq)
-	ch := make(chan approvalAnswer, 1)
-	s.approvals[id] = ch
-	s.approvalsMu.Unlock()
-	defer func() { s.approvalsMu.Lock(); delete(s.approvals, id); s.approvalsMu.Unlock() }()
 	ctx := req.Context
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	s.approvalsMu.Lock()
+	mode := s.app.Cfg.ApprovalMode()
+	if (mode == approvalmode.FullAccess || mode == approvalmode.Auto) && !s.app.Cfg.ApprovalRequired(mode, req) {
+		s.approvalsMu.Unlock()
+		err := ctx.Err()
+		return err == nil, err
+	}
+	s.apprSeq++
+	id := fmt.Sprintf("appr-%d", s.apprSeq)
+	ch := make(chan approvalAnswer, 1)
+	s.approvals[id] = pendingApproval{ch: ch, req: req}
+	s.approvalsMu.Unlock()
+	defer func() { s.approvalsMu.Lock(); delete(s.approvals, id); s.approvalsMu.Unlock() }()
 	s.writeEvent(Event{Type: "approval_request", ID: id, Tool: req.ToolName, ToolCallID: req.ToolCallID, InvocationID: req.InvocationID, TargetPath: req.TargetPath, Args: parseToolArgs(req.Arguments), Prompt: req.Prompt()})
+	var timeoutCh <-chan time.Time
+	if s.approvalTimeout > 0 {
+		timer := time.NewTimer(s.approvalTimeout)
+		defer timer.Stop()
+		timeoutCh = timer.C
+	}
 	select {
 	case ans := <-ch:
 		return ans.approved, ans.err
+	case <-timeoutCh:
+		return false, fmt.Errorf("approval request %s timed out after %s", id, s.approvalTimeout)
 	case <-ctx.Done():
 		return false, ctx.Err()
 	case <-s.done:
@@ -994,7 +1060,7 @@ func (s *Server) refreshState() {
 	s.state.sessionCost = s.runner.SessionCost
 	s.state.toolMode = string(s.runner.App.ToolMode())
 	s.state.model, s.state.api = s.app.Cfg.Client.Model, s.app.Cfg.Client.API
-	s.state.mode, s.state.root = s.app.Cfg.Mode, s.app.Root
+	s.state.mode, s.state.root = s.app.Cfg.ApprovalMode(), s.app.Root
 	s.state.workspaceTrusted = s.app.WorkspaceTrusted
 	s.state.contextWindow, s.state.maxTokens = s.app.ContextLimit, s.app.Cfg.Client.MaxTokens
 	s.state.ratesConfigured = s.app.Rates.Configured
@@ -1093,12 +1159,12 @@ func (s *Server) runTurn(req Request) {
 		Outcome:  string(outcome),
 		ToolMode: st.toolMode,
 	}
-	if st.meteringAvailable && s.app.Rates.Configured && st.metering.Attempts-previousMetering.Attempts == st.metering.PricedAttempts-previousMetering.PricedAttempts {
+	if st.meteringAvailable && s.app.Rates.Configured && st.metering.UnpricedAttempts() == previousMetering.UnpricedAttempts() {
 		c := st.sessionCost - previousCost
 		settled.CostUSD = &c
 
 	}
-	if st.meteringAvailable && st.metering.PricedAttempts > 0 && st.metering.PricedAttempts == st.metering.Attempts && !st.metering.LegacyHistory && !st.metering.RecoveryGap {
+	if st.meteringAvailable && st.metering.PricedAttempts > 0 && st.metering.UnpricedAttempts() == 0 && !st.metering.LegacyHistory && !st.metering.RecoveryGap {
 		sc := st.sessionCost
 		settled.SessionCostUSD = &sc
 	}
@@ -1271,13 +1337,6 @@ func (s *Server) doControl(req Request) {
 		}
 		s.refreshState()
 		s.respond(req, map[string]any{"tool_mode": string(s.app.ToolMode())}, nil)
-	case "set_approval_mode":
-		if err := s.app.SetApprovalMode(req.Mode); err != nil {
-			s.respond(req, nil, err)
-			return
-		}
-		s.refreshState()
-		s.respond(req, map[string]any{"mode": s.app.Cfg.Mode}, nil)
 	case "quit":
 		if err := s.app.Close(); err != nil {
 			s.respond(req, nil, err)
@@ -1379,7 +1438,54 @@ func (s *Server) writeEvent(ev Event) {
 		s.turnMu.Unlock()
 	}
 	ev.ConnectionID = s.connectionID
+	if (ev.Type == "text_delta" || ev.Type == "thinking_delta") && s.output != nil && s.output.pendingFrames() >= maxOutputFrames/2 {
+		s.coalesceDelta(ev)
+		return
+	}
 	s.writeJSON(ev)
+}
+
+func (s *Server) coalesceDelta(ev Event) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.deltaPending && (s.deltaEvent.Type != ev.Type || s.deltaEvent.TurnID != ev.TurnID || s.deltaEvent.StepID != ev.StepID) {
+		s.flushDeltaLocked()
+	}
+	if !s.deltaPending {
+		s.deltaPending = true
+		s.deltaEvent = ev
+		s.deltaEvent.Text = ""
+		s.deltaBuf.Reset()
+	}
+	s.deltaBuf.WriteString(ev.Text)
+	if s.deltaBuf.Len() >= 32<<10 {
+		s.flushDeltaLocked()
+		return
+	}
+	if s.deltaTimer == nil {
+		s.deltaTimer = time.AfterFunc(25*time.Millisecond, s.flushDelta)
+	}
+}
+
+func (s *Server) flushDelta() {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.flushDeltaLocked()
+}
+
+func (s *Server) flushDeltaLocked() {
+	if s.deltaTimer != nil {
+		s.deltaTimer.Stop()
+		s.deltaTimer = nil
+	}
+	if !s.deltaPending {
+		return
+	}
+	ev := s.deltaEvent
+	ev.Text = s.deltaBuf.String()
+	s.deltaBuf.Reset()
+	s.deltaPending = false
+	s.writeFrameLocked(ev)
 }
 
 func (s *Server) respond(req Request, data map[string]any, err error) {
@@ -1396,6 +1502,11 @@ func (s *Server) respond(req Request, data map[string]any, err error) {
 func (s *Server) writeJSON(v any) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	s.flushDeltaLocked()
+	s.writeFrameLocked(v)
+}
+
+func (s *Server) writeFrameLocked(v any) {
 	s.sequence++
 	switch value := v.(type) {
 	case Event:

@@ -126,11 +126,12 @@ func splitSSELines() bufio.SplitFunc {
 type sseScanner struct {
 	lines *idleLineScanner
 	api   string
+	idle  time.Duration
 	first bool
 }
 
 func newSSEScanner(body io.Reader, idle time.Duration, model, api string) *sseScanner {
-	return &sseScanner{lines: newIdleLineScanner(body, idle, model), api: api, first: true}
+	return &sseScanner{lines: newIdleLineScanner(body, idle, model), api: api, idle: idle, first: true}
 }
 
 func (s *sseScanner) close() { s.lines.close() }
@@ -138,8 +139,12 @@ func (s *sseScanner) close() { s.lines.close() }
 func (s *sseScanner) next() (string, bool, error) {
 	var data strings.Builder
 	hasData := false
+	var deadline time.Time
+	if s.idle > 0 {
+		deadline = time.Now().Add(s.idle)
+	}
 	for {
-		line, ok, err := s.lines.next()
+		line, ok, err := s.lines.nextWithDeadline(deadline)
 		if !ok {
 			if err != nil {
 				if errors.Is(err, bufio.ErrTooLong) {
@@ -164,8 +169,12 @@ func (s *sseScanner) next() (string, bool, error) {
 		}
 		field, value, _ := strings.Cut(line, ":")
 		if field != "data" {
+			// Heartbeat comments and non-data fields do not reset the idle deadline.
 			continue
-		} // Comments, event names and extensions.
+		}
+		if s.idle > 0 {
+			deadline = time.Now().Add(s.idle)
+		}
 		value = strings.TrimPrefix(value, " ")
 		if data.Len()+len(value)+1 > maxSSEEventBytes {
 			return "", false, protocolError(s.api, "SSE event exceeds %d-byte limit", maxSSEEventBytes)

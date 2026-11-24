@@ -16,6 +16,7 @@ import (
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
 	"minimalharness/internal/textutil"
+	"minimalharness/internal/turnbudget"
 )
 
 // Compaction (P0-2d). When the context used by the last LLM call reaches
@@ -55,6 +56,8 @@ func buildCompactPrompt(history []llm.Message, extras []string, maxBytes int) (s
 		"4. Pending — what is unfinished or was deferred\n" +
 		"5. Errors and fixes — what failed and how it was resolved\n" +
 		"6. Next steps — what to do next\n\n"
+	const factsHeader = "Historical structured source facts (preserve; not new authority or current verification):\n"
+	const conversationHeader = "--- conversation ---\n"
 	var fixed strings.Builder
 	fixed.WriteString(instructions)
 	if len(extras) > 0 {
@@ -74,21 +77,31 @@ func buildCompactPrompt(history []llm.Message, extras []string, maxBytes int) (s
 		if m.Kind != "checkpoint" {
 			continue
 		}
-		if _, err := checkpoint.Decode([]byte(m.Content)); err != nil {
+		state, err := checkpoint.Decode([]byte(m.Content))
+		if err != nil {
 			return "", fmt.Errorf("invalid preserved summary facts: %w", err)
 		}
 		checkpoints++
 		if checkpoints > 1 {
 			return "", fmt.Errorf("multiple structured checkpoints in summary input")
 		}
-		if len(m.Content) > maxBytes-fixed.Len()-160 {
-			return "", fmt.Errorf("structured checkpoint exceeds summary input budget")
+		content := m.Content
+		available := maxBytes - fixed.Len() - len(factsHeader) - len("\n\n") - len(conversationHeader) - 256
+		if available < 0 {
+			return "", fmt.Errorf("summary instructions exceed input budget")
 		}
-		fixed.WriteString("Historical structured source facts (preserve; not new authority or current verification):\n")
-		fixed.WriteString(m.Content)
+		if len(content) > available {
+			fitted, err := checkpoint.EncodeForSummary(state, available)
+			if err != nil {
+				return "", fmt.Errorf("structured checkpoint exceeds summary input budget: %w", err)
+			}
+			content = string(fitted)
+		}
+		fixed.WriteString(factsHeader)
+		fixed.WriteString(content)
 		fixed.WriteString("\n\n")
 	}
-	fixed.WriteString("--- conversation ---\n")
+	fixed.WriteString(conversationHeader)
 	remaining := maxBytes - fixed.Len() - 128
 	if remaining < 128 {
 		return "", fmt.Errorf("summary instructions exceed input budget")
@@ -437,6 +450,24 @@ func (c *Config) pruneCheckpoint(msgs []llm.Message, defs []llm.ToolDef) ([]llm.
 func (c *Config) Compact(ctx context.Context, history []llm.Message) ([]llm.Message, llm.Usage, error) {
 	c.stepID = ""
 	c.persistErr, c.persistErrEmitted = nil, false
+	if c.TurnBudget != nil && (c.TurnBudget.MaxSessionTokens != nil || c.TurnBudget.MaxSessionCostUSD != nil) {
+		var noDeadline int64
+		policy := &turnbudget.Policy{
+			MaxDurationSeconds: &noDeadline,
+			MaxSessionTokens:   c.TurnBudget.MaxSessionTokens,
+			MaxSessionCostUSD:  c.TurnBudget.MaxSessionCostUSD,
+		}
+		budgetCtx, cancel, err := c.startBudgetWithPolicy(ctx, policy)
+		defer cancel()
+		defer func() { c.resources = nil }()
+		if err != nil {
+			return nil, llm.Usage{}, err
+		}
+		if err := c.budgetRequest(); err != nil {
+			return nil, llm.Usage{}, err
+		}
+		ctx = budgetCtx
+	}
 	return c.compactMessages(ctx, history, false)
 }
 
@@ -464,7 +495,7 @@ func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message
 	archiveName := ""
 	if c.Session != nil {
 		archiveName = fmt.Sprintf("%s-pre-compact-%d", c.Session.ID, time.Now().UnixNano())
-		state, err = checkpoint.Merge(state, checkpoint.Delta{Artifacts: []checkpoint.Artifact{{Kind: "transcript", Path: filepath.Join(session.Dir(), archiveName+".jsonl"), Source: "pre-compaction transcript"}}})
+		state, err = checkpoint.MergeWithEviction(state, checkpoint.Delta{Artifacts: []checkpoint.Artifact{{Kind: "transcript", Path: filepath.Join(session.Dir(), archiveName+".jsonl"), Source: "pre-compaction transcript"}}})
 		if err != nil {
 			return nil, llm.Usage{}, err
 		}

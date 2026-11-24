@@ -869,13 +869,13 @@ func TestProtectedWorkspacePathRequiresApprovalInAutoMode(t *testing.T) {
 		Exec: &tools.Executor{Root: t.TempDir()},
 		Mode: "auto",
 	}
-	if !cfg.needsApproval("write", `{"path":".harness.json","content":"{}"}`) {
+	if !cfg.ApprovalRequired(cfg.Mode, ApprovalRequest{ToolName: "write", Arguments: `{"path":".harness.json","content":"{}"}`}) {
 		t.Fatal(".harness.json must require approval even in auto mode")
 	}
-	if !cfg.needsApproval("edit", `{"path":".git/hooks/pre-commit","oldText":"a","newText":"b"}`) {
+	if !cfg.ApprovalRequired(cfg.Mode, ApprovalRequest{ToolName: "edit", Arguments: `{"path":".git/hooks/pre-commit","oldText":"a","newText":"b"}`}) {
 		t.Fatal(".git/hooks must require approval even in auto mode")
 	}
-	if cfg.needsApproval("write", `{"path":"src/main.go","content":"package main"}`) {
+	if cfg.ApprovalRequired(cfg.Mode, ApprovalRequest{ToolName: "write", Arguments: `{"path":"src/main.go","content":"package main"}`}) {
 		t.Fatal("normal workspace file should not require approval in auto mode")
 	}
 }

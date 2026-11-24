@@ -59,7 +59,7 @@ func (r *Runner) sessionCostLine() string {
 	if r.SessionMetering.PricedAttempts == 0 {
 		return "fee: " + r.App.Cfg.Client.ProviderName() + " price unverified"
 	}
-	if r.SessionMetering.PricedAttempts != r.SessionMetering.Attempts || (r.SessionMetering.LegacyHistory || r.SessionMetering.RecoveryGap) {
+	if r.SessionMetering.UnpricedAttempts() != 0 || (r.SessionMetering.LegacyHistory || r.SessionMetering.RecoveryGap) {
 		return fmt.Sprintf("est. recorded subtotal: ~$%.4f (pricing incomplete; provider price unverified)", r.SessionCost)
 	}
 	return fmt.Sprintf("est. cost: ~$%.4f (rates: recorded attempt schedules; provider price unverified)", r.SessionCost)
@@ -71,9 +71,7 @@ func (r *Runner) CurrentRunCost() *float64 {
 	if !r.MeteringAvailable || r.SessionMetering.RecoveryGap && !r.runBaseline.RecoveryGap {
 		return nil
 	}
-	attempts := r.SessionMetering.Attempts - r.runBaseline.Attempts
-	priced := r.SessionMetering.PricedAttempts - r.runBaseline.PricedAttempts
-	if attempts != priced {
+	if r.SessionMetering.UnpricedAttempts() != r.runBaseline.UnpricedAttempts() {
 		return nil
 	}
 	cost := r.RunCost
