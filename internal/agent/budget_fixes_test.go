@@ -17,13 +17,12 @@ import (
 
 func TestBudgetRetryDistinguishesRejectionFromUnknownUsage(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		status    int
-		wantCalls int
+		name   string
+		status int
 	}{
-		{"rate limit", http.StatusTooManyRequests, 2},
-		{"gateway error", http.StatusBadGateway, 1},
-		{"connection lost", 0, 1},
+		{"rate limit", http.StatusTooManyRequests},
+		{"gateway error", http.StatusBadGateway},
+		{"connection lost", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
@@ -49,23 +48,55 @@ func TestBudgetRetryDistinguishesRejectionFromUnknownUsage(t *testing.T) {
 			history := []llm.Message{{Role: "user", Content: "work"}}
 			text, _, runErr := c.Run(t.Context(), history)
 			totals, err := store.UsageTotals()
-			if err != nil || calls != tc.wantCalls {
+			if err != nil || calls != 2 {
 				t.Fatalf("calls=%d, ledger=%+v, errors=%v/%v", calls, totals, runErr, err)
 			}
-			if tc.wantCalls == 2 {
-				if runErr != nil || text != "recovered" || totals.RejectedAttempts != 1 || !totals.TokenCountsComplete() {
-					t.Fatalf("rate-limit rejection spoiled the budget: %q, %+v, %v", text, totals, runErr)
-				}
-				if _, _, err := c.Run(t.Context(), history); err != nil || c.LastTurnBudget.SessionReportedTokens != 10 {
-					t.Fatalf("next turn did not inherit complete session usage: %+v, %v", c.LastTurnBudget, err)
-				}
-			} else {
-				var unavailable *turnbudget.Unavailable
-				if !errors.As(runErr, &unavailable) || totals.TokenCountsComplete() {
-					t.Fatalf("unknown usage was accepted: %+v, %v", totals, runErr)
-				}
+			rejected := tc.status == http.StatusTooManyRequests
+			if runErr != nil || text != "recovered" || totals.TokenCountsComplete() != rejected || c.LastTurnBudget.TokensComplete != rejected {
+				t.Fatalf("retryable failure spoiled the budget: %q, %+v, %v", text, totals, runErr)
+			}
+			if rejected && totals.RejectedAttempts != 1 {
+				t.Fatalf("expected 1 rejected attempt, got %+v", totals)
+			}
+			if !rejected && (totals.TransientAttempts != 1 || totals.UnreportedAttempts != 1) {
+				t.Fatalf("expected 1 transient attempt, got %+v", totals)
+			}
+			if _, _, err := c.Run(t.Context(), history); err != nil || c.LastTurnBudget.SessionReportedTokens != 10 || c.LastTurnBudget.BaselineIncomplete == rejected {
+				t.Fatalf("next turn did not inherit the session metering evidence: %+v, %v", c.LastTurnBudget, err)
+			}
+			if rejected {
+				return
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := session.Open("budget-retry", session.OpenOptions{Workspace: c.Exec.Root, Existing: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			c.Session = reopened
+			c.TurnBudget.StrictMetering = capBool(true)
+			_, _, err = c.Run(t.Context(), history)
+			var unavailable *turnbudget.Unavailable
+			if !errors.As(err, &unavailable) || unavailable.Resource != "session_tokens" || calls != 3 {
+				t.Fatalf("strict resume accepted an unknown baseline: calls=%d, err=%v", calls, err)
 			}
 		})
+	}
+}
+
+func TestStrictBudgetStopsOnTransientUnknownUsage(t *testing.T) {
+	c := budgetConfig(t, &turnbudget.Policy{StrictMetering: capBool(true)})
+	calls := 0
+	c.Client = fakeBudgetClient(func(*http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: http.StatusBadGateway, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("gateway error"))}, nil
+	})
+	_, _, err := c.Run(t.Context(), []llm.Message{{Role: "user", Content: "work"}})
+	var unavailable *turnbudget.Unavailable
+	if !errors.As(err, &unavailable) || unavailable.Resource != "tokens" || calls != 1 {
+		t.Fatalf("strict budget retried without usage evidence: calls=%d, err=%v", calls, err)
 	}
 }
 
@@ -146,5 +177,18 @@ func TestBudgetAnthropicCostBudgetWithCacheWriteRates(t *testing.T) {
 	requireBudgetStop(t, c, events, err, TerminalBudgetExceeded)
 	if !c.LastTurnBudget.CostComplete || c.LastTurnBudget.RecordedCostUSD != 2.205 {
 		t.Fatalf("unexpected anthropic cost state: %+v", c.LastTurnBudget)
+	}
+}
+
+func TestApprovalTimeoutDeniesSingleCallWithoutKillingTurn(t *testing.T) {
+	c := budgetConfig(t, nil)
+	c.Mode = "suggest"
+	c.Ask = func(req ApprovalRequest) (bool, error) {
+		return false, fmt.Errorf("%w: timed out waiting for user", ErrApprovalTimedOut)
+	}
+	calls := []llm.ToolCall{budgetCall("a", "write", `{"path":"a.txt","content":"hello"}`)}
+	events, bodies, err := runVerification(t, c, budgetSSE("", calls, newInt(5), true), budgetSSE("continued after timeout", nil, newInt(5), true))
+	if err != nil || c.LastTerminalReason != TerminalEndTurn || len(bodies) != 2 || countKind(events, EventDone) != 1 {
+		t.Fatalf("approval timeout killed turn: reason=%s bodies=%d err=%v", c.LastTerminalReason, len(bodies), err)
 	}
 }

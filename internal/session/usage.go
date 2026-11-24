@@ -40,6 +40,7 @@ type UsageTotals struct {
 	PartialAttempts    int       `json:"partial_attempts"`
 	PricedAttempts     int       `json:"priced_attempts"`
 	RejectedAttempts   int       `json:"rejected_attempts,omitempty"`
+	TransientAttempts  int       `json:"transient_attempts,omitempty"`
 	EstimateUSD        float64   `json:"estimate_usd"`
 	RecoveryGap        bool      `json:"recovery_gap"`
 	LegacyHistory      bool      `json:"legacy_history"`
@@ -63,6 +64,9 @@ func (t *UsageTotals) add(a UsageAttempt) error {
 		t.RejectedAttempts++
 	} else if a.Request.Usage == nil {
 		t.UnreportedAttempts++
+		if a.Request.TransientFailure() {
+			t.TransientAttempts++
+		}
 	} else {
 		t.Usage.Add(*a.Request.Usage)
 		if !a.Request.TokensComplete {

@@ -71,6 +71,7 @@ type Failure struct {
 	Command     string  `json:"command,omitempty"`
 	Cwd         string  `json:"cwd,omitempty"`
 	Output      Excerpt `json:"output"`
+	Interrupted bool    `json:"interrupted,omitempty"`
 }
 
 type PendingCall struct {
@@ -150,23 +151,61 @@ func Merge(previous State, d Delta) (State, error) {
 	return mergeValidated(previous, d, false)
 }
 
+// EvictionStats reports how many records of each class were dropped to keep
+// a checkpoint within MaxEntries and MaxBytes.
+type EvictionStats struct {
+	Artifacts           int
+	Jobs                int
+	Decisions           int
+	InterruptedFailures int
+	Failures            int
+}
+
+func (e EvictionStats) Total() int {
+	return e.Artifacts + e.Jobs + e.Decisions + e.InterruptedFailures + e.Failures
+}
+
+func (e *EvictionStats) Add(other EvictionStats) {
+	e.Artifacts += other.Artifacts
+	e.Jobs += other.Jobs
+	e.Decisions += other.Decisions
+	e.InterruptedFailures += other.InterruptedFailures
+	e.Failures += other.Failures
+}
+
+func (e EvictionStats) String() string {
+	return fmt.Sprintf("artifacts=%d jobs=%d decisions=%d interrupted_failures=%d failures=%d",
+		e.Artifacts, e.Jobs, e.Decisions, e.InterruptedFailures, e.Failures)
+}
+
 // MergeWithEviction behaves like Merge, but when the combined state exceeds
 // MaxEntries or MaxBytes it deterministically evicts the oldest lowest-priority
 // historical records (artifacts, delivered jobs, finished/unknown jobs,
-// decisions) while preserving ActiveTask, Constraints, Pending, Verification,
-// unresolved Failures, and Running jobs. If the preserved records still exceed
-// the limits, it fails closed with the encode error.
+// decisions, interrupted unknown failures, and oldest failures) while
+// preserving ActiveTask, Constraints, Pending, Verification, and Running jobs.
 func MergeWithEviction(previous State, d Delta) (State, error) {
+	out, _, err := MergeWithEvictionStats(previous, d)
+	return out, err
+}
+
+// MergeWithEvictionStats is MergeWithEviction returning structured eviction counts.
+func MergeWithEvictionStats(previous State, d Delta) (State, EvictionStats, error) {
 	if out, err := Merge(previous, d); err == nil {
-		return out, nil
+		return out, EvictionStats{}, nil
 	}
 	if err := d.validate(false); err != nil {
-		return State{}, err
+		return State{}, EvictionStats{}, err
 	}
-	return mergeValidated(previous, d, true)
+	var stats EvictionStats
+	out, err := mergeValidatedWithStats(previous, d, true, &stats)
+	return out, stats, err
 }
 
 func mergeValidated(previous State, d Delta, allowEviction bool) (State, error) {
+	return mergeValidatedWithStats(previous, d, allowEviction, nil)
+}
+
+func mergeValidatedWithStats(previous State, d Delta, allowEviction bool, stats *EvictionStats) (State, error) {
 	if previous.Version == 0 {
 		if previous.ActiveTask != nil || len(previous.Constraints)+len(previous.Decisions)+len(previous.Verification)+len(previous.Failures)+len(previous.Pending)+len(previous.Jobs)+len(previous.Artifacts) != 0 {
 			return State{}, fmt.Errorf("unversioned checkpoint contains state")
@@ -223,7 +262,7 @@ func mergeValidated(previous State, d Delta, allowEviction bool) (State, error) 
 	out.Jobs = upsert(out.Jobs, d.Jobs, jobKey)
 	out.Artifacts = upsert(out.Artifacts, d.Artifacts, func(a Artifact) string { b, _ := json.Marshal(a); return string(b) })
 	if allowEviction {
-		encoded, err = encodeWithEviction(&out, MaxBytes)
+		encoded, err = encodeWithEviction(&out, MaxBytes, stats, true)
 	} else {
 		encoded, err = Encode(out)
 	}
@@ -235,13 +274,14 @@ func mergeValidated(previous State, d Delta, allowEviction bool) (State, error) 
 
 // EncodeForSummary encodes an independent view of the checkpoint within the
 // summary's available bytes, retaining the full state for persistence.
+// Unlike MergeWithEviction, EncodeForSummary never drops unresolved Failures.
 func EncodeForSummary(s State, maxBytes int) ([]byte, error) {
 	// Eviction may move job entries in place.
 	s.Jobs = slices.Clone(s.Jobs)
-	return encodeWithEviction(&s, maxBytes)
+	return encodeWithEviction(&s, maxBytes, nil, false)
 }
 
-func encodeWithEviction(s *State, maxBytes int) ([]byte, error) {
+func encodeWithEviction(s *State, maxBytes int, stats *EvictionStats, evictFailures bool) ([]byte, error) {
 	for {
 		encoded, err := Encode(*s)
 		if err == nil {
@@ -250,7 +290,7 @@ func encodeWithEviction(s *State, maxBytes int) ([]byte, error) {
 			}
 			err = fmt.Errorf("checkpoint exceeds %d bytes", maxBytes)
 		}
-		if !evictOneOldest(s) {
+		if !evictOneOldest(s, stats, evictFailures) {
 			return nil, err
 		}
 	}
@@ -258,27 +298,59 @@ func encodeWithEviction(s *State, maxBytes int) ([]byte, error) {
 
 // evictOneOldest drops one oldest low-priority historical entry so compaction
 // can degrade gracefully instead of aborting long turns. ActiveTask,
-// Constraints, Pending, Verification, unresolved Failures, and Running jobs
-// are never evicted.
-func evictOneOldest(s *State) bool {
+// Constraints, Pending, Verification, and Running jobs are never evicted.
+// When evictFailures is true, interrupted unknown failures are evicted before
+// confirmed failures.
+func evictOneOldest(s *State, stats *EvictionStats, evictFailures bool) bool {
 	if len(s.Artifacts) > 0 {
 		s.Artifacts = s.Artifacts[1:]
+		if stats != nil {
+			stats.Artifacts++
+		}
 		return true
 	}
 	for i, j := range s.Jobs {
 		if j.Status == Done && j.Delivered {
 			s.Jobs = append(s.Jobs[:i], s.Jobs[i+1:]...)
+			if stats != nil {
+				stats.Jobs++
+			}
 			return true
 		}
 	}
 	for i, j := range s.Jobs {
 		if j.Status == Done || j.Status == Unknown {
 			s.Jobs = append(s.Jobs[:i], s.Jobs[i+1:]...)
+			if stats != nil {
+				stats.Jobs++
+			}
 			return true
 		}
 	}
 	if len(s.Decisions) > 0 {
 		s.Decisions = s.Decisions[1:]
+		if stats != nil {
+			stats.Decisions++
+		}
+		return true
+	}
+	if !evictFailures {
+		return false
+	}
+	for i, f := range s.Failures {
+		if f.Interrupted {
+			s.Failures = append(s.Failures[:i], s.Failures[i+1:]...)
+			if stats != nil {
+				stats.InterruptedFailures++
+			}
+			return true
+		}
+	}
+	if len(s.Failures) > 0 {
+		s.Failures = s.Failures[1:]
+		if stats != nil {
+			stats.Failures++
+		}
 		return true
 	}
 	return false

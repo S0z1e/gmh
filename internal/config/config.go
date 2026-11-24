@@ -68,8 +68,9 @@ import (
 
 // Defaults for optional model fields. A model that omits contextWindow/maxTokens gets these.
 const (
-	DefaultContextWindow = 128000
-	DefaultMaxTokens     = 16384
+	DefaultContextWindow          = 128000
+	DefaultMaxTokens              = 16384
+	DefaultApprovalTimeoutSeconds = 300
 )
 
 // GlobalFileName is the config file name under ~/.minimal-harness/.
@@ -98,9 +99,9 @@ func validPluginName(name string) bool {
 	return validPluginNameRe.MatchString(name)
 }
 
-// The four rates are required when a cost object is present; a rate of 0 is a free tier, not an absent one. The
-// harness parses and stores cost; it is not yet wired into the cost
-// estimate (env rates still drive that).
+// The four rates are required when a cost object is present; a rate of 0 is a
+// free tier, not an absent one. Configured model costs drive cost estimates and
+// dollar budgets unless overridden by OPENAI_PRICE_* environment variables.
 type ModelCost struct {
 	Input      *float64   `json:"input"`
 	Output     *float64   `json:"output"`
@@ -197,16 +198,17 @@ type File struct {
 	API     string `json:"api"`
 	Model   string `json:"model"`
 
-	Mode                string               `json:"mode"`
-	BashTimeoutSeconds  *int                 `json:"bashTimeoutSeconds"`
-	BashEnv             []string             `json:"bashEnv"`
-	Verification        *verification.Policy `json:"verification"`
-	BgThresholdSeconds  *int                 `json:"bgThresholdSeconds"`
-	DenyInsteadOfPrompt *bool                `json:"denyInsteadOfPrompt"`
-	Sandbox             *bool                `json:"sandbox"`
-	ContextLimit        *int                 `json:"contextLimit"`
-	AnthropicMaxTokens  *int                 `json:"anthropicMaxTokens"`
-	TUITheme            string               `json:"tuiTheme"`
+	Mode                   string               `json:"mode"`
+	BashTimeoutSeconds     *int                 `json:"bashTimeoutSeconds"`
+	ApprovalTimeoutSeconds *int                 `json:"approvalTimeoutSeconds"`
+	BashEnv                []string             `json:"bashEnv"`
+	Verification           *verification.Policy `json:"verification"`
+	BgThresholdSeconds     *int                 `json:"bgThresholdSeconds"`
+	DenyInsteadOfPrompt    *bool                `json:"denyInsteadOfPrompt"`
+	Sandbox                *bool                `json:"sandbox"`
+	ContextLimit           *int                 `json:"contextLimit"`
+	AnthropicMaxTokens     *int                 `json:"anthropicMaxTokens"`
+	TUITheme               string               `json:"tuiTheme"`
 	// Plugins is the optional plugins section (nil = unset: nothing
 	// is disabled). A project file's section replaces the global
 	// one, like a provider's models list.
@@ -341,6 +343,9 @@ func Merge(dst, src *File) {
 	}
 	if src.BashTimeoutSeconds != nil {
 		dst.BashTimeoutSeconds = src.BashTimeoutSeconds
+	}
+	if src.ApprovalTimeoutSeconds != nil {
+		dst.ApprovalTimeoutSeconds = src.ApprovalTimeoutSeconds
 	}
 	if src.BashEnv != nil {
 		dst.BashEnv = append([]string{}, src.BashEnv...)
@@ -623,6 +628,9 @@ func Validate(f *File) error {
 	}
 	if f.BashTimeoutSeconds != nil && *f.BashTimeoutSeconds <= 0 {
 		return fmt.Errorf("bashTimeoutSeconds must be > 0")
+	}
+	if f.ApprovalTimeoutSeconds != nil && *f.ApprovalTimeoutSeconds < 0 {
+		return fmt.Errorf("approvalTimeoutSeconds must be >= 0 (0 disables timeout)")
 	}
 	if _, err := f.TurnBudget.Resolve(); err != nil {
 		return fmt.Errorf("turnBudget: %w", err)

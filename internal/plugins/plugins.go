@@ -60,9 +60,13 @@ const (
 	// interruptGrace is how long Call waits for a runaway call to stop
 	// after Interrupt before giving up on the runtime.
 	interruptGrace = 5 * time.Second
-	// maxPluginRestarts bounds automatic runtime rebuilds after a wedged call
-	// before permanently marking the plugin broken.
+	// maxPluginRestarts bounds automatic runtime rebuilds within pluginRestartWindow
+	// before marking the plugin broken.
 	maxPluginRestarts = 3
+	// pluginRestartWindow is the sliding window over which restarts are counted.
+	pluginRestartWindow = 10 * time.Minute
+	// maxLeakedRuntimes caps concurrent abandoned wedged goroutines per plugin.
+	maxLeakedRuntimes = 4
 	// MaxStoreBytes caps one file in a plugin's data dir, read or written.
 	MaxStoreBytes = 1 << 20
 	// MaxObservationRunes caps one plugin tool's observation text.
@@ -130,11 +134,14 @@ type Plugin struct {
 	Dir         string
 	DataDir     string
 
-	rt       *moejs.Runtime
-	mu       sync.Mutex // serialises calls into this runtime (a runtime runs on one goroutine; only Interrupt is concurrent-safe)
-	loading  bool       // true while the entry's top level runs: registerTool is only valid then
-	broken   bool       // true when a call never stopped after Interrupt and restarts are exhausted
-	restarts int        // number of automatic runtime restarts after wedged calls
+	rt           *moejs.Runtime
+	mu           sync.Mutex // serialises calls into this runtime (a runtime runs on one goroutine; only Interrupt is concurrent-safe)
+	loading      bool       // true while the entry's top level runs: registerTool is only valid then
+	broken       bool       // true when a call never stopped after Interrupt and restarts are exhausted
+	restarts     int        // total successful runtime restarts (diagnostics)
+	restartTimes []time.Time
+	leakedMu     sync.Mutex
+	leaked       int // abandoned wedged call goroutines still unwinding
 	// registry is the owning registry: setMode/getMode read its
 	// ModeSetter/ModeGetter, which app.Setup wires after Load.
 	registry *Registry
@@ -914,11 +921,22 @@ func hookResultString(p *Plugin, res any) (string, bool) {
 	}
 }
 
+func (p *Plugin) ensureReadyLocked(ctx context.Context) error {
+	if !p.broken {
+		return nil
+	}
+	if p.tryRestartLocked(ctx) {
+		p.broken = false
+		return nil
+	}
+	return fmt.Errorf("plugin %s is unusable after a call that never stopped; restart the harness", p.Name)
+}
+
 func (p *Plugin) call(ctx context.Context, t *Tool, argsJSON string, timeout time.Duration) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.broken {
-		return "", fmt.Errorf("plugin %s is unusable after a call that never stopped; restart the harness", p.Name)
+	if err := p.ensureReadyLocked(ctx); err != nil {
+		return "", err
 	}
 	if strings.TrimSpace(argsJSON) == "" {
 		argsJSON = "{}"
@@ -964,8 +982,8 @@ func (p *Plugin) call(ctx context.Context, t *Tool, argsJSON string, timeout tim
 func (p *Plugin) callCommand(ctx context.Context, c *Command, args string, timeout time.Duration) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.broken {
-		return "", fmt.Errorf("plugin %s is unusable after a call that never stopped; restart the harness", p.Name)
+	if err := p.ensureReadyLocked(ctx); err != nil {
+		return "", err
 	}
 	argVal := moejs.String(args)
 	handler := c.handler
@@ -988,8 +1006,8 @@ func (p *Plugin) callCommand(ctx context.Context, c *Command, args string, timeo
 func (p *Plugin) callHook(ctx context.Context, fn *moejs.Value, inputJSON string, timeout time.Duration) (any, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.broken {
-		return nil, fmt.Errorf("plugin %s is unusable after a call that never stopped; restart the harness", p.Name)
+	if err := p.ensureReadyLocked(ctx); err != nil {
+		return nil, err
 	}
 	rt, handler := p.rt, *fn
 	asJSON := fn == &p.contextHook
@@ -1086,13 +1104,41 @@ func promiseStateName(state moejs.PromiseState) string {
 // and spent accounting on the realm (spike finding 1), so both are
 // cleared here. If the call never stops, the runtime is wedged and
 // the plugin is marked broken instead of hanging every later call.
+func closeRuntime(rt any) {
+	switch c := rt.(type) {
+	case interface{ Close() error }:
+		_ = c.Close()
+	case interface{ Close() }:
+		c.Close()
+	}
+}
+
+func (p *Plugin) leakedCount() int {
+	p.leakedMu.Lock()
+	n := p.leaked
+	p.leakedMu.Unlock()
+	return n
+}
+
 func (p *Plugin) interruptAndWait(ctx context.Context, done chan callResult, cause error) {
-	p.rt.Interrupt(cause)
+	oldRT := p.rt
+	oldRT.Interrupt(cause)
 	select {
 	case <-done:
-		p.rt.ClearInterrupt()
-		p.rt.ResetAllocation()
+		oldRT.ClearInterrupt()
+		oldRT.ResetAllocation()
 	case <-time.After(interruptGrace):
+		p.leakedMu.Lock()
+		p.leaked++
+		p.leakedMu.Unlock()
+		// Reclaim the abandoned runtime once the stuck call eventually unwinds.
+		go func(rt *moejs.Runtime, ch chan callResult) {
+			<-ch
+			closeRuntime(rt)
+			p.leakedMu.Lock()
+			p.leaked--
+			p.leakedMu.Unlock()
+		}(oldRT, done)
 		if !p.tryRestartLocked(ctx) {
 			p.broken = true
 		}
@@ -1100,13 +1146,22 @@ func (p *Plugin) interruptAndWait(ctx context.Context, done chan callResult, cau
 }
 
 // tryRestartLocked abandons a wedged runtime and rebuilds a fresh instance up
-// to maxPluginRestarts times so a single runaway call does not disable the
-// plugin for the rest of a long-running session.
+// to maxPluginRestarts times within pluginRestartWindow so a single runaway
+// call does not permanently disable the plugin in long-running sessions.
 func (p *Plugin) tryRestartLocked(ctx context.Context) bool {
-	if p.restarts >= maxPluginRestarts || p.Dir == "" || ctx.Err() != nil {
+	now := time.Now()
+	cutoff := now.Add(-pluginRestartWindow)
+	kept := p.restartTimes[:0]
+	for _, ts := range p.restartTimes {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
+		}
+	}
+	p.restartTimes = kept
+	if len(p.restartTimes) >= maxPluginRestarts || p.leakedCount() >= maxLeakedRuntimes || p.Dir == "" || ctx.Err() != nil {
 		return false
 	}
-	p.restarts++
+	p.restartTimes = append(p.restartTimes, now)
 	ctx, cancel := context.WithTimeout(ctx, interruptGrace)
 	defer cancel()
 	type reload struct {
@@ -1132,9 +1187,11 @@ func (p *Plugin) tryRestartLocked(ctx context.Context) bool {
 		return false
 	}
 	if !p.sameRegistrations(fresh) {
+		closeRuntime(fresh.rt)
 		fmt.Fprintf(os.Stderr, "warning: plugin %s runtime restart changed registrations\n", p.Name)
 		return false
 	}
+	p.restarts++
 	p.rt = fresh.rt
 	for _, t := range p.tools {
 		t.handler = fresh.byName[t.Name].handler
@@ -1147,7 +1204,7 @@ func (p *Plugin) tryRestartLocked(ctx context.Context) bool {
 	p.sessionBeforeCompactHook, p.sessionStartHook = fresh.sessionBeforeCompactHook, fresh.sessionStartHook
 	p.sessionSwitchHook, p.sessionRenameHook = fresh.sessionSwitchHook, fresh.sessionRenameHook
 	p.stopHook = fresh.stopHook
-	fmt.Fprintf(os.Stderr, "warning: plugin %s wedged; restarted runtime (%d/%d)\n", p.Name, p.restarts, maxPluginRestarts)
+	fmt.Fprintf(os.Stderr, "warning: plugin %s wedged; restarted runtime (%d/%d in %s)\n", p.Name, len(p.restartTimes), maxPluginRestarts, pluginRestartWindow)
 	return true
 }
 

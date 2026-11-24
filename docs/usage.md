@@ -35,12 +35,13 @@
   with an explicit incomplete error, preserved for resume. `-p` returns a
   nonzero exit status when the turn fails, including a cap or blocked task.
 - Each agent turn defaults to a 1-hour wall deadline, 1,000 requested tool calls,
-  and 8 concurrent background-capable Bash executions across current and retained
-  sessions on the executor. Required foreground verification checks do not consume
+  2,000,000 tokens, and 8 concurrent background-capable Bash executions across
+  current and retained sessions on the executor. Sessions default to 10,000,000
+  tokens across all turns. Required foreground verification checks do not consume
   a background-job slot. Configure global, explicit or trusted project settings:
 
   ```json
-  {"turnBudget":{"maxDurationSeconds":3600,"maxToolCalls":1000,"maxConcurrentJobs":8,"maxTokens":0,"maxCostUSD":0}}
+  {"turnBudget":{"maxDurationSeconds":3600,"maxToolCalls":1000,"maxConcurrentJobs":8,"maxTokens":2000000,"maxSessionTokens":10000000,"maxCostUSD":0,"strictMetering":false}}
   ```
 
   Omitted fields use these defaults; an explicit zero disables that cap. An omitted
@@ -51,8 +52,9 @@
   The deadline includes provider requests, tools, retries, background-result waits
   and approval/question waits. Custom prompt callbacks must observe the request's
   `Context`. Detached background jobs retain their existing lifecycle after a stop.
-- Token and dollar caps are opt-in. `maxSessionTokens` and `maxSessionCostUSD`
-  limit cumulative usage across turns, manual compaction and `--resume`.
+- Dollar caps are opt-in via `maxCostUSD` and `maxSessionCostUSD`.
+  `maxSessionTokens` and `maxSessionCostUSD` limit cumulative usage across turns,
+  manual compaction and `--resume`.
   Caps use reported usage from provider attempts, including failed retries,
   automatic compaction and grace calls. Requests rejected before inference
   can be retried without a usage report. A final response can use the exact
@@ -60,11 +62,14 @@
   after execution, so an in-flight request can overshoot. Its reported usage
   is retained. Dollar caps use configured rate estimates and require cache
   usage when input and cache-read rates differ. Environment pricing requires
-  all three base `OPENAI_PRICE_*_PER_MTOK` rates, including explicit zeros.
-  Anthropic also requires a cache-write rate. With no environment rates, the
-  harness uses the model's complete configured `cost` schedule if available.
-  Missing required usage or pricing stops with `budget_unavailable`. Exhaustion
-  stops with `budget_exceeded`. Both save an
+  all three base `OPENAI_PRICE_*_PER_MTOK` rates, including explicit zeros,
+  when the model has no configured `cost` schedule. Environment rates override
+  the corresponding model rates. Anthropic also requires a cache-write rate.
+  By default, missing usage or pricing leaves a metering gap and caps use only
+  recorded subtotals. If you relied on an existing cap stopping whenever usage
+  or pricing was incomplete, set `strictMetering: true` in `turnBudget` when
+  upgrading. Strict mode stops with `budget_unavailable` when metering required
+  by an active cap is incomplete. Exhaustion stops with `budget_exceeded`. Both save an
   `incomplete` task outcome with the budget snapshot and send no extra grace call.
   Unreported usage is recorded as unknown rather than zero. Ordinary UI usage
   totals remain separate from this per-attempt budget evidence.

@@ -38,7 +38,7 @@ func TestUsageLedgerSurvivesRewriteRenameResume(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.Attempts != 3 || got.UnreportedAttempts != 1 || got.PartialAttempts != 1 || got.Usage.TotalTokens != 30 || got.EstimateUSD != cost || got.LegacyHistory {
+		if got.Attempts != 3 || got.TransientAttempts != 1 || got.UnreportedAttempts != 1 || got.UnpricedAttempts() != 2 || got.PartialAttempts != 1 || got.Usage.TotalTokens != 30 || got.EstimateUSD != cost || got.LegacyHistory {
 			t.Fatalf("totals=%+v", got)
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 	"time"
 
@@ -57,6 +58,9 @@ func (c *Config) startBudgetWithPolicy(parent context.Context, policy *turnbudge
 		if err := b.SeedSessionUsage(int64(totals.Usage.TotalTokens), totals.ExactCost(), totals.TokenCountsComplete(), costComplete); err != nil {
 			c.resources.failure = err
 			return parent, func() {}, err
+		}
+		if b.State().BaselineIncomplete {
+			fmt.Fprintf(os.Stderr, "warning: session %s metering baseline is incomplete; enforcing budgets against recorded lower-bound usage\n", c.Session.ID)
 		}
 	}
 	c.resources.tracker = b

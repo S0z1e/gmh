@@ -23,6 +23,7 @@ import (
 
 func capInt(n int64) *int64     { return &n }
 func capUSD(n float64) *float64 { return &n }
+func capBool(b bool) *bool      { return &b }
 func budgetConfig(t *testing.T, p *turnbudget.Policy) *Config {
 	t.Helper()
 	return &Config{Exec: &tools.Executor{Root: t.TempDir()}, Tools: ToolDefs(), Mode: "auto", TurnBudget: p}
@@ -122,7 +123,7 @@ func TestBudgetTokenBoundariesAndMissingEvidence(t *testing.T) {
 		{"exact", newInt(10), ""}, {"overshoot", newInt(11), TerminalBudgetExceeded}, {"unknown", nil, TerminalBudgetUnavailable}, {"zero", newInt(0), ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(10)})
+			c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(10), StrictMetering: capBool(true)})
 			events, bodies, err := runVerification(t, c, budgetSSE("done", nil, tc.tokens, true))
 			if len(bodies) != 1 {
 				t.Fatal("extra provider request")
@@ -260,7 +261,7 @@ func TestBudgetGraceUsageAndUnavailablePrices(t *testing.T) {
 	if len(bodies) != 2 || c.LastTurnBudget.ReportedTokens != 20 {
 		t.Fatal("grace usage omitted")
 	}
-	c = budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(1)})
+	c = budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(1), StrictMetering: capBool(true)})
 	events, bodies, err = runVerification(t, c, textSSE("done"))
 	requireBudgetStop(t, c, events, err, TerminalBudgetUnavailable)
 	if len(bodies) != 0 {
@@ -269,7 +270,7 @@ func TestBudgetGraceUsageAndUnavailablePrices(t *testing.T) {
 }
 
 func TestBudgetPriceUsesAllAttemptsAndFreeRatesAreValid(t *testing.T) {
-	c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(.3)})
+	c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(.3), StrictMetering: capBool(true)})
 	c.UsageRates = llm.Rates{InputPerMTok: 100000, OutputPerMTok: 100000, CachedPerMTok: 100000, Configured: true, Complete: true}
 	calls := []llm.ToolCall{budgetCall("a", "read", `{"path":"missing"}`)}
 	events, bodies, err := runVerification(t, c, budgetSSE("", calls, newInt(1), true), budgetSSE("done", nil, newInt(2), true))
@@ -461,7 +462,7 @@ func TestBudgetWireCountsPreserveUnknownFieldsAcrossAPIs(t *testing.T) {
 					fmt.Fprint(w, response)
 				}))
 				defer srv.Close()
-				c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(10)})
+				c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(10), StrictMetering: capBool(true)})
 				c.Client = &llm.Client{BaseURL: srv.URL, Model: "fake", APIKey: "fake", API: api, HTTP: srv.Client()}
 				var events []Event
 				c.OnEvent = func(e Event) { events = append(events, e) }
@@ -488,7 +489,7 @@ func TestBudgetResponsesNonterminalUsageRemainsPartial(t *testing.T) {
 		fmt.Fprint(w, response)
 	}))
 	defer srv.Close()
-	c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(10)})
+	c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(10), StrictMetering: capBool(true)})
 	c.Client = &llm.Client{BaseURL: srv.URL, API: "responses", Model: "fake", APIKey: "fake"}
 	var events []Event
 	c.OnEvent = func(e Event) { events = append(events, e) }
@@ -513,7 +514,7 @@ func TestBudgetPartialUsageRetainsEarlierCounters(t *testing.T) {
 					fmt.Fprint(w, response)
 				}))
 				defer srv.Close()
-				c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(100)})
+				c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(100), StrictMetering: capBool(true)})
 				c.Client = &llm.Client{BaseURL: srv.URL, API: api, Model: "fake", APIKey: "fake"}
 				_, _, err := c.Run(context.Background(), []llm.Message{{Role: "user", Content: "work"}})
 				want := int64(10)
@@ -533,7 +534,7 @@ func TestBudgetPartialUsageRetainsEarlierCounters(t *testing.T) {
 }
 
 func TestBudgetCustomCompactionAncillaryFieldsDoNotProveZeroTokens(t *testing.T) {
-	c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(100)})
+	c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(100), StrictMetering: capBool(true)})
 	c.CompactHistory = func(context.Context, []llm.Message) (string, llm.Usage, error) {
 		return "summary", llm.Usage{CacheUsageReported: true, ReasoningTokens: 2}, nil
 	}
@@ -551,7 +552,7 @@ func TestBudgetCustomCompactionAncillaryFieldsDoNotProveZeroTokens(t *testing.T)
 func TestBudgetTerminalSettlementPrecedesEventCallback(t *testing.T) {
 	for _, tokens := range []*int{newInt(1), nil} {
 		t.Run(fmt.Sprint(tokens != nil), func(t *testing.T) {
-			c := budgetConfig(t, &turnbudget.Policy{MaxDurationSeconds: capInt(1), MaxTokens: capInt(100)})
+			c := budgetConfig(t, &turnbudget.Policy{MaxDurationSeconds: capInt(1), MaxTokens: capInt(100), StrictMetering: capBool(true)})
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				fmt.Fprint(w, budgetSSE("done", nil, tokens, true))
@@ -582,7 +583,7 @@ func TestBudgetTerminalSettlementPrecedesEventCallback(t *testing.T) {
 }
 
 func TestBudgetCustomCompactionTotalOnlyIsNotFreePricing(t *testing.T) {
-	c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(1)})
+	c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(1), StrictMetering: capBool(true)})
 	c.UsageRates = llm.Rates{InputPerMTok: 1, OutputPerMTok: 1, CachedPerMTok: 1, Configured: true, Complete: true}
 	c.CompactHistory = func(context.Context, []llm.Message) (string, llm.Usage, error) {
 		return "summary", llm.Usage{TotalTokens: 5}, nil
@@ -601,7 +602,7 @@ func TestBudgetCustomCompactionTotalOnlyIsNotFreePricing(t *testing.T) {
 func TestBudgetCustomCompactionNormalizesProgrammaticCacheUsage(t *testing.T) {
 	for _, partial := range []bool{false, true} {
 		t.Run(fmt.Sprint(partial), func(t *testing.T) {
-			c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(1)})
+			c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(1), StrictMetering: capBool(true)})
 			c.UsageRates = llm.Rates{InputPerMTok: 2, OutputPerMTok: 1, CachedPerMTok: 1, Configured: true, Complete: true}
 			c.CompactHistory = func(context.Context, []llm.Message) (string, llm.Usage, error) {
 				u := llm.Usage{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110, CachedTokens: 50}

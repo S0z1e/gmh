@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"minimalharness/internal/llm"
 )
@@ -115,6 +116,12 @@ func TestWriterLeaseProcessHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	if mode == "legacy" {
+		started := time.Now().Add(-lockStaleTTL - time.Minute).UTC().Format(time.RFC3339)
+		if err := writeLockOwnerData(s.writer, fmt.Appendf(nil, "pid=%d started=%s", os.Getpid(), started)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	fmt.Println("ready")
 	// Parent kills this process to prove the OS releases the lease after a crash.
 	var b [1]byte

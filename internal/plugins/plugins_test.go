@@ -120,6 +120,39 @@ func TestRuntimeRebuildRespectsContextDuringInitialization(t *testing.T) {
 	}
 }
 
+func TestRuntimeRebuildCountsFailuresAndStopsAtLeakedRuntimeLimit(t *testing.T) {
+	reg, root := loadEcho(t)
+	p := reg.Plugins()[0]
+	entry := filepath.Join(root, ".agents", "plugins", "echo", "echo.js")
+	if err := os.WriteFile(entry, []byte("function {"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for range maxPluginRestarts {
+		if p.tryRestartLocked(t.Context()) {
+			t.Fatal("invalid plugin reloaded")
+		}
+	}
+	if err := os.WriteFile(entry, []byte(echoPlugin), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if p.tryRestartLocked(t.Context()) {
+		t.Fatal("failed reloads did not exhaust the restart budget")
+	}
+	for i := range p.restartTimes {
+		p.restartTimes[i] = time.Now().Add(-2 * pluginRestartWindow)
+	}
+	p.leaked = maxLeakedRuntimes
+	if p.tryRestartLocked(t.Context()) {
+		t.Fatal("reloaded with the maximum number of leaked runtimes")
+	}
+	p.leaked--
+	if !p.tryRestartLocked(t.Context()) {
+		t.Fatal("reload did not recover when both limits cleared")
+	}
+}
+
 func TestLoadRejectsBadManifest(t *testing.T) {
 	cases := []struct {
 		name     string

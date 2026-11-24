@@ -417,8 +417,13 @@ func (s *Store) Rename(newID string) error {
 		return err
 	}
 	// The rename has committed: retain the new lease even if reopening fails.
+	if s.stopHeartbeat != nil {
+		s.stopHeartbeat()
+		s.stopHeartbeat = nil
+	}
 	s.writer.Close()
 	s.writer = target
+	s.stopHeartbeat = startWriterHeartbeat(target)
 	keep = true
 	newPath := filepath.Join(Dir(), newID+".jsonl")
 	s.ID, s.Path = newID, newPath

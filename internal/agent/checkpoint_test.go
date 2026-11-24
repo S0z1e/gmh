@@ -16,6 +16,7 @@ import (
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
 	"minimalharness/internal/tools"
+	"minimalharness/internal/turnbudget"
 )
 
 func appendFixtureBatch(msgs []llm.Message, i, size int) []llm.Message {
@@ -295,7 +296,7 @@ func TestCheckpointKeepsWireRequestsStableBetweenRewrites(t *testing.T) {
 		fmt.Fprintf(w, "data: {\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n", input)
 	}))
 	defer srv.Close()
-	cfg := &Config{Client: &llm.Client{BaseURL: srv.URL, Model: "mock", APIKey: "fake"}, Exec: &tools.Executor{Root: root}, Tools: defs, Mode: "auto", ContextLimit: DefaultContextLimit, TraceRequests: true,
+	cfg := &Config{Client: &llm.Client{BaseURL: srv.URL, Model: "mock", APIKey: "fake"}, Exec: &tools.Executor{Root: root}, Tools: defs, Mode: "auto", ContextLimit: DefaultContextLimit, TraceRequests: true, TurnBudget: &turnbudget.Policy{MaxTokens: capInt(0), MaxSessionTokens: capInt(0)},
 		OnEvent: func(e Event) {
 			if e.Request != nil {
 				traces = append(traces, *e.Request)

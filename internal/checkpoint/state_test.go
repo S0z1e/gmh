@@ -329,3 +329,33 @@ func TestMergeWithEvictionDropsOldArtifactsAndFinishedJobsBeforeFailing(t *testi
 		t.Fatalf("evicted state does not fit bounds: %v", err)
 	}
 }
+
+func TestMergeWithEvictionDropsInterruptedAndOldestFailuresWithStats(t *testing.T) {
+	task := Text{Source: "task:active", Content: "Finish migration safely."}
+	var failures []Failure
+	for i := 0; i < MaxEntries+20; i++ {
+		failures = append(failures, Failure{
+			Fingerprint: fmt.Sprintf("fail-%04d", i),
+			Source:      fmt.Sprintf("src:%d", i),
+			Tool:        "bash",
+			Output:      observe(t, fmt.Sprintf("error %d", i), 64),
+			Interrupted: i < 15,
+		})
+	}
+	s, stats, err := MergeWithEvictionStats(State{}, Delta{
+		ActiveTask: &task,
+		Failures:   failures,
+	})
+	if err != nil {
+		t.Fatalf("MergeWithEvictionStats failed: %v", err)
+	}
+	if stats.InterruptedFailures != 15 || stats.Failures == 0 || stats.Total() < 20 {
+		t.Fatalf("unexpected eviction stats: %+v", stats)
+	}
+	if s.ActiveTask == nil || *s.ActiveTask != task {
+		t.Fatalf("active task lost: %+v", s.ActiveTask)
+	}
+	if _, err := Encode(s); err != nil {
+		t.Fatalf("evicted state does not fit bounds: %v", err)
+	}
+}

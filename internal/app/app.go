@@ -551,38 +551,92 @@ func clientTimeouts(mdl config.Model) (timeout, idle time.Duration) {
 	return timeout, idle
 }
 
-// ratesForModel prefers explicit environment rates, then falls back to the
-// model's configured cost schedule (including cache-write and tiered rates).
+// ratesForModel merges explicit environment rates over the model's configured
+// cost schedule field-by-field so partial env overrides (e.g. missing
+// OPENAI_PRICE_CACHE_WRITE_PER_MTOK) still inherit model config fields.
 func ratesForModel(envRates llm.Rates, provName string, mdl config.Model) llm.Rates {
-	if envRates.Configured {
-		return envRates
-	}
-	if mdl.Cost == nil || mdl.Cost.Input == nil || mdl.Cost.Output == nil || mdl.Cost.CacheRead == nil || mdl.Cost.CacheWrite == nil {
-		return envRates
-	}
-	r := llm.Rates{
-		InputPerMTok:         *mdl.Cost.Input,
-		OutputPerMTok:        *mdl.Cost.Output,
-		CachedPerMTok:        *mdl.Cost.CacheRead,
-		CacheWritePerMTok:    *mdl.Cost.CacheWrite,
-		CacheWriteConfigured: true,
-		Source:               fmt.Sprintf("config %s/%s", provName, mdl.ID),
-		Configured:           true,
-		Complete:             true,
-	}
-	for _, t := range mdl.Cost.Tiers {
-		if t.InputTokensAbove == nil || t.Input == nil || t.Output == nil || t.CacheRead == nil || t.CacheWrite == nil {
-			continue
+	var base llm.Rates
+	hasModelCost := mdl.Cost != nil && mdl.Cost.Input != nil && mdl.Cost.Output != nil && mdl.Cost.CacheRead != nil && mdl.Cost.CacheWrite != nil
+	if hasModelCost {
+		base = llm.Rates{
+			InputPerMTok:         *mdl.Cost.Input,
+			OutputPerMTok:        *mdl.Cost.Output,
+			CachedPerMTok:        *mdl.Cost.CacheRead,
+			CacheWritePerMTok:    *mdl.Cost.CacheWrite,
+			InputConfigured:      true,
+			OutputConfigured:     true,
+			CachedConfigured:     true,
+			CacheWriteConfigured: true,
+			Source:               fmt.Sprintf("config %s/%s", provName, mdl.ID),
+			Configured:           true,
+			Complete:             true,
 		}
-		r.Tiers = append(r.Tiers, llm.RateTier{
-			InputTokensAbove:  int64(*t.InputTokensAbove),
-			InputPerMTok:      *t.Input,
-			OutputPerMTok:     *t.Output,
-			CachedPerMTok:     *t.CacheRead,
-			CacheWritePerMTok: *t.CacheWrite,
-		})
+		for _, t := range mdl.Cost.Tiers {
+			if t.InputTokensAbove == nil || t.Input == nil || t.Output == nil || t.CacheRead == nil || t.CacheWrite == nil {
+				continue
+			}
+			base.Tiers = append(base.Tiers, llm.RateTier{
+				InputTokensAbove:  int64(*t.InputTokensAbove),
+				InputPerMTok:      *t.Input,
+				OutputPerMTok:     *t.Output,
+				CachedPerMTok:     *t.CacheRead,
+				CacheWritePerMTok: *t.CacheWrite,
+			})
+		}
 	}
-	return r
+	if !envRates.Configured {
+		if hasModelCost {
+			return base
+		}
+		return envRates
+	}
+	if !hasModelCost {
+		return envRates
+	}
+	if envRates.InputConfigured {
+		base.InputPerMTok = envRates.InputPerMTok
+	}
+	if envRates.OutputConfigured {
+		base.OutputPerMTok = envRates.OutputPerMTok
+	}
+	if envRates.CachedConfigured {
+		base.CachedPerMTok = envRates.CachedPerMTok
+	}
+	if envRates.CacheWriteConfigured {
+		base.CacheWritePerMTok = envRates.CacheWritePerMTok
+		base.CacheWriteConfigured = true
+	}
+	if envRates.PeakInputPerMTok > 0 {
+		base.PeakInputPerMTok = envRates.PeakInputPerMTok
+	}
+	if envRates.PeakOutputPerMTok > 0 {
+		base.PeakOutputPerMTok = envRates.PeakOutputPerMTok
+	}
+	if envRates.PeakCachedPerMTok > 0 {
+		base.PeakCachedPerMTok = envRates.PeakCachedPerMTok
+	}
+	// Apply explicit env overrides to configured tiers too so env rates are
+	// never silently overridden above a tier threshold.
+	for i := range base.Tiers {
+		if envRates.InputConfigured {
+			base.Tiers[i].InputPerMTok = envRates.InputPerMTok
+		}
+		if envRates.OutputConfigured {
+			base.Tiers[i].OutputPerMTok = envRates.OutputPerMTok
+		}
+		if envRates.CachedConfigured {
+			base.Tiers[i].CachedPerMTok = envRates.CachedPerMTok
+		}
+		if envRates.CacheWriteConfigured {
+			base.Tiers[i].CacheWritePerMTok = envRates.CacheWritePerMTok
+		}
+	}
+	if envRates.Source != "" {
+		base.Source = envRates.Source
+	}
+	base.Complete = base.InputConfigured && base.OutputConfigured && base.CachedConfigured
+	base.Configured = true
+	return base
 }
 
 func (a *App) SwitchModel(provider, model string) (provName, modelID, api string, err error) {

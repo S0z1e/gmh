@@ -51,3 +51,8 @@ func checkTranscriptLinks(f *os.File) error {
 }
 
 const metadataReadFlags = 0
+const lockOwnerReadOffset = 1
+
+func processAlive(pid int) bool {
+	return pid > 0
+}

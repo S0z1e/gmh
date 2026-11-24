@@ -8,10 +8,14 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"minimalharness/internal/turnbudget"
 )
 
 func TestUsageRegressionCurrentRunOverflowRemainsValid(t *testing.T) {
 	s, out := usageRegressionServer(t, false)
+	zero := int64(0)
+	s.app.Cfg.TurnBudget = &turnbudget.Policy{MaxTokens: &zero, MaxSessionTokens: &zero}
 	count := 0
 	s.app.Cfg.Client.HTTP.Transport = usageRegressionTransport(func(*http.Request) (*http.Response, error) {
 		count++

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -160,6 +161,7 @@ func (c *Config) checkpointSources(view []llm.Message) ([]llm.Message, error) {
 func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoint.State, task *llm.Message, err error) {
 	history = completionFactOrder(history)
 	state.Version, beforeTask.Version = checkpoint.Version, checkpoint.Version
+	var evicted checkpoint.EvictionStats
 	calls := make(map[string]compactCall)
 	epoch := "initial"
 	hasCheckpoint := false
@@ -277,7 +279,9 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 				}
 				// Fold completion order before the stop acknowledgement. A
 				// prior success must not resolve a later job's failure.
-				state, err = checkpoint.MergeWithEviction(state, outcome)
+				var stats checkpoint.EvictionStats
+				state, stats, err = checkpoint.MergeWithEvictionStats(state, outcome)
+				evicted.Add(stats)
 				if err != nil {
 					return
 				}
@@ -306,16 +310,18 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 					info.name = "unknown"
 				}
 				if info.fingerprint == "" {
-					info.fingerprint = factDigest("unidentified:" + source)
+					info.fingerprint = factDigest("unidentified:" + info.name + ":" + info.command + ":" + info.cwd)
 				}
 				// An interrupted retry grants no new execution evidence.
 				// Keep its unknown outcome as a distinct unresolved fact so
-				// it cannot overwrite the original command's actual failure.
+				// it cannot overwrite the original command's actual failure,
+				// while deduplicating repeated interrupted retries for the same call.
 				fingerprint := info.fingerprint
-				if m.Kind == "interrupted" {
+				interrupted := m.Kind == "interrupted"
+				if interrupted {
 					fingerprint = factDigest("unknown:" + info.fingerprint)
 				}
-				d.Failures = append(d.Failures, checkpoint.Failure{Fingerprint: fingerprint, Source: source, Tool: info.name, Command: info.command, Cwd: info.cwd, Output: excerpt})
+				d.Failures = append(d.Failures, checkpoint.Failure{Fingerprint: fingerprint, Source: source, Tool: info.name, Command: info.command, Cwd: info.cwd, Output: excerpt, Interrupted: interrupted})
 			} else {
 				backgroundLaunch := m.Role == "tool" && m.Observation != nil && len(m.Observation.Jobs) > 0
 				if info.fingerprint != "" && !backgroundLaunch {
@@ -332,7 +338,9 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 				}
 			}
 		}
-		state, err = checkpoint.MergeWithEviction(state, d)
+		var stats checkpoint.EvictionStats
+		state, stats, err = checkpoint.MergeWithEvictionStats(state, d)
+		evicted.Add(stats)
 		if err != nil {
 			return
 		}
@@ -351,7 +359,12 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 			jobs = append(jobs, current)
 		}
 	}
-	state, err = checkpoint.MergeWithEviction(state, checkpoint.Delta{Jobs: jobs, RefreshJobs: true})
+	var finalStats checkpoint.EvictionStats
+	state, finalStats, err = checkpoint.MergeWithEvictionStats(state, checkpoint.Delta{Jobs: jobs, RefreshJobs: true})
+	evicted.Add(finalStats)
+	if evicted.Total() > 0 {
+		fmt.Fprintf(os.Stderr, "warning: checkpoint exceeded limits; evicted oldest records (%s)\n", evicted.String())
+	}
 	return
 }
 

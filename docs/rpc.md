@@ -92,6 +92,12 @@ echoed in the response):
   effective window and output cap for the current model — the values
   Setup resolved, so a GUI can meter context against the limit the
   compact trigger uses).
+- `replay` `{"after_sequence":N}` returns buffered events after that sequence
+  in order, with `connection_id`, `oldest_sequence`, `latest_sequence`, and
+  `pending_approvals`. When `has_more` is true, pass `next_after_sequence` as
+  `after_sequence` for the next page. When it is false, `next_after_sequence`
+  advances through the snapshot. `truncated` signals that some requested events
+  are no longer in the buffer. Use cursors within the same connection.
 - `usage` returns lifetime `session` and `current_run` usage. Treat counts
   as subtotals when their corresponding completeness flag is false.
   `metering_available` indicates whether lifetime metering can be read.
