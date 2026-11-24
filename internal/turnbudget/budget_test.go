@@ -11,6 +11,7 @@ import (
 
 func number(n int64) *int64      { return &n }
 func dollars(n float64) *float64 { return &n }
+func boolPtr(b bool) *bool       { return &b }
 func tracker(t *testing.T, p *Policy) *Tracker {
 	t.Helper()
 	b, err := New(p, time.Unix(1000, 0), true)
@@ -38,10 +39,10 @@ func unavailable(t *testing.T, err error, resource string) {
 }
 func TestDefaultsExplicitZeroAndFrozenPolicy(t *testing.T) {
 	defaults := tracker(t, nil).State().Limits
-	if defaults.Duration != time.Hour || defaults.ToolCalls != 1000 || defaults.ConcurrentJobs != 8 || defaults.Tokens != 0 || defaults.CostUSD != 0 {
+	if defaults.Duration != DefaultMaxDuration || defaults.ToolCalls != DefaultMaxToolCalls || defaults.ConcurrentJobs != DefaultMaxConcurrentJobs || defaults.Tokens != DefaultMaxTokens || defaults.SessionTokens != DefaultMaxSessionTokens || defaults.CostUSD != 0 || defaults.StrictMetering {
 		t.Fatalf("defaults=%+v", defaults)
 	}
-	p := &Policy{MaxDurationSeconds: number(0), MaxToolCalls: number(0), MaxConcurrentJobs: number(0), MaxTokens: number(0), MaxCostUSD: dollars(0)}
+	p := &Policy{MaxDurationSeconds: number(0), MaxToolCalls: number(0), MaxConcurrentJobs: number(0), MaxTokens: number(0), MaxSessionTokens: number(0), MaxCostUSD: dollars(0)}
 	copy := p.Clone()
 	*p.MaxToolCalls = 1
 	*p.MaxCostUSD = 99
@@ -70,7 +71,11 @@ func TestInvalidLimitsAndMissingRates(t *testing.T) {
 			t.Fatalf("accepted %+v", p)
 		}
 	}
-	_, err := New(&Policy{MaxCostUSD: dollars(1)}, time.Now(), false)
+	b, err := New(&Policy{MaxCostUSD: dollars(1)}, time.Now(), false)
+	if err != nil || !b.State().BaselineIncomplete || b.State().CostComplete {
+		t.Fatalf("best-effort missing rates failed: state=%+v err=%v", b, err)
+	}
+	_, err = New(&Policy{MaxCostUSD: dollars(1), StrictMetering: boolPtr(true)}, time.Now(), false)
 	unavailable(t, err, "cost_usd")
 	if _, err := New(nil, time.Now(), false); err != nil {
 		t.Fatal("disabled dollar cap required rates")
@@ -146,8 +151,8 @@ func TestUnknownCountersStayUnknownAndCannotBeRepairedByLaterUsage(t *testing.T)
 		policy   *Policy
 		missing  Usage
 	}{
-		{"tokens", &Policy{MaxTokens: number(100)}, Usage{CostUSD: dollars(.2)}},
-		{"cost_usd", &Policy{MaxCostUSD: dollars(1)}, Usage{Tokens: number(10)}},
+		{"tokens", &Policy{MaxTokens: number(100), StrictMetering: boolPtr(true)}, Usage{CostUSD: dollars(.2)}},
+		{"cost_usd", &Policy{MaxCostUSD: dollars(1), StrictMetering: boolPtr(true)}, Usage{Tokens: number(10)}},
 	} {
 		t.Run(tc.resource, func(t *testing.T) {
 			b := tracker(t, tc.policy)
@@ -205,7 +210,7 @@ func TestInvalidUsageCannotRefundOrEraseOtherConsumption(t *testing.T) {
 	if err := c.ReserveTools(1); err == nil || c.State().ToolCalls != math.MaxInt64 {
 		t.Fatal("tool count overflowed")
 	}
-	d := tracker(t, nil)
+	d := tracker(t, &Policy{MaxTokens: number(0), MaxSessionTokens: number(0)})
 	if err := d.RecordUsage(Usage{Tokens: number(math.MaxInt64), CostUSD: dollars(math.MaxFloat64)}); err != nil {
 		t.Fatal(err)
 	}

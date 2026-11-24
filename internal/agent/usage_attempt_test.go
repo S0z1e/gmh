@@ -6,6 +6,7 @@ import (
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
 	"minimalharness/internal/tools"
+	"minimalharness/internal/turnbudget"
 	"net/http"
 	"strings"
 	"testing"
@@ -57,7 +58,7 @@ func TestUsageLedgerFailureStopsBeforeTools(t *testing.T) {
 	}
 	// A closed writer must fail the pending gate before any provider dispatch.
 	store.Close()
-	cfg := &Config{Session: store, Exec: &tools.Executor{Root: root}, Tools: ToolDefs(), Mode: "auto"}
+	cfg := &Config{Session: store, Exec: &tools.Executor{Root: root}, Tools: ToolDefs(), Mode: "auto", TurnBudget: &turnbudget.Policy{MaxSessionTokens: capInt(0)}}
 	called := false
 	cfg.Client = &llm.Client{API: "chat", Model: "fake", APIKey: "fake", BaseURL: "https://example.invalid", HTTP: &http.Client{Transport: stoppedJobTransport(func(r *http.Request) (*http.Response, error) {
 		called = true

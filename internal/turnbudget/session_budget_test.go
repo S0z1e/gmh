@@ -27,3 +27,26 @@ func TestSessionBudgetsPersistAcrossSeededTurns(t *testing.T) {
 	}
 	exhausted(t, c.RecordUsage(Usage{Tokens: number(5), CostUSD: dollars(0.2)}), "session_cost_usd")
 }
+
+func TestSessionBudgetIncompleteBaselineBestEffortVsStrict(t *testing.T) {
+	// Default best-effort: legacy/incomplete baseline warns via BaselineIncomplete
+	// and still enforces lower-bound recorded usage instead of failing closed.
+	b := tracker(t, &Policy{MaxSessionTokens: number(100), MaxSessionCostUSD: dollars(1.0)})
+	if err := b.SeedSessionUsage(80, big.NewRat(3, 4), false, false); err != nil {
+		t.Fatalf("best-effort rejected incomplete baseline: %v", err)
+	}
+	if !b.State().BaselineIncomplete || b.State().SessionTokensComplete || b.State().SessionCostComplete {
+		t.Fatalf("unexpected baseline state: %+v", b.State())
+	}
+	if err := b.RecordUsage(Usage{Tokens: number(10)}); err != nil {
+		t.Fatalf("best-effort rejected partial metering: %v", err)
+	}
+	if b.State().UnmeteredAttempts != 1 {
+		t.Fatalf("expected unmetered attempt count 1, got %+v", b.State())
+	}
+	exhausted(t, b.RecordUsage(Usage{Tokens: number(20)}), "session_tokens")
+
+	// Strict mode: incomplete baseline fails closed immediately.
+	strict := tracker(t, &Policy{MaxSessionTokens: number(100), StrictMetering: boolPtr(true)})
+	unavailable(t, strict.SeedSessionUsage(80, big.NewRat(0, 1), false, true), "session_tokens")
+}

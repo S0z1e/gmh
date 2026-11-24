@@ -16,6 +16,7 @@ import (
 )
 
 func TestRPCOutputDisconnectCancelsProviderWithoutStdinEOF(t *testing.T) {
+	t.Setenv("HARNESS_RPC_DETACH_GRACE_SECONDS", "0")
 	for _, operation := range []string{"prompt", "compact"} {
 		t.Run(operation, func(t *testing.T) {
 			s, _ := usageRegressionServer(t, false)

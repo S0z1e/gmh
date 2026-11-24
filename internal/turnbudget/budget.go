@@ -10,10 +10,20 @@ import (
 	"time"
 )
 
+// Default budget limits applied when a Policy omits the corresponding field.
+// Explicit zero disables an individual cap.
+const (
+	DefaultMaxDuration       = time.Hour
+	DefaultMaxToolCalls      = int64(1000)
+	DefaultMaxConcurrentJobs = int64(8)
+	DefaultMaxTokens         = int64(2_000_000)
+	DefaultMaxSessionTokens  = int64(10_000_000)
+)
+
 // Policy uses nil for defaults and explicit zero to disable an individual cap.
-// Token and dollar limits are opt-in: not all providers report billable usage.
 // MaxSessionTokens and MaxSessionCostUSD enforce cumulative limits persisted
-// across turns and --resume within the same session.
+// across turns and --resume within the same session. StrictMetering opts into
+// fail-closed enforcement when historical or provider metering has gaps.
 type Policy struct {
 	MaxDurationSeconds *int64   `json:"maxDurationSeconds,omitempty"`
 	MaxToolCalls       *int64   `json:"maxToolCalls,omitempty"`
@@ -22,6 +32,7 @@ type Policy struct {
 	MaxCostUSD         *float64 `json:"maxCostUSD,omitempty"`
 	MaxSessionTokens   *int64   `json:"maxSessionTokens,omitempty"`
 	MaxSessionCostUSD  *float64 `json:"maxSessionCostUSD,omitempty"`
+	StrictMetering     *bool    `json:"strictMetering,omitempty"`
 }
 
 type Limits struct {
@@ -32,10 +43,17 @@ type Limits struct {
 	CostUSD        float64       `json:"cost_usd"`
 	SessionTokens  int64         `json:"session_tokens,omitempty"`
 	SessionCostUSD float64       `json:"session_cost_usd,omitempty"`
+	StrictMetering bool          `json:"strict_metering,omitempty"`
 }
 
 func (p *Policy) Resolve() (Limits, error) {
-	l := Limits{Duration: time.Hour, ToolCalls: 1000, ConcurrentJobs: 8}
+	l := Limits{
+		Duration:       DefaultMaxDuration,
+		ToolCalls:      DefaultMaxToolCalls,
+		ConcurrentJobs: DefaultMaxConcurrentJobs,
+		Tokens:         DefaultMaxTokens,
+		SessionTokens:  DefaultMaxSessionTokens,
+	}
 	if p == nil {
 		return l, nil
 	}
@@ -74,6 +92,9 @@ func (p *Policy) Resolve() (Limits, error) {
 		}
 		l.SessionCostUSD = *p.MaxSessionCostUSD
 	}
+	if p.StrictMetering != nil {
+		l.StrictMetering = *p.StrictMetering
+	}
 	return l, nil
 }
 
@@ -104,6 +125,10 @@ func (p *Policy) Clone() *Policy {
 	q.MaxSessionTokens = cloneInt(p.MaxSessionTokens)
 	q.MaxCostUSD = cloneFloat(p.MaxCostUSD)
 	q.MaxSessionCostUSD = cloneFloat(p.MaxSessionCostUSD)
+	if p.StrictMetering != nil {
+		b := *p.StrictMetering
+		q.StrictMetering = &b
+	}
 	return &q
 }
 
@@ -156,6 +181,8 @@ type State struct {
 	SessionTokensComplete  bool      `json:"session_tokens_complete,omitempty"`
 	SessionRecordedCostUSD float64   `json:"session_recorded_cost_usd,omitempty"`
 	SessionCostComplete    bool      `json:"session_cost_complete,omitempty"`
+	BaselineIncomplete     bool      `json:"baseline_incomplete,omitempty"`
+	UnmeteredAttempts      int       `json:"unmetered_attempts,omitempty"`
 }
 
 // Tracker is owned by the serial agent loop. Every provider attempt, including
@@ -177,14 +204,20 @@ func New(policy *Policy, started time.Time, ratesAvailable bool) (*Tracker, erro
 	if err != nil {
 		return nil, err
 	}
+	costComplete := true
+	baselineIncomplete := false
 	if (limits.CostUSD > 0 || limits.SessionCostUSD > 0) && !ratesAvailable {
-		resource := "cost_usd"
-		if limits.CostUSD == 0 {
-			resource = "session_cost_usd"
+		if limits.StrictMetering {
+			resource := "cost_usd"
+			if limits.CostUSD == 0 {
+				resource = "session_cost_usd"
+			}
+			return nil, &Unavailable{Resource: resource, Reason: "no configured rates"}
 		}
-		return nil, &Unavailable{Resource: resource, Reason: "no configured rates"}
+		costComplete = false
+		baselineIncomplete = true
 	}
-	b := &Tracker{state: State{Started: started, Limits: limits, TokensComplete: true, CostComplete: true, SessionTokensComplete: true, SessionCostComplete: true}}
+	b := &Tracker{state: State{Started: started, Limits: limits, TokensComplete: true, CostComplete: costComplete, SessionTokensComplete: true, SessionCostComplete: costComplete, BaselineIncomplete: baselineIncomplete}}
 	b.costLimit.Set(decimal(limits.CostUSD))
 	b.sessionCostLimit.Set(decimal(limits.SessionCostUSD))
 	return b, nil
@@ -209,12 +242,17 @@ func (b *Tracker) SeedSessionUsage(tokens int64, costUSD *big.Rat, tokensComplet
 	b.state.SessionTokensComplete = tokensComplete
 	b.sessionCost.Set(costUSD)
 	b.state.SessionRecordedCostUSD = amount
-	b.state.SessionCostComplete = costComplete
-	if b.state.Limits.SessionTokens > 0 && !tokensComplete {
-		return b.unmetered("session_tokens", "persisted session usage is incomplete")
+	b.state.SessionCostComplete = b.state.SessionCostComplete && costComplete
+	if (b.state.Limits.SessionTokens > 0 && !tokensComplete) || (b.state.Limits.SessionCostUSD > 0 && !b.state.SessionCostComplete) {
+		b.state.BaselineIncomplete = true
 	}
-	if b.state.Limits.SessionCostUSD > 0 && !costComplete {
-		return b.unmetered("session_cost_usd", "persisted session cost is incomplete")
+	if b.state.Limits.StrictMetering {
+		if b.state.Limits.SessionTokens > 0 && !tokensComplete {
+			return b.unmetered("session_tokens", "persisted session usage is incomplete")
+		}
+		if b.state.Limits.SessionCostUSD > 0 && !b.state.SessionCostComplete {
+			return b.unmetered("session_cost_usd", "persisted session cost is incomplete")
+		}
 	}
 	return nil
 }
@@ -289,9 +327,12 @@ func (b *Tracker) CheckJobLaunch(running int64) error {
 // counters remain unknown, not zero. Limits stop future requests; one already
 // running request can exceed them before the provider reports its final usage.
 func (b *Tracker) RecordUsage(u Usage) error {
+	missingTokens := false
+	missingCost := false
 	if u.Tokens == nil {
 		b.state.TokensComplete = false
 		b.state.SessionTokensComplete = false
+		missingTokens = true
 	} else if *u.Tokens < 0 || *u.Tokens > math.MaxInt64-b.state.ReportedTokens {
 		b.state.TokensComplete = false
 		b.state.SessionTokensComplete = false
@@ -308,6 +349,7 @@ func (b *Tracker) RecordUsage(u Usage) error {
 	if u.TokensPartial {
 		b.state.TokensComplete = false
 		b.state.SessionTokensComplete = false
+		missingTokens = true
 	}
 	var cost *big.Rat
 	invalidCost := false
@@ -329,6 +371,7 @@ func (b *Tracker) RecordUsage(u Usage) error {
 	} else if cost == nil {
 		b.state.CostComplete = false
 		b.state.SessionCostComplete = false
+		missingCost = true
 	} else {
 		next := new(big.Rat).Add(&b.cost, cost)
 		amount, _ := next.Float64()
@@ -351,18 +394,23 @@ func (b *Tracker) RecordUsage(u Usage) error {
 			b.state.SessionRecordedCostUSD = sessionAmount
 		}
 	}
+	if missingTokens || missingCost {
+		b.state.UnmeteredAttempts++
+	}
 	l, s := b.state.Limits, b.state
-	if l.Tokens > 0 && !s.TokensComplete {
-		return b.unmetered("tokens", "provider usage is incomplete")
-	}
-	if l.SessionTokens > 0 && !s.SessionTokensComplete {
-		return b.unmetered("session_tokens", "provider usage is incomplete")
-	}
-	if l.CostUSD > 0 && !s.CostComplete {
-		return b.unmetered("cost_usd", "usage or pricing evidence is incomplete")
-	}
-	if l.SessionCostUSD > 0 && !s.SessionCostComplete {
-		return b.unmetered("session_cost_usd", "usage or pricing evidence is incomplete")
+	if l.StrictMetering {
+		if l.Tokens > 0 && !s.TokensComplete {
+			return b.unmetered("tokens", "provider usage is incomplete")
+		}
+		if l.SessionTokens > 0 && !s.SessionTokensComplete {
+			return b.unmetered("session_tokens", "provider usage is incomplete")
+		}
+		if l.CostUSD > 0 && !s.CostComplete {
+			return b.unmetered("cost_usd", "usage or pricing evidence is incomplete")
+		}
+		if l.SessionCostUSD > 0 && !s.SessionCostComplete {
+			return b.unmetered("session_cost_usd", "usage or pricing evidence is incomplete")
+		}
 	}
 	if b.unavailable != nil {
 		return b.unavailable

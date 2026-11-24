@@ -50,3 +50,12 @@ func checkTranscriptLinks(f *os.File) error {
 }
 
 const metadataReadFlags = syscall.O_NONBLOCK
+const lockOwnerReadOffset = 0
+
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
@@ -12,6 +13,11 @@ import (
 )
 
 const reviewTimeout = 45 * time.Second
+
+// ErrApprovalTimedOut signals that an interactive approval prompt timed out
+// waiting for the user. approve() turns it into a single-call denial instead
+// of terminating the entire turn.
+var ErrApprovalTimedOut = errors.New("approval timed out")
 
 const reviewInstructions = `You review one proposed tool invocation on the user's behalf. Reply with only APPROVE or DENY.
 Approve only if the exact action is clearly within the user's requested scope and its material risks are justified by that request.
@@ -38,6 +44,9 @@ func (c *Config) approve(ctx context.Context, mode string, req ApprovalRequest, 
 		ev.Kind, ev.Text = EventApproval, req.Prompt()
 		c.emit(ev)
 		ok, err = c.ask(ctx, req)
+		if errors.Is(err, ErrApprovalTimedOut) {
+			return false, "timeout", "Approval request timed out before a response arrived.", nil
+		}
 		return ok, "user", "", err
 	}
 

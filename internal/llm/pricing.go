@@ -35,6 +35,9 @@ type Rates struct {
 	OutputPerMTok        float64
 	CachedPerMTok        float64
 	CacheWritePerMTok    float64
+	InputConfigured      bool
+	OutputConfigured     bool
+	CachedConfigured     bool
 	CacheWriteConfigured bool
 	PeakInputPerMTok     float64 // 0 = same as off-peak
 	PeakOutputPerMTok    float64
@@ -56,53 +59,45 @@ type Rates struct {
 // An unparsable number is an error; unset means unconfigured.
 func RatesFromEnv() (Rates, error) {
 	var r Rates
-	get := func(key string) (float64, error) {
+	get := func(key string) (float64, bool, error) {
 		v, ok := os.LookupEnv(key)
 		if !ok || v == "" {
-			return 0, nil
+			return 0, false, nil
 		}
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
+			return 0, false, fmt.Errorf("invalid %s %q: %w", key, v, err)
 		}
 		if f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
-			return 0, fmt.Errorf("invalid %s %q: rates must be finite and nonnegative", key, v)
+			return 0, false, fmt.Errorf("invalid %s %q: rates must be finite and nonnegative", key, v)
 		}
-		return f, nil
+		return f, true, nil
 	}
 	var err error
-	if r.InputPerMTok, err = get("OPENAI_PRICE_INPUT_PER_MTOK"); err != nil {
+	if r.InputPerMTok, r.InputConfigured, err = get("OPENAI_PRICE_INPUT_PER_MTOK"); err != nil {
 		return r, err
 	}
-	if r.OutputPerMTok, err = get("OPENAI_PRICE_OUTPUT_PER_MTOK"); err != nil {
+	if r.OutputPerMTok, r.OutputConfigured, err = get("OPENAI_PRICE_OUTPUT_PER_MTOK"); err != nil {
 		return r, err
 	}
-	if r.CachedPerMTok, err = get("OPENAI_PRICE_CACHED_PER_MTOK"); err != nil {
+	if r.CachedPerMTok, r.CachedConfigured, err = get("OPENAI_PRICE_CACHED_PER_MTOK"); err != nil {
 		return r, err
 	}
-	if v, ok := os.LookupEnv("OPENAI_PRICE_CACHE_WRITE_PER_MTOK"); ok && v != "" {
-		if r.CacheWritePerMTok, err = get("OPENAI_PRICE_CACHE_WRITE_PER_MTOK"); err != nil {
-			return r, err
-		}
-		r.CacheWriteConfigured = true
-	}
-	if r.PeakInputPerMTok, err = get("OPENAI_PRICE_PEAK_INPUT_PER_MTOK"); err != nil {
+	if r.CacheWritePerMTok, r.CacheWriteConfigured, err = get("OPENAI_PRICE_CACHE_WRITE_PER_MTOK"); err != nil {
 		return r, err
 	}
-	if r.PeakOutputPerMTok, err = get("OPENAI_PRICE_PEAK_OUTPUT_PER_MTOK"); err != nil {
+	if r.PeakInputPerMTok, _, err = get("OPENAI_PRICE_PEAK_INPUT_PER_MTOK"); err != nil {
 		return r, err
 	}
-	if r.PeakCachedPerMTok, err = get("OPENAI_PRICE_PEAK_CACHED_PER_MTOK"); err != nil {
+	if r.PeakOutputPerMTok, _, err = get("OPENAI_PRICE_PEAK_OUTPUT_PER_MTOK"); err != nil {
 		return r, err
 	}
-	r.Complete = true
-	for _, key := range []string{"OPENAI_PRICE_INPUT_PER_MTOK", "OPENAI_PRICE_OUTPUT_PER_MTOK", "OPENAI_PRICE_CACHED_PER_MTOK"} {
-		if os.Getenv(key) == "" {
-			r.Complete = false
-		}
+	if r.PeakCachedPerMTok, _, err = get("OPENAI_PRICE_PEAK_CACHED_PER_MTOK"); err != nil {
+		return r, err
 	}
+	r.Complete = r.InputConfigured && r.OutputConfigured && r.CachedConfigured
 	r.Source = os.Getenv("OPENAI_PRICE_SOURCE")
-	r.Configured = r.Complete || r.InputPerMTok > 0 || r.OutputPerMTok > 0 || r.CachedPerMTok > 0 ||
+	r.Configured = r.Complete || r.InputConfigured || r.OutputConfigured || r.CachedConfigured ||
 		r.CacheWriteConfigured ||
 		r.PeakInputPerMTok > 0 || r.PeakOutputPerMTok > 0 || r.PeakCachedPerMTok > 0
 	if r.Configured && r.Source == "" {
@@ -142,8 +137,15 @@ func (r Rates) Cost(u Usage, t time.Time) float64 {
 	return (float64(nonCached)*in + float64(u.CachedTokens)*cached + float64(u.CacheWriteTokens)*cacheWrite + float64(u.CompletionTokens)*out) / 1e6
 }
 
-func (r Rates) at(t time.Time) (in, out, cached float64) {
-	in, out, cached = r.InputPerMTok, r.OutputPerMTok, r.CachedPerMTok
+func (r Rates) atForUsage(u Usage, t time.Time) (in, out, cached, cacheWrite float64) {
+	in, out, cached, cacheWrite = r.InputPerMTok, r.OutputPerMTok, r.CachedPerMTok, r.CacheWritePerMTok
+	var matchedAbove int64 = -1
+	for _, tier := range r.Tiers {
+		if int64(u.PromptTokens) > tier.InputTokensAbove && tier.InputTokensAbove >= matchedAbove {
+			matchedAbove = tier.InputTokensAbove
+			in, out, cached, cacheWrite = tier.InputPerMTok, tier.OutputPerMTok, tier.CachedPerMTok, tier.CacheWritePerMTok
+		}
+	}
 	if IsPeak(t) {
 		if r.PeakInputPerMTok > 0 {
 			in = r.PeakInputPerMTok
@@ -153,19 +155,6 @@ func (r Rates) at(t time.Time) (in, out, cached float64) {
 		}
 		if r.PeakCachedPerMTok > 0 {
 			cached = r.PeakCachedPerMTok
-		}
-	}
-	return
-}
-
-func (r Rates) atForUsage(u Usage, t time.Time) (in, out, cached, cacheWrite float64) {
-	in, out, cached = r.at(t)
-	cacheWrite = r.CacheWritePerMTok
-	var matchedAbove int64 = -1
-	for _, tier := range r.Tiers {
-		if int64(u.PromptTokens) > tier.InputTokensAbove && tier.InputTokensAbove >= matchedAbove {
-			matchedAbove = tier.InputTokensAbove
-			in, out, cached, cacheWrite = tier.InputPerMTok, tier.OutputPerMTok, tier.CachedPerMTok, tier.CacheWritePerMTok
 		}
 	}
 	return

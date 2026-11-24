@@ -20,7 +20,7 @@ func TestTurnBudgetMergeAndValidation(t *testing.T) {
 	Merge(&global, &project)
 	*project.TurnBudget.MaxToolCalls = 99
 	limits, err := global.TurnBudget.Resolve()
-	if err != nil || limits.ToolCalls != 0 || limits.Tokens != 0 || limits.ConcurrentJobs != 8 {
+	if err != nil || limits.ToolCalls != 0 || limits.Tokens != 2_000_000 || limits.SessionTokens != 10_000_000 || limits.ConcurrentJobs != 8 {
 		t.Fatalf("whole policy replacement/clone failed: %+v %v", limits, err)
 	}
 	for _, raw := range []string{`{"maxTokens":-1}`, `{"maxCostUSD":-1}`, `{"maxDurationSeconds":9223372036854775807}`} {

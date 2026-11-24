@@ -62,6 +62,21 @@ func (t RequestTrace) RejectedBeforeInference() bool {
 	return false
 }
 
+// TransientFailure identifies gateway, timeout, or transport failures with
+// unreported usage. A transient failure can occur after inference started.
+func (t RequestTrace) TransientFailure() bool {
+	if t.Usage != nil || t.Outcome == "complete" || t.RejectedBeforeInference() {
+		return false
+	}
+	switch t.StatusCode {
+	case 0, http.StatusRequestTimeout,
+		http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
 type requestStartKey struct{}
 type traceKey struct{}
 type requestObservation struct {

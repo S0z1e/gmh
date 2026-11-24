@@ -18,13 +18,14 @@ import (
 )
 
 type Store struct {
-	ID           string
-	Path         string
-	file         *os.File
-	writer       *os.File // lifetime lease, independent of rewritten transcript inode
-	outputWriter *os.File // output identity lease, independent of session name
-	header       *Header
-	auditFile    *os.File // lazily opened sidecar for audit records
+	ID            string
+	Path          string
+	file          *os.File
+	writer        *os.File // lifetime lease, independent of rewritten transcript inode
+	stopHeartbeat func()
+	outputWriter  *os.File // output identity lease, independent of session name
+	header        *Header
+	auditFile     *os.File // lazily opened sidecar for audit records
 	// mu guards Append and Audit: a background job's completion audit
 	// can land on its own goroutine while the loop appends or audits
 	// on the main one.
@@ -200,7 +201,7 @@ func createAutoStore(dir, base string, preflight func(*os.File, bool) error) (*S
 				return nil, err
 			}
 		}
-		return &Store{ID: id, Path: path, file: f, writer: writer}, nil
+		return &Store{ID: id, Path: path, file: f, writer: writer, stopHeartbeat: startWriterHeartbeat(writer)}, nil
 	}
 }
 
@@ -269,7 +270,7 @@ func newStore(id string, existing bool, preflight func(*os.File, bool) error) (*
 		return nil, err
 	}
 	keep = true
-	return &Store{ID: id, Path: path, file: f, writer: writer}, nil
+	return &Store{ID: id, Path: path, file: f, writer: writer, stopHeartbeat: startWriterHeartbeat(writer)}, nil
 }
 
 func (s *Store) Append(m llm.Message) error {
@@ -584,6 +585,10 @@ func (s *Store) Close() error {
 	var err error
 	if s.file != nil {
 		err = s.file.Close()
+	}
+	if s.stopHeartbeat != nil {
+		s.stopHeartbeat()
+		s.stopHeartbeat = nil
 	}
 	if s.writer != nil {
 		err = errors.Join(err, s.writer.Close())

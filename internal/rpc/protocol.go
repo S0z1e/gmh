@@ -77,6 +77,8 @@ type Request struct {
 	QuestionID string `json:"question_id,omitempty"`
 	// Answers answers a question_request, one per question.
 	Answers []agent.QuestionAnswer `json:"answers,omitempty"`
+	// AfterSequence requests buffered events with Sequence > AfterSequence for replay.
+	AfterSequence uint64 `json:"after_sequence,omitempty"`
 }
 
 // Response is the reply to one request, correlated by ID. Exactly one
