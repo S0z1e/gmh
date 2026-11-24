@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -48,6 +49,10 @@ const (
 	// SessionAllowedKeyLimit caps the per-session allowlist, like
 	// Qwen's 128.
 	SessionAllowedKeyLimit = 128
+	// SessionAllowedRepeatCap bounds how many extra identical calls an
+	// AllowSession decision permits before re-checking, so a session
+	// exemption cannot turn into an infinite loop.
+	SessionAllowedRepeatCap = 20
 )
 
 // ErrRepeatedToolCallDenied is returned by Run when a repeated tool
@@ -106,7 +111,7 @@ type DoomLoopGuard struct {
 	// lastKey, used by Observe to tell progress from a loop.
 	lastObs string
 	hasObs  bool
-	allowed map[string]struct{}
+	allowed map[string]int
 	order   []string
 }
 
@@ -114,7 +119,7 @@ func NewDoomLoopGuard(threshold int) *DoomLoopGuard {
 	if threshold <= 0 {
 		threshold = RepeatedToolCallThreshold
 	}
-	return &DoomLoopGuard{threshold: threshold, allowed: map[string]struct{}{}}
+	return &DoomLoopGuard{threshold: threshold, allowed: map[string]int{}}
 }
 
 // CanonicalToolKey is the identity of one tool invocation: the tool
@@ -177,7 +182,13 @@ func canonicalJSON(v any) string {
 // trips, and clears the streak.
 func (g *DoomLoopGuard) Check(toolName, argsJSON string) (detected bool, det *RepeatedToolCallDetection) {
 	key := CanonicalToolKey(toolName, argsJSON)
-	if _, ok := g.allowed[key]; ok {
+	if rem, ok := g.allowed[key]; ok && rem > 0 {
+		if rem == 1 {
+			delete(g.allowed, key)
+			g.order = slices.DeleteFunc(g.order, func(allowed string) bool { return allowed == key })
+		} else {
+			g.allowed[key] = rem - 1
+		}
 		g.clearStreak()
 		return false, nil
 	}
@@ -215,18 +226,17 @@ func (g *DoomLoopGuard) AllowOnce(key string) {
 	g.lastObs = ""
 }
 
-// AllowSession adds key to the session allowlist (oldest evicted
-// past the limit) and clears the streak, so the call never trips
-// again in this session.
+// AllowSession adds key to the session allowlist with a bounded repeat
+// budget (SessionAllowedRepeatCap) and clears the streak.
 func (g *DoomLoopGuard) AllowSession(key string) {
 	if _, ok := g.allowed[key]; !ok {
-		g.allowed[key] = struct{}{}
 		g.order = append(g.order, key)
 		for len(g.order) > SessionAllowedKeyLimit {
 			delete(g.allowed, g.order[0])
 			g.order = g.order[1:]
 		}
 	}
+	g.allowed[key] = SessionAllowedRepeatCap
 	g.clearStreak()
 }
 

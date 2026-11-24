@@ -20,15 +20,28 @@ import (
 // trusts are the ones the API returns in usage. (A local tokenizer
 // would undercount — tiktoken undercounts Claude by ~15–20% — so there
 // is deliberately no tokenizer in this codebase.)
-type Rates struct {
-	InputPerMTok      float64 // non-cached input tokens
+// RateTier overrides base rates for the entire request when total prompt
+// tokens exceed InputTokensAbove.
+type RateTier struct {
+	InputTokensAbove  int64
+	InputPerMTok      float64
 	OutputPerMTok     float64
 	CachedPerMTok     float64
-	PeakInputPerMTok  float64 // 0 = same as off-peak
-	PeakOutputPerMTok float64
-	PeakCachedPerMTok float64
-	Source            string // human-readable rate source, shown with estimates
-	Configured        bool   // true when any rate is set
+	CacheWritePerMTok float64
+}
+
+type Rates struct {
+	InputPerMTok         float64 // non-cached input tokens
+	OutputPerMTok        float64
+	CachedPerMTok        float64
+	CacheWritePerMTok    float64
+	CacheWriteConfigured bool
+	PeakInputPerMTok     float64 // 0 = same as off-peak
+	PeakOutputPerMTok    float64
+	PeakCachedPerMTok    float64
+	Tiers                []RateTier
+	Source               string // human-readable rate source, shown with estimates
+	Configured           bool   // true when any rate is set
 	// Complete means every base rate (including explicit zero) was supplied;
 	// optional dollar budgets must never treat an omitted component as free.
 	Complete bool
@@ -67,6 +80,12 @@ func RatesFromEnv() (Rates, error) {
 	if r.CachedPerMTok, err = get("OPENAI_PRICE_CACHED_PER_MTOK"); err != nil {
 		return r, err
 	}
+	if v, ok := os.LookupEnv("OPENAI_PRICE_CACHE_WRITE_PER_MTOK"); ok && v != "" {
+		if r.CacheWritePerMTok, err = get("OPENAI_PRICE_CACHE_WRITE_PER_MTOK"); err != nil {
+			return r, err
+		}
+		r.CacheWriteConfigured = true
+	}
 	if r.PeakInputPerMTok, err = get("OPENAI_PRICE_PEAK_INPUT_PER_MTOK"); err != nil {
 		return r, err
 	}
@@ -84,6 +103,7 @@ func RatesFromEnv() (Rates, error) {
 	}
 	r.Source = os.Getenv("OPENAI_PRICE_SOURCE")
 	r.Configured = r.Complete || r.InputPerMTok > 0 || r.OutputPerMTok > 0 || r.CachedPerMTok > 0 ||
+		r.CacheWriteConfigured ||
 		r.PeakInputPerMTok > 0 || r.PeakOutputPerMTok > 0 || r.PeakCachedPerMTok > 0
 	if r.Configured && r.Source == "" {
 		r.Source = "env OPENAI_PRICE_*"
@@ -107,18 +127,19 @@ func IsPeak(t time.Time) bool {
 }
 
 // Cost estimates the USD cost of one Usage at time t. Cached tokens are
-// priced at the cached rate; the rest of the prompt at the input rate.
+// priced at the cached rate; cache-write tokens at the cache-write rate;
+// the rest of the prompt at the input rate.
 // Returns 0 when no rates are configured.
 func (r Rates) Cost(u Usage, t time.Time) float64 {
 	if !r.Configured {
 		return 0
 	}
-	in, out, cached := r.at(t)
-	nonCached := u.PromptTokens - u.CachedTokens
+	in, out, cached, cacheWrite := r.atForUsage(u, t)
+	nonCached := u.PromptTokens - u.CachedTokens - u.CacheWriteTokens
 	if nonCached < 0 {
 		nonCached = 0
 	}
-	return (float64(nonCached)*in + float64(u.CachedTokens)*cached + float64(u.CompletionTokens)*out) / 1e6
+	return (float64(nonCached)*in + float64(u.CachedTokens)*cached + float64(u.CacheWriteTokens)*cacheWrite + float64(u.CompletionTokens)*out) / 1e6
 }
 
 func (r Rates) at(t time.Time) (in, out, cached float64) {
@@ -137,15 +158,38 @@ func (r Rates) at(t time.Time) (in, out, cached float64) {
 	return
 }
 
+func (r Rates) atForUsage(u Usage, t time.Time) (in, out, cached, cacheWrite float64) {
+	in, out, cached = r.at(t)
+	cacheWrite = r.CacheWritePerMTok
+	var matchedAbove int64 = -1
+	for _, tier := range r.Tiers {
+		if int64(u.PromptTokens) > tier.InputTokensAbove && tier.InputTokensAbove >= matchedAbove {
+			matchedAbove = tier.InputTokensAbove
+			in, out, cached, cacheWrite = tier.InputPerMTok, tier.OutputPerMTok, tier.CachedPerMTok, tier.CacheWritePerMTok
+		}
+	}
+	return
+}
+
 // BudgetReady requires a complete finite rate schedule. Persisted estimates
 // and budget enforcement must not treat omitted rates as zero.
 func (r Rates) BudgetReady() bool {
 	if !r.Complete {
 		return false
 	}
-	for _, v := range []float64{r.InputPerMTok, r.OutputPerMTok, r.CachedPerMTok, r.PeakInputPerMTok, r.PeakOutputPerMTok, r.PeakCachedPerMTok} {
+	for _, v := range []float64{r.InputPerMTok, r.OutputPerMTok, r.CachedPerMTok, r.CacheWritePerMTok, r.PeakInputPerMTok, r.PeakOutputPerMTok, r.PeakCachedPerMTok} {
 		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
 			return false
+		}
+	}
+	for _, tier := range r.Tiers {
+		if tier.InputTokensAbove < 0 {
+			return false
+		}
+		for _, v := range []float64{tier.InputPerMTok, tier.OutputPerMTok, tier.CachedPerMTok, tier.CacheWritePerMTok} {
+			if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+				return false
+			}
 		}
 	}
 	return true
@@ -156,18 +200,21 @@ func (r Rates) BudgetReady() bool {
 // The caller must separately establish that input/output counters are present.
 func (r Rates) BudgetCost(u Usage, t time.Time) (*big.Rat, bool) {
 	u.normalize()
-	if !r.BudgetReady() || !u.Valid() || u.PromptTokens < 0 || u.CompletionTokens < 0 || u.CachedTokens < 0 || u.CachedTokens > u.PromptTokens {
+	if !r.BudgetReady() || !u.Valid() || u.PromptTokens < 0 || u.CompletionTokens < 0 || u.CachedTokens < 0 || u.CacheWriteTokens < 0 || u.CachedTokens+u.CacheWriteTokens > u.PromptTokens {
 		return nil, false
 	}
-	in, out, cached := r.at(t)
+	in, out, cached, cacheWrite := r.atForUsage(u, t)
 	if u.PromptTokens > 0 && !u.CacheUsageReported && in != cached {
+		return nil, false
+	}
+	if u.CacheWriteTokens > 0 && !r.CacheWriteConfigured && in != cacheWrite {
 		return nil, false
 	}
 	amount := new(big.Rat)
 	for _, part := range []struct {
 		tokens int
 		rate   float64
-	}{{u.PromptTokens - u.CachedTokens, in}, {u.CachedTokens, cached}, {u.CompletionTokens, out}} {
+	}{{u.PromptTokens - u.CachedTokens - u.CacheWriteTokens, in}, {u.CachedTokens, cached}, {u.CacheWriteTokens, cacheWrite}, {u.CompletionTokens, out}} {
 		rate, _ := new(big.Rat).SetString(strconv.FormatFloat(part.rate, 'g', -1, 64))
 		amount.Add(amount, new(big.Rat).Mul(rate, new(big.Rat).SetInt64(int64(part.tokens))))
 	}

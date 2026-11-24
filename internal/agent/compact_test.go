@@ -11,8 +11,60 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"minimalharness/internal/checkpoint"
 	"minimalharness/internal/llm"
 )
+
+func TestSummaryEvictsOptionalFactsToFitButKeepsUnresolvedFailures(t *testing.T) {
+	out, err := checkpoint.Observe("UNRESOLVED-FAILURE", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := checkpoint.State{Version: checkpoint.Version, Failures: []checkpoint.Failure{{
+		Fingerprint: strings.Repeat("a", 64), Source: "tool:test", Tool: "bash", Output: out,
+	}}}
+	for i := range 150 {
+		state.Artifacts = append(state.Artifacts, checkpoint.Artifact{
+			Kind: "workspace_path", Path: fmt.Sprintf("artifact-%03d-%s", i, strings.Repeat("x", 920)), Source: "tool:test",
+		})
+	}
+	facts, err := checkpointMessage(state)
+	if err != nil || len(facts.Content) <= 128<<10 {
+		t.Fatalf("test checkpoint must exceed the summary ceiling: bytes=%d, err=%v", len(facts.Content), err)
+	}
+	prompt, err := BuildCompactPrompt([]llm.Message{facts}, []string{"Keep the source facts."})
+	if err != nil || len(prompt) > 128<<10 || strings.Contains(prompt, "artifact-000") || !strings.Contains(prompt, "artifact-149") || !strings.Contains(prompt, "UNRESOLVED-FAILURE") {
+		t.Fatalf("summary evicted the wrong content or exceeded its limit: bytes=%d, err=%v", len(prompt), err)
+	}
+	if _, err := checkpoint.EncodeForSummary(state, 64); err == nil {
+		t.Fatal("discarded unresolved failure to fit a smaller limit")
+	}
+}
+
+func TestContextOverflowDiscardsVisibleDraftBeforeCompaction(t *testing.T) {
+	c := budgetConfig(t, nil)
+	calls := 0
+	c.Client = fakeBudgetClient(func(*http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			draft := budgetSSE("discard this draft", nil, nil, false)
+			return budgetResponse(draft + `data: {"error":{"code":"context_length_exceeded","message":"context window exceeded"}}` + "\n\n"), nil
+		}
+		return budgetResponse(budgetSSE("replayed answer", nil, newInt(5), true)), nil
+	})
+	c.CompactHistory = func(context.Context, []llm.Message) (string, llm.Usage, error) {
+		return "summary", llm.Usage{PromptTokens: 1, TotalTokens: 1}, nil
+	}
+	var events []Event
+	c.OnEvent = func(e Event) { events = append(events, e) }
+	answer, _, err := c.Run(t.Context(), []llm.Message{{Role: "user", Kind: "task", Content: "work"}})
+	if err != nil || calls != 2 || answer != "replayed answer" {
+		t.Fatalf("context overflow was not recovered: answer=%q, calls=%d, err=%v", answer, calls, err)
+	}
+	if len(events) < 3 || events[0].Kind != EventTextDelta || events[1].Kind != EventStepDiscard || events[2].Kind != EventStepUsage || events[0].StepID != events[1].StepID {
+		t.Fatalf("draft not discarded before the first usage event: %+v", events)
+	}
+}
 
 func TestShouldCompact(t *testing.T) {
 	cases := []struct {

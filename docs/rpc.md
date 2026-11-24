@@ -80,6 +80,11 @@ echoed in the response):
   queued for normal execution. Pending attachments
   are consumed by the next standalone prompt. A missing or stale turn
   ID returns an error.
+- `steer_prompt` also accepts `{"message":"...","active_turn_id":"<running>"}`
+  with an optional active turn ID. The response contains the new `turn_id`
+  and a `disposition` of `steered` or `queued`. It precedes any event for
+  that prompt. If the requested turn is no longer accepting steering,
+  the prompt is queued for standalone execution.
 - `get_state` → session/model/api/mode/root, `tool_mode`
   (`"default"` or `"plan"`), `streaming`, `queued`, `messages`,
   `turns`, `total_tokens`, `metering_available`, `session_usage_complete`,
@@ -135,8 +140,11 @@ echoed in the response):
 - `delete_session` `{"session":"..."}` → `{"deleted":true,"session":"..."}`. Removes another session's owned transcript, archives, audit, recovery records and unshared output family. The current session cannot be deleted (resume or start another one first); an unknown id is an error.
 - `set_tool_mode` `{"mode":"plan"|"default"}` → `{"tool_mode":"plan"}`. First-class switch of the loop's tool set (read-only plan mode, or back to the full default set): the same effect as the plan plugin's `/plan` / `/execute`, but it works even when the project has no plan plugin. An unknown or missing mode is an error; switching to the current mode is a no-op. `get_state` and `agent_settled` report the new mode at once. The mode is session-only: a new or resumed session resets it to default.
 - `set_approval_mode` `{"mode":"ask-for-approval"|"approve-for-me"|"full-access"}`
-  → `{"mode":"..."}`. Applies between turns, for the lifetime of the
-  server process. `suggest` and `auto` are also accepted. The
+  → `{"mode":"..."}`. Applies immediately and lasts for the life of the
+  server process. In-flight tool preparation and automated review use the
+  mode captured for that invocation. Pending manual approvals are released
+  only if the new mode permits that invocation without approval.
+  `suggest` and `auto` are also accepted. The
   `/permissions <mode>` prompt maps to this method, and `/permissions`
   returns `get_state`.
 - `command` `{"name":"plan","message":""}` → `{"ok":true,"output":"..."}`. Runs a plugin command by name (`message` is the raw args string, the text after `/name`); same as typing `/name` in the REPL. A `/name ...` prompt line behaves the same way.

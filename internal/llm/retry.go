@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -28,15 +29,27 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("LLM API %s: %s", e.Status, e.Body)
 }
 
-// parseRetryAfter reads a Retry-After header as seconds. Only the
-// seconds form is supported; an HTTP-date or an unparsable value is
-// ignored (zero duration).
+// parseRetryAfter reads a Retry-After header as either delta-seconds or an
+// RFC 7231 HTTP-date. Past dates and unparsable values return zero duration.
 func parseRetryAfter(h string) time.Duration {
-	n, err := strconv.Atoi(strings.TrimSpace(h))
-	if err != nil || n < 0 {
+	h = strings.TrimSpace(h)
+	if h == "" {
 		return 0
 	}
-	return time.Duration(n) * time.Second
+	if n, err := strconv.Atoi(h); err == nil {
+		if n < 0 {
+			return 0
+		}
+		return time.Duration(n) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			return 0
+		}
+		return d
+	}
+	return 0
 }
 
 // IsRetryable reports whether a failed LLM call is worth retrying:
@@ -102,4 +115,42 @@ func RetryAfter(err error) time.Duration {
 		return api.RetryAfter
 	}
 	return 0
+}
+
+// IsContextLengthExceeded reports whether the provider rejected the request
+// because the prompt exceeded the model's context window. Callers can treat
+// this as a reactive trigger for emergency compaction before retrying.
+func IsContextLengthExceeded(err error) bool {
+	if err == nil {
+		return false
+	}
+	var text string
+	var api *APIError
+	if errors.As(err, &api) {
+		if api.StatusCode != 400 && api.StatusCode != 413 {
+			return false
+		}
+		text = strings.ToLower(api.Body)
+	} else {
+		var stream *StreamError
+		if !errors.As(err, &stream) {
+			return false
+		}
+		text = strings.ToLower(stream.Code + " " + stream.Message)
+	}
+	for _, needle := range []string{
+		"context_length_exceeded",
+		"maximum context length",
+		"prompt is too long",
+		"input is too long",
+		"too many tokens",
+		"exceeds the maximum number of tokens",
+		"request_too_large",
+		"context window",
+	} {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
 }

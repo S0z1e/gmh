@@ -437,11 +437,12 @@ func Setup(p Params) (*App, error) {
 		a.TUITheme = cfg.TUITheme
 	}
 
-	rates, err := llm.RatesFromEnv()
+	envRates, err := llm.RatesFromEnv()
 	if err != nil {
 		store.Close()
 		return nil, err
 	}
+	rates := ratesForModel(envRates, provName, mdl)
 	a.Rates = rates
 	a.Cfg.UsageRates = rates
 
@@ -550,6 +551,40 @@ func clientTimeouts(mdl config.Model) (timeout, idle time.Duration) {
 	return timeout, idle
 }
 
+// ratesForModel prefers explicit environment rates, then falls back to the
+// model's configured cost schedule (including cache-write and tiered rates).
+func ratesForModel(envRates llm.Rates, provName string, mdl config.Model) llm.Rates {
+	if envRates.Configured {
+		return envRates
+	}
+	if mdl.Cost == nil || mdl.Cost.Input == nil || mdl.Cost.Output == nil || mdl.Cost.CacheRead == nil || mdl.Cost.CacheWrite == nil {
+		return envRates
+	}
+	r := llm.Rates{
+		InputPerMTok:         *mdl.Cost.Input,
+		OutputPerMTok:        *mdl.Cost.Output,
+		CachedPerMTok:        *mdl.Cost.CacheRead,
+		CacheWritePerMTok:    *mdl.Cost.CacheWrite,
+		CacheWriteConfigured: true,
+		Source:               fmt.Sprintf("config %s/%s", provName, mdl.ID),
+		Configured:           true,
+		Complete:             true,
+	}
+	for _, t := range mdl.Cost.Tiers {
+		if t.InputTokensAbove == nil || t.Input == nil || t.Output == nil || t.CacheRead == nil || t.CacheWrite == nil {
+			continue
+		}
+		r.Tiers = append(r.Tiers, llm.RateTier{
+			InputTokensAbove:  int64(*t.InputTokensAbove),
+			InputPerMTok:      *t.Input,
+			OutputPerMTok:     *t.Output,
+			CachedPerMTok:     *t.CacheRead,
+			CacheWritePerMTok: *t.CacheWrite,
+		})
+	}
+	return r
+}
+
 func (a *App) SwitchModel(provider, model string) (provName, modelID, api string, err error) {
 	if a.Config == nil || a.Cfg == nil {
 		return "", "", "", fmt.Errorf("no config loaded")
@@ -639,6 +674,11 @@ func (a *App) SwitchModel(provider, model string) (provName, modelID, api string
 	a.Provider = provName
 	a.ContextLimit = contextLimit
 	a.Cfg.ContextLimit = contextLimit
+	if envRates, rateErr := llm.RatesFromEnv(); rateErr == nil {
+		rates := ratesForModel(envRates, provName, mdl)
+		a.Rates = rates
+		a.Cfg.UsageRates = rates
+	}
 	return provName, mdl.ID, apiMode, nil
 }
 
@@ -655,12 +695,12 @@ func modelIDs(p config.Provider) string {
 	return strings.Join(ids, ", ")
 }
 
-// SetApprovalMode changes the approval policy between turns.
+// SetApprovalMode changes the approval policy safely even while a turn is running.
 func (a *App) SetApprovalMode(mode string) error {
 	if err := approvalmode.Validate(mode); err != nil {
 		return err
 	}
-	a.Cfg.Mode = mode
+	a.Cfg.SetApprovalMode(mode)
 	return nil
 }
 
@@ -1100,7 +1140,7 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 	if line == "/permissions" || strings.HasPrefix(line, "/permissions ") {
 		mode := strings.TrimSpace(strings.TrimPrefix(line, "/permissions"))
 		if mode == "" {
-			r.Print("Approval mode is %s. Use /permissions with %s.", r.App.Cfg.Mode, approvalmode.Choices)
+			r.Print("Approval mode is %s. Use /permissions with %s.", r.App.Cfg.ApprovalMode(), approvalmode.Choices)
 		} else if err := r.App.SetApprovalMode(mode); err != nil {
 			r.Print("[error] %v", err)
 		} else {
@@ -1397,7 +1437,7 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	// reverse their order in Bubble Tea v2 (verified), so the turn
 	// and session lines must travel as a single print.
 	turnLine := fmt.Sprintf("[usage] turn: %s", usage)
-	if r.MeteringAvailable && r.App.Rates.Configured && r.SessionMetering.Attempts-previousMetering.Attempts == r.SessionMetering.PricedAttempts-previousMetering.PricedAttempts {
+	if r.MeteringAvailable && r.App.Rates.Configured && r.SessionMetering.UnpricedAttempts() == previousMetering.UnpricedAttempts() {
 		turnLine += " | " + r.costLine(turnCost)
 	}
 	if !r.MeteringAvailable {

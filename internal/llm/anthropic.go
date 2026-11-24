@@ -423,6 +423,8 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 		usage.Invalid = usage.Invalid || delta.invalid || !validTokenSum(inputUsage.InputTokens, inputUsage.CacheReadInputTokens, inputUsage.CacheCreationInputTokens, inputUsage.OutputTokens)
 		usage.PromptTokens = inputUsage.InputTokens + inputUsage.CacheReadInputTokens + inputUsage.CacheCreationInputTokens
 		usage.CachedTokens = inputUsage.CacheReadInputTokens
+		usage.CacheWriteTokens = inputUsage.CacheCreationInputTokens
+		usage.CacheWriteReported = inputUsage.hasCreation
 		usage.CompletionTokens = inputUsage.OutputTokens
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 		usage.CacheUsageReported = inputUsage.CacheUsageReported
@@ -433,7 +435,8 @@ func (c *Client) streamAnthropic(ctx context.Context, messages []Message, tools 
 		if !inputUsage.hasInput && !inputUsage.hasOutput && !inputUsage.hasCreation && !inputUsage.CacheUsageReported {
 			return
 		}
-		traceUsage(ctx, usage, finalOutputUsage && inputUsage.hasInput && inputUsage.hasOutput && inputUsage.hasCreation && inputUsage.CacheUsageReported, false)
+		complete := finalOutputUsage && inputUsage.hasInput && inputUsage.hasOutput && inputUsage.hasCreation && inputUsage.CacheUsageReported
+		traceUsage(ctx, usage, complete, complete)
 	}
 	type acc struct {
 		id    string

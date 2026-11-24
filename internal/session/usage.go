@@ -8,23 +8,28 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"minimalharness/internal/llm"
+	"math/big"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+
+	"minimalharness/internal/llm"
 )
 
 // UsageAttempt is a content-free ledger entry for one actual provider request.
 // Nil Usage records missing metering, never a fabricated zero-token request.
 type UsageAttempt struct {
-	Version       int              `json:"version"`
-	ID            string           `json:"id"`
-	Operation     string           `json:"operation"`
-	Attempt       int              `json:"attempt"`
-	Request       llm.RequestTrace `json:"request"`
-	EstimateUSD   *float64         `json:"estimate_usd,omitempty"`
-	RateSource    string           `json:"rate_source,omitempty"`
-	InvalidUsage  bool             `json:"invalid_usage,omitempty"`
-	LegacyHistory bool             `json:"legacy_history,omitempty"`
+	Version          int              `json:"version"`
+	ID               string           `json:"id"`
+	Operation        string           `json:"operation"`
+	Attempt          int              `json:"attempt"`
+	Request          llm.RequestTrace `json:"request"`
+	EstimateUSD      *float64         `json:"estimate_usd,omitempty"`
+	ExactEstimateUSD string           `json:"exact_estimate_usd,omitempty"`
+	RateSource       string           `json:"rate_source,omitempty"`
+	InvalidUsage     bool             `json:"invalid_usage,omitempty"`
+	LegacyHistory    bool             `json:"legacy_history,omitempty"`
 }
 
 type UsageTotals struct {
@@ -34,21 +39,29 @@ type UsageTotals struct {
 	UnreportedAttempts int       `json:"unreported_attempts"`
 	PartialAttempts    int       `json:"partial_attempts"`
 	PricedAttempts     int       `json:"priced_attempts"`
+	RejectedAttempts   int       `json:"rejected_attempts,omitempty"`
 	EstimateUSD        float64   `json:"estimate_usd"`
 	RecoveryGap        bool      `json:"recovery_gap"`
 	LegacyHistory      bool      `json:"legacy_history"`
+	exactEstimateUSD   *big.Rat  // replaced on each update so snapshots stay immutable
 }
 
-func (t *UsageTotals) add(a UsageAttempt) {
+func (t *UsageTotals) add(a UsageAttempt) error {
 	if a.ID == "" {
 		t.LegacyHistory = t.LegacyHistory || a.LegacyHistory
-		return
+		return nil
+	}
+	cost, err := a.exactCost()
+	if err != nil {
+		return err
 	}
 	t.Attempts++
 	if a.InvalidUsage {
 		t.InvalidAttempts++
 	}
-	if a.Request.Usage == nil {
+	if a.Request.RejectedBeforeInference() {
+		t.RejectedAttempts++
+	} else if a.Request.Usage == nil {
 		t.UnreportedAttempts++
 	} else {
 		t.Usage.Add(*a.Request.Usage)
@@ -56,10 +69,46 @@ func (t *UsageTotals) add(a UsageAttempt) {
 			t.PartialAttempts++
 		}
 	}
-	if a.EstimateUSD != nil {
+	if cost != nil {
+		if t.exactEstimateUSD != nil {
+			cost.Add(cost, t.exactEstimateUSD)
+		}
+		amount, _ := cost.Float64()
+		if math.IsInf(amount, 0) {
+			return fmt.Errorf("usage cost overflow")
+		}
+		t.exactEstimateUSD = cost
 		t.PricedAttempts++
-		t.EstimateUSD += *a.EstimateUSD
+		t.EstimateUSD = amount
 	}
+	return nil
+}
+
+func (a UsageAttempt) exactCost() (*big.Rat, error) {
+	if a.EstimateUSD == nil && a.ExactEstimateUSD == "" {
+		return nil, nil
+	}
+	if a.EstimateUSD == nil || *a.EstimateUSD < 0 || math.IsNaN(*a.EstimateUSD) || math.IsInf(*a.EstimateUSD, 0) || a.Request.RejectedBeforeInference() {
+		return nil, fmt.Errorf("invalid usage cost")
+	}
+	if a.ExactEstimateUSD == "" {
+		// Older ledgers store per-attempt float estimates. Interpret each
+		// estimate as a decimal before summing it, as turn budgets do.
+		cost, _ := new(big.Rat).SetString(strconv.FormatFloat(*a.EstimateUSD, 'g', -1, 64))
+		return cost, nil
+	}
+	raw := a.ExactEstimateUSD
+	if len(raw) > 2048 || strings.ContainsFunc(raw, func(r rune) bool { return r != '/' && (r < '0' || r > '9') }) {
+		return nil, fmt.Errorf("invalid exact usage cost")
+	}
+	cost, ok := new(big.Rat).SetString(raw)
+	if !ok || cost.RatString() != raw {
+		return nil, fmt.Errorf("invalid exact usage cost")
+	}
+	if amount, _ := cost.Float64(); amount != *a.EstimateUSD {
+		return nil, fmt.Errorf("exact usage cost does not match estimate")
+	}
+	return cost, nil
 }
 
 func (s *Store) usagePathLocked() string {
@@ -136,19 +185,15 @@ func (s *Store) loadUsageLocked() error {
 		if a.Version != 1 || (first && a.ID != "") || (!first && (a.ID == "" || a.Request.ID != a.ID)) {
 			return fmt.Errorf("invalid usage journal record")
 		}
-		if a.EstimateUSD != nil && (*a.EstimateUSD < 0 || math.IsInf(*a.EstimateUSD, 0) || math.IsNaN(*a.EstimateUSD)) {
-			return fmt.Errorf("invalid usage cost")
-		}
 		if a.Request.Usage != nil && (!a.Request.Usage.Valid() || !totals.Usage.CanAdd(*a.Request.Usage)) {
 			return fmt.Errorf("invalid or overflowing usage counters")
 		}
-		if a.InvalidUsage && (a.Request.Usage != nil || a.EstimateUSD != nil) {
+		if a.InvalidUsage && (a.Request.Usage != nil || a.EstimateUSD != nil || a.ExactEstimateUSD != "") {
 			return fmt.Errorf("invalid usage marker")
 		}
-		if a.EstimateUSD != nil && math.IsInf(totals.EstimateUSD+*a.EstimateUSD, 0) {
-			return fmt.Errorf("usage cost overflow")
+		if err := totals.add(a); err != nil {
+			return err
 		}
-		totals.add(a)
 		delete(pending, a.ID)
 		first = false
 	}
@@ -216,16 +261,18 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 		a.Request.TokensComplete = false
 		a.Request.PriceCountsComplete = false
 		a.EstimateUSD = nil
+		a.ExactEstimateUSD = ""
 		a.RateSource = ""
 	}
-	if a.InvalidUsage && (a.Request.Usage != nil || a.EstimateUSD != nil) {
+	if a.InvalidUsage && (a.Request.Usage != nil || a.EstimateUSD != nil || a.ExactEstimateUSD != "") {
 		return fmt.Errorf("invalid usage marker")
 	}
-	if a.EstimateUSD != nil && (*a.EstimateUSD < 0 || math.IsNaN(*a.EstimateUSD) || math.IsInf(*a.EstimateUSD, 0) || math.IsInf(s.usageTotals.EstimateUSD+*a.EstimateUSD, 0)) {
-		return fmt.Errorf("invalid or overflowing usage cost")
+	nextTotals := s.usageTotals
+	if err := nextTotals.add(a); err != nil {
+		return err
 	}
 	tr := a.Request
-	a.Request = llm.RequestTrace{ID: tr.ID, StartedAt: tr.StartedAt, Model: tr.Model, API: tr.API, EndpointHash: tr.EndpointHash, DurationMS: tr.DurationMS, Outcome: tr.Outcome, Usage: tr.Usage, TokensComplete: tr.TokensComplete, PriceCountsComplete: tr.PriceCountsComplete}
+	a.Request = llm.RequestTrace{ID: tr.ID, StartedAt: tr.StartedAt, Model: tr.Model, API: tr.API, EndpointHash: tr.EndpointHash, DurationMS: tr.DurationMS, Outcome: tr.Outcome, Usage: tr.Usage, TokensComplete: tr.TokensComplete, PriceCountsComplete: tr.PriceCountsComplete, StatusCode: tr.StatusCode}
 	data, err := json.Marshal(a)
 	if err != nil {
 		return err
@@ -277,7 +324,7 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 	if err := s.clearPendingUsageLocked(a.ID); err != nil {
 		return err
 	}
-	s.usageTotals.add(a)
+	s.usageTotals = nextTotals
 	recorded = true
 	if a.InvalidUsage {
 		return fmt.Errorf("invalid or overflowing provider usage recorded as unknown")
@@ -355,4 +402,18 @@ func (s *Store) openUsageLocked(create bool) (*os.File, error) {
 // final attempt was lost, even after its invalid tail has been truncated.
 func (t UsageTotals) TokenCountsComplete() bool {
 	return !t.LegacyHistory && !t.RecoveryGap && t.UnreportedAttempts == 0 && t.PartialAttempts == 0 && t.InvalidAttempts == 0
+}
+
+// UnpricedAttempts counts requests whose cost is unknown.
+func (t UsageTotals) UnpricedAttempts() int {
+	return t.Attempts - t.PricedAttempts - t.RejectedAttempts
+}
+
+// ExactCost returns the recorded subtotal as an independent value.
+func (t UsageTotals) ExactCost() *big.Rat {
+	cost := new(big.Rat)
+	if t.exactEstimateUSD != nil {
+		cost.Set(t.exactEstimateUSD)
+	}
+	return cost
 }

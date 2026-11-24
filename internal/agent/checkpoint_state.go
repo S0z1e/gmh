@@ -277,7 +277,7 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 				}
 				// Fold completion order before the stop acknowledgement. A
 				// prior success must not resolve a later job's failure.
-				state, err = checkpoint.Merge(state, outcome)
+				state, err = checkpoint.MergeWithEviction(state, outcome)
 				if err != nil {
 					return
 				}
@@ -332,7 +332,7 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 				}
 			}
 		}
-		state, err = checkpoint.Merge(state, d)
+		state, err = checkpoint.MergeWithEviction(state, d)
 		if err != nil {
 			return
 		}
@@ -351,7 +351,7 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 			jobs = append(jobs, current)
 		}
 	}
-	state, err = checkpoint.Merge(state, checkpoint.Delta{Jobs: jobs, RefreshJobs: true})
+	state, err = checkpoint.MergeWithEviction(state, checkpoint.Delta{Jobs: jobs, RefreshJobs: true})
 	return
 }
 

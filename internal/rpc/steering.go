@@ -1,14 +1,30 @@
 package rpc
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 func (s *Server) handleSteerPrompt(req Request) {
+	// Support single-step inline steering ({"type":"steer_prompt","message":"..."})
+	// to avoid the two-step prompt -> takeWork() -> steer_prompt race window.
+	if req.TurnID == "" && strings.TrimSpace(req.Message) != "" {
+		accepted := make(chan struct{})
+		req.accepted = accepted
+		defer close(accepted)
+		turnID, disposition, err := s.scheduleInlineSteering(req)
+		if err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		s.respond(req, map[string]any{"turn_id": turnID, "active_turn_id": req.ActiveTurnID, "disposition": disposition}, nil)
+		return
+	}
 	if req.TurnID == "" || req.ActiveTurnID == "" {
-		s.respond(req, nil, errors.New("steer_prompt needs turn_id and active_turn_id"))
+		s.respond(req, nil, errors.New("steer_prompt needs turn_id and active_turn_id (or message)"))
 		return
 	}
 	if err := s.scheduleSteering(req.TurnID, req.ActiveTurnID); err != nil {
@@ -16,6 +32,28 @@ func (s *Server) handleSteerPrompt(req Request) {
 		return
 	}
 	s.respond(req, map[string]any{"turn_id": req.TurnID, "active_turn_id": req.ActiveTurnID}, nil)
+}
+
+func (s *Server) scheduleInlineSteering(req Request) (string, string, error) {
+	msg := strings.TrimSpace(req.Message)
+	s.workMu.Lock()
+	defer s.workMu.Unlock()
+	if s.closed {
+		return "", "", errShutdown
+	}
+	if len(s.work) == maxQueue {
+		return "", "", errors.New("prompt queue is full")
+	}
+	turnID := rand.Text()
+	itemReq := Request{ID: req.ID, Type: "prompt", Message: msg, TurnID: turnID, accepted: req.accepted}
+	s.work = append(s.work, workItem{kind: workPrompt, req: itemReq})
+	if s.steeringTurn != "" && (req.ActiveTurnID == "" || s.steeringTurn == req.ActiveTurnID) {
+		s.steeringQueue = append(s.steeringQueue, turnID)
+		s.workReady.Signal()
+		return turnID, "steered", nil
+	}
+	s.workReady.Signal()
+	return turnID, "queued", nil
 }
 
 func (s *Server) scheduleSteering(queued, active string) error {
@@ -58,6 +96,9 @@ func (s *Server) receiveSteering(finishing bool, deliver func(string) bool) {
 		req := s.work[idx].req
 		s.steeringClaim = turnID
 		s.workMu.Unlock()
+		if req.accepted != nil {
+			<-req.accepted
+		}
 
 		saved := deliver(req.Message)
 		s.workMu.Lock()

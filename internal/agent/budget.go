@@ -27,15 +27,37 @@ type turnResources struct {
 
 func (c *Config) startBudget(parent context.Context) (context.Context, context.CancelFunc, error) {
 	c.LastTurnBudget = nil
+	return c.startBudgetWithPolicy(parent, c.TurnBudget)
+}
+
+func (c *Config) startBudgetWithPolicy(parent context.Context, policy *turnbudget.Policy) (context.Context, context.CancelFunc, error) {
 	api := ""
 	if c.Client != nil {
 		api = c.Client.Mode()
 	}
 	c.resources = &turnResources{parent: parent, rates: c.UsageRates, api: api}
-	b, err := turnbudget.New(c.TurnBudget, time.Now(), c.UsageRates.BudgetReady() && api != "anthropic")
+	ratesReady := c.UsageRates.BudgetReady() && (api != "anthropic" || c.UsageRates.CacheWriteConfigured)
+	b, err := turnbudget.New(policy, time.Now(), ratesReady)
 	if err != nil {
 		c.resources.failure = err
 		return parent, func() {}, err
+	}
+	limits := b.State().Limits
+	if c.Session != nil && (limits.SessionTokens > 0 || limits.SessionCostUSD > 0) {
+		totals, err := c.Session.UsageTotals()
+		if err != nil {
+			unavail := &turnbudget.Unavailable{Resource: "session_tokens", Reason: err.Error()}
+			if limits.SessionTokens == 0 {
+				unavail.Resource = "session_cost_usd"
+			}
+			c.resources.failure = unavail
+			return parent, func() {}, unavail
+		}
+		costComplete := totals.UnpricedAttempts() == 0 && !totals.LegacyHistory && !totals.RecoveryGap
+		if err := b.SeedSessionUsage(int64(totals.Usage.TotalTokens), totals.ExactCost(), totals.TokenCountsComplete(), costComplete); err != nil {
+			c.resources.failure = err
+			return parent, func() {}, err
+		}
 	}
 	c.resources.tracker = b
 	if deadline, ok := b.Deadline(); ok {
@@ -100,7 +122,7 @@ func (c *Config) recordBudgetUsage(usage *llm.Usage, started time.Time, tokensCo
 		}
 		measured.Tokens = &tokens
 		measured.TokensPartial = !tokensComplete
-		if priceCountsComplete && r.api != "anthropic" && tokens >= 0 && tokens == int64(u.PromptTokens)+int64(u.CompletionTokens) {
+		if priceCountsComplete && (r.api != "anthropic" || r.rates.CacheWriteConfigured) && tokens >= 0 && tokens == int64(u.PromptTokens)+int64(u.CompletionTokens) {
 			if cost, known := r.rates.BudgetCost(u, started); known {
 				measured.ExactCostUSD = cost
 			}

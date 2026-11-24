@@ -78,6 +78,25 @@ func TestDoomLoopGuardObserveClearsOnChangedOutput(t *testing.T) {
 	}
 }
 
+func TestDoomLoopGuardRenewsExhaustedAllowance(t *testing.T) {
+	g := NewDoomLoopGuard(2)
+	const args = `{"path":"renewed.txt"}`
+	key := CanonicalToolKey("read", args)
+	g.AllowSession(key)
+	for range SessionAllowedRepeatCap {
+		g.Check("read", args)
+	}
+	g.AllowSession(key)
+	for i := range SessionAllowedKeyLimit - 1 {
+		g.AllowSession(CanonicalToolKey("read", fmt.Sprintf(`{"path":"other-%d.txt"}`, i)))
+	}
+	for range 2 {
+		if detected, _ := g.Check("read", args); detected {
+			t.Fatal("expired queue slot removed a live renewal")
+		}
+	}
+}
+
 func TestDoomLoopGuardAllowOnceRestartsStreak(t *testing.T) {
 	g := NewDoomLoopGuard(0)
 	key := CanonicalToolKey("read", `{"path":"a.txt"}`)

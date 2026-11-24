@@ -39,6 +39,9 @@ const (
 	// normal install, build or test stays foreground and returns
 	// its result directly; only the truly long tail backgrounds.
 	DefaultBackgroundThreshold = 120 * time.Second
+	// DefaultBackgroundMaxLifetime bounds explicit background:true jobs when
+	// no per-call timeout is given (negative BackgroundMaxLifetime disables).
+	DefaultBackgroundMaxLifetime = 2 * time.Hour
 )
 
 type Executor struct {
@@ -58,6 +61,9 @@ type Executor struct {
 	// loop backgrounds it (0 = never background; DefaultBackgroundThreshold
 	// when Setup leaves it unset).
 	BackgroundThreshold time.Duration
+	// BackgroundMaxLifetime caps background:true jobs when Timeout == 0
+	// (0 = DefaultBackgroundMaxLifetime; <0 = unlimited).
+	BackgroundMaxLifetime time.Duration
 	// Audit receives one entry per bash execution and denylist denial
 	// (nil = no audit). Approval decisions are audited by the loop.
 	Audit func(AuditEntry)
@@ -99,6 +105,7 @@ type Executor struct {
 	jobs        *JobRegistry
 	sessionJobs map[string]*JobRegistry
 	sessionID   string
+	nextJobSeq  int
 	jobsClosed  bool
 	activeBash  map[*bashRun]struct{}
 

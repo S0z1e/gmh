@@ -292,3 +292,40 @@ func TestDecodeKeepsSourceUnicodeAndEncoderBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestMergeWithEvictionDropsOldArtifactsAndFinishedJobsBeforeFailing(t *testing.T) {
+	task := Text{Source: "task:active", Content: "Finish migration safely."}
+	running := Job{ID: "bg-run", Started: time.Unix(100, 0).UTC(), Command: "make build", Status: Running}
+	code := 0
+	var artifacts []Artifact
+	for i := 0; i < MaxEntries+50; i++ {
+		artifacts = append(artifacts, Artifact{Kind: "workspace_path", Path: fmt.Sprintf("dir/file-%04d.go", i), Source: fmt.Sprintf("src:%d", i)})
+	}
+	finished := Job{ID: "bg-old", Started: time.Unix(50, 0).UTC(), Command: "echo done", Status: Done, ExitCode: &code, Delivered: true}
+	s, err := MergeWithEviction(State{}, Delta{
+		ActiveTask: &task,
+		Jobs:       []Job{finished, running},
+		Artifacts:  artifacts,
+	})
+	if err != nil {
+		t.Fatalf("MergeWithEviction failed: %v", err)
+	}
+	if s.ActiveTask == nil || *s.ActiveTask != task {
+		t.Fatalf("active task lost after eviction: %+v", s.ActiveTask)
+	}
+	foundRunning := false
+	for _, j := range s.Jobs {
+		if j.ID == running.ID && j.Status == Running {
+			foundRunning = true
+		}
+	}
+	if !foundRunning {
+		t.Fatalf("running job was evicted: %+v", s.Jobs)
+	}
+	if len(s.Artifacts) >= len(artifacts) {
+		t.Fatalf("expected old artifacts to be evicted, got %d", len(s.Artifacts))
+	}
+	if _, err := Encode(s); err != nil {
+		t.Fatalf("evicted state does not fit bounds: %v", err)
+	}
+}

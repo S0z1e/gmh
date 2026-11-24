@@ -20,6 +20,21 @@ import (
 	"minimalharness/internal/turnbudget"
 )
 
+func TestInlineSteeringAcknowledgesQueuedTurnBeforeStart(t *testing.T) {
+	s, _ := usageRegressionServer(t, false)
+	d := startDriver(t, s.app, s.runner)
+	d.waitFor("ready", time.Second)
+	d.send(map[string]any{"id": "inline", "type": "steer_prompt", "message": "Run this as a new turn"})
+	response := d.waitForResponse("inline", time.Second)
+	data, _ := response["data"].(map[string]any)
+	started := d.waitFor("turn_started", time.Second)
+	if data["disposition"] != "queued" || data["turn_id"] != started["turn_id"] || response["sequence"].(float64) >= started["sequence"].(float64) {
+		t.Fatalf("out-of-order inline acceptance: %v then %v", response, started)
+	}
+	d.waitFor("agent_settled", time.Second)
+	d.quit(t)
+}
+
 func TestSteerPrompt(t *testing.T) {
 	for _, first := range []fakeStep{
 		{kind: "text", text: "Original answer"},

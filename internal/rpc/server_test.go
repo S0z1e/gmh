@@ -17,9 +17,12 @@ import (
 	"testing"
 	"time"
 
+	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
+	"minimalharness/internal/approvalmode"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
+	"minimalharness/internal/tools"
 )
 
 // fakeStep is one scripted LLM reply, mirroring /tmp/tui-shot/
@@ -474,6 +477,30 @@ func TestApprovalApproveAndDeny(t *testing.T) {
 			}
 			d.quit(t)
 		})
+	}
+}
+
+func TestRPCSwitchToAutoKeepsMandatoryApprovalsPending(t *testing.T) {
+	s, _ := usageRegressionServer(t, false)
+	s.app.Cfg.SetApprovalMode(approvalmode.AskForApproval)
+	s.app.Cfg.Exec.Sandbox = true
+	s.approvals = map[string]pendingApproval{
+		"git":       {ch: make(chan approvalAnswer, 1), req: agent.ApprovalRequest{ToolName: tools.GitStatusTool}},
+		"protected": {ch: make(chan approvalAnswer, 1), req: agent.ApprovalRequest{ToolName: "write", Protected: true}},
+		"ordinary":  {ch: make(chan approvalAnswer, 1), req: agent.ApprovalRequest{ToolName: "bash"}},
+	}
+	ordinary := s.approvals["ordinary"].ch
+	s.handleSetApprovalMode(Request{Mode: approvalmode.Auto})
+	if len(s.approvals) != 2 || s.approvals["git"].ch == nil || s.approvals["protected"].ch == nil {
+		t.Fatalf("switch released a mandatory approval: %+v", s.approvals)
+	}
+	select {
+	case result := <-ordinary:
+		if !result.approved || result.err != nil {
+			t.Fatalf("ordinary pending approval = %+v", result)
+		}
+	default:
+		t.Fatal("switch did not release the ordinary approval")
 	}
 }
 

@@ -183,10 +183,21 @@ type JobRegistry struct {
 }
 
 func (r *JobRegistry) add(j *Job) {
+	r.addWithSeq(j, 0)
+}
+
+func (r *JobRegistry) addWithSeq(j *Job, seq int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.next++
-	j.ID = fmt.Sprintf("bg-%d", r.next)
+	if seq > 0 {
+		if seq > r.next {
+			r.next = seq
+		}
+		j.ID = fmt.Sprintf("bg-%d", seq)
+	} else {
+		r.next++
+		j.ID = fmt.Sprintf("bg-%d", r.next)
+	}
 	j.mu.Lock()
 	j.registry = r
 	j.mu.Unlock()
@@ -194,7 +205,10 @@ func (r *JobRegistry) add(j *Job) {
 	r.evictDelivered()
 }
 
-const recentJobsLimit = 50
+const (
+	recentJobsLimit        = 50
+	staleUndeliveredJobAge = time.Hour
+)
 
 func (r *JobRegistry) trimDelivered() {
 	r.mu.Lock()
@@ -220,6 +234,26 @@ func (r *JobRegistry) evictDelivered() {
 		}
 		job.registry = nil
 		remaining--
+		return true
+	})
+	// Also reclaim abandoned finished jobs once the registry exceeds 2x the
+	// normal cap so long-running processes do not leak memory indefinitely.
+	overflow := len(r.jobs) - recentJobsLimit*2
+	if overflow <= 0 {
+		return
+	}
+	cutoff := time.Now().Add(-staleUndeliveredJobAge)
+	r.jobs = slices.DeleteFunc(r.jobs, func(job *Job) bool {
+		if overflow == 0 {
+			return false
+		}
+		job.mu.Lock()
+		defer job.mu.Unlock()
+		if !job.finished || job.finishedAt.After(cutoff) {
+			return false
+		}
+		job.registry = nil
+		overflow--
 		return true
 	})
 }
@@ -595,7 +629,7 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	}
 	timeout := e.bashTimeout(a)
 	if a.Background && a.Timeout == 0 {
-		timeout = 0
+		timeout = e.backgroundMaxLifetime()
 	}
 	output, err := e.newBashOutput(commandCtx)
 	if err != nil {
@@ -622,7 +656,8 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	if e.jobs == nil {
 		e.jobs = &JobRegistry{}
 	}
-	e.jobs.add(job)
+	e.nextJobSeq++
+	e.jobs.addWithSeq(job, e.nextJobSeq)
 	e.jobsMu.Unlock()
 	// Close the race with an abort that ran its registry snapshot just
 	// before this job was registered.
@@ -731,6 +766,16 @@ func (e *Executor) registry() *JobRegistry {
 	return e.jobs
 }
 
+func (e *Executor) backgroundMaxLifetime() time.Duration {
+	if e.BackgroundMaxLifetime < 0 {
+		return 0
+	}
+	if e.BackgroundMaxLifetime > 0 {
+		return e.BackgroundMaxLifetime
+	}
+	return DefaultBackgroundMaxLifetime
+}
+
 // SwitchSession retains each session's jobs without exposing them to another.
 // Session switches happen between turns; job goroutines capture their owner.
 func (e *Executor) SwitchSession(id string) {
@@ -744,6 +789,22 @@ func (e *Executor) SwitchSession(id string) {
 	}
 	if e.jobs != nil {
 		e.sessionJobs[e.sessionID] = e.jobs
+	}
+	// Prune inactive session registries that have no running or undelivered jobs.
+	for sid, reg := range e.sessionJobs {
+		if sid == id || reg == nil {
+			continue
+		}
+		keep := false
+		for _, job := range reg.List() {
+			if _, done := job.Result(); !done || !job.Delivered() {
+				keep = true
+				break
+			}
+		}
+		if !keep {
+			delete(e.sessionJobs, sid)
+		}
 	}
 	e.sessionID = id
 	e.jobs = e.sessionJobs[id]

@@ -107,6 +107,8 @@ type Usage struct {
 	// top-level cached_tokens, prompt_cache_hit_tokens, or
 	// prompt_tokens_details.cached_tokens. See Usage.normalize.
 	CachedTokens              int    `json:"cached_tokens"`
+	CacheWriteTokens          int    `json:"cache_write_tokens,omitempty"`
+	CacheWriteReported        bool   `json:"cache_write_reported,omitempty"`
 	CacheUsageReported        bool   `json:"cache_usage_reported"`
 	CacheUsageSource          string `json:"cache_usage_source,omitempty"`
 	CacheReportedPromptTokens int    `json:"cache_reported_prompt_tokens"`
@@ -373,7 +375,7 @@ func (c *Client) httpClient() *http.Client {
 // The idle guard catches a truly stuck stream within 60s, so a
 // larger total is safe — it only fires on a request that never
 // finishes at all.
-const DefaultTotalTimeout = 600 * time.Second
+const DefaultTotalTimeout = 1800 * time.Second
 
 // DefaultIdleTimeout is the silence cap when the model sets no
 // idleTimeoutSeconds: 60s with no SSE line means the stream
@@ -450,11 +452,24 @@ func (s *idleLineScanner) close() {
 	s.once.Do(func() { close(s.stop) })
 }
 
-// next returns the next scanned line. ok=false ends the stream:
-// err nil means clean EOF, non-nil the read or idle failure.
+// next returns the next scanned line using the scanner's full idle timeout.
 func (s *idleLineScanner) next() (line string, ok bool, err error) {
+	var deadline time.Time
 	if s.idle > 0 {
-		timer := time.NewTimer(s.idle)
+		deadline = time.Now().Add(s.idle)
+	}
+	return s.nextWithDeadline(deadline)
+}
+
+// nextWithDeadline waits for the next scanned line up to deadline (zero = no
+// idle bound). ok=false ends the stream: err nil means clean EOF.
+func (s *idleLineScanner) nextWithDeadline(deadline time.Time) (line string, ok bool, err error) {
+	if !deadline.IsZero() {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return "", false, fmt.Errorf("%w: no stream data for %s from model %q", ErrIdleTimeout, s.idle, s.model)
+		}
+		timer := time.NewTimer(remaining)
 		defer timer.Stop()
 		select {
 		case l, open := <-s.lines:

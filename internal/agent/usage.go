@@ -17,7 +17,9 @@ func (c *Config) recordAttempt(operation string, attempt int, trace llm.RequestT
 	if invalid && c.persistErr == nil {
 		c.persistErr = fmt.Errorf("invalid provider usage counters")
 	}
-	c.recordBudgetUsage(trace.Usage, trace.StartedAt, trace.TokensComplete, trace.PriceCountsComplete)
+	if !trace.RejectedBeforeInference() {
+		c.recordBudgetUsage(trace.Usage, trace.StartedAt, trace.TokensComplete, trace.PriceCountsComplete)
+	}
 	if c.Session == nil {
 		return
 	}
@@ -27,6 +29,7 @@ func (c *Config) recordAttempt(operation string, attempt int, trace llm.RequestT
 			estimate, _ := amount.Float64()
 			if !math.IsNaN(estimate) && !math.IsInf(estimate, 0) && estimate >= 0 {
 				record.EstimateUSD, record.RateSource = &estimate, c.UsageRates.Source
+				record.ExactEstimateUSD = amount.RatString()
 			}
 		}
 	}

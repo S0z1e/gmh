@@ -33,6 +33,31 @@ func TestApprovalReceivesCompleteInvocation(t *testing.T) {
 	}
 }
 
+func TestBashInvocationKeepsApprovalModeDuringSwitch(t *testing.T) {
+	cfg := budgetConfig(t, nil)
+	cfg.SetApprovalMode(approvalmode.AskForApproval)
+	calls, manualApprovals := 0, 0
+	cfg.Client = fakeBudgetClient(func(*http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return budgetResponse(toolCallSSE("bash", "bash", `{"command":"printf test"}`)), nil
+		}
+		return budgetResponse(textSSE("done")), nil
+	})
+	cfg.OnEvent = func(e Event) {
+		if e.Kind == EventToolStart && e.ToolName == "bash" {
+			cfg.SetApprovalMode(approvalmode.ApproveForMe)
+		}
+	}
+	cfg.Ask = func(ApprovalRequest) (bool, error) {
+		manualApprovals++
+		return false, nil
+	}
+	if _, _, err := cfg.RunTask(t.Context(), nil, "Run the Bash command."); err != nil || calls != 2 || manualApprovals != 1 {
+		t.Fatalf("invocation changed approval mode: provider calls=%d, manual approvals=%d, err=%v", calls, manualApprovals, err)
+	}
+}
+
 func TestAutomaticApprovalReviewsExactInvocationAndAccountsUsage(t *testing.T) {
 	const task = "Write the report to report.txt."
 	for _, tc := range []struct {
@@ -271,7 +296,7 @@ func TestAutomaticApprovalBindsBashDirectory(t *testing.T) {
 	}
 }
 
-func TestAutomaticApprovalIncludesCurrentHumanAnswers(t *testing.T) {
+func TestAutomaticApprovalIncludesHumanAnswersGivenBeforeModeSwitch(t *testing.T) {
 	root := t.TempDir()
 	const questions = `{"questions":[{"question":"Which file should I update?","options":[{"label":"first.txt","description":"First file"},{"label":"second.txt","description":"Second file"}]}]}`
 	const write = `{"path":"second.txt","content":"updated"}`
@@ -318,10 +343,15 @@ func TestAutomaticApprovalIncludesCurrentHumanAnswers(t *testing.T) {
 	defer srv.Close()
 	cfg := &Config{
 		Client: &llm.Client{BaseURL: srv.URL, APIKey: "fake", Model: "test"},
-		Exec:   &tools.Executor{Root: root}, Tools: ToolDefs(), Mode: approvalmode.ApproveForMe,
+		Exec:   &tools.Executor{Root: root}, Tools: ToolDefs(), Mode: approvalmode.AskForApproval,
 		AskQuestion: func(QuestionRequest) (QuestionAnswers, error) {
 			return QuestionAnswers{Answers: []QuestionAnswer{{Question: 0, Selected: []string{"second.txt"}}}}, nil
 		},
+	}
+	cfg.OnEvent = func(e Event) {
+		if e.Kind == EventToolEnd && e.ToolName == "ask_user" {
+			cfg.SetApprovalMode(approvalmode.ApproveForMe)
+		}
 	}
 	if _, _, err := cfg.RunTask(t.Context(), nil, "Ask which file to update, then update the selected file."); err != nil {
 		t.Fatal(err)

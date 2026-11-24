@@ -22,6 +22,7 @@ type ApprovalRequest struct {
 	InvocationID string
 	ToolName     string
 	Arguments    string
+	Protected    bool
 }
 
 func (r ApprovalRequest) Prompt() string {

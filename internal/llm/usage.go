@@ -153,6 +153,7 @@ func (u *Usage) Add(o Usage) {
 	u.CompletionTokens += o.CompletionTokens
 	u.TotalTokens += o.TotalTokens
 	u.CachedTokens += o.CachedTokens
+	u.CacheWriteTokens += o.CacheWriteTokens
 	u.ReasoningTokens += o.ReasoningTokens
 }
 
@@ -245,7 +246,7 @@ func (u Usage) Valid() bool {
 	if u.Invalid {
 		return false
 	}
-	for _, n := range []int{u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CachedTokens, u.ReasoningTokens, u.CacheReportedPromptTokens, u.PromptCacheHitTokens, u.PromptTokensDetails.CachedTokens, u.CompletionTokensDetails.ReasoningTokens} {
+	for _, n := range []int{u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CachedTokens, u.CacheWriteTokens, u.ReasoningTokens, u.CacheReportedPromptTokens, u.PromptCacheHitTokens, u.PromptTokensDetails.CachedTokens, u.CompletionTokensDetails.ReasoningTokens} {
 		if n < 0 {
 			return false
 		}
@@ -259,8 +260,8 @@ func (u Usage) CanAdd(o Usage) bool {
 	if !u.Valid() || !o.Valid() {
 		return false
 	}
-	a := []int{u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CachedTokens, u.ReasoningTokens, u.CacheReportedPromptTokens}
-	b := []int{o.PromptTokens, o.CompletionTokens, o.TotalTokens, o.CachedTokens, o.ReasoningTokens, o.CacheReportedPromptTokens}
+	a := []int{u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CachedTokens, u.CacheWriteTokens, u.ReasoningTokens, u.CacheReportedPromptTokens}
+	b := []int{o.PromptTokens, o.CompletionTokens, o.TotalTokens, o.CachedTokens, o.CacheWriteTokens, o.ReasoningTokens, o.CacheReportedPromptTokens}
 	for i, n := range a {
 		if b[i] > math.MaxInt-n {
 			return false
