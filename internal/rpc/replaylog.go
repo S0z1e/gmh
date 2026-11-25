@@ -328,9 +328,10 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 			continue
 		}
 		if head.Type == "replay_capped" {
-			sealed = true
 			if head.ConnectionID == connectionID && head.Sequence > capAt {
 				capAt = head.Sequence
+			} else if head.ConnectionID != connectionID {
+				sealed = true
 			}
 			continue
 		}
@@ -350,12 +351,8 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 		events, stored, dropped = admitReplayEvent(events, stored, replayEvent{sequence: head.Sequence, data: copied, critical: criticalReplayType(copied)})
 		raiseEvicted(&evicted, dropped)
 	}
-	if capAt == 0 && (fileFull || sealed) {
-		if last == 0 {
-			capAt = 1
-		} else if last < ^uint64(0) {
-			capAt = last + 1
-		}
+	if capAt == 0 && last == 0 && (fileFull || sealed) {
+		capAt = 1
 	}
 	return events, evicted, capAt, oversized, nil
 }

@@ -2031,6 +2031,16 @@ func (s *Server) noteEvicted(seq uint64) {
 	}
 }
 
+func replayLineSequence(data []byte, fallback uint64) uint64 {
+	var head struct {
+		Sequence uint64 `json:"sequence"`
+	}
+	if json.Unmarshal(data, &head) == nil && head.Sequence > 0 {
+		return head.Sequence
+	}
+	return fallback
+}
+
 func (s *Server) omissionMarker(size int) []byte {
 	marker, err := json.Marshal(map[string]any{
 		"sequence": s.sequence, "connection_id": s.connectionID,
@@ -2061,7 +2071,7 @@ func (s *Server) writeReplayLocked(data []byte, sync bool) {
 		if errors.Is(err, errReplayLogFull) {
 			if !s.replayLog.full {
 				marker, mErr := json.Marshal(map[string]any{
-					"type": "replay_capped", "sequence": s.sequence, "connection_id": s.connectionID,
+					"type": "replay_capped", "sequence": replayLineSequence(data, s.sequence), "connection_id": s.connectionID,
 				})
 				if mErr == nil {
 					if capErr := s.replayLog.appendCap(marker); capErr != nil && !errors.Is(capErr, errReplayLogFull) {

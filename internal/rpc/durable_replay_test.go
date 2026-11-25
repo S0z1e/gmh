@@ -470,8 +470,9 @@ func TestInheritedReplayCapTruncatesAnotherConnection(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
 	}
-	body := "{\"sequence\":1,\"connection_id\":\"first\",\"type\":\"turn_started\"}\n" +
-		"{\"sequence\":2,\"connection_id\":\"first\",\"type\":\"replay_capped\"}\n"
+	body := "{\"sequence\":1,\"connection_id\":\"early\",\"type\":\"turn_started\"}\n" +
+		"{\"sequence\":2,\"connection_id\":\"early\",\"type\":\"agent_settled\"}\n" +
+		"{\"sequence\":3,\"connection_id\":\"later\",\"type\":\"replay_capped\"}\n"
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -485,6 +486,49 @@ func TestInheritedReplayCapTruncatesAnotherConnection(t *testing.T) {
 	}
 	if !resp.Data.Truncated || len(resp.Data.Events) != 0 {
 		t.Fatalf("inherited cap: %+v", resp.Data)
+	}
+	out.Reset()
+	s.handleQuery(Request{ID: "early", Type: "replay", AfterSequence: 2, ConnectionID: "early", ResumeSession: s.app.Store.ID})
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Data.Truncated || len(resp.Data.Events) != 0 {
+		t.Fatalf("completed connection was marked truncated: %+v", resp.Data)
+	}
+}
+
+func TestCapMarkerUsesTheRejectedEventSequence(t *testing.T) {
+	if got := replayLineSequence([]byte(`{"sequence":10,"type":"text_delta"}`), 12); got != 10 {
+		t.Fatalf("sequence = %d", got)
+	}
+	s, _ := usageRegressionServer(t, false)
+	orig := replayLogByteCap
+	replayLogByteCap = 500
+	t.Cleanup(func() { replayLogByteCap = orig })
+	log, err := openReplayLog(s.app.Store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.replayLog = log
+	s.replayLogID = s.app.Store.ID
+	s.connectionID = "held"
+	s.sequence = 12
+	if err := log.append([]byte(strings.Repeat("a", 100)), true); err != nil {
+		t.Fatal(err)
+	}
+	rejected := []byte(`{"sequence":10,"connection_id":"held","type":"text_delta","text":"` + strings.Repeat("b", 300) + `"}`)
+	s.writeMu.Lock()
+	s.writeReplayLocked(rejected, true)
+	s.writeMu.Unlock()
+	if err := log.close(); err != nil {
+		t.Fatal(err)
+	}
+	_, _, capAt, _, err := loadReplayLog(s.app.Store.ID, "held")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capAt != 10 {
+		t.Fatalf("cap sequence = %d, want the rejected event", capAt)
 	}
 }
 
