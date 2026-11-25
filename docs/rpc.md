@@ -36,12 +36,18 @@ and for input frames over 4 MiB. Individual output frames are limited to
 Replay is durable for the life of the session file's directory
 (`~/.minimal-harness/sessions/rpc-replay/<session>.jsonl`), keyed by
 `connection_id`, `session`, and `sequence`. It survives a process restart.
-The in-memory window is still 2,048 events or 16 MiB. One event larger than
-the per-event cap is skipped by itself (`skipped_sequences`); earlier events
-stay. `text_delta` and `thinking_delta` coalesce under backpressure so
-`turn_started`, `tool_start`, `tool_end`, `approval_request`, and
-`agent_settled` keep a reserved slot. `replay` reports `output_open: false`
-after the live stream has failed.
+The in-memory window, and the durable log when it is read back, keeps
+2,048 events or 16 MiB. The file itself stops growing at 64 MiB; events
+already written stay readable, and later events are not appended. One
+event larger than the per-event cap is skipped by itself
+(`skipped_sequences`); earlier events stay. `text_delta` and
+`thinking_delta` coalesce under backpressure. When the window is full,
+non-critical events are dropped before `turn_started`, `tool_start`,
+`tool_end`, `approval_request`, and `agent_settled`. If the window is
+already full of those lifecycle events, the oldest one is dropped so the
+newest one is kept. `output_open` reports whether this process can still
+write stdout. It stays true on a healthy process that is only reading an
+older connection's log.
 
 Requests (each `{"id":"<req>","type":"..."}`; `id` is optional and
 echoed in the response):
@@ -116,8 +122,9 @@ echoed in the response):
   is true, pass `next_after_sequence` as `after_sequence` for the next page.
   When it is false, `next_after_sequence` advances through the snapshot.
   `truncated` signals that some requested events are no longer retained, including
-  a single oversized event listed in `skipped_sequences`. `output_open` is false
-  once this process's stdout has failed; reconnect with a new process.
+  a single oversized event listed in `skipped_sequences`. `output_open` reports
+  this process's stdout. It is false after that stream fails. Reading another
+  connection's log does not by itself mean this process's stdout is closed.
 - `usage` returns lifetime `session` and `current_run` usage. Treat counts
   as subtotals when their corresponding completeness flag is false.
   `metering_available` indicates whether lifetime metering can be read.

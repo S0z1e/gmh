@@ -187,7 +187,10 @@ func renameSessionFiles(oldID, newID string) error {
 	if err != nil {
 		return err
 	}
-	return performOperation(op)
+	if err := performOperation(op); err != nil {
+		return err
+	}
+	return moveReplayBesideSession(oldID, newID)
 }
 
 // RenameSession renames a session that is not currently open. For the
@@ -357,7 +360,42 @@ func DeleteSession(id string) error {
 	if err != nil {
 		return err
 	}
-	return performOperation(op)
+	if err := performOperation(op); err != nil {
+		return err
+	}
+	return removeReplayBesideSession(id)
+}
+
+func moveReplayBesideSession(oldID, newID string) error {
+	oldPath := filepath.Join(Dir(), "rpc-replay", oldID+".jsonl")
+	newPath := filepath.Join(Dir(), "rpc-replay", newID+".jsonl")
+	oldInfo, err := os.Lstat(oldPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !oldInfo.Mode().IsRegular() {
+		return fmt.Errorf("rpc replay log must be a regular file")
+	}
+	if newInfo, err := os.Lstat(newPath); err == nil {
+		if os.SameFile(oldInfo, newInfo) {
+			return os.Rename(oldPath, newPath)
+		}
+		return fmt.Errorf("replay log %s already exists", newID)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return os.Rename(oldPath, newPath)
+}
+
+func removeReplayBesideSession(id string) error {
+	err := os.Remove(filepath.Join(Dir(), "rpc-replay", id+".jsonl"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 // Rename renames the open store's session: the handles are closed,
@@ -415,6 +453,9 @@ func (s *Store) Rename(newID string) error {
 			s.file = f
 		}
 		return err
+	}
+	if moveErr := moveReplayBesideSession(oldID, newID); moveErr != nil {
+		return moveErr
 	}
 	// The rename has committed: retain the new lease even if reopening fails.
 	if s.stopHeartbeat != nil {

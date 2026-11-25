@@ -16,10 +16,10 @@ import (
 // replayLog appends encoded events for one RPC connection so a later process
 // can resume from after_sequence. The file lives next to the session transcript.
 type replayLog struct {
-	path   string
-	file   *os.File
-	unlock func()
-	bytes  int64
+	path  string
+	file  *os.File
+	bytes int64
+	full  bool
 }
 
 func replayLogPath(sessionID string) (string, error) {
@@ -30,6 +30,32 @@ func replayLogPath(sessionID string) (string, error) {
 }
 
 const maxReplayLogBytes = 64 << 20
+
+func openReplayFile(path string, flags int) (*os.File, func(), error) {
+	if err := checkReplayPath(path); err != nil {
+		return nil, nil, err
+	}
+	f, err := privatefile.Open(path, flags)
+	if err != nil {
+		return nil, nil, err
+	}
+	actual, statErr := f.Stat()
+	named, nameErr := os.Lstat(path)
+	if statErr != nil || nameErr != nil || !named.Mode().IsRegular() || !os.SameFile(actual, named) {
+		f.Close()
+		return nil, nil, fmt.Errorf("rpc replay log must be a regular, unaliased file")
+	}
+	if err := checkReplayLinks(f); err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	unlock, err := lockReplay(f)
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	return f, unlock, nil
+}
 
 func openReplayLog(sessionID string) (*replayLog, error) {
 	path, err := replayLogPath(sessionID)
@@ -42,20 +68,8 @@ func openReplayLog(sessionID string) (*replayLog, error) {
 	if err := os.Chmod(filepath.Dir(path), replayDirMode()); err != nil {
 		return nil, err
 	}
-	if err := checkReplayPath(path); err != nil {
-		return nil, err
-	}
-	f, err := privatefile.Open(path, os.O_CREATE|os.O_RDWR)
+	f, unlock, err := openReplayFile(path, os.O_CREATE|os.O_RDWR)
 	if err != nil {
-		return nil, err
-	}
-	if err := checkReplayLinks(f); err != nil {
-		f.Close()
-		return nil, err
-	}
-	unlock, err := lockReplay(f)
-	if err != nil {
-		f.Close()
 		return nil, err
 	}
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
@@ -63,22 +77,33 @@ func openReplayLog(sessionID string) (*replayLog, error) {
 		f.Close()
 		return nil, err
 	}
-	return &replayLog{path: path, file: f, unlock: unlock}, nil
+	info, err := f.Stat()
+	if err != nil {
+		unlock()
+		f.Close()
+		return nil, err
+	}
+	unlock()
+	return &replayLog{path: path, file: f, bytes: info.Size(), full: info.Size() >= maxReplayLogBytes}, nil
 }
 
 func (l *replayLog) append(data []byte, syncWrite bool) error {
 	if l == nil || l.file == nil {
 		return errors.New("replay log is closed")
 	}
-	if l.bytes == 0 {
-		if info, err := l.file.Stat(); err == nil {
-			l.bytes = info.Size()
-		}
+	if l.full {
+		return errReplayLogFull
 	}
 	line := append(append([]byte(nil), data...), '\n')
 	if l.bytes+int64(len(line)) > maxReplayLogBytes {
-		return fmt.Errorf("rpc replay log exceeds %d bytes", maxReplayLogBytes)
+		l.full = true
+		return errReplayLogFull
 	}
+	unlock, err := lockReplay(l.file)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if _, err := l.file.Write(line); err != nil {
 		return err
 	}
@@ -89,15 +114,13 @@ func (l *replayLog) append(data []byte, syncWrite bool) error {
 	return l.file.Sync()
 }
 
+var errReplayLogFull = errors.New("rpc replay log is full")
+
 func (l *replayLog) close() error {
 	if l == nil || l.file == nil {
 		return nil
 	}
 	err := l.file.Close()
-	if l.unlock != nil {
-		l.unlock()
-		l.unlock = nil
-	}
 	l.file = nil
 	return err
 }
@@ -110,25 +133,15 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	f, err := os.Open(path)
+	f, unlock, err := openReplayFile(path, os.O_RDONLY)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, 0, nil, nil
 		}
 		return nil, 0, nil, err
 	}
-	defer f.Close()
-	if err := checkReplayPath(path); err != nil {
-		return nil, 0, nil, err
-	}
-	if err := checkReplayLinks(f); err != nil {
-		return nil, 0, nil, err
-	}
-	unlock, err := lockReplay(f)
-	if err != nil {
-		return nil, 0, nil, err
-	}
 	defer unlock()
+	defer f.Close()
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), maxOutputFrameBytes+1)
 	var bytes int
@@ -143,12 +156,9 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 			Type         string `json:"type"`
 		}
 		if err := json.Unmarshal(line, &head); err != nil {
-			// A torn final line is ignored. A corrupt earlier line is a gap so
-			// replay does not pretend the prefix is contiguous.
-			if evicted < ^uint64(0) {
-				evicted++
-			}
-			continue
+			// A corrupt record is a gap at this file position. The final torn
+			// line is handled after the scan, so a prefix stays contiguous.
+			return events, headGap(events), oversized, nil
 		}
 		if head.ConnectionID != connectionID || head.Sequence == 0 {
 			continue
@@ -169,16 +179,20 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 	}
 	if err := scanner.Err(); err != nil {
 		if errors.Is(err, bufio.ErrTooLong) {
-			if evicted < ^uint64(0) {
-				evicted++
-			}
-			return events, evicted, oversized, nil
+			return events, headGap(events), oversized, nil
 		}
 		if !errors.Is(err, io.ErrUnexpectedEOF) {
 			return events, evicted, oversized, err
 		}
 	}
 	return events, evicted, oversized, nil
+}
+
+func headGap(events []replayEvent) uint64 {
+	if len(events) == 0 {
+		return 1
+	}
+	return events[len(events)-1].sequence
 }
 
 func moveReplayLog(oldID, newID string) error {
@@ -196,7 +210,8 @@ func moveReplayLog(oldID, newID string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Lstat(oldPath); err != nil {
+	oldInfo, err := os.Lstat(oldPath)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
@@ -205,8 +220,11 @@ func moveReplayLog(oldID, newID string) error {
 	if err := checkReplayPath(oldPath); err != nil {
 		return err
 	}
-	if info, err := os.Lstat(newPath); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+	if newInfo, err := os.Lstat(newPath); err == nil {
+		if os.SameFile(oldInfo, newInfo) {
+			return os.Rename(oldPath, newPath)
+		}
+		if newInfo.Mode()&os.ModeSymlink != 0 || !newInfo.Mode().IsRegular() {
 			return fmt.Errorf("replay log %s is not a regular file", newID)
 		}
 		return fmt.Errorf("replay log %s already exists", newID)

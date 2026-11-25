@@ -737,7 +737,7 @@ func (s *Server) handleReplay(req Request) {
 	page := replayPage{
 		ConnectionID: connectionID, Session: sessionID, LatestSequence: s.sequence,
 		NextAfterSequence: math.MaxUint64, Truncated: req.AfterSequence < evicted,
-		OutputOpen:       !durable && s.outputOpen(),
+		OutputOpen:       s.outputOpen(),
 		SkippedSequences: skipped,
 		Events:           []json.RawMessage{}, PendingApprovals: pendingApprovals,
 	}
@@ -757,7 +757,6 @@ func (s *Server) handleReplay(req Request) {
 			latest = evicted
 		}
 		page.LatestSequence = latest
-		page.OutputOpen = false
 	}
 	if len(history) > 0 {
 		page.OldestSequence = history[0].sequence
@@ -995,6 +994,9 @@ func (s *Server) ask(req agent.ApprovalRequest) (bool, error) {
 	case <-timeoutCh:
 		return false, fmt.Errorf("%w: approval request %s after %s", agent.ErrApprovalTimedOut, id, s.approvalTimeout)
 	case <-ctx.Done():
+		if s.isDetached() {
+			return false, agent.ErrApprovalDetached
+		}
 		return false, ctx.Err()
 	case <-s.done:
 		if s.isDetached() {
@@ -1055,6 +1057,9 @@ func (s *Server) confirmContinuation(req agent.ContinuationRequest) (agent.Conti
 	case <-timeoutCh:
 		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, fmt.Errorf("%w: continuation request %s after %s", agent.ErrApprovalTimedOut, id, s.approvalTimeout)
 	case <-ctx.Done():
+		if s.isDetached() {
+			return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, agent.ErrApprovalDetached
+		}
 		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, ctx.Err()
 	case <-s.done:
 		if s.isDetached() {
@@ -1130,6 +1135,9 @@ func (s *Server) askQuestion(req agent.QuestionRequest) (agent.QuestionAnswers, 
 	case <-timeoutCh:
 		return agent.QuestionAnswers{}, fmt.Errorf("%w: question request %s after %s", agent.ErrApprovalTimedOut, id, s.approvalTimeout)
 	case <-ctx.Done():
+		if s.isDetached() {
+			return agent.QuestionAnswers{}, agent.ErrApprovalDetached
+		}
 		return agent.QuestionAnswers{}, ctx.Err()
 	case <-s.done:
 		if s.isDetached() {
@@ -1564,7 +1572,17 @@ func (s *Server) doControl(req Request) {
 			s.respond(req, nil, err)
 			return
 		}
-		s.moveReplayForRename(req.Name, req.New)
+		oldID := req.Name
+		if s.app.Store != nil && s.app.Store.ID == req.New {
+			s.writeMu.Lock()
+			if s.replayLogID != "" {
+				oldID = s.replayLogID
+			}
+			s.writeMu.Unlock()
+		}
+		if err := s.moveReplayForRename(oldID, req.New); err != nil {
+			fmt.Fprintf(os.Stderr, "harness rpc replay log rename failed: %v\n", err)
+		}
 		s.refreshState()
 		s.respond(req, map[string]any{"renamed": true, "from": req.Name, "to": req.New}, nil)
 	case "resume_session":
@@ -1703,27 +1721,27 @@ func (s *Server) rebindReplayLog() {
 	s.replayLogID = id
 }
 
-func (s *Server) moveReplayForRename(oldID, newID string) {
+func (s *Server) moveReplayForRename(oldID, newID string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.replayLogID == oldID && s.replayLog != nil {
+	if s.replayLog != nil && (s.replayLogID == oldID || s.replayLogID == newID) {
 		_ = s.replayLog.close()
 		s.replayLog = nil
 		s.replayLogID = ""
 	}
-	if err := moveReplayLog(oldID, newID); err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "harness rpc replay log rename failed: %v\n", err)
+	if err := moveReplayLog(oldID, newID); err != nil {
+		return err
 	}
 	if s.app == nil || s.app.Store == nil || s.app.Store.ID != newID {
-		return
+		return nil
 	}
 	log, err := openReplayLog(newID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "harness rpc replay log unavailable: %v\n", err)
-		return
+		return err
 	}
 	s.replayLog = log
 	s.replayLogID = newID
+	return nil
 }
 
 func applyApprovalTimeout(s *Server) {
@@ -1803,9 +1821,15 @@ func (s *Server) shutdown() {
 		s.turnCancel()
 	}
 	s.turnMu.Unlock()
-	s.failApprovals(agent.ErrApprovalDetached)
-	s.failContinuations(agent.ErrApprovalDetached)
-	s.failQuestions(agent.ErrApprovalDetached)
+	if s.isDetached() {
+		s.failApprovals(agent.ErrApprovalDetached)
+		s.failContinuations(agent.ErrApprovalDetached)
+		s.failQuestions(agent.ErrApprovalDetached)
+		return
+	}
+	s.failApprovals(errShutdown)
+	s.failContinuations(errShutdown)
+	s.failQuestions(errShutdown)
 }
 
 func (s *Server) isDone() bool {
@@ -1997,6 +2021,11 @@ func (s *Server) appendReplayLocked(data []byte, sync bool) {
 		return
 	}
 	if err := s.replayLog.append(data, sync); err != nil {
+		if errors.Is(err, errReplayLogFull) {
+			s.replayLog.full = true
+			fmt.Fprintf(os.Stderr, "harness rpc replay log reached its %d byte cap; older events remain readable\n", maxReplayLogBytes)
+			return
+		}
 		fmt.Fprintf(os.Stderr, "harness rpc replay log write failed: %v\n", err)
 		_ = s.replayLog.close()
 		s.replayLog = nil
@@ -2052,14 +2081,10 @@ func admitReplayEvent(events []replayEvent, bytes int, ev replayEvent) ([]replay
 		if dropped {
 			continue
 		}
-		if ev.critical && len(events) > 0 && bytes+len(ev.data) > maxReplayBytes {
-			// Byte pressure with only critical history: drop the oldest critical
-			// event so the newest lifecycle event still fits.
+		if ev.critical && len(events) > 0 {
 			dropAt(0)
 			continue
 		}
-		// Count is full of critical events, or the incoming delta cannot fit
-		// without removing one. Keep the critical history and drop the newcomer.
 		return events, bytes, ev.sequence
 	}
 	if len(ev.data) > maxReplayBytes {

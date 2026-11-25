@@ -118,8 +118,24 @@ func TestDurableReplaySurvivesProcessRestart(t *testing.T) {
 	t.Setenv("HOME", home)
 	next.app.Store = s.app.Store
 	next.connectionID = "conn-new"
+	reopened, err := openReplayLog(s.app.Store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next.replayLog = reopened
+	next.replayLogID = s.app.Store.ID
+	t.Cleanup(func() { _ = reopened.close() })
 	out.Reset()
-	next.handleQuery(Request{ID: "resume", Type: "replay", AfterSequence: 0, ConnectionID: "conn-durable", ResumeSession: s.app.Store.ID})
+	done := make(chan struct{})
+	go func() {
+		next.handleQuery(Request{ID: "resume", Type: "replay", AfterSequence: 0, ConnectionID: "conn-durable", ResumeSession: s.app.Store.ID})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replay of the open session log blocked on its own lock")
+	}
 	var resp struct {
 		Type  string     `json:"type"`
 		Error string     `json:"error"`
@@ -131,8 +147,8 @@ func TestDurableReplaySurvivesProcessRestart(t *testing.T) {
 	if resp.Type != "response" || resp.Error != "" {
 		t.Fatalf("replay after restart: type=%s err=%s", resp.Type, resp.Error)
 	}
-	if resp.Data.ConnectionID != "conn-durable" || resp.Data.Session != s.app.Store.ID || len(resp.Data.Events) != 2 {
-		t.Fatalf("durable page: id=%s session=%s events=%d", resp.Data.ConnectionID, resp.Data.Session, len(resp.Data.Events))
+	if resp.Data.ConnectionID != "conn-durable" || resp.Data.Session != s.app.Store.ID || len(resp.Data.Events) != 2 || !resp.Data.OutputOpen {
+		t.Fatalf("durable page: id=%s session=%s events=%d open=%t", resp.Data.ConnectionID, resp.Data.Session, len(resp.Data.Events), resp.Data.OutputOpen)
 	}
 }
 

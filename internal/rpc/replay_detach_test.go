@@ -202,10 +202,10 @@ func TestOutputTimeoutPlusDetachGraceLetsTurnFinish(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("stdout write did not block")
 	}
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(5500 * time.Millisecond)
 	select {
 	case <-completed:
-		t.Fatal("turn was cancelled during the write timeout, before detach grace")
+		t.Fatal("turn finished before detach grace, during the write timeout")
 	default:
 	}
 	close(release)

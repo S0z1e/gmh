@@ -1406,15 +1406,11 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 			// not be asked twice about the same call. A denied
 			// call ends the turn with the structured reason.
 			useArgs, allowed, contErr := c.checkRepeatedCall(ctx, tc.Function.Name, argsJSON)
-			if contErr != nil && (errors.Is(contErr, ErrApprovalDetached) || ctx.Err() != nil) {
-				err := contErr
-				if ctx.Err() != nil {
-					err = ctx.Err()
-				}
-				c.rejectBudgetTools(assistant.ToolCalls[i:], err)
+			if errors.Is(contErr, ErrApprovalDetached) {
+				c.rejectBudgetTools(assistant.ToolCalls[i:], contErr)
 				c.LastTerminalReason = TerminalAbort
-				c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
-				return lastText, total, err
+				c.emit(Event{Kind: EventError, Err: contErr, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+				return lastText, total, contErr
 			}
 			if err := ctx.Err(); err != nil {
 				c.rejectBudgetTools(assistant.ToolCalls[i:], err)
@@ -1559,9 +1555,10 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 					if approver == "reviewer" || c.budgetError() != nil {
 						c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
 					}
-					c.LastTerminalReason = TerminalError
-					if ctx.Err() != nil {
+					if errors.Is(err, ErrApprovalDetached) || ctx.Err() != nil {
 						c.LastTerminalReason = TerminalAbort
+					} else {
+						c.LastTerminalReason = TerminalError
 					}
 					c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: c.LastTerminalReason})
 					closeMutation()
