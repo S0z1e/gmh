@@ -35,6 +35,7 @@ func main() {
 		maxSteps       = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
 		viewSessionID  = flag.String("view-session", "", "read a session as JSONL without opening a writer or loading providers")
 		resume         = flag.String("resume", "", "resume session id")
+		steal          = flag.Bool("steal", false, "with --resume, take a busy session from a proven stalled or dead owner (asks before signalling a live process)")
 		rebindSession  = flag.Bool("rebind-session", false, "explicitly bind resumed or legacy history to this workspace")
 		sessionID      = flag.String("session", "", "session id (default: timestamp)")
 		ctxLimit       = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
@@ -51,8 +52,8 @@ func main() {
 	flag.Var(&files, "attach", "attach a UTF-8 text file to the first turn (repeatable)")
 	flag.Parse()
 	if *viewSessionID != "" {
-		if *rpcMode || *printMode != "" || *resume != "" || *sessionID != "" || *rebindSession || len(files) > 0 {
-			fatal(fmt.Errorf("--view-session conflicts with --rpc, -p, --resume, --session and -attach"))
+		if *rpcMode || *printMode != "" || *resume != "" || *steal || *sessionID != "" || *rebindSession || len(files) > 0 {
+			fatal(fmt.Errorf("--view-session conflicts with --rpc, -p, --resume, --steal, --session and -attach"))
 		}
 		if err := viewSession(os.Stdout, *viewSessionID); err != nil {
 			fatal(err)
@@ -62,6 +63,12 @@ func main() {
 
 	if *rpcMode && *printMode != "" {
 		fatal(fmt.Errorf("--rpc conflicts with -p"))
+	}
+	if *steal && *resume == "" {
+		fatal(fmt.Errorf("--steal requires --resume <session-id>"))
+	}
+	if *steal && *rpcMode {
+		fatal(fmt.Errorf("--steal is a confirmed takeover; RPC clients send steal_session instead"))
 	}
 
 	// UI selection happens before setup: the TUI is a separate binary
@@ -74,13 +81,28 @@ func main() {
 			fatal(err)
 		}
 		if uiMode == "tui" {
-			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *sandbox, images, files, *workspaceTrust, *rebindSession); err != nil {
+			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *steal, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *sandbox, images, files, *workspaceTrust, *rebindSession); err != nil {
 				fmt.Fprintf(os.Stderr, "harness: TUI unavailable (%v); continuing in plain mode.\n", err)
 			} else {
 				return // Windows waits for the child rather than replacing this process.
 			}
 		} else if *ui == "tui" {
 			fmt.Fprintln(os.Stderr, "harness: --ui tui needs a terminal; using plain mode.")
+		}
+	}
+	// The TUI confirms in its own dialog and returns before this process
+	// opens the session. Every other path asks on one scanner, which the REPL
+	// keeps, so a piped answer is not swallowed by a second reader.
+	var sessionInput *input.Lines
+	if *steal {
+		sessionInput = input.New(os.Stdin)
+		defer sessionInput.Close()
+		ok, err := confirmFrom(sessionInput, os.Stderr, context.Background(), *resume)
+		if err != nil && err != io.EOF {
+			fatal(err)
+		}
+		if err != nil || !ok {
+			fatal(fmt.Errorf("steal of session %q was not confirmed", *resume))
 		}
 	}
 
@@ -95,6 +117,7 @@ func main() {
 		MaxSteps:                   *maxSteps,
 		ContextLimit:               *ctxLimit,
 		Resume:                     *resume,
+		Steal:                      *steal,
 		RebindSession:              *rebindSession,
 		SessionID:                  *sessionID,
 		DenyInsteadOfPrompt:        *deny,
@@ -196,9 +219,12 @@ func main() {
 	}
 
 	// REPL
-	fmt.Println("Type a task, /attach <path> to attach a text file, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /permissions [mode] to view or change approval mode, /sessions to list sessions, /resume <id> to switch session, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /prune-artifacts to remove unreferenced images older than seven days, /clear to drop context, /compact to summarise context, /rollback [N] to drop the last N turns, or /quit to exit.")
-	scanner := input.New(os.Stdin)
-	defer scanner.Close()
+	fmt.Println("Type a task, /attach <path> to attach a text file, /image <path> to attach an image, /model to list models or /model <provider>/<model> to switch model, /permissions [mode] to view or change approval mode, /sessions to list sessions, /resume <id> to switch session, /steal <id> to take a busy session after confirmation, /rename <old> <new> to rename one, /skill:<name> to load a skill, /usage for session totals, /jobs for background jobs, /prune-artifacts to remove unreferenced images older than seven days, /clear to drop context, /compact to summarise context, /rollback [N] to drop the last N turns, or /quit to exit.")
+	scanner := sessionInput
+	if scanner == nil {
+		scanner = input.New(os.Stdin)
+		defer scanner.Close()
+	}
 	// The approval prompt shares the REPL's scanner: the scanner
 	// buffers piped stdin ahead, so a fresh reader on os.Stdin in
 	// the loop's default ask would see EOF after the first task
@@ -213,6 +239,7 @@ func main() {
 	// question — option numbers (comma-separated for multi-select),
 	// or free text for "Other".
 	a.Cfg.AskQuestion = askQuestionFromScanner(scanner)
+	runner.ConfirmSteal = confirmStealFromScanner(scanner)
 	for {
 		fmt.Print("> ")
 		line, err := scanner.Read(ctx)
@@ -223,6 +250,34 @@ func main() {
 			break
 		}
 	}
+}
+
+// confirmSteal is the explicit confirmation --steal requires before Setup may
+// signal a live owner. A non-interactive reader still has to answer "y"; EOF
+// or anything else refuses the steal.
+func confirmSteal(in io.Reader, out io.Writer, id string) bool {
+	scanner := input.New(in)
+	defer scanner.Close()
+	ok, err := confirmFrom(scanner, out, context.Background(), id)
+	return err == nil && ok
+}
+
+// confirmStealFromScanner is the REPL form. It shares the REPL scanner so a
+// piped answer is not lost to a second reader on os.Stdin.
+func confirmStealFromScanner(scanner *input.Lines) func(context.Context, string) (bool, error) {
+	return func(ctx context.Context, id string) (bool, error) {
+		return confirmFrom(scanner, os.Stderr, ctx, id)
+	}
+}
+
+func confirmFrom(scanner *input.Lines, out io.Writer, ctx context.Context, id string) (bool, error) {
+	fmt.Fprintf(out, "Steal session %s? This ends a stalled owner when its process identity is proven, and refuses when it is not. [y/N] ", id)
+	line, err := scanner.Read(ctx)
+	if err != nil {
+		return false, err
+	}
+	ans := strings.ToLower(strings.TrimSpace(line))
+	return ans == "y" || ans == "yes", nil
 }
 
 // askFromScanner is the plain CLI's approval prompt: it reads the
@@ -318,15 +373,15 @@ func askQuestionFromScanner(scanner *input.Lines) func(agent.QuestionRequest) (a
 
 // execTUI replaces this process with the sibling harness-tui binary,
 // passing the same flags through. Windows waits for that process to finish.
-func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images, files []string, workspaceTrust string, rebindSession bool) error {
+func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume string, steal bool, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images, files []string, workspaceTrust string, rebindSession bool) error {
 	sibling, err := tuiSibling()
 	if err != nil {
 		return err
 	}
-	return runTUIProcess(sibling, tuiArgs(sibling, root, mode, model, api, provider, config, maxSteps, resume, sessionID, ctxLimit, deny, bashTO, bgThresh, sandbox, images, files, workspaceTrust, rebindSession))
+	return runTUIProcess(sibling, tuiArgs(sibling, root, mode, model, api, provider, config, maxSteps, resume, steal, sessionID, ctxLimit, deny, bashTO, bgThresh, sandbox, images, files, workspaceTrust, rebindSession))
 }
 
-func tuiArgs(sibling, root, mode, model, api, provider, config string, maxSteps int, resume, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images, files []string, workspaceTrust string, rebindSession bool) []string {
+func tuiArgs(sibling, root, mode, model, api, provider, config string, maxSteps int, resume string, steal bool, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images, files []string, workspaceTrust string, rebindSession bool) []string {
 	args := []string{
 		sibling,
 		"-root", root,
@@ -339,6 +394,7 @@ func tuiArgs(sibling, root, mode, model, api, provider, config string, maxSteps 
 		"-config", config,
 		"-max-steps", strconv.Itoa(maxSteps),
 		"-resume", resume,
+		"-steal=" + strconv.FormatBool(steal),
 		"-session", sessionID,
 		"-context-limit", strconv.Itoa(ctxLimit),
 		"-deny-instead-of-prompt=" + strconv.FormatBool(deny),

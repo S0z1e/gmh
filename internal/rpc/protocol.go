@@ -26,7 +26,7 @@ type Request struct {
 	// Type is one of: prompt, approval_response, continuation_response,
 	// question_response, abort, clear_queue, steer_prompt, get_state, new_session,
 	// clear, compact, usage, jobs, skill, quit, attach_image, attach_file, list_pending_files,
-	// set_model, list_sessions, rename_session, resume_session,
+	// set_model, list_sessions, rename_session, resume_session, steal_session,
 	// delete_session, set_tool_mode, set_approval_mode, rollback, list_plugins,
 	// list_models, list_skills, history, command.
 	Type string `json:"type"`
@@ -48,8 +48,11 @@ type Request struct {
 	// current provider first, then the rest.
 	Model    string `json:"model,omitempty"`
 	Provider string `json:"provider,omitempty"`
-	// Session is the session id for resume_session and delete_session.
+	// Session is the session id for resume_session, steal_session and delete_session.
 	Session string `json:"session,omitempty"`
+	// Rebind, on steal_session, adopts a legacy transcript or moves the session.
+	// The steal request is itself the confirmation; resume_session never steals.
+	Rebind bool `json:"rebind,omitempty"`
 	// New is the new id for rename_session (Name holds the old one).
 	New string `json:"new,omitempty"`
 	// Mode selects a tool mode or an approval mode for the corresponding request.

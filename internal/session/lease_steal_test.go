@@ -71,7 +71,7 @@ func TestStealWriterLockRefusesLiveLegacyWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := exec.CommandContext(t.Context(), exe, "-test.run=^TestWriterLeaseProcessHelper$")
-	child.Env = append(os.Environ(), "GMH_LEASE_HELPER=legacy")
+	child.Env = append(os.Environ(), "GMH_LEASE_HELPER=legacy", "GMH_LEASE_ROOT="+t.TempDir())
 	stdin, err := child.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -85,10 +85,14 @@ func TestStealWriterLockRefusesLiveLegacyWriter(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = stdin.Close(); _ = child.Wait() })
 	line := bufio.NewScanner(stdout)
+	if !line.Scan() || line.Text() == "" {
+		t.Fatalf("legacy writer did not publish its workspace: %q (%v)", line.Text(), line.Err())
+	}
+	root := line.Text()
 	if !line.Scan() || line.Text() != "ready" {
 		t.Fatalf("legacy writer did not start: %q (%v)", line.Text(), line.Err())
 	}
-	if err := StealWriterLock("shared", ""); !errors.Is(err, ErrSessionBusy) || !strings.Contains(err.Error(), "cannot verify heartbeat") {
+	if err := StealWriterLock("shared", root); !errors.Is(err, ErrSessionBusy) || !strings.Contains(err.Error(), "cannot prove process identity") {
 		t.Fatalf("expected legacy writer refusal, got %v", err)
 	}
 	if err := stdin.Close(); err != nil {
@@ -97,7 +101,7 @@ func TestStealWriterLockRefusesLiveLegacyWriter(t *testing.T) {
 	if err := child.Wait(); err != nil {
 		t.Fatalf("legacy writer did not shut down normally: %v", err)
 	}
-	if err := StealWriterLock("shared", ""); err != nil {
+	if err := StealWriterLock("shared", root); err != nil {
 		t.Fatalf("could not recover free lease: %v", err)
 	}
 }

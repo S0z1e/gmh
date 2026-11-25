@@ -2,6 +2,7 @@ package session
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -101,7 +102,13 @@ func TestWriterLeaseProcessHelper(t *testing.T) {
 	if mode == "" {
 		return
 	}
-	s, err := New("shared")
+	// An empty GMH_LEASE_ROOT keeps the historical helper binding: older
+	// tests open "shared" with New, which records the helper's own directory.
+	workspace := os.Getenv("GMH_LEASE_ROOT")
+	if workspace == "" {
+		workspace = "."
+	}
+	s, err := Open("shared", OpenOptions{Workspace: workspace})
 	if mode == "busy" {
 		if err == nil {
 			s.Close()
@@ -116,13 +123,60 @@ func TestWriterLeaseProcessHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	if mode == "dead" {
+		if s.stopHeartbeat != nil {
+			s.stopHeartbeat()
+			s.stopHeartbeat = nil
+		}
+		host, _ := os.Hostname()
+		dead := LockOwner{
+			PID: 1<<30 - 1, Host: host,
+			Started:        time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+			Heartbeat:      time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+			ProcessStarted: "dead-identity-that-cannot-match",
+		}
+		data, err := json.Marshal(dead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeLockOwnerData(s.writer, data); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Println("ready")
+		return // exiting releases the OS lock and leaves the dead owner record
+	}
 	if mode == "legacy" {
 		started := time.Now().Add(-lockStaleTTL - time.Minute).UTC().Format(time.RFC3339)
 		if err := writeLockOwnerData(s.writer, fmt.Appendf(nil, "pid=%d started=%s", os.Getpid(), started)); err != nil {
 			t.Fatal(err)
 		}
+		fmt.Println(s.header.Workspace.Path)
+	}
+	if mode == "stall" {
+		// Freeze the heartbeat before announcing ready, so a stealer observes
+		// the stalled record and the refresh goroutine cannot rewrite it.
+		if s.stopHeartbeat != nil {
+			s.stopHeartbeat()
+			s.stopHeartbeat = nil
+		}
+		owner, ok := parseLockOwner(s.writer)
+		if !ok {
+			t.Fatal("stall helper has no lock owner")
+		}
+		owner.Heartbeat = time.Now().Add(-lockStaleTTL - time.Minute).UTC().Format(time.RFC3339)
+		data, err := json.Marshal(owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeLockOwnerData(s.writer, data); err != nil {
+			t.Fatal(err)
+		}
 	}
 	fmt.Println("ready")
+	if mode == "stall" {
+		owner, _ := parseLockOwner(s.writer)
+		fmt.Println(owner.ProcessStarted)
+	}
 	// Parent kills this process to prove the OS releases the lease after a crash.
 	var b [1]byte
 	_, _ = os.Stdin.Read(b[:])
@@ -136,7 +190,7 @@ func TestWriterLeaseAcrossProcessesAndCrash(t *testing.T) {
 	}
 	child := func(mode string) *exec.Cmd {
 		c := exec.Command(exe, "-test.run=^TestWriterLeaseProcessHelper$")
-		c.Env = append(os.Environ(), "GMH_LEASE_HELPER="+mode)
+		c.Env = append(os.Environ(), "GMH_LEASE_HELPER="+mode, "GMH_LEASE_ROOT="+os.Getenv("GMH_LEASE_ROOT"))
 		return c
 	}
 	s, err := New("shared")

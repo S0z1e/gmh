@@ -36,7 +36,7 @@ echoed in the response):
   `agent_settled`. A second prompt while a turn runs is queued (cap
   64; beyond that an error). A known slash line (`/usage`, `/jobs`,
   `/clear`, `/compact`, `/skill:<name>`, `/sessions`, `/resume <id>`,
-  `/rename <old> <new>`, `/plugins`, `/attach [path]`, `/quit`) behaves as the
+  `/steal <id>`, `/rename <old> <new>`, `/plugins`, `/attach [path]`, `/quit`) behaves as the
   matching control request, exactly like the REPL; any other line,
   including an unknown `/foo`, is a task for the model.
 - `approval_response` `{"approval_id":"appr-1","approved":true}` →
@@ -141,7 +141,8 @@ echoed in the response):
   deliveries may carry harness-only `observation` metadata for actual errors,
   output references and job snapshots; provider wire adapters omit that metadata.
 - `rename_session` `{"name":"old","new":"new"}` → `{"renamed":true,"from":"old","to":"new"}`. Same rename as `/rename` in the REPL.
-- `resume_session` `{"session":"..."}` → `{"session":"...","messages":N}`. Same switch as `/resume` in the REPL; `get_state` reports the new session at once.
+- `resume_session` `{"session":"..."}` → `{"session":"...","messages":N}`. Same switch as `/resume` in the REPL; `get_state` reports the new session at once. When another process holds the writer the error is `session is already open for writing` and the session is not taken. Use `steal_session` for that.
+- `steal_session` `{"session":"...","rebind":false}` → `{"session":"...","messages":N,"stolen":true}`. The request is the confirmation. The lock is taken and the session reopened as one handoff, matching `harness --resume <id> --steal` and `/steal <id>`. A live owner is terminated only when its host, heartbeat and process identity are proven and the heartbeat is stale. Unproven identity, including a Windows PID whose query fails, is refused. A PID that does not exist is a dead owner and may be taken. `rebind` adopts a legacy transcript or moves the session, the same consent as `--rebind-session`.
 - `prune_artifacts` → `{"deleted_blobs":N,"reclaimed_bytes":N}`. Reclaims unreferenced image blobs older than seven days after scanning session history, archives and recovery records.
 - `delete_session` `{"session":"..."}` → `{"deleted":true,"session":"..."}`. Removes another session's owned transcript, archives, audit, recovery records and unshared output family. The current session cannot be deleted (resume or start another one first); an unknown id is an error.
 - `set_tool_mode` `{"mode":"plan"|"default"}` → `{"tool_mode":"plan"}`. First-class switch of the loop's tool set (read-only plan mode, or back to the full default set): the same effect as the plan plugin's `/plan` / `/execute`, but it works even when the project has no plan plugin. An unknown or missing mode is an error; switching to the current mode is a no-op. `get_state` and `agent_settled` report the new mode at once. The mode is session-only: a new or resumed session resets it to default.

@@ -60,6 +60,9 @@ Then run it in the project you want it to work in:
 
 # Resume a session:
 ./harness --resume <session-id> -root /path/to/project
+
+# Take a busy session after confirmation (refuses when the owner cannot be proven):
+./harness --resume <session-id> --steal -root /path/to/project
 ```
 
 Flags and env vars override the config file (flag > env > model >

@@ -54,5 +54,14 @@ const metadataReadFlags = 0
 const lockOwnerReadOffset = 1
 
 func processAlive(pid int) bool {
-	return pid > 0
+	if pid <= 0 {
+		return false
+	}
+	h, err := openWriterProcess(pid, windowsProcessSynchronize)
+	if err != nil {
+		return false
+	}
+	defer syscall.CloseHandle(h)
+	event, err := syscall.WaitForSingleObject(h, 0)
+	return err == nil && event != syscall.WAIT_OBJECT_0
 }

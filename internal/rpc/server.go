@@ -339,7 +339,7 @@ func (s *Server) handlePrompt(req Request) {
 		if typ == "set_approval_mode" {
 			ctrl.Mode = arg
 		}
-		if typ == "resume_session" {
+		if typ == "resume_session" || typ == "steal_session" {
 			ctrl = Request{ID: req.ID, Type: typ, Session: arg}
 		}
 		if typ == "stop_job" {
@@ -429,6 +429,8 @@ func slashRequest(line string) (typ, arg string) {
 		return "list_plugins", ""
 	case line == "/resume" || strings.HasPrefix(line, "/resume "):
 		return "resume_session", strings.TrimSpace(strings.TrimPrefix(line, "/resume"))
+	case line == "/steal" || strings.HasPrefix(line, "/steal "):
+		return "steal_session", strings.TrimSpace(strings.TrimPrefix(line, "/steal"))
 	case line == "/rollback" || strings.HasPrefix(line, "/rollback "):
 		return "rollback", strings.TrimSpace(strings.TrimPrefix(line, "/rollback"))
 	case line == "/rename" || strings.HasPrefix(line, "/rename "):
@@ -1456,11 +1458,10 @@ func (s *Server) doControl(req Request) {
 			s.respond(req, nil, fmt.Errorf("steal_session needs {\"session\": id}"))
 			return
 		}
-		if err := session.StealWriterLock(req.Session, s.app.Root); err != nil {
-			s.respond(req, nil, err)
-			return
-		}
-		n, err := s.runner.ResumeSession(req.Session)
+		// The request itself is the confirmation: the lock is taken and the
+		// session reopened together. A resume that finds the session busy
+		// returns ErrSessionBusy and does not steal.
+		n, err := s.runner.StealSession(req.Session, req.Rebind)
 		if err != nil {
 			s.respond(req, nil, err)
 			return

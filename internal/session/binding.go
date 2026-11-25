@@ -47,47 +47,66 @@ type OpenOptions struct {
 func New(id string) (*Store, error) { return Open(id, OpenOptions{}) }
 
 func Open(id string, opts OpenOptions) (*Store, error) {
-	return open(id, opts, (*Store).replaceHeader)
-}
-
-func open(id string, opts OpenOptions, replaceHeader func(*Store, *Header, int64) error) (*Store, error) {
-	if id != "" {
-		if err := ValidateSessionID(id); err != nil {
-			return nil, err
-		}
-	}
 	unlock, err := lockManagement()
 	if err != nil {
 		return nil, err
 	}
 	defer unlock()
-	if opts.Existing && id == "" {
-		return nil, fmt.Errorf("an existing session id is required")
-	}
-	if id == "" {
-		_, err = recoverOperations()
-	} else {
-		_, err = recoverOperations(id)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("recover session operations: %w", err)
+	return openLocked(id, opts, (*Store).replaceHeader, nil)
+}
+
+func open(id string, opts OpenOptions, replaceHeader func(*Store, *Header, int64) error, claimed *os.File) (*Store, error) {
+	return openLocked(id, opts, replaceHeader, claimed)
+}
+
+// openLocked runs with the management lock already held. claimed, when set, is
+// a writer lease this process already owns and must not be reacquired.
+func openLocked(id string, opts OpenOptions, replaceHeader func(*Store, *Header, int64) error, claimed *os.File) (*Store, error) {
+	handed := false
+	if claimed != nil {
+		defer func() {
+			if !handed {
+				claimed.Close()
+			}
+		}()
 	}
 	if id != "" {
-		id, err = canonicalSessionID(id)
+		if err := ValidateSessionID(id); err != nil {
+			return nil, err
+		}
+	}
+	var err error
+	if claimed == nil {
+		if opts.Existing && id == "" {
+			return nil, fmt.Errorf("an existing session id is required")
+		}
+		if id == "" {
+			_, err = recoverOperations()
+		} else {
+			_, err = recoverOperations(id)
+		}
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("recover session operations: %w", err)
 		}
-	}
-	if id != "" {
-		header, err := readArtifactHeader(filepath.Join(Dir(), id+".jsonl"))
-		if err != nil && !os.IsNotExist(err) {
-			return nil, err
-		}
-		if header != nil {
-			if err := recoverOutputOperations(header.OutputID); err != nil {
-				return nil, fmt.Errorf("recover artifact family: %w", err)
+		if id != "" {
+			id, err = canonicalSessionID(id)
+			if err != nil {
+				return nil, err
 			}
 		}
+		if id != "" {
+			header, err := readArtifactHeader(filepath.Join(Dir(), id+".jsonl"))
+			if err != nil && !os.IsNotExist(err) {
+				return nil, err
+			}
+			if header != nil {
+				if err := recoverOutputOperations(header.OutputID); err != nil {
+					return nil, fmt.Errorf("recover artifact family: %w", err)
+				}
+			}
+		}
+	} else if opts.Existing && id == "" {
+		return nil, fmt.Errorf("an existing session id is required")
 	}
 	identity, err := workspace.Identify(opts.Workspace)
 	if err != nil {
@@ -98,7 +117,7 @@ func open(id string, opts OpenOptions, replaceHeader func(*Store, *Header, int64
 	var skip int64
 	var replace bool
 	var fresh bool
-	s, err := newStore(id, opts.Existing, func(f *os.File, created bool) error {
+	preflight := func(f *os.File, created bool) error {
 		if created {
 			fresh = true
 			replace = true
@@ -117,9 +136,19 @@ func open(id string, opts OpenOptions, replaceHeader func(*Store, *Header, int64
 			replace = true
 		}
 		return nil
-	})
-	if err != nil {
-		return nil, err
+	}
+	var s *Store
+	if claimed != nil {
+		s, err = finishStore(id, opts.Existing, claimed, preflight)
+		if err != nil {
+			return nil, err
+		}
+		handed = true
+	} else {
+		s, err = newStore(id, opts.Existing, preflight)
+		if err != nil {
+			return nil, err
+		}
 	}
 	headerless := header == nil
 	if replace {

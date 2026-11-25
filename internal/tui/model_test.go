@@ -409,6 +409,33 @@ func TestModelApprovalYesNo(t *testing.T) {
 	}
 }
 
+func TestStartupStealAnswerQuits(t *testing.T) {
+	req := &ApprovalRequest{ToolName: "steal", Prompt: StealPrompt("held"), Reply: make(chan bool, 1)}
+	m := NewModel("").WithApproval(req)
+	_, cmd := m.Update(tea.KeyPressMsg{Text: "y", Code: 'y'})
+	if cmd == nil {
+		t.Fatal("answering the startup steal dialog should quit")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatal("startup answer did not quit the program")
+	}
+	select {
+	case allowed := <-req.Reply:
+		if !allowed {
+			t.Fatal("y refused the startup steal")
+		}
+	default:
+		t.Fatal("startup answer did not reply")
+	}
+
+	normal := &ApprovalRequest{Prompt: "Run bash?", Reply: make(chan bool, 1)}
+	m = apply(t, NewModel(""), ApprovalMsg{Request: normal})
+	_, cmd = m.Update(tea.KeyPressMsg{Text: "n", Code: 'n'})
+	if cmd != nil {
+		t.Fatal("a tool approval must not quit the session")
+	}
+}
+
 func TestModelCtrlCQuits(t *testing.T) {
 	m := NewModel("")
 	_, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})

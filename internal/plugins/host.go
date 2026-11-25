@@ -41,6 +41,7 @@ func (p *Plugin) nativeGetSession(_ *moejs.Realm, _ moejs.Value, _ []moejs.Value
 // "/model" would stop switching models.
 var builtinCommands = map[string]bool{
 	"attach": true, "image": true, "sessions": true, "plugins": true, "resume": true,
+	"steal":  true,
 	"rename": true, "model": true, "quit": true, "exit": true,
 	"usage": true, "jobs": true, "clear": true, "compact": true,
 	"skill": true,

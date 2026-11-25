@@ -61,6 +61,17 @@ func (a *Approver) askContext(ctx context.Context, req *ApprovalRequest) (bool, 
 	}
 }
 
+// ConfirmSteal asks before /steal may signal another process. The caller must
+// cancel ctx when the program stops, including a quit that never answered.
+func (a *Approver) ConfirmSteal(ctx context.Context, id string) (bool, error) {
+	return a.askContext(ctx, &ApprovalRequest{ToolName: "steal", Prompt: StealPrompt(id), Reply: make(chan bool, 1)})
+}
+
+// StealPrompt is the confirmation shown before a live owner may be signalled.
+func StealPrompt(id string) string {
+	return fmt.Sprintf("Steal session %s? This ends a stalled owner when its process identity is proven, and refuses when it is not.", id)
+}
+
 // ConfirmContinuation is the TUI's doom-loop prompt, reusing the
 // approval dialog: y continues once, n stops. The dialog is y/n
 // only, so "always this session" is not offered here — the CLI and
