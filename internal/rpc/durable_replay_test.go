@@ -381,6 +381,55 @@ func TestSlowReaderTimesOutActiveTurnAfterDetachGrace(t *testing.T) {
 	}
 }
 
+func TestReplayCapCursorTruncatesAtTheUnstoredSequence(t *testing.T) {
+	s, out := usageRegressionServer(t, false)
+	orig := replayLogByteCap
+	replayLogByteCap = 700
+	t.Cleanup(func() { replayLogByteCap = orig })
+	log, err := openReplayLog(s.app.Store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.replayLog = log
+	s.replayLogID = s.app.Store.ID
+	s.connectionID = "capped"
+	for range 40 {
+		s.writeEvent(Event{Type: "text_delta", Text: strings.Repeat("x", 40)})
+	}
+	if err := log.close(); err != nil {
+		t.Fatal(err)
+	}
+	s.replayLog = nil
+	events, _, capAt, _, err := loadReplayLog(s.app.Store.ID, "capped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capAt == 0 || len(events) == 0 || capAt != events[len(events)-1].sequence+1 {
+		t.Fatalf("cap=%d events=%d", capAt, len(events))
+	}
+	s.connectionID = "reader"
+	read := func(after uint64) replayPage {
+		t.Helper()
+		out.Reset()
+		s.handleQuery(Request{ID: "cap", Type: "replay", AfterSequence: after, ConnectionID: "capped", ResumeSession: s.app.Store.ID})
+		var resp struct {
+			Data replayPage `json:"data"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp.Data
+	}
+	first := read(0)
+	if first.Truncated || len(first.Events) == 0 || first.LatestSequence >= capAt {
+		t.Fatalf("prefix before cap: %+v cap=%d", first, capAt)
+	}
+	caughtUp := read(events[len(events)-1].sequence)
+	if !caughtUp.Truncated || len(caughtUp.Events) != 0 {
+		t.Fatalf("cursor at last stored event: %+v", caughtUp)
+	}
+}
+
 func TestReplayLogReadsLinesPastTheReadBuffer(t *testing.T) {
 	s, _ := usageRegressionServer(t, false)
 	log, err := openReplayLog(s.app.Store.ID)

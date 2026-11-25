@@ -138,6 +138,7 @@ type Server struct {
 	evictedSeq   uint64 // highest event sequence evicted from eventHistory, guarded by writeMu
 	replayLog    *replayLog
 	replayLogID  string
+	replayCap    uint64
 	skippedSeqs  []uint64 // oversized events omitted individually, guarded by writeMu
 	inputErr     error
 	state        serverState
@@ -742,7 +743,7 @@ func (s *Server) handleReplay(req Request) {
 	}
 	page := replayPage{
 		ConnectionID: connectionID, Session: sessionID, LatestSequence: s.sequence,
-		NextAfterSequence: math.MaxUint64, Truncated: req.AfterSequence < evicted || (capAt > 0 && req.AfterSequence >= capAt),
+		NextAfterSequence: math.MaxUint64, Truncated: req.AfterSequence < evicted || capCovers(req.AfterSequence, capAt),
 		OutputOpen:       s.outputOpen(),
 		SkippedSequences: skipped,
 		Events:           []json.RawMessage{}, PendingApprovals: pendingApprovals,
@@ -793,6 +794,15 @@ func (s *Server) handleReplay(req Request) {
 	s.writeJSON(Response{ID: req.ID, Type: "response", Data: page})
 }
 
+func capCovers(after, capAt uint64) bool {
+	// capAt is the first sequence that was not stored. A cursor that has already
+	// consumed every earlier event (after+1 >= capAt) has reached that gap.
+	if capAt == 0 {
+		return false
+	}
+	return after >= capAt-1
+}
+
 func (s *Server) outputOpen() bool {
 	s.mu.Lock()
 	failed := s.outputFailed
@@ -815,7 +825,7 @@ func (s *Server) replaySourceLocked(sessionID, connectionID, liveSession string)
 	live := sameConnection && (sessionID == "" || sessionID == owner)
 	if live {
 		history = append([]replayEvent(nil), s.eventHistory...)
-		return history, s.evictedSeq, append([]uint64(nil), s.skippedSeqs...), 0, false, nil
+		return history, s.evictedSeq, append([]uint64(nil), s.skippedSeqs...), s.replayCap, false, nil
 	}
 	s.writeMu.Unlock()
 	history, evicted, capAt, skipped, err = loadReplayLog(sessionID, connectionID)
@@ -1709,6 +1719,7 @@ func (s *Server) releaseReplayLog() {
 		s.replayLog = nil
 	}
 	s.replayLogID = ""
+	s.replayCap = 0
 }
 
 func (s *Server) rebindReplayLog() {
@@ -2013,14 +2024,19 @@ func (s *Server) appendReplayLocked(data []byte, sync bool) {
 	}
 	if err := s.replayLog.append(data, sync); err != nil {
 		if errors.Is(err, errReplayLogFull) {
+			if s.replayCap == 0 {
+				s.replayCap = s.sequence
+			}
 			if !s.replayLog.full {
 				marker, mErr := json.Marshal(map[string]any{
 					"type": "replay_capped", "sequence": s.sequence, "connection_id": s.connectionID,
 				})
 				if mErr == nil {
-					_ = s.replayLog.appendCap(marker)
+					if capErr := s.replayLog.appendCap(marker); capErr != nil && !errors.Is(capErr, errReplayLogFull) {
+						fmt.Fprintf(os.Stderr, "harness rpc replay cap marker failed: %v\n", capErr)
+					}
 				}
-				fmt.Fprintf(os.Stderr, "harness rpc replay log reached its %d byte cap; older events remain readable\n", maxReplayLogBytes)
+				fmt.Fprintf(os.Stderr, "harness rpc replay log reached its %d byte cap; older events remain readable\n", replayLogByteCap)
 			}
 			return
 		}

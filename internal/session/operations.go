@@ -21,15 +21,18 @@ type artifactMove struct {
 	Kind string `json:"kind"`
 }
 type artifactOperation struct {
-	Version int              `json:"version"`
-	Nonce   string           `json:"nonce"`
-	Kind    string           `json:"kind"`
-	OldID   string           `json:"old_id"`
-	NewID   string           `json:"new_id,omitempty"`
-	Header  *Header          `json:"header,omitempty"`
-	Moves   []artifactMove   `json:"moves"`
-	Before  artifactRegistry `json:"before"`
-	After   artifactRegistry `json:"after"`
+	Version int            `json:"version"`
+	Nonce   string         `json:"nonce"`
+	Kind    string         `json:"kind"`
+	OldID   string         `json:"old_id"`
+	NewID   string         `json:"new_id,omitempty"`
+	Header  *Header        `json:"header,omitempty"`
+	Moves   []artifactMove `json:"moves"`
+	// Replay records that rpc-replay/<old>.jsonl moved with this rename, so
+	// recovery can finish or undo it with the transcript.
+	Replay bool             `json:"replay,omitempty"`
+	Before artifactRegistry `json:"before"`
+	After  artifactRegistry `json:"after"`
 }
 
 // The management lock protects plans and namespace changes, not active turns.
@@ -127,6 +130,13 @@ func prepareOperation(kind, oldID, newID string, m ArtifactManifest) (artifactOp
 		op.Moves = append(op.Moves, artifactMove{a.Path, to, a.Kind})
 	}
 	op.Moves = append(op.Moves, transcript)
+	if kind == "rename" {
+		if _, err := replayFileInfo(oldID); err == nil {
+			op.Replay = true
+		} else if !os.IsNotExist(err) {
+			return op, err
+		}
+	}
 	if err := validateOperation(op); err != nil {
 		return op, err
 	}
@@ -316,6 +326,9 @@ func reconcileMove(m artifactMove, forward bool) error {
 func reconcileOperation(op artifactOperation, forward bool) error {
 	var result error
 	if forward {
+		if err := reconcileReplay(op, true); err != nil {
+			return err
+		}
 		for _, move := range op.Moves {
 			if err := reconcileMove(move, true); err != nil {
 				return err
@@ -325,6 +338,7 @@ func reconcileOperation(op artifactOperation, forward bool) error {
 		for i := len(op.Moves) - 1; i >= 0; i-- {
 			result = errors.Join(result, reconcileMove(op.Moves[i], false))
 		}
+		result = errors.Join(result, reconcileReplay(op, false))
 	}
 	if result != nil {
 		return result

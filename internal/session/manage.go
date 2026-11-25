@@ -187,19 +187,7 @@ func renameSessionFiles(oldID, newID string) error {
 	if err != nil {
 		return err
 	}
-	if err := moveReplayBesideSession(oldID, newID); err != nil {
-		if clean := cleanupOperation(op); clean != nil {
-			return errors.Join(err, clean)
-		}
-		return err
-	}
-	if err := performOperation(op); err != nil {
-		if back := moveReplayBesideSession(newID, oldID); back != nil {
-			return errors.Join(err, back)
-		}
-		return err
-	}
-	return nil
+	return performOperation(op)
 }
 
 // RenameSession renames a session that is not currently open. For the
@@ -376,30 +364,49 @@ func DeleteSession(id string) error {
 }
 
 func replayRoot() (*os.Root, error) {
-	if err := os.MkdirAll(Dir(), 0700); err != nil {
-		return nil, err
-	}
 	parent, err := os.OpenRoot(Dir())
 	if err != nil {
 		return nil, err
 	}
 	defer parent.Close()
-	st, err := parent.Lstat("rpc-replay")
+	observed, err := parent.Lstat("rpc-replay")
 	if err != nil {
 		return nil, err
 	}
-	if st.Mode()&os.ModeSymlink != 0 || !st.IsDir() {
+	if observed.Mode()&os.ModeSymlink != 0 || !observed.IsDir() {
 		return nil, fmt.Errorf("rpc replay directory must not be an alias")
 	}
-	return os.OpenRoot(filepath.Join(Dir(), "rpc-replay"))
+	child, err := parent.OpenRoot("rpc-replay")
+	if err != nil {
+		return nil, err
+	}
+	opened, err := child.Stat(".")
+	if err != nil || !os.SameFile(observed, opened) {
+		child.Close()
+		return nil, fmt.Errorf("rpc replay directory changed while opening")
+	}
+	return child, nil
 }
 
-func moveReplayBesideSession(oldID, newID string) error {
-	if err := ValidateSessionID(oldID); err != nil {
-		return err
+func replayFileInfo(id string) (os.FileInfo, error) {
+	if err := ValidateSessionID(id); err != nil {
+		return nil, err
 	}
-	if err := ValidateSessionID(newID); err != nil {
-		return err
+	root, err := replayRoot()
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return root.Lstat(id + ".jsonl")
+}
+
+func reconcileReplay(op artifactOperation, forward bool) error {
+	if !op.Replay || op.Kind != "rename" {
+		return nil
+	}
+	from, to := op.OldID+".jsonl", op.NewID+".jsonl"
+	if !forward {
+		from, to = to, from
 	}
 	root, err := replayRoot()
 	if err != nil {
@@ -409,29 +416,21 @@ func moveReplayBesideSession(oldID, newID string) error {
 		return err
 	}
 	defer root.Close()
-	oldName, newName := oldID+".jsonl", newID+".jsonl"
-	oldInfo, err := root.Lstat(oldName)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
+	_, srcErr := root.Lstat(from)
+	_, dstErr := root.Lstat(to)
+	if os.IsNotExist(srcErr) && (dstErr == nil || os.IsNotExist(dstErr)) {
+		return nil
 	}
-	if oldInfo.Mode()&os.ModeSymlink != 0 || !oldInfo.Mode().IsRegular() {
-		return fmt.Errorf("rpc replay log must be a regular file")
+	if srcErr != nil {
+		return srcErr
 	}
-	if newInfo, err := root.Lstat(newName); err == nil {
-		if newInfo.Mode()&os.ModeSymlink != 0 || !newInfo.Mode().IsRegular() {
-			return fmt.Errorf("replay log %s is not a regular file", newID)
-		}
-		if os.SameFile(oldInfo, newInfo) {
-			return root.Rename(oldName, newName)
-		}
-		return fmt.Errorf("replay log %s already exists", newID)
-	} else if !os.IsNotExist(err) {
-		return err
+	if dstErr == nil {
+		return fmt.Errorf("replay log %s already exists", to)
 	}
-	return root.Rename(oldName, newName)
+	if !os.IsNotExist(dstErr) {
+		return dstErr
+	}
+	return root.Rename(from, to)
 }
 
 func removeReplayBesideSession(id string) error {
