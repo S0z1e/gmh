@@ -136,6 +136,13 @@ func prepareOperation(kind, oldID, newID string, m ArtifactManifest) (artifactOp
 		} else if !os.IsNotExist(err) {
 			return op, err
 		}
+		if op.Replay {
+			if _, err := replayFileInfo(newID); err == nil {
+				return op, fmt.Errorf("replay log %s already exists", newID)
+			} else if !os.IsNotExist(err) {
+				return op, err
+			}
+		}
 	}
 	if err := validateOperation(op); err != nil {
 		return op, err
@@ -524,9 +531,15 @@ func recoverMatchingOperations(match func(artifactOperation) bool, skipBusy bool
 			if oldErr != nil && !os.IsNotExist(oldErr) {
 				err = oldErr
 			} else if op.Kind == "delete" && forward {
-				err = cleanupOperation(op)
+				err = removeReplayBesideSession(op.OldID)
+				if err == nil {
+					err = cleanupOperation(op)
+				}
 			} else {
 				err = reconcileOperation(op, forward)
+				if err == nil && forward && op.Kind == "delete" {
+					err = removeReplayBesideSession(op.OldID)
+				}
 				if err == nil {
 					err = cleanupOperation(op)
 				}

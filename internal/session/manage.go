@@ -357,10 +357,10 @@ func DeleteSession(id string) error {
 	if err != nil {
 		return err
 	}
-	if err := performOperation(op); err != nil {
-		return err
+	if err := removeReplayBesideSession(id); err != nil {
+		return errors.Join(err, cleanupOperation(op))
 	}
-	return removeReplayBesideSession(id)
+	return performOperation(op)
 }
 
 func replayRoot() (*os.Root, error) {
@@ -425,6 +425,9 @@ func reconcileReplay(op artifactOperation, forward bool) error {
 		return srcErr
 	}
 	if dstErr == nil {
+		if !forward {
+			return nil
+		}
 		return fmt.Errorf("replay log %s already exists", to)
 	}
 	if !os.IsNotExist(dstErr) {

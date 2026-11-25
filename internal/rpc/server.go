@@ -139,6 +139,7 @@ type Server struct {
 	replayLog    *replayLog
 	replayLogID  string
 	replayCap    uint64
+	replayPaused bool
 	skippedSeqs  []uint64 // oversized events omitted individually, guarded by writeMu
 	inputErr     error
 	state        serverState
@@ -817,6 +818,9 @@ func (s *Server) outputOpen() bool {
 // the durable log when the client names another connection or session.
 // writeMu is already held.
 func (s *Server) replaySourceLocked(sessionID, connectionID, liveSession string) (history []replayEvent, evicted uint64, skipped []uint64, capAt uint64, durable bool, err error) {
+	if s.replayPaused {
+		return nil, 0, nil, 0, false, errors.New("replay is paused while the session is being renamed")
+	}
 	sameConnection := connectionID == s.connectionID || (connectionID == "" && s.connectionID == "")
 	owner := s.replayLogID
 	if owner == "" {
@@ -825,7 +829,8 @@ func (s *Server) replaySourceLocked(sessionID, connectionID, liveSession string)
 	live := sameConnection && (sessionID == "" || sessionID == owner)
 	if live {
 		history = append([]replayEvent(nil), s.eventHistory...)
-		return history, s.evictedSeq, append([]uint64(nil), s.skippedSeqs...), s.replayCap, false, nil
+		// The durable file cap does not apply to events still in memory.
+		return history, s.evictedSeq, append([]uint64(nil), s.skippedSeqs...), 0, false, nil
 	}
 	s.writeMu.Unlock()
 	history, evicted, capAt, skipped, err = loadReplayLog(sessionID, connectionID)
@@ -1589,11 +1594,13 @@ func (s *Server) doControl(req Request) {
 		}
 		owned := s.app.Store != nil && s.app.Store.Owns(req.Name)
 		if owned {
-			s.releaseReplayLog()
+			s.pauseReplay()
 		}
 		err := s.app.RenameSession(req.Name, req.New)
 		if owned {
+			s.refreshState()
 			s.rebindReplayLog()
+			s.resumeReplay()
 		}
 		if err != nil {
 			s.respond(req, nil, err)
@@ -1711,6 +1718,24 @@ func (s *Server) findSkill(name string) (string, bool) {
 	return "", false
 }
 
+func (s *Server) pauseReplay() {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.replayLog != nil {
+		_ = s.replayLog.close()
+		s.replayLog = nil
+	}
+	s.replayLogID = ""
+	s.replayCap = 0
+	s.replayPaused = true
+}
+
+func (s *Server) resumeReplay() {
+	s.writeMu.Lock()
+	s.replayPaused = false
+	s.writeMu.Unlock()
+}
+
 func (s *Server) releaseReplayLog() {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -1737,6 +1762,7 @@ func (s *Server) rebindReplayLog() {
 		s.replayLog = nil
 	}
 	s.replayLogID = ""
+	s.replayCap = 0
 	log, err := openReplayLog(id)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "harness rpc replay log unavailable: %v\n", err)
