@@ -140,6 +140,7 @@ type Server struct {
 	replayLogID  string
 	replayCap    uint64
 	replayPaused bool
+	replayHold   [][]byte
 	skippedSeqs  []uint64 // oversized events omitted individually, guarded by writeMu
 	inputErr     error
 	state        serverState
@@ -719,10 +720,13 @@ func (s *Server) handleReplay(req Request) {
 	s.approvalsMu.Unlock()
 	slices.Sort(pendingApprovals)
 
+	connectionID := req.ConnectionID
+
+	s.writeMu.Lock()
+	s.flushDeltaLocked()
 	s.mu.Lock()
 	liveSession := s.state.sessionID
 	s.mu.Unlock()
-	connectionID := req.ConnectionID
 	if connectionID == "" {
 		connectionID = s.connectionID
 	}
@@ -730,9 +734,6 @@ func (s *Server) handleReplay(req Request) {
 	if sessionID == "" {
 		sessionID = liveSession
 	}
-
-	s.writeMu.Lock()
-	s.flushDeltaLocked()
 	history, evicted, skipped, capAt, durable, err := s.replaySourceLocked(sessionID, connectionID, liveSession)
 	if err != nil {
 		s.writeMu.Unlock()
@@ -832,9 +833,7 @@ func (s *Server) replaySourceLocked(sessionID, connectionID, liveSession string)
 		// The durable file cap does not apply to events still in memory.
 		return history, s.evictedSeq, append([]uint64(nil), s.skippedSeqs...), 0, false, nil
 	}
-	s.writeMu.Unlock()
 	history, evicted, capAt, skipped, err = loadReplayLog(sessionID, connectionID)
-	s.writeMu.Lock()
 	return history, evicted, skipped, capAt, true, err
 }
 
@@ -1770,6 +1769,19 @@ func (s *Server) rebindReplayLog() {
 	}
 	s.replayLog = log
 	s.replayLogID = id
+	s.flushReplayHoldLocked()
+}
+
+func (s *Server) flushReplayHoldLocked() {
+	if s.replayLog == nil {
+		return
+	}
+	for _, line := range s.replayHold {
+		if err := s.replayLog.append(line, true); err != nil {
+			break
+		}
+	}
+	s.replayHold = nil
 }
 
 func applyApprovalTimeout(s *Server) {
@@ -2045,7 +2057,14 @@ func (s *Server) omissionMarker(size int) []byte {
 }
 
 func (s *Server) appendReplayLocked(data []byte, sync bool) {
-	if s.replayLog == nil || s.replayLogID == "" || len(data) == 0 {
+	if len(data) == 0 {
+		return
+	}
+	if s.replayPaused {
+		s.replayHold = append(s.replayHold, append([]byte(nil), data...))
+		return
+	}
+	if s.replayLog == nil || s.replayLogID == "" {
 		return
 	}
 	if err := s.replayLog.append(data, sync); err != nil {

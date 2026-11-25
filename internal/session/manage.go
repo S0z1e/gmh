@@ -357,10 +357,10 @@ func DeleteSession(id string) error {
 	if err != nil {
 		return err
 	}
-	if err := removeReplayBesideSession(id); err != nil {
-		return errors.Join(err, cleanupOperation(op))
+	if err := performOperation(op); err != nil {
+		return err
 	}
-	return performOperation(op)
+	return removeReplayBesideSession(id)
 }
 
 func replayRoot() (*os.Root, error) {
@@ -416,15 +416,21 @@ func reconcileReplay(op artifactOperation, forward bool) error {
 		return err
 	}
 	defer root.Close()
-	_, srcErr := root.Lstat(from)
-	_, dstErr := root.Lstat(to)
+	src, srcErr := root.Lstat(from)
+	dst, dstErr := root.Lstat(to)
 	if os.IsNotExist(srcErr) && (dstErr == nil || os.IsNotExist(dstErr)) {
 		return nil
 	}
 	if srcErr != nil {
 		return srcErr
 	}
+	if src.Mode()&os.ModeSymlink != 0 || !src.Mode().IsRegular() {
+		return fmt.Errorf("rpc replay log must be a regular file")
+	}
 	if dstErr == nil {
+		if dst.Mode()&os.ModeSymlink != 0 || !dst.Mode().IsRegular() {
+			return fmt.Errorf("rpc replay log must be a regular file")
+		}
 		if !forward {
 			return nil
 		}
@@ -433,7 +439,10 @@ func reconcileReplay(op artifactOperation, forward bool) error {
 	if !os.IsNotExist(dstErr) {
 		return dstErr
 	}
-	return root.Rename(from, to)
+	if err := root.Rename(from, to); err != nil {
+		return err
+	}
+	return syncRecoveryDirectory(filepath.Join(Dir(), "rpc-replay"))
 }
 
 func removeReplayBesideSession(id string) error {

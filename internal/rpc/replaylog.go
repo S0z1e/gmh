@@ -167,7 +167,44 @@ func openReplayLog(sessionID string) (*replayLog, error) {
 		}
 	}
 	unlock()
-	return &replayLog{path: path, file: f, bytes: size, full: size >= replayLogByteCap}, nil
+	return &replayLog{path: path, file: f, bytes: size, full: replayFileFull(f, size)}, nil
+}
+
+func replayFileFull(f *os.File, size int64) bool {
+	if size >= replayLogByteCap-256 || tailReplayCapped(f) {
+		return true
+	}
+	return false
+}
+
+func tailReplayCapped(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return false
+	}
+	n := info.Size()
+	if n > 512 {
+		n = 512
+	}
+	buf := make([]byte, n)
+	if _, err := f.ReadAt(buf, info.Size()-n); err != nil {
+		return false
+	}
+	line := buf
+	if i := bytes.LastIndex(buf, []byte("\n")); i >= 0 && i < len(buf)-1 {
+		line = buf[i+1:]
+	} else if i == len(buf)-1 {
+		buf = bytes.TrimRight(buf, "\n")
+		if j := bytes.LastIndex(buf, []byte("\n")); j >= 0 {
+			line = buf[j+1:]
+		} else {
+			line = buf
+		}
+	}
+	var head struct {
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(bytes.TrimSpace(line), &head) == nil && head.Type == "replay_capped"
 }
 
 func (l *replayLog) append(data []byte, syncWrite bool) error {
@@ -258,7 +295,7 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 	defer f.Close()
 	defer unlock()
 	info, statErr := f.Stat()
-	fileFull := statErr == nil && info.Size() >= replayLogByteCap
+	fileFull := statErr == nil && info.Size() >= replayLogByteCap-256
 	reader := bufio.NewReaderSize(f, 64*1024)
 	var stored int
 	var last uint64

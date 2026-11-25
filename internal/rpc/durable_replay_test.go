@@ -430,6 +430,37 @@ func TestReplayCapCursorTruncatesAtTheUnstoredSequence(t *testing.T) {
 	}
 }
 
+func TestReplayCapStaysClosedAfterReopen(t *testing.T) {
+	s, _ := usageRegressionServer(t, false)
+	orig := replayLogByteCap
+	replayLogByteCap = 800
+	t.Cleanup(func() { replayLogByteCap = orig })
+	log, err := openReplayLog(s.app.Store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.replayLog = log
+	s.replayLogID = s.app.Store.ID
+	s.connectionID = "reopen"
+	for range 20 {
+		s.writeEvent(Event{Type: "text_delta", Text: strings.Repeat("q", 80)})
+	}
+	if err := log.close(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := openReplayLog(s.app.Store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.close()
+	if !again.full {
+		t.Fatal("reopening a capped replay log allowed more events")
+	}
+	if err := again.append([]byte(`{"type":"text_delta","sequence":99,"connection_id":"reopen","text":"no"}`), true); !errors.Is(err, errReplayLogFull) {
+		t.Fatalf("append after reopen: %v", err)
+	}
+}
+
 func TestReplayLogReadsLinesPastTheReadBuffer(t *testing.T) {
 	s, _ := usageRegressionServer(t, false)
 	log, err := openReplayLog(s.app.Store.ID)
