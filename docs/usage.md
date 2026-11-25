@@ -171,7 +171,17 @@
   and creation time. This record is excluded from model history and preserved by
   clear, compaction, rollback and rename. Resume and `/resume` require the same
   workspace and repository; replacing a directory or changing repositories also
-  requires a new binding. Symlink aliases of the same directory are accepted.
+  requires a new binding. A session another process is writing returns
+   `session is already open for writing` (`ErrSessionBusy`) and is left alone:
+   ordinary `--resume` and `/resume` do not take that lock. `harness --resume <id> --steal`
+   and `/steal <id>` ask for confirmation, then take the lock and reopen the session
+   as one handoff. A live owner is signalled only when its host, heartbeat and process
+   identity all match and the heartbeat is stale. If identity cannot be proven,
+   including on Windows when the PID cannot be opened or its creation time and image
+   path cannot be read, or the recorded identity does not match, the steal is refused.
+   A PID that no longer exists is a dead owner and may be recovered without a signal.
+   RPC `resume_session` refuses the same way; `steal_session` is the confirmed handoff.
+   Symlink aliases of the same directory are accepted.
   To adopt an older transcript without metadata or move one deliberately, run
   `harness --root <project> --resume <id> --rebind-session`. This preserves history
   and creation time when available; it does not grant workspace trust. Unsupported
@@ -185,7 +195,9 @@
   file). `/plugins` lists the discovered plugins with their tools
   and state. `/sessions` lists the sessions (newest first, with message
   count and the first user message as a preview; the current one is
-  marked `*`); `/resume <id>` switches to one, `/rename <old> <new>`
+  marked `*`); `/resume <id>` switches to one and reports the busy error when
+   another process holds it, `/steal <id>` asks and then takes a proven stalled
+   or dead owner, `/rename <old> <new>`
   renames one (transcript, audit sidecar and pre-compact archives
   follow). `/model` lists the configured models; `/model <provider>/<model>`
   (or a bare model id) switches model mid-session — the client is

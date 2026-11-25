@@ -106,7 +106,10 @@ type Model struct {
 	// approval is non-nil while the agent waits for a y/n answer.
 	approval       *ApprovalRequest
 	approvalScroll int
-	height         int
+	// quitOnAnswer closes a startup-only program after y/n/Esc. The main TUI
+	// leaves it false so a tool approval does not exit the session.
+	quitOnAnswer bool
+	height       int
 	// pendingReply is a finished turn's text, waiting to be committed
 	// to the scrollback together with the runner's next print (usually
 	// the usage lines). It exists because two separate tea.Println
@@ -157,6 +160,14 @@ func (m Model) WithMeta(mode, api, model string) Model {
 	m.metaMode = mode
 	m.metaAPI = api
 	m.metaModel = model
+	return m
+}
+
+// WithApproval opens the model on a y/n dialog. Used by the startup steal
+// prompt, which has no agent loop to send ApprovalMsg after Init.
+func (m Model) WithApproval(req *ApprovalRequest) Model {
+	m.approval = req
+	m.quitOnAnswer = true
 	return m
 }
 
@@ -252,6 +263,9 @@ func headerLine(line string) string {
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.QuitMsg:
+		m.declineApproval()
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -261,7 +275,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyPressMsg:
-		return m.handleKey(msg.Key())
+		next, cmd := m.handleKey(msg.Key())
+		return next, cmd
 	case tea.KeyReleaseMsg:
 		return m, nil // ignore releases; presses already handled
 	case spinnerTickMsg:
@@ -318,9 +333,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) answerApproval(allow bool) {
+	if m.approval == nil || m.approval.Reply == nil {
+		return
+	}
+	select {
+	case m.approval.Reply <- allow:
+	default:
+	}
+	m.approval = nil
+}
+
+func (m Model) declineApproval() {
+	if m.approval == nil || m.approval.Reply == nil {
+		return
+	}
+	select {
+	case m.approval.Reply <- false:
+	default:
+	}
+}
+
 func (m Model) handleKey(k tea.Key) (tea.Model, tea.Cmd) {
-	// Ctrl-C quits.
+	// Ctrl-C quits. Answer a pending dialog first so the waiter cannot block
+	// shutdown after the program has already stopped.
 	if k.Mod == tea.ModCtrl && k.Code == 'c' {
+		m.declineApproval()
 		return m, tea.Quit
 	}
 	// While an approval is pending, the dialog replaces the input line:
@@ -335,11 +373,12 @@ func (m Model) handleKey(k tea.Key) (tea.Model, tea.Cmd) {
 				m.approvalScroll--
 			}
 		case k.Code == 'y' || k.Code == 'Y':
-			m.approval.Reply <- true
-			m.approval = nil
+			m.answerApproval(true)
 		case k.Code == 'n' || k.Code == 'N' || k.Code == tea.KeyEscape:
-			m.approval.Reply <- false
-			m.approval = nil
+			m.answerApproval(false)
+		}
+		if m.quitOnAnswer && m.approval == nil {
+			return m, tea.Quit
 		}
 		return m, nil
 	}
@@ -996,7 +1035,7 @@ func (m Model) inputLine() string {
 // placeholderText is the empty-input hint; it replaces the startup
 // help line. Truncated to the terminal width when known.
 func placeholderText(width int) string {
-	const ph = "Ask anything…  /skill:<name> /usage /jobs /clear /compact /quit"
+	const ph = "Ask anything…  /resume /steal /skill:<name> /usage /jobs /compact /quit"
 	if width <= 2 {
 		return ph
 	}
@@ -1124,8 +1163,9 @@ func (m Model) approvalBox() string {
 	width, textWidth := m.approvalGeometry()
 	tool, detail := m.approval.ToolName, m.approval.Arguments
 	summary := toolSummary(tool, detail)
-	if tool == "" {
-		summary, detail = m.approval.Prompt, m.approval.Prompt
+	if tool == "" || tool == "steal" {
+		summary = m.approval.Prompt
+		detail = "Confirm to take the session. Deny leaves the current owner in place."
 	}
 	// The summary is only a label; the complete invocation remains scrollable.
 	summary = ansi.Truncate(strings.SplitN(summary, "\n", 2)[0], textWidth-2, "…")

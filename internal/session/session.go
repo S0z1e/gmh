@@ -218,17 +218,22 @@ func newStore(id string, existing bool, preflight func(*os.File, bool) error) (*
 	if id == "" {
 		return createAutoStore(dir, time.Now().Format("20060102-150405"), preflight)
 	}
-	path := filepath.Join(dir, id+".jsonl")
 	writer, err := acquireWriter(id)
 	if err != nil {
 		return nil, err
 	}
-	keep := false
-	defer func() {
-		if !keep {
-			writer.Close()
-		}
-	}()
+	store, err := finishStore(id, existing, writer, preflight)
+	if err != nil {
+		writer.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+// finishStore does not close writer. The caller closes it on failure; on
+// success the returned store owns it.
+func finishStore(id string, existing bool, writer *os.File, preflight func(*os.File, bool) error) (*Store, error) {
+	path := filepath.Join(Dir(), id+".jsonl")
 	// Windows append handles cannot truncate, even with O_RDWR. Repair
 	// through a separate read/write handle, then reopen for append-only use.
 	if err := checkTranscriptPath(path); err != nil {
@@ -269,7 +274,6 @@ func newStore(id string, existing bool, preflight func(*os.File, bool) error) (*
 	if err != nil {
 		return nil, err
 	}
-	keep = true
 	return &Store{ID: id, Path: path, file: f, writer: writer, stopHeartbeat: startWriterHeartbeat(writer)}, nil
 }
 

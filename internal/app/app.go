@@ -38,7 +38,11 @@ type Params struct {
 	ContextLimit   int
 	Resume         string
 	RebindSession  bool // direct startup consent, only valid with Resume
-	SessionID      string
+	// Steal takes over a busy writer before opening Resume. It is a direct
+	// user choice (CLI --steal or an answered TUI/REPL prompt) and is refused
+	// when the owner's process identity cannot be proven.
+	Steal     bool
+	SessionID string
 	// Provider selects a provider entry from the config file
 	// (defaultProvider when empty).
 	Provider string
@@ -130,6 +134,9 @@ type App struct {
 func Setup(p Params) (*App, error) {
 	if p.RebindSession && p.Resume == "" {
 		return nil, fmt.Errorf("--rebind-session requires --resume")
+	}
+	if p.Steal && p.Resume == "" {
+		return nil, fmt.Errorf("--steal requires --resume")
 	}
 	identity, err := workspace.Identify(p.Root)
 	if err != nil {
@@ -239,7 +246,12 @@ func Setup(p Params) (*App, error) {
 	if p.Resume != "" {
 		id = p.Resume
 	}
-	store, err := session.Open(id, session.OpenOptions{Workspace: absRoot, Rebind: p.RebindSession, Existing: p.Resume != ""})
+	var store *session.Store
+	if p.Steal {
+		store, err = session.StealSession(id, absRoot, p.RebindSession)
+	} else {
+		store, err = session.Open(id, session.OpenOptions{Workspace: absRoot, Rebind: p.RebindSession, Existing: p.Resume != ""})
+	}
 	if err != nil {
 		if p.Resume != "" {
 			return nil, fmt.Errorf("cannot resume session %q: %w", p.Resume, err)
@@ -262,6 +274,9 @@ func Setup(p Params) (*App, error) {
 		}
 		a.History = history
 		a.ResumedMessage = fmt.Sprintf("Resumed session %s (%d messages).", p.Resume, len(history))
+		if p.Steal {
+			a.ResumedMessage = fmt.Sprintf("Stole and resumed session %s (%d messages).", p.Resume, len(history))
+		}
 	}
 
 	skillList := skills.DiscoverForTrust(absRoot, trusted)
@@ -902,7 +917,19 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 // LoadSession switches to an existing session: its history is loaded
 // (like --resume) and the store is opened for appending. The id must
 // name a session file; a missing one is an error, not a new session.
+// A session another process is writing returns ErrSessionBusy. Pass steal
+// only after the user confirms: the lock is taken and the session reopened
+// as one handoff, or the steal is refused when ownership cannot be proven.
 func (a *App) LoadSession(id string) ([]llm.Message, error) {
+	return a.loadSession(id, false, false)
+}
+
+// StealSession is LoadSession after an explicit steal confirmation.
+func (a *App) StealSession(id string, rebind bool) ([]llm.Message, error) {
+	return a.loadSession(id, true, rebind)
+}
+
+func (a *App) loadSession(id string, steal, rebind bool) ([]llm.Message, error) {
 	if err := session.ValidateSessionID(id); err != nil {
 		return nil, err
 	}
@@ -924,13 +951,19 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	}
 	if !reuse {
 		var err error
-		store, err = session.Open(id, session.OpenOptions{Workspace: a.Root, Existing: true})
+		if steal {
+			store, err = session.StealSession(id, a.Root, rebind)
+		} else {
+			store, err = session.Open(id, session.OpenOptions{Workspace: a.Root, Existing: true})
+		}
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("unknown session %q (see /sessions): %w", id, err)
 		}
 		if err != nil {
 			return nil, err
 		}
+	} else if steal {
+		return nil, fmt.Errorf("session %q: %w (already owned by current process)", id, session.ErrSessionBusy)
 	}
 	history, err := session.Load(store.ID)
 	if err != nil {
@@ -945,6 +978,9 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	}
 	var recovered []tools.RecoveredJob
 	resumedMsg := fmt.Sprintf("Resumed session %s (%d messages).", id, len(history))
+	if steal {
+		resumedMsg = fmt.Sprintf("Stole and resumed session %s (%d messages).", id, len(history))
+	}
 	if !reuse && a.Cfg != nil && a.Cfg.Exec != nil {
 		exec := a.Cfg.Exec
 		prevDir, prevOutID, prevJobsDir := exec.OutputDir, exec.OutputID, exec.JobsDir
@@ -1068,6 +1104,11 @@ type Runner struct {
 	// The RPC server reads it to report a turn's outcome; the plain
 	// CLI and TUI already print the error through Print.
 	LastErr error
+	// ConfirmSteal asks before /steal may signal another process. The CLI and
+	// TUI set it; a nil callback refuses the steal instead of guessing. The
+	// context ends when the frontend shuts down, so a pending prompt cannot
+	// block process exit.
+	ConfirmSteal func(ctx context.Context, id string) (bool, error)
 	// OnCompact, when set, fires after a successful compaction
 	// (manual or automatic) with the new message count and the
 	// summary's token count. The RPC server sets it to emit the
@@ -1096,8 +1137,26 @@ func (r *Runner) ResetSession() (string, error) {
 }
 
 // ResumeSession restores lifetime totals and starts fresh current-run totals. It returns how many messages were loaded.
+// Another process holding the writer returns ErrSessionBusy; use StealSession after the user confirms.
 func (r *Runner) ResumeSession(id string) (int, error) {
-	history, err := r.App.LoadSession(id)
+	return r.finishResume(r.App.LoadSession(id))
+}
+
+// StealSession resumes id by taking its writer lease in the same handoff.
+// rebind adopts a legacy transcript or moves the session, and only after confirmation.
+func (r *Runner) StealSession(id string, rebind bool) (int, error) {
+	return r.finishResume(r.App.StealSession(id, rebind))
+}
+
+func (r *Runner) printResumed(id string, n int) {
+	if r.App.ResumedMessage != "" {
+		r.Print("%s", r.App.ResumedMessage)
+		return
+	}
+	r.Print("Resumed session %s (%d messages).", id, n)
+}
+
+func (r *Runner) finishResume(history []llm.Message, err error) (int, error) {
 	if err != nil {
 		return 0, err
 	}
@@ -1195,13 +1254,39 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 		n, err := r.ResumeSession(id)
 		if err != nil {
 			r.Print("[error] %v", err)
+			if errors.Is(err, session.ErrSessionBusy) {
+				r.Print("Session %s is open for writing. /resume does not take it. Use /steal %s and confirm to take a proven stalled or dead owner.", id, id)
+			}
 			return false
 		}
-		if r.App.ResumedMessage != "" {
-			r.Print("%s", r.App.ResumedMessage)
-		} else {
-			r.Print("Resumed session %s (%d messages).", id, n)
+		r.printResumed(id, n)
+		return false
+	}
+	if line == "/steal" || strings.HasPrefix(line, "/steal ") {
+		id := strings.TrimSpace(strings.TrimPrefix(line, "/steal"))
+		if id == "" {
+			r.Print("Usage: /steal <id> (confirms, then takes a busy session whose owner is proven stalled or dead).")
+			return false
 		}
+		if r.ConfirmSteal == nil {
+			r.Print("[error] steal needs an explicit confirmation, and this frontend has none.")
+			return false
+		}
+		ok, err := r.ConfirmSteal(ctx, id)
+		if err != nil {
+			r.Print("[error] %v", err)
+			return false
+		}
+		if !ok {
+			r.Print("Steal of session %s was not confirmed.", id)
+			return false
+		}
+		n, err := r.StealSession(id, false)
+		if err != nil {
+			r.Print("[error] %v", err)
+			return false
+		}
+		r.printResumed(id, n)
 		return false
 	}
 	if line == "/rename" || strings.HasPrefix(line, "/rename ") {
@@ -1369,7 +1454,7 @@ func (r *Runner) printSessions() {
 		}
 		r.Print("%s", line)
 	}
-	r.Print("/resume <id> to switch, /rename <old> <new> to rename.")
+	r.Print("/resume <id> to switch, /steal <id> to take a busy session after confirmation, /rename <old> <new> to rename.")
 }
 
 // printPlugins lists every discovered plugin with its tools and

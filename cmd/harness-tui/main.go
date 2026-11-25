@@ -30,6 +30,7 @@ func main() {
 		config         = flag.String("config", "", "config file (default: ~/.minimal-harness/config.json + <root>/.harness.json)")
 		maxSteps       = flag.Int("max-steps", 0, "max agent steps (0 = unlimited)")
 		resume         = flag.String("resume", "", "resume session id")
+		steal          = flag.Bool("steal", false, "with --resume, take a busy session after confirmation")
 		rebindSession  = flag.Bool("rebind-session", false, "explicitly bind resumed or legacy history to this workspace")
 		sessionID      = flag.String("session", "", "session id (default: timestamp)")
 		ctxLimit       = flag.Int("context-limit", 0, "context window in tokens for the compaction trigger (default: env OPENAI_CONTEXT_LIMIT, model contextWindow, config contextLimit, or 128000)")
@@ -49,6 +50,12 @@ func main() {
 	if !uimode.IsTTY(os.Stdout) {
 		fatal(fmt.Errorf("harness-tui needs a terminal; run harness (plain mode) or harness --ui plain instead"))
 	}
+	if *steal && *resume == "" {
+		fatal(fmt.Errorf("--steal requires --resume <session-id>"))
+	}
+	if *steal && !confirmStartupSteal(*resume) {
+		fatal(fmt.Errorf("steal of session %q was not confirmed", *resume))
+	}
 
 	a, err := app.Setup(app.Params{
 		Root:                       *root,
@@ -61,6 +68,7 @@ func main() {
 		MaxSteps:                   *maxSteps,
 		ContextLimit:               *ctxLimit,
 		Resume:                     *resume,
+		Steal:                      *steal,
 		RebindSession:              *rebindSession,
 		SessionID:                  *sessionID,
 		DenyInsteadOfPrompt:        *deny,
@@ -99,7 +107,10 @@ func main() {
 	// background) or catppuccin-mocha; anything else is the default.
 	// Setup already resolved env > config for this.
 	tui.SetTheme(tui.ThemeByName(a.TUITheme))
-	runner := &app.Runner{App: a}
+	var approver *tui.Approver
+	runner := &app.Runner{App: a, ConfirmSteal: func(ctx context.Context, id string) (bool, error) {
+		return approver.ConfirmSteal(ctx, id)
+	}}
 	if err := runner.RefreshUsage(); err != nil {
 		fatal(err)
 	}
@@ -113,6 +124,7 @@ func main() {
 		}
 	}
 	prog := tea.NewProgram(m)
+	approver = tui.NewApprover(prog)
 
 	// The agent loop runs in a goroutine and feeds events into the
 	// program; Bubble Tea owns the main goroutine and stdin.
@@ -120,7 +132,6 @@ func main() {
 		prog.Send(tui.EventMsg{Event: ev})
 	}
 	// Keep the dialog available when /permissions changes the approval mode.
-	approver := tui.NewApprover(prog)
 	a.Cfg.Ask = approver.Ask
 	a.Cfg.ConfirmContinuation = approver.ConfirmContinuation
 
@@ -183,6 +194,25 @@ func gitBranch(root string) string {
 		return strings.TrimPrefix(head, prefix)
 	}
 	return ""
+}
+
+// confirmStartupSteal asks in its own short-lived program so a refused steal
+// never opens the session. The main TUI is created only after a yes.
+func confirmStartupSteal(id string) bool {
+	reply := make(chan bool, 1)
+	m := tui.NewModel("").WithApproval(&tui.ApprovalRequest{
+		ToolName: "steal",
+		Prompt:   tui.StealPrompt(id),
+		Reply:    reply,
+	})
+	p := tea.NewProgram(m)
+	_, err := p.Run()
+	select {
+	case answered := <-reply:
+		return err == nil && answered
+	default:
+		return false
+	}
 }
 
 func fatal(err error) {

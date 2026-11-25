@@ -792,6 +792,20 @@ func (e *Executor) RecoverSessionJobs(
 	}
 
 	records := collectMergedRecoveryRecords(diskRecords, cpJobs, transcriptHints)
+
+	// A job already in this session's registry is the live incarnation. Recovery
+	// must not build a second copy and rewrite its record: that races the live
+	// job's own persist, including after the turn that owns the temp directory
+	// has returned.
+	e.jobsMu.Lock()
+	live := map[JobIdentityKey]bool{}
+	if reg := e.registryForRecoveryLocked(sessionID); reg != nil {
+		for _, j := range reg.List() {
+			live[MakeJobIdentityKey(j.ID, j.Started)] = true
+		}
+	}
+	e.jobsMu.Unlock()
+
 	var recoveredJobs []*Job
 	var summaries []RecoveredJob
 	var monitors []adoptionMonitor
@@ -801,6 +815,9 @@ func (e *Executor) RecoverSessionJobs(
 			maxSeq = seq
 		}
 		key := MakeJobIdentityKey(rec.ID, rec.Started)
+		if live[key] {
+			continue
+		}
 		job, mon := e.resolveRecoveredJob(rec, deliveries[key], jobsDir)
 		recoveredJobs = append(recoveredJobs, job)
 		summaries = append(summaries, summaryFromRecoveredJob(job))

@@ -30,7 +30,7 @@ func TestHeaderlessAdoptionRetryKeepsOriginalOutput(t *testing.T) {
 	w.Close()
 	opts := OpenOptions{Workspace: root, Rebind: true}
 	replaceErr := errors.New("header replacement failed")
-	s, openErr := open(id, opts, func(*Store, *Header, int64) error { return replaceErr })
+	s, openErr := open(id, opts, func(*Store, *Header, int64) error { return replaceErr }, nil)
 	if s != nil {
 		s.Close()
 		t.Fatal("expected header replacement failure")

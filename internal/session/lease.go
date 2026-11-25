@@ -17,6 +17,10 @@ import (
 // ErrSessionBusy reports a transcript already owned by another Store/process.
 var ErrSessionBusy = fmt.Errorf("session is already open for writing")
 
+// errWriterExited reports that the recorded owner had already exited when
+// termination was attempted. The steal then waits for the OS lock.
+var errWriterExited = fmt.Errorf("writer process has exited")
+
 const (
 	lockHeartbeatInterval = 15 * time.Second
 	lockStaleTTL          = 90 * time.Second
@@ -151,86 +155,195 @@ func startWriterHeartbeat(f *os.File) func() {
 	}
 }
 
-// StealWriterLock recovers a lock for a session bound to root. A live owner
-// must be verified on this host and have a stale heartbeat before termination.
-func StealWriterLock(id, root string) error {
-	if err := ValidateSessionID(id); err != nil {
-		return err
-	}
-	identity, err := workspace.Identify(root)
+// StealSession takes a session's writer lease and reopens it as one handoff.
+// The returned store already owns the lock, so another writer cannot enter
+// between the steal and the resume. A live owner must be proven on this host
+// and have a stale heartbeat before it is terminated. When process identity
+// cannot be proven the steal is refused.
+func StealSession(id, root string, rebind bool) (*Store, error) {
+	id, unlock, err := beginSteal(id, root, rebind)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	unlock, err := lockManagement()
+	defer unlock()
+	lease, err := claimWriterLease(id)
+	if err != nil {
+		return nil, err
+	}
+	// openLocked closes lease if it cannot finish the store. On success the
+	// store owns it, so this function must not close it again.
+	return openLocked(id, OpenOptions{Workspace: root, Existing: true, Rebind: rebind}, (*Store).replaceHeader, lease)
+}
+
+// StealWriterLock claims a busy lease and releases it again. It does not open
+// the transcript. A later open can still race; callers that reopen must use
+// StealSession so the lock never drops between the two steps.
+func StealWriterLock(id, root string) error {
+	id, unlock, err := beginSteal(id, root, false)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	id, err = canonicalSessionID(id)
+	if _, err := os.Stat(filepath.Join(Dir(), ".writers", id+".lock")); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	lease, err := claimWriterLease(id)
 	if err != nil {
 		return err
 	}
-	header, err := readArtifactHeader(filepath.Join(Dir(), id+".jsonl"))
-	if err == nil {
-		err = checkBinding(header, identity, repositoryIdentity(identity.Path))
+	return lease.Close()
+}
+
+// beginSteal holds the management lock. The caller must call unlock, including
+// when it returns an error only after the lock was taken; a non-nil unlock
+// means the lock is held.
+func beginSteal(id, root string, rebind bool) (string, func(), error) {
+	if err := ValidateSessionID(id); err != nil {
+		return "", nil, err
 	}
+	identity, err := workspace.Identify(root)
 	if err != nil {
-		return fmt.Errorf("session %q: %w", id, err)
+		return "", nil, err
 	}
+	unlock, err := lockManagement()
+	if err != nil {
+		return "", nil, err
+	}
+	id, err = prepareSteal(id, identity, rebind)
+	if err != nil {
+		unlock()
+		return "", nil, err
+	}
+	return id, unlock, nil
+}
+
+func prepareSteal(id string, identity workspace.Identity, rebind bool) (string, error) {
+	if _, err := recoverOperations(id); err != nil {
+		return "", err
+	}
+	id, err := canonicalSessionID(id)
+	if err != nil {
+		return "", err
+	}
+	header, err := readArtifactHeader(filepath.Join(Dir(), id+".jsonl"))
+	if err != nil {
+		return "", err
+	}
+	if header != nil {
+		if err := recoverOutputOperations(header.OutputID); err != nil {
+			return "", fmt.Errorf("recover artifact family: %w", err)
+		}
+	}
+	if !rebind {
+		if err := checkBinding(header, identity, repositoryIdentity(identity.Path)); err != nil {
+			return "", fmt.Errorf("session %q: %w", id, err)
+		}
+	}
+	return id, nil
+}
+
+// claimWriterLease returns an open writer lease held by this process. The
+// caller must keep it (or close it) ; dropping the file would release the lock.
+func claimWriterLease(id string) (*os.File, error) {
 	path := filepath.Join(Dir(), ".writers", id+".lock")
 	f, err := openWriterLease(path, os.O_RDWR)
 	if os.IsNotExist(err) {
-		return nil
+		acquired, err := acquireWriterFile(id)
+		if err != nil {
+			return nil, err
+		}
+		return acquired, nil
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer f.Close()
+	keep := false
+	defer func() {
+		if !keep {
+			f.Close()
+		}
+	}()
 	if err := tryLockWriter(f); err == nil {
-		return nil
+		if err := keepWriterLease(f); err != nil {
+			return nil, err
+		}
+		keep = true
+		return f, nil
 	} else if !errors.Is(err, ErrSessionBusy) {
-		return err
+		return nil, err
 	}
 	owner, ok := parseLockOwner(f)
 	if !ok || owner.PID <= 0 {
-		return fmt.Errorf("session %q: %w (cannot determine lock owner to steal)", id, ErrSessionBusy)
+		return nil, fmt.Errorf("session %q: %w (cannot determine lock owner to steal)", id, ErrSessionBusy)
 	}
 	if owner.PID == os.Getpid() {
-		return fmt.Errorf("session %q: %w (already owned by current process pid=%d)", id, ErrSessionBusy, owner.PID)
+		return nil, fmt.Errorf("session %q: %w (already owned by current process pid=%d)", id, ErrSessionBusy, owner.PID)
 	}
 	localHost, _ := os.Hostname()
-	if localHost != "" && owner.Host != "" && owner.Host != localHost {
-		return fmt.Errorf("session %q: %w (owned by remote host %q, current host %q; refusing to signal pid=%d)", id, ErrSessionBusy, owner.Host, localHost, owner.PID)
+	if owner.Host != "" && (localHost == "" || owner.Host != localHost) {
+		return nil, fmt.Errorf("session %q: %w (owned by remote host %q, current host %q; refusing to signal pid=%d)", id, ErrSessionBusy, owner.Host, localHost, owner.PID)
 	}
-	if processAlive(owner.PID) {
+	alive, proven, err := writerOwnership(owner)
+	if err != nil {
+		return nil, fmt.Errorf("session %q: %w (cannot verify identity of owner pid=%d: %v)", id, ErrSessionBusy, owner.PID, err)
+	}
+	if !proven {
+		return nil, fmt.Errorf("session %q: %w (cannot prove process identity of owner pid=%d; refusing to steal)", id, ErrSessionBusy, owner.PID)
+	}
+	if alive {
 		if localHost == "" || owner.Host == "" || owner.Heartbeat == "" || owner.ProcessStarted == "" {
-			return fmt.Errorf("session %q: %w (cannot verify heartbeat and identity of owner pid=%d)", id, ErrSessionBusy, owner.PID)
+			return nil, fmt.Errorf("session %q: %w (cannot verify heartbeat and identity of owner pid=%d)", id, ErrSessionBusy, owner.PID)
 		}
 		if !lockOwnerStale(owner, time.Now()) {
-			return fmt.Errorf("session %q: %w (owner pid=%d is still active; refusing to steal)", id, ErrSessionBusy, owner.PID)
+			return nil, fmt.Errorf("session %q: %w (owner pid=%d is still active; refusing to steal)", id, ErrSessionBusy, owner.PID)
 		}
 		if err := tryLockWriter(f); err == nil {
-			return nil
+			if err := keepWriterLease(f); err != nil {
+				return nil, err
+			}
+			keep = true
+			return f, nil
 		} else if !errors.Is(err, ErrSessionBusy) {
-			return err
+			return nil, err
 		}
 		if latest, ok := parseLockOwner(f); !ok || latest != owner {
-			return fmt.Errorf("session %q: %w (lock owner or heartbeat changed)", id, ErrSessionBusy)
+			return nil, fmt.Errorf("session %q: %w (lock owner or heartbeat changed)", id, ErrSessionBusy)
 		}
-		if err := terminateWriterProcess(owner); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			return fmt.Errorf("session %q: %w (cannot terminate stalled owner pid=%d: %v)", id, ErrSessionBusy, owner.PID, err)
+		if err := terminateWriterProcess(owner); err != nil && !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, errWriterExited) {
+			return nil, fmt.Errorf("session %q: %w (cannot terminate stalled owner pid=%d: %v)", id, ErrSessionBusy, owner.PID, err)
 		}
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := tryLockWriter(f); err == nil {
-			return nil
+			if err := keepWriterLease(f); err != nil {
+				return nil, err
+			}
+			keep = true
+			return f, nil
 		} else if !errors.Is(err, ErrSessionBusy) {
-			return err
+			return nil, err
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return fmt.Errorf("session %q: %w (stalled owner pid=%d did not release lock in time)", id, ErrSessionBusy, owner.PID)
+	return nil, fmt.Errorf("session %q: %w (stalled owner pid=%d did not release lock in time)", id, ErrSessionBusy, owner.PID)
+}
+
+func keepWriterLease(f *os.File) error {
+	if err := writeLockOwner(f, newLockOwner()); err != nil {
+		return fmt.Errorf("record writer lock owner: %w", err)
+	}
+	return nil
+}
+
+func writerProcessIdentityOrEmpty(pid int) string {
+	identity, err := writerProcessIdentity(pid)
+	if err != nil {
+		return ""
+	}
+	return identity
 }
 
 func newLockOwner() LockOwner {
@@ -238,7 +351,7 @@ func newLockOwner() LockOwner {
 	pid := os.Getpid()
 	return LockOwner{
 		PID: pid, Host: host, Started: time.Now().UTC().Format(time.RFC3339),
-		ProcessStarted: writerProcessIdentity(pid),
+		ProcessStarted: writerProcessIdentityOrEmpty(pid),
 	}
 }
 

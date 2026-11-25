@@ -75,7 +75,7 @@ harness.registerCommand("plan", "Switch to plan mode.", (args) => {
 Commands register at load time only (like tools: a handler that
 registers one after load fails). The name must be lowercase
 alphanumeric with underscores, and must not collide with a built-in
-slash command (`image`, `sessions`, `plugins`, `resume`, `rename`,
+slash command (`image`, `sessions`, `plugins`, `resume`, `steal`, `rename`,
 `model`, `quit`, `exit`, `usage`, `jobs`, `clear`, `compact`,
 `skill`). The handler returns the output text (any other value is
 JSON-encoded); a throw or a call past the 10 s timeout becomes
