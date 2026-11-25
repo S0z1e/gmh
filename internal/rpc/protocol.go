@@ -15,6 +15,7 @@ import (
 	"minimalharness/internal/agent"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
+	"minimalharness/internal/tools"
 )
 
 // Request is one line from the GUI. ID is echoed in the response when
@@ -79,6 +80,8 @@ type Request struct {
 	Answers []agent.QuestionAnswer `json:"answers,omitempty"`
 	// AfterSequence requests buffered events with Sequence > AfterSequence for replay.
 	AfterSequence uint64 `json:"after_sequence,omitempty"`
+	// JobID identifies a background job for stop_job.
+	JobID string `json:"job_id,omitempty"`
 }
 
 // Response is the reply to one request, correlated by ID. Exactly one
@@ -125,14 +128,16 @@ type Event struct {
 	Attempt         int               `json:"attempt,omitempty"`
 	Type            string            `json:"type"`
 	// ready: protocol version and session identity.
-	Protocol int    `json:"protocol,omitempty"`
-	Session  string `json:"session,omitempty"`
-	Model    string `json:"model,omitempty"`
-	API      string `json:"api,omitempty"`
-	Mode     string `json:"mode,omitempty"`
-	Root     string `json:"root,omitempty"`
-	Resumed  bool   `json:"resumed,omitempty"`
-	Messages int    `json:"messages,omitempty"`
+	Protocol       int                  `json:"protocol,omitempty"`
+	Session        string               `json:"session,omitempty"`
+	Model          string               `json:"model,omitempty"`
+	API            string               `json:"api,omitempty"`
+	Mode           string               `json:"mode,omitempty"`
+	Root           string               `json:"root,omitempty"`
+	Resumed        bool                 `json:"resumed,omitempty"`
+	Messages       int                  `json:"messages,omitempty"`
+	ResumedMessage string               `json:"resumed_message,omitempty"`
+	RecoveredJobs  []tools.RecoveredJob `json:"recovered_jobs,omitempty"`
 	// text_delta, background_wait, turn_started: the text.
 	Text string `json:"text,omitempty"`
 	// step_usage, agent_settled.

@@ -70,7 +70,7 @@ func (c *Config) progressBookkeepingExclusions() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	paths := []string{filepath.Dir(session.Dir()), c.Exec.OutputDir}
+	paths := []string{filepath.Dir(session.Dir()), c.Exec.OutputDir, c.Exec.JobsDirPath()}
 	if c.Session != nil {
 		paths = append(paths, c.Session.Path, c.Session.AuditPath())
 	}

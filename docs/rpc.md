@@ -12,7 +12,7 @@ harness --rpc -root /path/to/project -mode suggest
 ```
 
 The first line on stdout is a `ready` event:
-`{"type":"ready","protocol":1,"session":"<id>","model":"...","api":"chat","mode":"suggest","root":"...","resumed":false,"messages":0}`.
+`{"type":"ready","protocol":1,"session":"<id>","model":"...","api":"chat","mode":"suggest","root":"...","resumed":false,"messages":0}` (when resumed with recovered background jobs, `ready`, `resume_session`, and `steal_session` may also include `resumed_message` and `recovered_jobs`).
 
 All responses and events carry a strictly increasing `sequence` for the
 connection. Events carry `connection_id` and, when applicable, `session`,
@@ -103,8 +103,8 @@ echoed in the response):
   `metering_available` indicates whether lifetime metering can be read.
   `cost_usd` and `current_run_cost_usd` are present only when the respective
   provider usage has complete pricing evidence.
-- `jobs` → background bash jobs (id, status, elapsed seconds,
-  command, exit code once done).
+- `jobs` → background bash jobs (`id`, `status` [`running`, `done`, or `unknown`], `elapsed` seconds, `command`, plus `cwd`, `output_file`, `pid`, `pgid`, `adopted`, `recovery_note`, `exit_code` when known, and `error` when present).
+- `stop_job` `{"job_id":"bg-1"}` → explicitly terminates a running/adopted job (also available via `/jobs stop <id>` or `/jobs kill <id>`); refuses `unknown` jobs without signalling. Returns `{"job_id":"bg-1","text":"...","exit_code":...,"output_file":"..."}`.
 - `new_session` → `{"session":"<new id>"}`. Starts a fresh session
   and zeroes the runner totals. Session ids are second-resolution
   timestamps; two created in the same second get a `-1`, `-2`…

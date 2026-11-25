@@ -24,3 +24,11 @@ Foreground commands follow turn cancellation until handed to the session as
 background jobs. Cancelling, aborting, or normally finishing a turn preserves
 session-owned jobs. Each session has a separate registry, so starting
 or resuming another session cannot inject the previous session's results.
+
+After a harness crash or restart, reopening a session validates each persisted
+job's OS process identity (`PID`, process group, and OS start token): verifiable
+live processes are adopted (with notice that post-crash stdout/stderr pipe
+capture closed on crash while pre-crash output stays readable), while exited
+processes or reused PIDs are marked `unknown` without signalling or automatic
+command replay. `/jobs stop <id>` (and `/jobs kill <id>`) explicitly stops a
+running or adopted job and refuses `unknown` jobs safely.

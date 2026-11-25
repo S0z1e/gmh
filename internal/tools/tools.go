@@ -91,6 +91,12 @@ type Executor struct {
 	// result). Read allows absolute paths under it even though they
 	// sit outside the workspace root; Write/Edit/Glob/Grep do not.
 	OutputDir string
+	// OutputID identifies the active session's output family directory.
+	OutputID string
+	// JobsDir stores durable background-job recovery metadata across crashes.
+	// When empty and OutputDir is non-empty, a sibling "<OutputDir>-jobs"
+	// directory is used so OutputDir continues holding only raw bash-*.log files.
+	JobsDir string
 	// OutputMaxBytes bounds all retained Bash output for the session. Zero uses
 	// DefaultSessionOutputMaxBytes. A session switch selects a separate budget.
 	OutputMaxBytes int64
@@ -101,13 +107,15 @@ type Executor struct {
 	// with its file access jailed to its own data dir.
 	Plugins PluginRunner
 
-	jobsMu      sync.Mutex
-	jobs        *JobRegistry
-	sessionJobs map[string]*JobRegistry
-	sessionID   string
-	nextJobSeq  int
-	jobsClosed  bool
-	activeBash  map[*bashRun]struct{}
+	jobsMu            sync.Mutex
+	jobs              *JobRegistry
+	sessionJobs       map[string]*JobRegistry
+	recoveredSessions map[string]bool
+	recovering        map[string]chan struct{}
+	sessionID         string
+	nextJobSeq        int
+	jobsClosed        bool
+	activeBash        map[*bashRun]struct{}
 
 	outMu         sync.Mutex
 	outputBudgets map[string]*bashOutputBudget
@@ -856,14 +864,46 @@ func (e *Executor) killJob(id string) (ToolResult, error) {
 	if job == nil {
 		return ToolResult{}, fmt.Errorf("unknown background job %q", id)
 	}
-	job.Cancel()
+	if job.Status() == JobUnknown {
+		reason := job.RecoveryNoteText()
+		return ToolResult{
+			Text:       fmt.Sprintf("Background job %s has status unknown (%s); no signal was sent. Inspect its output file before manually acting.", job.ID, reason),
+			OutputFile: job.OutputFile,
+		}, fmt.Errorf("cannot stop background job %s: %s", job.ID, reason)
+	}
+	if err := job.CancelErr(); err != nil {
+		if job.Status() == JobUnknown {
+			reason := job.RecoveryNoteText()
+			return ToolResult{
+				Text:       fmt.Sprintf("Background job %s became unknown (%s); no signal was sent.", job.ID, reason),
+				OutputFile: job.OutputFile,
+			}, fmt.Errorf("cannot stop background job %s: %s", job.ID, reason)
+		}
+		return ToolResult{
+			Text:       fmt.Sprintf("Failed to signal background job %s: %v", job.ID, err),
+			OutputFile: job.OutputFile,
+		}, fmt.Errorf("cannot stop background job %s: %w", job.ID, err)
+	}
 	select {
 	case <-job.Done():
 	case <-time.After(5 * time.Second):
 	}
-	res, ok := job.Result()
-	if ok {
-		if job.Delivered() {
+	snap := job.Snapshot()
+	if snap.Status == JobUnknown {
+		return ToolResult{
+			Text:       fmt.Sprintf("Background job %s became unknown (%s); no signal was sent.", job.ID, snap.RecoveryNote),
+			OutputFile: job.OutputFile,
+		}, fmt.Errorf("cannot stop background job %s: %s", job.ID, snap.RecoveryNote)
+	}
+	if snap.Status == JobDone {
+		res := snap.Result
+		if res.ExitCodeUnknown {
+			if snap.Delivered {
+				return ToolResult{Text: fmt.Sprintf("Background job %s already finished (exit status unavailable); its result was delivered.", job.ID), OutputFile: job.OutputFile}, nil
+			}
+			return ToolResult{Text: fmt.Sprintf("Stopped background job %s (exit status unavailable).\nOutput:\n%s", job.ID, truncate(res.Output, 32*1024)), OutputFile: job.OutputFile, StoppedJob: job}, nil
+		}
+		if snap.Delivered {
 			return ToolResult{Text: fmt.Sprintf("Background job %s already finished (exit %d); its result was delivered.", job.ID, res.ExitCode), ExitCode: &res.ExitCode, OutputFile: job.OutputFile}, nil
 		}
 		return ToolResult{Text: fmt.Sprintf("Stopped background job %s (exit %d).\nOutput:\n%s", job.ID, res.ExitCode, truncate(res.Output, 32*1024)), ExitCode: &res.ExitCode, OutputFile: job.OutputFile, StoppedJob: job}, nil

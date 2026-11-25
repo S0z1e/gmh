@@ -1,0 +1,1013 @@
+package tools
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"minimalharness/internal/checkpoint"
+	"minimalharness/internal/outputreceipt"
+)
+
+// JobUnknown indicates a previously started job whose post-crash live process
+// cannot be safely verified and adopted (for example, because it exited while
+// the harness was down or its PID was reused by another process).
+const JobUnknown JobStatus = "unknown"
+
+// JobIdentityKey uniquely identifies a job incarnation even when display IDs
+// are reused across sessions or tests.
+type JobIdentityKey struct {
+	ID      string
+	Started int64
+}
+
+// MakeJobIdentityKey constructs a stable lookup key from a job ID and start time.
+func MakeJobIdentityKey(id string, started time.Time) JobIdentityKey {
+	return JobIdentityKey{ID: id, Started: started.UnixNano()}
+}
+
+// DeliveryStatus summarizes what job notices have already been persisted to the
+// session transcript or checkpoint so reopen does not deliver duplicates.
+type DeliveryStatus struct {
+	DoneDelivered   bool
+	UnknownNoticed  bool
+	AdoptionNoticed bool
+}
+
+// PersistedJob stores durable background-job metadata across harness crashes.
+type PersistedJob struct {
+	ID              string    `json:"id"`
+	Started         time.Time `json:"started"`
+	InvocationID    string    `json:"invocation_id,omitempty"`
+	ToolCallID      string    `json:"tool_call_id,omitempty"`
+	Command         string    `json:"command"`
+	Cwd             string    `json:"cwd,omitempty"`
+	OutputFile      string    `json:"output_file,omitempty"`
+	OutputID        string    `json:"output_id,omitempty"`
+	OutputReceipt   string    `json:"output_receipt,omitempty"`
+	PID             int       `json:"pid,omitempty"`
+	PGID            int       `json:"pgid,omitempty"`
+	ProcessStarted  string    `json:"process_started,omitempty"`
+	Status          JobStatus `json:"status"`
+	ExitCode        *int      `json:"exit_code,omitempty"`
+	ExitCodeUnknown bool      `json:"exit_code_unknown,omitempty"`
+	Error           string    `json:"error,omitempty"`
+	FinishedAt      time.Time `json:"finished_at,omitempty"`
+	Delivered       bool      `json:"delivered,omitempty"`
+	StopRequested   bool      `json:"stop_requested,omitempty"`
+	AdoptionNoticed bool      `json:"adoption_noticed,omitempty"`
+	UnknownNoticed  bool      `json:"unknown_noticed,omitempty"`
+	RecoveryNote    string    `json:"recovery_note,omitempty"`
+}
+
+// RecoveredJob describes one retained job inspected while reopening a session.
+type RecoveredJob struct {
+	ID         string    `json:"id"`
+	Command    string    `json:"command"`
+	Cwd        string    `json:"cwd,omitempty"`
+	OutputFile string    `json:"output_file,omitempty"`
+	Status     JobStatus `json:"status"`
+	PID        int       `json:"pid,omitempty"`
+	PGID       int       `json:"pgid,omitempty"`
+	ExitCode   *int      `json:"exit_code,omitempty"`
+	Reason     string    `json:"reason,omitempty"`
+	Adopted    bool      `json:"adopted,omitempty"`
+	Delivered  bool      `json:"delivered,omitempty"`
+}
+
+func randomHexToken(nbytes int) string {
+	buf := make([]byte, nbytes)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
+}
+
+func jobSequenceNumber(id string) int {
+	if !strings.HasPrefix(id, "bg-") {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(id, "bg-"))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+func safeJobRecordName(id string, started time.Time) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(id) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	prefix := b.String()
+	if prefix == "" {
+		prefix = "job"
+	}
+	if len(prefix) > 32 {
+		prefix = prefix[:32]
+	}
+	return fmt.Sprintf("%s-%016x.json", prefix, uint64(started.UnixNano()))
+}
+
+func savePersistedJob(jobsDir string, rec PersistedJob) error {
+	if jobsDir == "" || rec.ID == "" {
+		return nil
+	}
+	if err := os.MkdirAll(jobsDir, 0700); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(jobsDir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	finalName := safeJobRecordName(rec.ID, rec.Started)
+	tmpName := ".tmp-" + randomHexToken(8) + ".json"
+	f, err := root.OpenFile(tmpName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write(data)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		_ = root.Remove(tmpName)
+		return errors.Join(writeErr, syncErr, closeErr)
+	}
+	if err := root.Rename(tmpName, finalName); err != nil {
+		_ = root.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+func removePersistedJob(jobsDir, id string, started time.Time) {
+	if jobsDir == "" || id == "" {
+		return
+	}
+	root, err := os.OpenRoot(jobsDir)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+	_ = root.Remove(safeJobRecordName(id, started))
+}
+
+func loadPersistedJobs(jobsDir string) ([]PersistedJob, error) {
+	if jobsDir == "" {
+		return nil, nil
+	}
+	root, err := os.OpenRoot(jobsDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer root.Close()
+
+	dirFile, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer dirFile.Close()
+
+	entries, err := dirFile.ReadDir(-1)
+	if err != nil {
+		return nil, err
+	}
+	var out []PersistedJob
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		info, err := root.Lstat(name)
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("non-regular persisted job file: %q", name)
+		}
+		if info.Size() > 256<<10 {
+			return nil, fmt.Errorf("oversized persisted job file: %q", name)
+		}
+		data, err := root.ReadFile(name)
+		if err != nil {
+			return nil, err
+		}
+		var rec PersistedJob
+		if err := json.Unmarshal(data, &rec); err != nil {
+			return nil, fmt.Errorf("decode persisted job %q: %w", name, err)
+		}
+		if rec.ID == "" {
+			continue
+		}
+		out = append(out, rec)
+	}
+	sortPersistedJobs(out)
+	return out, nil
+}
+
+func sortPersistedJobs(records []PersistedJob) {
+	sort.SliceStable(records, func(i, j int) bool {
+		if !records[i].Started.Equal(records[j].Started) {
+			return records[i].Started.Before(records[j].Started)
+		}
+		si, sj := jobSequenceNumber(records[i].ID), jobSequenceNumber(records[j].ID)
+		if si != sj {
+			return si < sj
+		}
+		return records[i].ID < records[j].ID
+	})
+}
+
+func prunePersistedJobs(jobsDir string, records []PersistedJob) {
+	if jobsDir == "" || len(records) <= recentJobsLimit*2 {
+		return
+	}
+	root, err := os.OpenRoot(jobsDir)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+
+	cutoff := time.Now().Add(-staleUndeliveredJobAge)
+	excess := len(records) - recentJobsLimit
+	for _, rec := range records {
+		if excess <= 0 {
+			break
+		}
+		// Never prune running, unknown, or undelivered records: unknown jobs
+		// retain non-replay/notice state across restarts.
+		if rec.Status != JobDone || !rec.Delivered {
+			continue
+		}
+		finishedAt := rec.FinishedAt
+		if finishedAt.IsZero() {
+			finishedAt = rec.Started
+		}
+		if finishedAt.After(cutoff) {
+			continue
+		}
+		if err := root.Remove(safeJobRecordName(rec.ID, rec.Started)); err == nil {
+			excess--
+		}
+	}
+}
+
+func validRecoveredOutputPath(outputFile, jobOutputID, execOutputID, execOutputDir string) bool {
+	// Fail closed unless this executor owns an initialized OutputDir.
+	if outputFile == "" || execOutputDir == "" {
+		return false
+	}
+	clean := filepath.Clean(outputFile)
+	if !filepath.IsAbs(clean) {
+		return false
+	}
+	base := filepath.Base(clean)
+	if !strings.HasPrefix(base, "bash-") || !strings.HasSuffix(base, ".log") {
+		return false
+	}
+	if execOutputID != "" && jobOutputID != "" && jobOutputID != execOutputID {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(execOutputDir), clean)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || strings.ContainsRune(rel, filepath.Separator) {
+		return false
+	}
+	root, err := os.OpenRoot(filepath.Dir(clean))
+	if err != nil {
+		return false
+	}
+	defer root.Close()
+	info, err := root.Lstat(base)
+	return err == nil && info.Mode().IsRegular()
+}
+
+func summarizeOutputFile(path, cwd string) (summary string, preview *BashOutputPreview, bytes int64, ok bool) {
+	if path == "" {
+		return "", nil, 0, false
+	}
+	clean := filepath.Clean(path)
+	root, err := os.OpenRoot(filepath.Dir(clean))
+	if err != nil {
+		return "", nil, 0, false
+	}
+	defer root.Close()
+
+	base := filepath.Base(clean)
+	info, err := root.Lstat(base)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", nil, 0, false
+	}
+	f, err := root.Open(base)
+	if err != nil {
+		return "", nil, 0, false
+	}
+	defer f.Close()
+
+	sink := newBashOutputSink()
+	_, err = io.Copy(sink, io.LimitReader(f, OutputFileMaxBytes+1))
+	_ = sink.Close()
+	if err != nil {
+		return "", nil, 0, false
+	}
+	lines, readBytes, capped, head, tail := sink.snapshot()
+	pv := bashPreview(head, tail, lines <= len(head))
+	return FormatBashOutput(lines, readBytes, capped, head, tail, clean, cwd), &pv, readBytes, true
+}
+
+func intPtrCopy(v *int) *int {
+	if v == nil {
+		return nil
+	}
+	cp := *v
+	return &cp
+}
+
+// CheckpointJobToPersisted converts a serialized checkpoint job record to the
+// canonical PersistedJob representation used by recovery merging.
+func CheckpointJobToPersisted(cj checkpoint.Job) PersistedJob {
+	status := JobRunning
+	switch cj.Status {
+	case checkpoint.Done:
+		status = JobDone
+	case checkpoint.Unknown:
+		status = JobUnknown
+	}
+	return PersistedJob{
+		ID:              cj.ID,
+		Started:         cj.Started,
+		InvocationID:    cj.InvocationID,
+		Command:         cj.Command,
+		Cwd:             cj.Cwd,
+		OutputFile:      cj.OutputFile,
+		OutputID:        cj.OutputID,
+		OutputReceipt:   cj.OutputReceipt,
+		PID:             cj.PID,
+		PGID:            cj.PGID,
+		ProcessStarted:  cj.ProcessStarted,
+		Status:          status,
+		ExitCode:        intPtrCopy(cj.ExitCode),
+		ExitCodeUnknown: cj.Status == checkpoint.Done && cj.ExitCode == nil,
+		Error:           cj.Error,
+		Delivered:       cj.Delivered,
+		AdoptionNoticed: cj.AdoptionNoticed,
+		UnknownNoticed:  cj.UnknownNoticed,
+	}
+}
+
+func jobStatusRank(s JobStatus) int {
+	switch s {
+	case JobDone:
+		return 3
+	case JobUnknown:
+		return 2
+	case JobRunning:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// MergeRecoveredRecord folds src into dst without discarding known identity,
+// delivery, or higher-precedence terminal status.
+func MergeRecoveredRecord(dst *PersistedJob, src PersistedJob) {
+	if dst.ID == "" {
+		*dst = src
+		dst.ExitCode = intPtrCopy(src.ExitCode)
+		return
+	}
+	if dst.Started.IsZero() && !src.Started.IsZero() {
+		dst.Started = src.Started
+	}
+	if dst.InvocationID == "" {
+		dst.InvocationID = src.InvocationID
+	}
+	if dst.ToolCallID == "" {
+		dst.ToolCallID = src.ToolCallID
+	}
+	if dst.Command == "" {
+		dst.Command = src.Command
+	}
+	if dst.Cwd == "" {
+		dst.Cwd = src.Cwd
+	}
+	if dst.OutputFile == "" {
+		dst.OutputFile = src.OutputFile
+	}
+	if dst.OutputID == "" {
+		dst.OutputID = src.OutputID
+	}
+	if dst.OutputReceipt == "" {
+		dst.OutputReceipt = src.OutputReceipt
+	}
+	if dst.PID == 0 && src.PID > 0 {
+		dst.PID = src.PID
+	}
+	if dst.PGID == 0 && src.PGID > 0 {
+		dst.PGID = src.PGID
+	}
+	if dst.ProcessStarted == "" {
+		dst.ProcessStarted = src.ProcessStarted
+	}
+	if jobStatusRank(src.Status) > jobStatusRank(dst.Status) {
+		dst.Status = src.Status
+		if src.ExitCode != nil {
+			dst.ExitCode = intPtrCopy(src.ExitCode)
+		}
+		if src.ExitCodeUnknown {
+			dst.ExitCodeUnknown = true
+		}
+		if src.Error != "" {
+			dst.Error = src.Error
+		}
+		if src.RecoveryNote != "" {
+			dst.RecoveryNote = src.RecoveryNote
+		}
+		if !src.FinishedAt.IsZero() {
+			dst.FinishedAt = src.FinishedAt
+		}
+	} else if dst.Status == src.Status {
+		if dst.ExitCode == nil && src.ExitCode != nil {
+			dst.ExitCode = intPtrCopy(src.ExitCode)
+		}
+		if !dst.ExitCodeUnknown && src.ExitCodeUnknown {
+			dst.ExitCodeUnknown = true
+		}
+		if dst.Error == "" && src.Error != "" {
+			dst.Error = src.Error
+		}
+		if dst.RecoveryNote == "" && src.RecoveryNote != "" {
+			dst.RecoveryNote = src.RecoveryNote
+		}
+		if dst.FinishedAt.IsZero() && !src.FinishedAt.IsZero() {
+			dst.FinishedAt = src.FinishedAt
+		}
+	}
+	if src.Delivered {
+		dst.Delivered = true
+	}
+	if src.StopRequested {
+		dst.StopRequested = true
+	}
+	if src.AdoptionNoticed {
+		dst.AdoptionNoticed = true
+	}
+	if src.UnknownNoticed {
+		dst.UnknownNoticed = true
+	}
+}
+
+func collectMergedRecoveryRecords(diskRecords []PersistedJob, cpJobs []checkpoint.Job, transcriptHints []PersistedJob) []PersistedJob {
+	merged := map[JobIdentityKey]*PersistedJob{}
+	order := make([]JobIdentityKey, 0, len(diskRecords)+len(cpJobs)+len(transcriptHints))
+	byID := map[string]JobIdentityKey{}
+	addSource := func(src PersistedJob) {
+		if src.ID == "" {
+			return
+		}
+		if src.Status == "" {
+			src.Status = JobRunning
+		}
+		key := MakeJobIdentityKey(src.ID, src.Started)
+		if existing, ok := merged[key]; ok {
+			MergeRecoveredRecord(existing, src)
+			return
+		}
+		if src.Started.IsZero() {
+			if prevKey, ok := byID[src.ID]; ok {
+				MergeRecoveredRecord(merged[prevKey], src)
+				return
+			}
+		}
+		cp := src
+		cp.ExitCode = intPtrCopy(src.ExitCode)
+		merged[key] = &cp
+		order = append(order, key)
+		byID[src.ID] = key
+	}
+
+	for _, rec := range diskRecords {
+		addSource(rec)
+	}
+	for _, cj := range cpJobs {
+		addSource(CheckpointJobToPersisted(cj))
+	}
+	for _, th := range transcriptHints {
+		addSource(th)
+	}
+
+	out := make([]PersistedJob, 0, len(order))
+	for _, key := range order {
+		out = append(out, *merged[key])
+	}
+	sortPersistedJobs(out)
+	return out
+}
+
+func pipeCaptureEndedNote(outputFile string) string {
+	if outputFile != "" {
+		return fmt.Sprintf("live stdout/stderr pipe closed when the previous harness exited; pre-crash captured output remains in %s, while post-crash writes cannot be captured", outputFile)
+	}
+	return "live stdout/stderr pipe closed when the previous harness exited; post-crash output cannot be captured"
+}
+
+type adoptionMonitor struct {
+	job *Job
+	ctx context.Context
+}
+
+func (e *Executor) newRecoveredJobObject(rec PersistedJob, jobsDir string, status JobStatus, delivered, adoptionNoticed bool, note string, res JobResult) *Job {
+	doneCh := make(chan struct{})
+	if status != JobRunning {
+		close(doneCh)
+	}
+	finishedAt := time.Time{}
+	if status != JobRunning {
+		finishedAt = rec.FinishedAt
+		if finishedAt.IsZero() {
+			finishedAt = rec.Started
+		}
+	}
+	return &Job{
+		InvocationID:    rec.InvocationID,
+		ToolCallID:      rec.ToolCallID,
+		ID:              rec.ID,
+		Command:         rec.Command,
+		Cwd:             rec.Cwd,
+		OutputFile:      rec.OutputFile,
+		OutputID:        rec.OutputID,
+		OutputReceipt:   rec.OutputReceipt,
+		PID:             rec.PID,
+		PGID:            rec.PGID,
+		ProcessStarted:  rec.ProcessStarted,
+		Adopted:         status == JobRunning,
+		RecoveryNote:    note,
+		jobsDir:         jobsDir,
+		outputDir:       e.OutputDir,
+		retained:        true,
+		Started:         rec.Started,
+		done:            doneCh,
+		finished:        status == JobDone,
+		unknown:         status == JobUnknown,
+		finishedAt:      finishedAt,
+		delivered:       delivered,
+		stopRequested:   rec.StopRequested,
+		adoptionNoticed: adoptionNoticed,
+		result:          res,
+	}
+}
+
+func summaryFromRecoveredJob(job *Job) RecoveredJob {
+	snap := job.Snapshot()
+	var exitCode *int
+	reason := snap.RecoveryNote
+	if snap.Status == JobDone {
+		if !snap.Result.ExitCodeUnknown {
+			code := snap.Result.ExitCode
+			exitCode = &code
+		}
+		if reason == "" && snap.Result.Err != nil {
+			reason = snap.Result.Err.Error()
+		}
+	}
+	return RecoveredJob{
+		ID:         snap.ID,
+		Command:    snap.Command,
+		Cwd:        snap.Cwd,
+		OutputFile: snap.OutputFile,
+		Status:     snap.Status,
+		PID:        snap.Identity.PID,
+		PGID:       snap.Identity.PGID,
+		ExitCode:   exitCode,
+		Reason:     reason,
+		Adopted:    snap.Adopted,
+		Delivered:  snap.Delivered,
+	}
+}
+
+func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsDir string) (*Job, *adoptionMonitor) {
+	if !validRecoveredOutputPath(rec.OutputFile, rec.OutputID, e.OutputID, e.OutputDir) {
+		rec.OutputFile = ""
+	}
+	receiptExists := rec.OutputFile != "" && e.OutputDir != "" && outputreceipt.Exists(e.OutputDir, rec.OutputFile)
+	doneDelivered := rec.Delivered || d.DoneDelivered || receiptExists
+	unknownNoticed := rec.UnknownNoticed || rec.Delivered || d.UnknownNoticed
+	adoptionNoticed := rec.AdoptionNoticed || d.AdoptionNoticed
+	if rec.Started.IsZero() {
+		rec.Started = time.Now()
+	}
+
+	switch rec.Status {
+	case JobDone:
+		rec.OutputReceipt = ""
+		if doneDelivered && rec.OutputFile != "" && e.OutputDir != "" {
+			if receiptExists || rec.OutputReceipt != "" || outputreceipt.Path(e.OutputDir, rec.OutputFile) != "" {
+				rec.OutputReceipt = filepath.Base(rec.OutputFile)
+			}
+		}
+		summary, preview, _, hasFile := summarizeOutputFile(rec.OutputFile, rec.Cwd)
+		if !hasFile && rec.Error == "" {
+			summary = "(output unavailable after restart)"
+		}
+		var errVal error
+		if rec.Error != "" {
+			errVal = errors.New(rec.Error)
+		}
+		exitUnknown := rec.ExitCodeUnknown || rec.ExitCode == nil
+		code := -1
+		if rec.ExitCode != nil {
+			code = *rec.ExitCode
+			exitUnknown = false
+		}
+		job := e.newRecoveredJobObject(rec, jobsDir, JobDone, doneDelivered, adoptionNoticed, rec.RecoveryNote, JobResult{
+			Output:          summary,
+			Err:             errVal,
+			ExitCode:        code,
+			ExitCodeUnknown: exitUnknown,
+			Preview:         preview,
+		})
+		if doneDelivered != rec.Delivered && jobsDir != "" {
+			_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+		}
+		return job, nil
+
+	case JobUnknown:
+		rec.OutputReceipt = ""
+		reason := rec.RecoveryNote
+		if reason == "" {
+			reason = rec.Error
+		}
+		if reason == "" {
+			reason = "process state could not be verified after harness restart"
+		}
+		summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
+		job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
+			Output:          summary,
+			Err:             errors.New(reason),
+			ExitCode:        -1,
+			ExitCodeUnknown: true,
+			Preview:         preview,
+		})
+		if jobsDir != "" && (unknownNoticed != rec.UnknownNoticed || rec.RecoveryNote != reason) {
+			_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+		}
+		return job, nil
+
+	default: // JobRunning: validate live process identity and group before adopting.
+		rec.OutputReceipt = ""
+		id := ProcessIdentityInfo{PID: rec.PID, PGID: rec.PGID, StartToken: rec.ProcessStarted}
+		info := inspectProcess(rec.PID)
+		if id.Matches(info) {
+			waitCtx, cancelCause := context.WithCancelCause(context.Background())
+			note := fmt.Sprintf("adopted live OS process PID %d (pgid %d); %s", id.PID, id.PGID, pipeCaptureEndedNote(rec.OutputFile))
+			job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
+			job.cancel = func() { cancelCause(context.Canceled) }
+			job.closeCancel = func() {
+				_ = stopVerifiedProcessGroup(id)
+				cancelCause(ErrExecutorClosed)
+			}
+			if job.OutputFile != "" && e.OutputDir != "" {
+				e.markActiveOutput(e.OutputDir, job.OutputFile)
+			}
+			if jobsDir != "" {
+				_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+			}
+			return job, &adoptionMonitor{job: job, ctx: waitCtx}
+		}
+
+		var reason string
+		switch {
+		case !id.Valid():
+			reason = "process identity, group, or start token missing after harness restart; refusing blind reattach"
+		case info.Alive && !info.Zombie:
+			reason = fmt.Sprintf("refused to attach to PID %d: process identity, group, or start token mismatch (PID reused)", id.PID)
+		default:
+			reason = fmt.Sprintf("previous process PID %d is no longer running (exited while harness was down; exit status unavailable)", id.PID)
+		}
+		if rec.FinishedAt.IsZero() {
+			rec.FinishedAt = time.Now()
+		}
+		summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
+		job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
+			Output:          summary,
+			Err:             errors.New(reason),
+			ExitCode:        -1,
+			ExitCodeUnknown: true,
+			Preview:         preview,
+		})
+		if jobsDir != "" {
+			_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+		}
+		return job, nil
+	}
+}
+
+// JobsDirPath returns the directory storing durable background-job metadata.
+func (e *Executor) JobsDirPath() string {
+	if e.JobsDir != "" {
+		return e.JobsDir
+	}
+	if e.OutputDir != "" {
+		return filepath.Clean(e.OutputDir) + "-jobs"
+	}
+	return ""
+}
+
+// SessionRecovered reports whether recovery has already run for sessionID in
+// this Executor lifecycle.
+func (e *Executor) SessionRecovered(sessionID string) bool {
+	e.jobsMu.Lock()
+	defer e.jobsMu.Unlock()
+	return e.recoveredSessions[sessionID]
+}
+
+// RecoverSessionJobs reloads retained jobs from durable job records, the latest
+// checkpoint, and the repaired transcript, validates live OS process identity,
+// and adopts verified running processes into the session registry.
+func (e *Executor) RecoverSessionJobs(
+	sessionID string,
+	cpJobs []checkpoint.Job,
+	transcriptHints []PersistedJob,
+	deliveries map[JobIdentityKey]DeliveryStatus,
+) ([]RecoveredJob, error) {
+	e.jobsMu.Lock()
+	for {
+		if e.jobsClosed {
+			e.jobsMu.Unlock()
+			return nil, ErrExecutorClosed
+		}
+		if e.recoveredSessions != nil && e.recoveredSessions[sessionID] {
+			reg := e.registryForRecoveryLocked(sessionID)
+			e.jobsMu.Unlock()
+			return recoveredSummaryFromJobs(reg), nil
+		}
+		if waitCh := e.recovering[sessionID]; waitCh != nil {
+			e.jobsMu.Unlock()
+			<-waitCh
+			e.jobsMu.Lock()
+			continue
+		}
+		if e.recoveredSessions == nil {
+			e.recoveredSessions = map[string]bool{}
+		}
+		if e.recovering == nil {
+			e.recovering = map[string]chan struct{}{}
+		}
+		gate := make(chan struct{})
+		e.recovering[sessionID] = gate
+		e.jobsMu.Unlock()
+		defer func() {
+			e.jobsMu.Lock()
+			delete(e.recovering, sessionID)
+			close(gate)
+			e.jobsMu.Unlock()
+		}()
+		break
+	}
+
+	jobsDir := e.JobsDirPath()
+	diskRecords, loadErr := loadPersistedJobs(jobsDir)
+	if loadErr != nil {
+		return nil, loadErr
+	}
+
+	records := collectMergedRecoveryRecords(diskRecords, cpJobs, transcriptHints)
+	var recoveredJobs []*Job
+	var summaries []RecoveredJob
+	var monitors []adoptionMonitor
+	maxSeq := 0
+	for _, rec := range records {
+		if seq := jobSequenceNumber(rec.ID); seq > maxSeq {
+			maxSeq = seq
+		}
+		key := MakeJobIdentityKey(rec.ID, rec.Started)
+		job, mon := e.resolveRecoveredJob(rec, deliveries[key], jobsDir)
+		recoveredJobs = append(recoveredJobs, job)
+		summaries = append(summaries, summaryFromRecoveredJob(job))
+		if mon != nil {
+			monitors = append(monitors, *mon)
+		}
+	}
+
+	e.jobsMu.Lock()
+	if e.jobsClosed {
+		e.jobsMu.Unlock()
+		for _, m := range monitors {
+			m.job.Cancel()
+			if m.job.OutputFile != "" && e.OutputDir != "" {
+				e.unmarkActiveOutput(e.OutputDir, m.job.OutputFile)
+			}
+		}
+		return nil, ErrExecutorClosed
+	}
+	if e.sessionJobs == nil {
+		e.sessionJobs = map[string]*JobRegistry{}
+	}
+	useCurrent := sessionID == e.sessionID || (e.sessionID == "" && e.sessionJobs[sessionID] == nil)
+	var reg *JobRegistry
+	if useCurrent {
+		reg = e.jobs
+		if sessionID != "" && e.sessionID == "" {
+			e.sessionID = sessionID
+		}
+	} else {
+		reg = e.sessionJobs[sessionID]
+	}
+	if reg == nil {
+		reg = &JobRegistry{}
+	}
+	existingKeys := map[JobIdentityKey]bool{}
+	reg.mu.Lock()
+	for _, j := range reg.listLocked() {
+		existingKeys[MakeJobIdentityKey(j.ID, j.Started)] = true
+		if seq := jobSequenceNumber(j.ID); seq > maxSeq {
+			maxSeq = seq
+		}
+	}
+	reg.mu.Unlock()
+	for _, j := range recoveredJobs {
+		if existingKeys[MakeJobIdentityKey(j.ID, j.Started)] {
+			continue
+		}
+		reg.addPreserved(j)
+	}
+	reg.mu.Lock()
+	if maxSeq > reg.next {
+		reg.next = maxSeq
+	}
+	reg.mu.Unlock()
+	if maxSeq > e.nextJobSeq {
+		e.nextJobSeq = maxSeq
+	}
+	if useCurrent {
+		e.jobs = reg
+	}
+	e.sessionJobs[sessionID] = reg
+	e.recoveredSessions[sessionID] = true
+	e.jobsMu.Unlock()
+
+	audit := e.Audit
+	for _, m := range monitors {
+		go e.monitorAdoptedJob(m.job, m.ctx, audit)
+	}
+	prunePersistedJobs(jobsDir, diskRecords)
+	return summaries, nil
+}
+
+func (e *Executor) registryForRecoveryLocked(sessionID string) *JobRegistry {
+	if sessionID == e.sessionID || (e.sessionID == "" && (e.sessionJobs == nil || e.sessionJobs[sessionID] == nil)) {
+		return e.jobs
+	}
+	if e.sessionJobs != nil {
+		return e.sessionJobs[sessionID]
+	}
+	return nil
+}
+
+func recoveredSummaryFromJobs(reg *JobRegistry) []RecoveredJob {
+	if reg == nil {
+		return nil
+	}
+	var out []RecoveredJob
+	for _, job := range reg.List() {
+		snap := job.Snapshot()
+		if snap.Status == JobRunning && !snap.Adopted {
+			continue
+		}
+		out = append(out, summaryFromRecoveredJob(job))
+	}
+	return out
+}
+
+func (e *Executor) monitorAdoptedJob(job *Job, ctx context.Context, audit func(AuditEntry)) {
+	defer func() {
+		if job.OutputFile != "" && job.outputDir != "" {
+			e.unmarkActiveOutput(job.outputDir, job.OutputFile)
+		}
+	}()
+	snap := job.Snapshot()
+	exitCode, exitKnown, err := waitAdoptedProcess(ctx, snap.Identity)
+	if errors.Is(err, ErrProcessIdentityMismatch) {
+		summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
+		job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
+		return
+	}
+	if errors.Is(context.Cause(ctx), ErrExecutorClosed) {
+		err = ErrExecutorClosed
+	}
+	if !exitKnown && err == nil {
+		err = errAdoptedProcessExited
+	}
+	summary, preview, _, hasFile := summarizeOutputFile(job.OutputFile, job.Cwd)
+	if !hasFile {
+		summary = fmt.Sprintf("(adopted background job exited; %s)", pipeCaptureEndedNote(job.OutputFile))
+	} else {
+		summary += "\n[" + pipeCaptureEndedNote(job.OutputFile) + "]"
+	}
+	if preview != nil {
+		note := "[" + pipeCaptureEndedNote(job.OutputFile) + "]"
+		if preview.Notice != "" {
+			preview.Notice += "\n" + note
+		} else {
+			preview.Notice = note
+		}
+	}
+	if audit != nil {
+		entry := AuditEntry{
+			InvocationID: job.InvocationID,
+			ToolCallID:   job.ToolCallID,
+			TS:           time.Now(),
+			Kind:         "bash",
+			Tool:         "bash",
+			Args:         truncate(job.Command, 500),
+			ExitCode:     exitCode,
+		}
+		if err != nil {
+			entry.Error = err.Error()
+		}
+		audit(entry)
+	}
+	job.finish(JobResult{
+		Output:          summary,
+		Err:             err,
+		ExitCode:        exitCode,
+		ExitCodeUnknown: !exitKnown,
+		Preview:         preview,
+	})
+}
+
+// FormatRecoveredJobsSummary formats recovered jobs concisely for terminal and
+// resume display, keeping each job's running/unknown/finished state explicit.
+func FormatRecoveredJobsSummary(jobs []RecoveredJob) string {
+	if len(jobs) == 0 {
+		return ""
+	}
+	var running, unknown, finished int
+	for _, j := range jobs {
+		switch j.Status {
+		case JobRunning:
+			running++
+		case JobUnknown:
+			unknown++
+		case JobDone:
+			finished++
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Recovered %d background job(s) (%d running, %d unknown, %d finished):", len(jobs), running, unknown, finished)
+	for _, j := range jobs {
+		cmd := strings.ReplaceAll(strings.TrimSpace(j.Command), "\n", " ")
+		if len(cmd) > 64 {
+			cmd = cmd[:61] + "..."
+		}
+		fmt.Fprintf(&b, "\n  - %s  status=%s", j.ID, j.Status)
+		if j.PID > 0 {
+			fmt.Fprintf(&b, "  pid=%d", j.PID)
+		}
+		if j.Adopted {
+			b.WriteString(" (adopted)")
+		}
+		if j.ExitCode != nil {
+			fmt.Fprintf(&b, "  exit=%d", *j.ExitCode)
+		}
+		if j.Cwd != "" {
+			fmt.Fprintf(&b, "  cwd=%s", j.Cwd)
+		}
+		if j.OutputFile != "" {
+			fmt.Fprintf(&b, "  output=%s", j.OutputFile)
+		}
+		if cmd != "" {
+			fmt.Fprintf(&b, "  cmd=%q", cmd)
+		}
+		if j.Reason != "" {
+			fmt.Fprintf(&b, "  (%s)", j.Reason)
+		}
+	}
+	return b.String()
+}
+
+// StopJob explicitly cancels a running background job (or rejects safely when its
+// status is unknown) and waits briefly for confirmation.
+func (e *Executor) StopJob(id string) (ToolResult, error) {
+	return e.killJob(id)
+}

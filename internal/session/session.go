@@ -601,16 +601,26 @@ func (s *Store) Close() error {
 	return err
 }
 
+// OutputID returns the stable output-family identity for this store.
+func (s *Store) OutputID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.header != nil && s.header.OutputID != "" {
+		return s.header.OutputID
+	}
+	return s.ID
+}
+
 // OutputDir follows the persistent output identity, including for old sessions
 // whose original directory is adopted on first open with this version.
 func (s *Store) OutputDir() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := s.ID
-	if s.header != nil && s.header.OutputID != "" {
-		id = s.header.OutputID
-	}
-	return filepath.Join(Dir(), id, "bash-output")
+	return filepath.Join(Dir(), s.OutputID(), "bash-output")
+}
+
+// JobsDir returns the durable background-job metadata directory owned by this
+// session's persistent output identity.
+func (s *Store) JobsDir() string {
+	return filepath.Join(Dir(), s.OutputID(), "bash-output-jobs")
 }
 
 // Load replays the active checkpoint and repairs incomplete tool batches

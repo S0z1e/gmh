@@ -27,6 +27,7 @@ type ToolObservation struct {
 	BeforeInvocationID string       `json:"before_invocation_id,omitempty"`
 	JobDisplay         *JobDisplay  `json:"job_display,omitempty"`
 	PendingStop        *JobIdentity `json:"pending_stop,omitempty"`
+	Recovery           bool         `json:"recovery,omitempty"`
 }
 
 // JobIdentity distinguishes a retained job from an ID reused by a later process.

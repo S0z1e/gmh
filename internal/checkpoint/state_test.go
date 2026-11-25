@@ -359,3 +359,91 @@ func TestMergeWithEvictionDropsInterruptedAndOldestFailuresWithStats(t *testing.
 		t.Fatalf("evicted state does not fit bounds: %v", err)
 	}
 }
+
+func TestJobIdentityFieldsAndValidation(t *testing.T) {
+	started := time.Now().Add(-time.Minute).UTC().Truncate(time.Millisecond)
+	code := 0
+	state := State{
+		Version: Version,
+		Jobs: []Job{
+			{
+				ID:              "bg-1",
+				Started:         started,
+				InvocationID:    "inv-1",
+				Command:         "sleep 10",
+				Cwd:             "/tmp/work",
+				OutputFile:      "/tmp/out/bash-1.log",
+				OutputID:        "sess-out-1",
+				OutputReceipt:   "bash-1.log",
+				PID:             4321,
+				PGID:            4321,
+				ProcessStarted:  "1700000000:123",
+				AdoptionNoticed: true,
+				Status:          Done,
+				ExitCode:        &code,
+				Delivered:       true,
+			},
+			{
+				ID:             "bg-2",
+				Started:        started.Add(time.Second),
+				Command:        "make test",
+				Cwd:            "/tmp/work",
+				OutputID:       "sess-out-1",
+				PID:            4322,
+				PGID:           4322,
+				ProcessStarted: "1700000001:456",
+				UnknownNoticed: true,
+				Status:         Unknown,
+			},
+		},
+	}
+	encoded, err := Encode(state)
+	if err != nil {
+		t.Fatalf("Encode valid recovery jobs: %v", err)
+	}
+	decoded, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode valid recovery jobs: %v", err)
+	}
+	if decoded.Jobs[0].Cwd != "/tmp/work" || decoded.Jobs[0].OutputReceipt != "bash-1.log" ||
+		decoded.Jobs[0].PID != 4321 || decoded.Jobs[0].ProcessStarted != "1700000000:123" ||
+		!decoded.Jobs[0].AdoptionNoticed {
+		t.Fatalf("decoded job[0] lost identity fields: %+v", decoded.Jobs[0])
+	}
+	if decoded.Jobs[1].Status != Unknown || !decoded.Jobs[1].UnknownNoticed {
+		t.Fatalf("decoded job[1] wrong state: %+v", decoded.Jobs[1])
+	}
+
+	invalidCases := []struct {
+		name string
+		job  Job
+	}{
+		{
+			name: "negative pid",
+			job:  Job{ID: "bg-1", Started: started, Command: "x", Status: Running, PID: -1},
+		},
+		{
+			name: "negative pgid",
+			job:  Job{ID: "bg-1", Started: started, Command: "x", Status: Running, PGID: -2},
+		},
+		{
+			name: "receipt while running",
+			job:  Job{ID: "bg-1", Started: started, Command: "x", Status: Running, OutputReceipt: "bash-1.log"},
+		},
+		{
+			name: "receipt while undelivered done",
+			job:  Job{ID: "bg-1", Started: started, Command: "x", Status: Done, ExitCode: &code, OutputReceipt: "bash-1.log"},
+		},
+		{
+			name: "unknown marked delivered",
+			job:  Job{ID: "bg-1", Started: started, Command: "x", Status: Unknown, Delivered: true},
+		},
+	}
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := (State{Version: Version, Jobs: []Job{tc.job}}).validate(); err == nil {
+				t.Fatalf("expected validation error for %s, got nil", tc.name)
+			}
+		})
+	}
+}

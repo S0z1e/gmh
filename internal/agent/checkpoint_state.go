@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,12 +25,42 @@ func factDigest(s string) string {
 }
 
 func snapshotJob(job *tools.Job, delivered bool) checkpoint.Job {
-	out := checkpoint.Job{ID: job.ID, Started: job.Started, InvocationID: job.InvocationID, Command: job.Command, OutputFile: job.OutputFile, Status: checkpoint.Running}
-	if res, done := job.Result(); done {
-		out.Status, out.ExitCode, out.Delivered = checkpoint.Done, &res.ExitCode, delivered || job.Delivered()
-		if res.Err != nil {
-			out.Error = res.Err.Error()
+	snap := job.Snapshot()
+	out := checkpoint.Job{
+		ID:              snap.ID,
+		Started:         snap.Started,
+		InvocationID:    snap.InvocationID,
+		Command:         snap.Command,
+		Cwd:             snap.Cwd,
+		OutputFile:      snap.OutputFile,
+		OutputID:        snap.OutputID,
+		PID:             snap.Identity.PID,
+		PGID:            snap.Identity.PGID,
+		ProcessStarted:  snap.Identity.StartToken,
+		AdoptionNoticed: snap.AdoptionNoticed,
+		Status:          checkpoint.Running,
+	}
+	switch snap.Status {
+	case tools.JobDone:
+		out.Status = checkpoint.Done
+		if !snap.Result.ExitCodeUnknown {
+			code := snap.Result.ExitCode
+			out.ExitCode = &code
 		}
+		out.Delivered = delivered || snap.Delivered
+		if out.Delivered && snap.OutputFile != "" {
+			if snap.OutputReceipt != "" {
+				out.OutputReceipt = snap.OutputReceipt
+			} else if snap.HasOutputDir {
+				out.OutputReceipt = filepath.Base(snap.OutputFile)
+			}
+		}
+		if snap.Result.Err != nil {
+			out.Error = snap.Result.Err.Error()
+		}
+	case tools.JobUnknown:
+		out.Status = checkpoint.Unknown
+		out.UnknownNoticed = snap.Delivered
 	}
 	return out
 }
@@ -69,9 +100,16 @@ func completedJobMessage(job *tools.Job, res tools.JobResult, display string) ll
 	obs := &llm.ToolObservation{Tool: "bash", Fingerprint: completed.Fingerprint, Command: job.Command, Cwd: completed.Cwd,
 		OutputFile: job.OutputFile, Failure: completed.Failure, Jobs: []checkpoint.Job{completed.Job}}
 	if preview := res.Preview; preview != nil {
-		header := fmt.Sprintf("Background job %s finished (exit %d).", job.ID, res.ExitCode)
-		if res.Err != nil {
+		var header string
+		switch {
+		case res.ExitCodeUnknown && res.Err != nil:
+			header = fmt.Sprintf("Background job %s finished (%v; exit status unavailable).", job.ID, res.Err)
+		case res.ExitCodeUnknown:
+			header = fmt.Sprintf("Background job %s finished (exit status unavailable).", job.ID)
+		case res.Err != nil:
 			header = fmt.Sprintf("Background job %s finished with error: %v (exit %d).", job.ID, res.Err, res.ExitCode)
+		default:
+			header = fmt.Sprintf("Background job %s finished (exit %d).", job.ID, res.ExitCode)
 		}
 		original, _ := jobResultMessage(job, res)
 		note := strings.TrimPrefix(display, original)
@@ -317,14 +355,15 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 				// it cannot overwrite the original command's actual failure,
 				// while deduplicating repeated interrupted retries for the same call.
 				fingerprint := info.fingerprint
-				interrupted := m.Kind == "interrupted"
+				interrupted := m.Kind == "interrupted" || (m.Observation != nil && m.Observation.Recovery)
 				if interrupted {
 					fingerprint = factDigest("unknown:" + info.fingerprint)
 				}
 				d.Failures = append(d.Failures, checkpoint.Failure{Fingerprint: fingerprint, Source: source, Tool: info.name, Command: info.command, Cwd: info.cwd, Output: excerpt, Interrupted: interrupted})
 			} else {
 				backgroundLaunch := m.Role == "tool" && m.Observation != nil && len(m.Observation.Jobs) > 0
-				if info.fingerprint != "" && !backgroundLaunch {
+				recoveryNotice := m.Observation != nil && m.Observation.Recovery
+				if info.fingerprint != "" && !backgroundLaunch && !recoveryNotice {
 					d.ResolvedFailures = append(d.ResolvedFailures, info.fingerprint, factDigest("unknown:"+info.fingerprint))
 				}
 				if info.name == "ask_user" {
@@ -350,10 +389,14 @@ func (c *Config) compactState(history []llm.Message) (state, beforeTask checkpoi
 		for _, job := range c.Exec.Jobs() {
 			current := snapshotJob(job, false)
 			for _, old := range state.Jobs {
-				// A durable delivery can precede MarkDelivered by a few
-				// instructions. Never retract it for the same incarnation.
-				if old.ID == current.ID && old.Started.Equal(current.Started) && current.Status == checkpoint.Done {
-					current.Delivered = current.Delivered || old.Delivered
+				// A durable delivery or recovery notice can precede the in-memory
+				// flag by a few instructions. Never retract it for the same incarnation.
+				if old.ID == current.ID && old.Started.Equal(current.Started) {
+					current.AdoptionNoticed = current.AdoptionNoticed || old.AdoptionNoticed
+					current.UnknownNoticed = current.UnknownNoticed || old.UnknownNoticed
+					if current.Status == checkpoint.Done {
+						current.Delivered = current.Delivered || old.Delivered
+					}
 				}
 			}
 			jobs = append(jobs, current)
@@ -375,4 +418,114 @@ func checkpointMessage(state checkpoint.State) (llm.Message, error) {
 
 func hasCheckpointFacts(s checkpoint.State) bool {
 	return s.ActiveTask != nil || len(s.Constraints)+len(s.Decisions)+len(s.Verification)+len(s.Failures)+len(s.Pending)+len(s.Jobs)+len(s.Artifacts) > 0
+}
+
+// ExtractRecoveryData inspects transcript messages to extract checkpoint job
+// snapshots, transcript job hints (including cwd from assistant bash tool calls),
+// and persisted delivery statuses for crash-safe recovery on reopen.
+func ExtractRecoveryData(history []llm.Message) ([]checkpoint.Job, []tools.PersistedJob, map[tools.JobIdentityKey]tools.DeliveryStatus, error) {
+	var cpJobs []checkpoint.Job
+	callArgs := make(map[string]struct{ command, cwd string })
+	hintsByKey := make(map[tools.JobIdentityKey]*tools.PersistedJob)
+	var hintOrder []tools.JobIdentityKey
+
+	addJob := func(cj checkpoint.Job, callID, fallbackCwd string) {
+		if cj.ID == "" || cj.Started.IsZero() {
+			return
+		}
+		rec := tools.CheckpointJobToPersisted(cj)
+		rec.ToolCallID = callID
+		if rec.Cwd == "" {
+			rec.Cwd = fallbackCwd
+		}
+		k := tools.MakeJobIdentityKey(cj.ID, cj.Started)
+		if h, exists := hintsByKey[k]; exists {
+			tools.MergeRecoveredRecord(h, rec)
+			return
+		}
+		hintsByKey[k] = &rec
+		hintOrder = append(hintOrder, k)
+	}
+
+	for _, m := range history {
+		if m.Role == "assistant" {
+			for _, call := range m.ToolCalls {
+				if call.Function.Name == "bash" {
+					var a tools.BashArgs
+					if json.Unmarshal([]byte(call.Function.Arguments), &a) == nil {
+						callArgs[call.ID] = struct{ command, cwd string }{command: a.Command, cwd: a.Cwd}
+					}
+				}
+			}
+		}
+		if m.Kind == "checkpoint" {
+			state, err := checkpoint.Decode([]byte(m.Content))
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			cpJobs = state.Jobs
+			for _, cj := range state.Jobs {
+				addJob(cj, "", "")
+			}
+		}
+		if m.Observation != nil {
+			fallbackCwd := m.Observation.Cwd
+			if ca, ok := callArgs[m.ToolCallID]; ok && fallbackCwd == "" {
+				fallbackCwd = ca.cwd
+			}
+			for _, cj := range m.Observation.Jobs {
+				addJob(cj, m.ToolCallID, fallbackCwd)
+			}
+			for _, completed := range m.Observation.JobCompletions() {
+				addJob(completed.Job, m.ToolCallID, completed.Cwd)
+			}
+		}
+	}
+
+	deliveries, err := recordedJobDeliveries(history)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	toolDeliveries := make(map[tools.JobIdentityKey]tools.DeliveryStatus, len(deliveries))
+	hints := make([]tools.PersistedJob, 0, len(hintOrder))
+	for _, k := range hintOrder {
+		h := *hintsByKey[k]
+		if st, ok := deliveries[jobDeliveryKey(h.ID, h.Started)]; ok {
+			toolDeliveries[k] = tools.DeliveryStatus{
+				DoneDelivered:   st.doneDelivered,
+				UnknownNoticed:  st.unknownNoticed,
+				AdoptionNoticed: st.adoptionNoticed,
+			}
+		}
+		hints = append(hints, h)
+	}
+	for _, cj := range cpJobs {
+		if cj.Started.IsZero() {
+			continue
+		}
+		k := tools.MakeJobIdentityKey(cj.ID, cj.Started)
+		if _, exists := toolDeliveries[k]; !exists {
+			if st, ok := deliveries[jobDeliveryKey(cj.ID, cj.Started)]; ok {
+				toolDeliveries[k] = tools.DeliveryStatus{
+					DoneDelivered:   st.doneDelivered,
+					UnknownNoticed:  st.unknownNoticed,
+					AdoptionNoticed: st.adoptionNoticed,
+				}
+			}
+		}
+	}
+	return cpJobs, hints, toolDeliveries, nil
+}
+
+// RecoverExecutorJobs restores retained background jobs into exec from saved
+// durable job files, checkpoints, and repaired session history.
+func RecoverExecutorJobs(exec *tools.Executor, sessionID string, history []llm.Message) ([]tools.RecoveredJob, error) {
+	if exec == nil {
+		return nil, nil
+	}
+	cpJobs, hints, deliveries, err := ExtractRecoveryData(history)
+	if err != nil {
+		return nil, err
+	}
+	return exec.RecoverSessionJobs(sessionID, cpJobs, hints, deliveries)
 }

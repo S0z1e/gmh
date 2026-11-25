@@ -94,6 +94,9 @@ type App struct {
 	Rates llm.Rates
 	// ResumedMessage is non-empty when --resume loaded a session.
 	ResumedMessage string
+	// RecoveredJobs summarizes any retained background jobs inspected while
+	// reopening the current session.
+	RecoveredJobs []tools.RecoveredJob
 	// TUITheme is the resolved TUI theme name: HARNESS_TUI_THEME,
 	// else the config file, else "" (the default theme).
 	TUITheme string
@@ -301,6 +304,8 @@ func Setup(p Params) (*App, error) {
 	// new session / resume re-points the executor (see newSession
 	// and LoadSession, which reset it alongside the audit hook).
 	executor.OutputDir = store.OutputDir()
+	executor.OutputID = store.OutputID()
+	executor.JobsDir = store.JobsDir()
 	executor.SwitchSession(store.ID)
 	if p.BashTimeoutSeconds > 0 {
 		executor.BashTimeout = time.Duration(p.BashTimeoutSeconds) * time.Second
@@ -449,6 +454,11 @@ func Setup(p Params) (*App, error) {
 	// Images stored in a resumed session carry only paths; re-read
 	// their bytes now, while the executor exists.
 	a.hydrateImages(a.History)
+	if p.Resume != "" {
+		if err := a.recoverSessionJobs(store, a.History); err != nil {
+			return nil, err
+		}
+	}
 	// -image attachments fail the run when a file cannot be loaded.
 	for _, p := range p.Images {
 		if _, err := a.AttachImage(p); err != nil {
@@ -464,6 +474,21 @@ func Setup(p Params) (*App, error) {
 	}
 	setupComplete = true
 	return a, nil
+}
+
+func (a *App) recoverSessionJobs(store *session.Store, history []llm.Message) error {
+	if a.Cfg == nil || a.Cfg.Exec == nil || store == nil {
+		return nil
+	}
+	recovered, err := agent.RecoverExecutorJobs(a.Cfg.Exec, store.ID, history)
+	if err != nil {
+		return err
+	}
+	a.RecoveredJobs = recovered
+	if summary := tools.FormatRecoveredJobsSummary(recovered); summary != "" {
+		a.ResumedMessage += "\n" + summary
+	}
+	return nil
 }
 
 // AttachImage loads one image file and queues it for the next turn.
@@ -847,6 +872,8 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 	a.History = nil
 	a.PendingImages = nil
 	a.PendingFiles = nil
+	a.ResumedMessage = ""
+	a.RecoveredJobs = nil
 	a.resetToolMode()
 	if a.Cfg != nil {
 		a.Cfg.Session = store
@@ -860,6 +887,8 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 			// Bash output files follow the current session too.
 			a.Cfg.Exec.OutputDir = store.OutputDir()
+			a.Cfg.Exec.OutputID = store.OutputID()
+			a.Cfg.Exec.JobsDir = store.JobsDir()
 			a.Cfg.Exec.SwitchSession(store.ID)
 		}
 	}
@@ -914,13 +943,44 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 	if old != nil {
 		oldID = old.ID
 	}
+	var recovered []tools.RecoveredJob
+	resumedMsg := fmt.Sprintf("Resumed session %s (%d messages).", id, len(history))
+	if !reuse && a.Cfg != nil && a.Cfg.Exec != nil {
+		exec := a.Cfg.Exec
+		prevDir, prevOutID, prevJobsDir := exec.OutputDir, exec.OutputID, exec.JobsDir
+		prevAudit := exec.Audit
+		exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
+		exec.OutputDir = store.OutputDir()
+		exec.OutputID = store.OutputID()
+		exec.JobsDir = store.JobsDir()
+		exec.ReacquireOutput(store.OutputDir())
+		exec.SwitchSession(store.ID)
+		var recErr error
+		recovered, recErr = agent.RecoverExecutorJobs(exec, store.ID, history)
+		if recErr != nil {
+			exec.Audit = prevAudit
+			exec.OutputDir = prevDir
+			exec.OutputID = prevOutID
+			exec.JobsDir = prevJobsDir
+			if prevDir != "" {
+				exec.ReacquireOutput(prevDir)
+			}
+			exec.SwitchSession(oldID)
+			_ = store.Close()
+			return nil, recErr
+		}
+		if summary := tools.FormatRecoveredJobsSummary(recovered); summary != "" {
+			resumedMsg += "\n" + summary
+		}
+	}
 	a.Store = store
 	delete(a.retainedStores, store)
 	a.hydrateImages(history)
 	a.History = history
 	a.PendingImages = nil
 	a.PendingFiles = nil
-	a.ResumedMessage = fmt.Sprintf("Resumed session %s (%d messages).", id, len(history))
+	a.ResumedMessage = resumedMsg
+	a.RecoveredJobs = recovered
 	a.resetToolMode()
 	if a.Cfg != nil {
 		a.Cfg.Session = store
@@ -929,13 +989,11 @@ func (a *App) LoadSession(id string) ([]llm.Message, error) {
 			// The cache key follows the current session.
 			a.Cfg.Client.PromptCacheKey = store.ID
 		}
-		if a.Cfg.Exec != nil {
+		if a.Cfg.Exec != nil && reuse {
 			a.Cfg.Exec.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
-			// Bash output files follow the resumed session too.
 			a.Cfg.Exec.OutputDir = store.OutputDir()
-			if !reuse {
-				a.Cfg.Exec.ReacquireOutput(store.OutputDir())
-			}
+			a.Cfg.Exec.OutputID = store.OutputID()
+			a.Cfg.Exec.JobsDir = store.JobsDir()
 			a.Cfg.Exec.SwitchSession(store.ID)
 		}
 	}
@@ -1139,7 +1197,11 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 			r.Print("[error] %v", err)
 			return false
 		}
-		r.Print("Resumed session %s (%d messages).", id, n)
+		if r.App.ResumedMessage != "" {
+			r.Print("%s", r.App.ResumedMessage)
+		} else {
+			r.Print("Resumed session %s (%d messages).", id, n)
+		}
 		return false
 	}
 	if line == "/rename" || strings.HasPrefix(line, "/rename ") {
@@ -1200,6 +1262,27 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 		} else {
 			r.Print("Approval mode set to %s.", mode)
 		}
+		return false
+	}
+	if arg, matched := ParseJobsStopArg(line); matched {
+		if arg == "" {
+			r.Print("Usage: /jobs stop <job-id>")
+			return false
+		}
+		res, err := r.App.Cfg.Exec.StopJob(arg)
+		if r.App.Store != nil {
+			if saved, saveErr := agent.SaveJobResultsMessages(r.App.Store, r.App.Cfg.Exec.Jobs()); saveErr == nil && len(saved) > 0 {
+				r.App.History = append(r.App.History, saved...)
+			}
+		}
+		if err != nil {
+			r.Print("[error] %v", err)
+			if res.Text != "" {
+				r.Print("%s", res.Text)
+			}
+			return false
+		}
+		r.Print("%s", res.Text)
 		return false
 	}
 	switch line {
@@ -1360,6 +1443,18 @@ func (r *Runner) printModels() {
 	r.Print("Usage: /model <provider>/<model> or /model <model>")
 }
 
+// ParseJobsStopArg parses interactive "/jobs stop [id]" or "/jobs kill [id]".
+func ParseJobsStopArg(line string) (string, bool) {
+	fields := strings.Fields(line)
+	if len(fields) >= 2 && fields[0] == "/jobs" && (fields[1] == "stop" || fields[1] == "kill") {
+		if len(fields) == 2 {
+			return "", true
+		}
+		return strings.Join(fields[2:], " "), true
+	}
+	return "", false
+}
+
 // printJobs lists the background bash jobs of this process, oldest
 // first: id, status, elapsed time, command, and exit code once done.
 func (r *Runner) printJobs() {
@@ -1369,16 +1464,35 @@ func (r *Runner) printJobs() {
 		return
 	}
 	for _, j := range jobs {
-		cmd := j.Command
+		snap := j.Snapshot()
+		cmd := snap.Command
 		if len(cmd) > 80 {
 			cmd = cmd[:77] + "…"
 		}
-		line := fmt.Sprintf("%s  %s  %s  %s", j.ID, j.Status(), j.Elapsed().Round(time.Second), cmd)
-		if res, ok := j.Result(); ok {
-			line += fmt.Sprintf("  exit %d", res.ExitCode)
-			if res.Err != nil {
-				line += fmt.Sprintf("  (%v)", res.Err)
+		line := fmt.Sprintf("%s  %s  %s  %s", snap.ID, snap.Status, j.Elapsed().Round(time.Second), cmd)
+		if snap.Identity.PID > 0 {
+			line += fmt.Sprintf("  pid=%d", snap.Identity.PID)
+			if snap.Adopted {
+				line += " (adopted)"
 			}
+		}
+		if snap.Cwd != "" {
+			line += fmt.Sprintf("  cwd=%s", snap.Cwd)
+		}
+		if snap.OutputFile != "" {
+			line += fmt.Sprintf("  output=%s", snap.OutputFile)
+		}
+		if snap.Status == tools.JobDone {
+			if snap.Result.ExitCodeUnknown {
+				line += "  exit unavailable"
+			} else {
+				line += fmt.Sprintf("  exit %d", snap.Result.ExitCode)
+			}
+			if snap.Result.Err != nil {
+				line += fmt.Sprintf("  (%v)", snap.Result.Err)
+			}
+		} else if snap.Status == tools.JobUnknown && snap.RecoveryNote != "" {
+			line += fmt.Sprintf("  (%s)", snap.RecoveryNote)
 		}
 		r.Print("%s", line)
 	}
