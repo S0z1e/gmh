@@ -21,13 +21,36 @@ for their start/result pair. When a background result arrives in a later
 turn, `origin_turn_id`, `origin_request_id`, and `origin_step_id` identify
 the originating call if it was launched on this connection.
 
-Read stdout continuously. If a write stays blocked for five seconds or
-a write would exceed 1,024 queued frames or 16 MiB, the server disconnects
-and cancels active provider calls and control operations. A failed write
-also disconnects. The client should treat the stream as closed and
-reconnect before sending further requests. The server returns an error
-for output failure and for input frames over 4 MiB. Individual output
-frames are limited to 8 MiB.
+Read stdout continuously. A blocked write fails after five seconds.
+That starts a separate five-second detach grace (override it with
+`HARNESS_RPC_DETACH_GRACE_SECONDS`). The two intervals add. During the
+grace an already-running turn may finish and persist. When the grace
+ends, or immediately when no turn is running, the server cancels the
+turn. A write that would exceed 1,024 queued frames or 16 MiB, or a
+failed write, also starts this detach. The failed stdout stream stays
+closed for this process: open a new `harness --rpc` process and `replay`
+the previous connection. The server returns an error for output failure
+and for input frames over 4 MiB. Individual output frames are limited to
+8 MiB.
+
+Replay is durable for the life of the session file's directory
+(`~/.minimal-harness/sessions/rpc-replay/<session>.jsonl`), keyed by
+`connection_id`, `session`, and `sequence`. It survives a process restart.
+The in-memory window, and the durable log when it is read back, keeps
+2,048 events or 16 MiB. The file itself stops growing at 64 MiB and writes one capped marker at the
+sequence that could not be stored. Events before that sequence stay readable.
+A cursor that has consumed every event before that marker is `truncated`,
+because the marker sequence itself was not stored. Earlier cursors stay
+contiguous unless an older event was evicted or skipped. One
+event larger than the per-event cap is skipped by itself
+(`skipped_sequences`); earlier events stay. `text_delta` and
+`thinking_delta` coalesce under backpressure. When the window is full,
+non-critical events are dropped before `turn_started`, `tool_start`,
+`tool_end`, `approval_request`, and `agent_settled`. If the window is
+already full of those lifecycle events, the oldest one is dropped so the
+newest one is kept. `output_open` reports whether this process can still
+write stdout. It stays true on a healthy process that is only reading an
+older connection's log.
 
 Requests (each `{"id":"<req>","type":"..."}`; `id` is optional and
 echoed in the response):
@@ -92,12 +115,19 @@ echoed in the response):
   effective window and output cap for the current model — the values
   Setup resolved, so a GUI can meter context against the limit the
   compact trigger uses).
-- `replay` `{"after_sequence":N}` returns buffered events after that sequence
-  in order, with `connection_id`, `oldest_sequence`, `latest_sequence`, and
-  `pending_approvals`. When `has_more` is true, pass `next_after_sequence` as
-  `after_sequence` for the next page. When it is false, `next_after_sequence`
-  advances through the snapshot. `truncated` signals that some requested events
-  are no longer in the buffer. Use cursors within the same connection.
+- `replay` `{"after_sequence":N,"connection_id":"<id>","resume_session":"<session>"}`
+  returns buffered events after that sequence in order, with `connection_id`,
+  `session`, `oldest_sequence`, `latest_sequence`, `output_open`,
+  `skipped_sequences`, and `pending_approvals`. Omit `connection_id` to use the
+  live connection. Set `connection_id` (and `resume_session` when the process
+  was restarted onto another session) to read that connection's durable log,
+  including after stdout has failed and after a process restart. When `has_more`
+  is true, pass `next_after_sequence` as `after_sequence` for the next page.
+  When it is false, `next_after_sequence` advances through the snapshot.
+  `truncated` signals that some requested events are no longer retained, including
+  a single oversized event listed in `skipped_sequences`. `output_open` reports
+  this process's stdout. It is false after that stream fails. Reading another
+  connection's log does not by itself mean this process's stdout is closed.
 - `usage` returns lifetime `session` and `current_run` usage. Treat counts
   as subtotals when their corresponding completeness flag is false.
   `metering_available` indicates whether lifetime metering can be read.
@@ -210,7 +240,15 @@ Events (stdout):
   notices.
 - `approval_request` `{"id":"appr-1","tool":"write","args":{...},"prompt":"Run write ...?"}` — `args` contains the complete invocation, without a preview cap; render it in a scrollable or expandable view. Emitted by the approval bridge (not
   by the loop's `approval` event, which the server ignores to avoid
-  sending it twice). The agent blocks until the GUI answers. Manual
+  sending it twice). The agent blocks until the GUI answers, the RPC
+  approval timeout elapses, or the client detaches. The timeout defaults to
+  300 seconds and applies only to RPC (`approval_request`,
+  `continuation_request`, and `question_request`). It does not apply to the
+  REPL or TUI. Set `approvalTimeoutSeconds` in config, or
+  `HARNESS_APPROVAL_TIMEOUT_SECONDS` (the environment value wins). `0` disables
+  the deadline. Detach, including the shutdown that follows a detach, reports
+  `approval cancelled: rpc client detached`, not `approval timed out`. A
+  pending continuation or question uses the same detach error. Manual
   requests can come from `ask-for-approval`/`suggest` and from the
   protected operations still gated in legacy `auto`. Deny-without-prompt
   suppresses them.

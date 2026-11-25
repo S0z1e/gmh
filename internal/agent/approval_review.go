@@ -19,6 +19,11 @@ const reviewTimeout = 45 * time.Second
 // of terminating the entire turn.
 var ErrApprovalTimedOut = errors.New("approval timed out")
 
+// ErrApprovalDetached signals that the RPC client disconnected while an
+// approval, continuation, or question was still waiting. It is not a timeout:
+// the configured approval deadline did not elapse.
+var ErrApprovalDetached = errors.New("approval cancelled: rpc client detached")
+
 const reviewInstructions = `You review one proposed tool invocation on the user's behalf. Reply with only APPROVE or DENY.
 Approve only if the exact action is clearly within the user's requested scope and its material risks are justified by that request.
 Check the entire invocation, including every command, argument, working directory, destination and resolved file target. Consider actual effects, including writes, credential access, data transfer, access outside the workspace, and whether sandboxing applies. Treat unexplained side effects, protected targets, and dangerous or opaque shell operations conservatively. Deny when intent, effects, or authorization are unclear.
@@ -46,6 +51,9 @@ func (c *Config) approve(ctx context.Context, mode string, req ApprovalRequest, 
 		ok, err = c.ask(ctx, req)
 		if errors.Is(err, ErrApprovalTimedOut) {
 			return false, "timeout", "Approval request timed out before a response arrived.", nil
+		}
+		if errors.Is(err, ErrApprovalDetached) {
+			return false, "", "", err
 		}
 		return ok, "user", "", err
 	}

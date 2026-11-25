@@ -129,7 +129,10 @@ per file. Unknown fields are rejected, so a typo fails fast. A
 the `providers` map. The `mode` field accepts `ask-for-approval`,
 `approve-for-me`, `full-access`, and the legacy values `suggest` and
 `auto`. The `-mode` flag takes precedence. Other top-level knobs include
-`bashTimeoutSeconds`, `bgThresholdSeconds` (`0`
+`bashTimeoutSeconds`, `approvalTimeoutSeconds` (RPC dialogs only:
+approval, continuation, and question requests; default 300;
+`0` waits with no deadline; `HARNESS_APPROVAL_TIMEOUT_SECONDS`
+overrides the file), `bgThresholdSeconds` (`0`
 disables backgrounding), `denyInsteadOfPrompt`, `contextLimit`,
 `anthropicMaxTokens`, `tuiTheme`
 (`default|terminal|catppuccin-mocha`). Precedence is flag >

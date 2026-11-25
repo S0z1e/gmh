@@ -242,3 +242,38 @@ func TestDeleteSession(t *testing.T) {
 		t.Fatal("deleting an invalid id should fail")
 	}
 }
+
+func TestRenameRejectsExistingReplayDestination(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	s, err := New("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeMsgs(t, s, "keep")
+	s.Close()
+	dir := filepath.Join(Dir(), "rpc-replay")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "alpha.jsonl"), []byte("{\"sequence\":1}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gamma.jsonl"), []byte("{\"sequence\":1}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenameSession("alpha", "gamma"); err == nil || !strings.Contains(err.Error(), "replay log") {
+		t.Fatalf("rename onto an existing replay log: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(Dir(), "alpha.jsonl")); err != nil {
+		t.Fatal("source transcript moved despite the replay conflict")
+	}
+	entries, err := os.ReadDir(filepath.Join(Dir(), ".operations"))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".json") {
+			t.Fatalf("rename journal leaked: %s", entry.Name())
+		}
+	}
+}

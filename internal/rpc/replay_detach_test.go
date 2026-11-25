@@ -157,3 +157,68 @@ func TestRPCOutputDisconnectAllowsActiveTurnToFinishInGraceWindow(t *testing.T) 
 		t.Fatal("server did not exit after detached turn finished")
 	}
 }
+
+func TestOutputTimeoutPlusDetachGraceLetsTurnFinish(t *testing.T) {
+	t.Setenv("HARNESS_RPC_DETACH_GRACE_SECONDS", "5")
+	s, _ := usageRegressionServer(t, false)
+	inR, inW := io.Pipe()
+	out := newBlockingWriter()
+	defer inW.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	completed := make(chan struct{})
+	s.app.Cfg.Client.HTTP.Transport = usageRegressionTransport(func(r *http.Request) (*http.Response, error) {
+		close(started)
+		select {
+		case <-release:
+			close(completed)
+			body := "data: {\"choices\":[{\"delta\":{\"content\":\"after both intervals\"}}]}\n\ndata: [DONE]\n\n"
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	})
+	done := make(chan error, 1)
+	go func() { done <- Run(s.app, s.runner, inR, out) }()
+	select {
+	case <-out.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ready was not written")
+	}
+	out.mu.Lock()
+	out.hold = make(chan struct{})
+	out.blocked = make(chan struct{})
+	out.mu.Unlock()
+	if _, err := io.WriteString(inW, "{\"id\":\"p1\",\"type\":\"prompt\",\"message\":\"block then finish\"}\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider did not start")
+	}
+	select {
+	case <-out.blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stdout write did not block")
+	}
+	time.Sleep(5500 * time.Millisecond)
+	select {
+	case <-completed:
+		t.Fatal("turn finished before detach grace, during the write timeout")
+	default:
+	}
+	close(release)
+	select {
+	case <-completed:
+	case <-time.After(6 * time.Second):
+		t.Fatal("turn did not finish inside the detach grace after the write timeout")
+	}
+	out.unblock()
+	_ = inW.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not exit")
+	}
+}

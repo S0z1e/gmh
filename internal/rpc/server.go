@@ -39,11 +39,12 @@ const (
 	protocolVersion    = 1
 	maxQueue           = 64
 	maxToolOutputChars = 32 * 1024
-	maxReplayEvents    = 2048
 	maxReplayBytes     = 2 * maxOutputFrameBytes
 	maxReplayEventSize = maxOutputFrameBytes - 4096 // leave room for the response envelope
 	defaultDetachGrace = 5 * time.Second
 )
+
+var maxReplayEvents = 2048
 
 var (
 	errAborted  = errors.New("turn aborted")
@@ -95,6 +96,11 @@ type pendingApproval struct {
 	req agent.ApprovalRequest
 }
 
+type continuationWait struct {
+	ch  chan agent.ContinuationDecision
+	err chan error
+}
+
 // questionAnswer is one question_request's reply, or the abort that
 // cancelled it.
 type questionAnswer struct {
@@ -124,11 +130,17 @@ type Server struct {
 	mu           sync.Mutex // guards state, never output I/O
 	writeMu      sync.Mutex // orders frames, independent from state
 	output       *protocolOutput
+	outputFailed bool
 	sequence     uint64
 	connectionID string
 	eventHistory []replayEvent // replay history and its size, guarded by writeMu
 	replayBytes  int
 	evictedSeq   uint64 // highest event sequence evicted from eventHistory, guarded by writeMu
+	replayLog    *replayLog
+	replayLogID  string
+	replayPaused bool
+	replayHold   [][]byte
+	skippedSeqs  []uint64 // oversized events omitted individually, guarded by writeMu
 	inputErr     error
 	state        serverState
 
@@ -159,7 +171,7 @@ type Server struct {
 	// continuations are the doom-loop guard's pending prompts, by
 	// id, like approvals but on a separate channel: the question is
 	// not a permission, so its answer is not an approval_response.
-	continuations   map[string]chan agent.ContinuationDecision
+	continuations   map[string]continuationWait
 	continuationsMu sync.Mutex
 	contSeq         int
 
@@ -196,11 +208,25 @@ func Run(a *app.App, runner *app.Runner, in io.Reader, out io.Writer) error {
 		out:           out,
 		done:          make(chan struct{}),
 		approvals:     map[string]pendingApproval{},
-		continuations: map[string]chan agent.ContinuationDecision{},
+		continuations: map[string]continuationWait{},
 		questions:     map[string]chan questionAnswer{},
 	}
 	s.workReady = sync.NewCond(&s.workMu)
 	return s.run()
+}
+
+func (s *Server) onOutputFailure() {
+	s.mu.Lock()
+	already := s.outputFailed
+	s.outputFailed = true
+	s.mu.Unlock()
+	if already {
+		return
+	}
+	s.detach()
+	if c, ok := s.in.(io.Closer); ok {
+		_ = c.Close()
+	}
 }
 
 func (s *Server) run() error {
@@ -208,22 +234,23 @@ func (s *Server) run() error {
 	if err := s.runner.RefreshUsage(); err != nil {
 		return err
 	}
-	s.approvalTimeout = time.Duration(config.DefaultApprovalTimeoutSeconds) * time.Second
-	if s.app != nil && s.app.Config != nil && s.app.Config.ApprovalTimeoutSeconds != nil {
-		s.approvalTimeout = time.Duration(*s.app.Config.ApprovalTimeoutSeconds) * time.Second
-	}
-	if raw := strings.TrimSpace(os.Getenv("HARNESS_APPROVAL_TIMEOUT_SECONDS")); raw != "" {
-		if secs, err := strconv.Atoi(raw); err == nil && secs >= 0 {
-			s.approvalTimeout = time.Duration(secs) * time.Second
-		}
-	}
+	applyApprovalTimeout(s)
 	s.connectionID = rand.Text()
-	s.output = newProtocolOutput(s.out, func() {
-		s.detach()
-		if c, ok := s.in.(io.Closer); ok {
-			_ = c.Close()
+	if log, err := openReplayLog(s.app.Store.ID); err != nil {
+		fmt.Fprintf(os.Stderr, "harness rpc replay log unavailable: %v\n", err)
+	} else {
+		s.replayLog = log
+		s.replayLogID = s.app.Store.ID
+	}
+	defer func() {
+		s.writeMu.Lock()
+		if s.replayLog != nil {
+			_ = s.replayLog.close()
+			s.replayLog = nil
 		}
-	})
+		s.writeMu.Unlock()
+	}()
+	s.output = newProtocolOutput(s.out, s.onOutputFailure)
 	s.app.Cfg.OnEvent = s.onEvent
 	s.app.Cfg.Ask = s.ask
 	s.app.Cfg.ConfirmContinuation = s.confirmContinuation
@@ -247,6 +274,7 @@ func (s *Server) run() error {
 	})
 	go s.readLoop()
 	s.agentLoop()
+	s.doneOnce.Do(func() { close(s.done) })
 	if c, ok := s.in.(io.Closer); ok {
 		_ = c.Close()
 	}
@@ -276,6 +304,7 @@ func (s *Server) readLoop() {
 		s.writeEvent(Event{Type: "error", Error: "rpc request exceeds the size limit or input failed"})
 	}
 	if s.isDetached() {
+		<-s.done
 		return
 	}
 	s.shutdown()
@@ -663,16 +692,20 @@ func (s *Server) handleQuery(req Request) {
 
 type replayEvent struct {
 	sequence uint64
-	data     json.RawMessage
+	data     []byte
+	critical bool
 }
 
 type replayPage struct {
 	ConnectionID      string            `json:"connection_id"`
+	Session           string            `json:"session,omitempty"`
 	LatestSequence    uint64            `json:"latest_sequence"`
 	OldestSequence    uint64            `json:"oldest_sequence"`
 	NextAfterSequence uint64            `json:"next_after_sequence"`
 	Truncated         bool              `json:"truncated"`
 	HasMore           bool              `json:"has_more"`
+	OutputOpen        bool              `json:"output_open"`
+	SkippedSequences  []uint64          `json:"skipped_sequences,omitempty"`
 	Events            []json.RawMessage `json:"events"`
 	PendingApprovals  []string          `json:"pending_approvals"`
 }
@@ -686,22 +719,60 @@ func (s *Server) handleReplay(req Request) {
 	s.approvalsMu.Unlock()
 	slices.Sort(pendingApprovals)
 
+	connectionID := req.ConnectionID
+
 	s.writeMu.Lock()
 	s.flushDeltaLocked()
+	s.mu.Lock()
+	liveSession := s.state.sessionID
+	s.mu.Unlock()
+	if connectionID == "" {
+		connectionID = s.connectionID
+	}
+	sessionID := req.ResumeSession
+	if sessionID == "" {
+		sessionID = liveSession
+	}
+	history, evicted, skipped, capAt, durable, err := s.replaySourceLocked(sessionID, connectionID, liveSession)
+	if err != nil {
+		s.writeMu.Unlock()
+		s.respond(req, nil, err)
+		return
+	}
+	if durable {
+		pendingApprovals = []string{}
+	}
 	page := replayPage{
-		ConnectionID: s.connectionID, LatestSequence: s.sequence,
-		NextAfterSequence: math.MaxUint64, Truncated: req.AfterSequence < s.evictedSeq,
-		Events: []json.RawMessage{}, PendingApprovals: pendingApprovals,
+		ConnectionID: connectionID, Session: sessionID, LatestSequence: s.sequence,
+		NextAfterSequence: math.MaxUint64, Truncated: req.AfterSequence < evicted || capCovers(req.AfterSequence, capAt),
+		OutputOpen:       s.outputOpen(),
+		SkippedSequences: skipped,
+		Events:           []json.RawMessage{}, PendingApprovals: pendingApprovals,
 	}
-	if len(s.eventHistory) > 0 {
-		page.OldestSequence = s.eventHistory[0].sequence
+	if durable {
+		var latest uint64
+		for _, ev := range history {
+			if ev.sequence > latest {
+				latest = ev.sequence
+			}
+		}
+		for _, seq := range skipped {
+			if seq > latest {
+				latest = seq
+			}
+		}
+		if evicted > latest {
+			latest = evicted
+		}
+		page.LatestSequence = latest
 	}
-	// Reserve the longest sequence numbers and boolean values before adding
-	// already encoded events and their separators to the frame.
+	if len(history) > 0 {
+		page.OldestSequence = history[0].sequence
+	}
 	envelope, err := encodeLine(Response{ID: req.ID, Type: "response", Sequence: math.MaxUint64, Data: page})
 	remaining := maxOutputFrameBytes - len(envelope)
 	page.NextAfterSequence = req.AfterSequence
-	for _, ev := range s.eventHistory {
+	for _, ev := range history {
 		if ev.sequence <= req.AfterSequence {
 			continue
 		}
@@ -709,7 +780,7 @@ func (s *Server) handleReplay(req Request) {
 			page.HasMore = true
 			break
 		}
-		page.Events = append(page.Events, ev.data)
+		page.Events = append(page.Events, json.RawMessage(ev.data))
 		page.NextAfterSequence = ev.sequence
 		remaining -= len(ev.data) + 1
 	}
@@ -722,6 +793,47 @@ func (s *Server) handleReplay(req Request) {
 		page.NextAfterSequence = max(req.AfterSequence, page.LatestSequence)
 	}
 	s.writeJSON(Response{ID: req.ID, Type: "response", Data: page})
+}
+
+func capCovers(after, capAt uint64) bool {
+	// capAt is the first sequence that was not stored. A cursor that has already
+	// consumed every earlier event (after+1 >= capAt) has reached that gap.
+	if capAt == 0 {
+		return false
+	}
+	return after >= capAt-1
+}
+
+func (s *Server) outputOpen() bool {
+	s.mu.Lock()
+	failed := s.outputFailed
+	s.mu.Unlock()
+	if failed {
+		return false
+	}
+	return s.output == nil || s.output.usable()
+}
+
+// replaySourceLocked returns the in-memory buffer for the live connection, or
+// the durable log when the client names another connection or session.
+// writeMu is already held.
+func (s *Server) replaySourceLocked(sessionID, connectionID, liveSession string) (history []replayEvent, evicted uint64, skipped []uint64, capAt uint64, durable bool, err error) {
+	if s.replayPaused {
+		return nil, 0, nil, 0, false, errors.New("replay is paused while the session is being renamed")
+	}
+	sameConnection := connectionID == s.connectionID || (connectionID == "" && s.connectionID == "")
+	owner := s.replayLogID
+	if owner == "" {
+		owner = liveSession
+	}
+	live := sameConnection && (sessionID == "" || sessionID == owner)
+	if live {
+		history = append([]replayEvent(nil), s.eventHistory...)
+		// The durable file cap does not apply to events still in memory.
+		return history, s.evictedSeq, append([]uint64(nil), s.skippedSeqs...), 0, false, nil
+	}
+	history, evicted, capAt, skipped, err = loadReplayLog(sessionID, connectionID)
+	return history, evicted, skipped, capAt, true, err
 }
 
 // pluginsList renders the registry's discovery outcome for
@@ -870,6 +982,14 @@ func (s *Server) ask(req agent.ApprovalRequest) (bool, error) {
 		err := ctx.Err()
 		return err == nil, err
 	}
+	if s.isDetached() {
+		s.approvalsMu.Unlock()
+		return false, agent.ErrApprovalDetached
+	}
+	if err := ctx.Err(); err != nil {
+		s.approvalsMu.Unlock()
+		return false, err
+	}
 	s.apprSeq++
 	id := fmt.Sprintf("appr-%d", s.apprSeq)
 	ch := make(chan approvalAnswer, 1)
@@ -889,8 +1009,14 @@ func (s *Server) ask(req agent.ApprovalRequest) (bool, error) {
 	case <-timeoutCh:
 		return false, fmt.Errorf("%w: approval request %s after %s", agent.ErrApprovalTimedOut, id, s.approvalTimeout)
 	case <-ctx.Done():
+		if s.isDetached() {
+			return false, agent.ErrApprovalDetached
+		}
 		return false, ctx.Err()
 	case <-s.done:
+		if s.isDetached() {
+			return false, agent.ErrApprovalDetached
+		}
 		return false, errShutdown
 	}
 }
@@ -910,14 +1036,22 @@ func (s *Server) confirmContinuation(req agent.ContinuationRequest) (agent.Conti
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if s.isDetached() {
+		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, agent.ErrApprovalDetached
+	}
 	if err := ctx.Err(); err != nil {
 		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
 	}
 	s.continuationsMu.Lock()
+	if s.isDetached() {
+		s.continuationsMu.Unlock()
+		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, agent.ErrApprovalDetached
+	}
 	s.contSeq++
 	id := fmt.Sprintf("cont-%d", s.contSeq)
 	ch := make(chan agent.ContinuationDecision, 1)
-	s.continuations[id] = ch
+	errCh := make(chan error, 1)
+	s.continuations[id] = continuationWait{ch: ch, err: errCh}
 	s.continuationsMu.Unlock()
 	defer func() {
 		s.continuationsMu.Lock()
@@ -937,11 +1071,19 @@ func (s *Server) confirmContinuation(req agent.ContinuationRequest) (agent.Conti
 	select {
 	case dec := <-ch:
 		return dec, nil
+	case err := <-errCh:
+		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
 	case <-timeoutCh:
 		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, fmt.Errorf("%w: continuation request %s after %s", agent.ErrApprovalTimedOut, id, s.approvalTimeout)
 	case <-ctx.Done():
+		if s.isDetached() {
+			return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, agent.ErrApprovalDetached
+		}
 		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, ctx.Err()
 	case <-s.done:
+		if s.isDetached() {
+			return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, agent.ErrApprovalDetached
+		}
 		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, errShutdown
 	}
 }
@@ -962,7 +1104,7 @@ func (s *Server) handleContinuationResponse(req Request) {
 		}
 	}
 	s.continuationsMu.Lock()
-	ch, ok := s.continuations[req.ContinuationID]
+	wait, ok := s.continuations[req.ContinuationID]
 	if ok {
 		delete(s.continuations, req.ContinuationID)
 	}
@@ -972,7 +1114,7 @@ func (s *Server) handleContinuationResponse(req Request) {
 		return
 	}
 	select {
-	case ch <- dec:
+	case wait.ch <- dec:
 	default:
 	}
 	s.respond(req, map[string]any{"ok": true}, nil)
@@ -982,17 +1124,27 @@ func (s *Server) handleContinuationResponse(req Request) {
 // question_request and blocks until the GUI answers with
 // question_response, the turn is aborted, or the server shuts down.
 func (s *Server) askQuestion(req agent.QuestionRequest) (agent.QuestionAnswers, error) {
+	ctx := req.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.isDetached() {
+		return agent.QuestionAnswers{}, agent.ErrApprovalDetached
+	}
+	if err := ctx.Err(); err != nil {
+		return agent.QuestionAnswers{}, err
+	}
 	s.questionsMu.Lock()
+	if s.isDetached() {
+		s.questionsMu.Unlock()
+		return agent.QuestionAnswers{}, agent.ErrApprovalDetached
+	}
 	s.questSeq++
 	id := fmt.Sprintf("quest-%d", s.questSeq)
 	ch := make(chan questionAnswer, 1)
 	s.questions[id] = ch
 	s.questionsMu.Unlock()
 	defer func() { s.questionsMu.Lock(); delete(s.questions, id); s.questionsMu.Unlock() }()
-	ctx := req.Context
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	s.writeEvent(Event{Type: "question_request", ID: id, Questions: req.Questions})
 	var timeoutCh <-chan time.Time
 	if s.approvalTimeout > 0 {
@@ -1006,8 +1158,14 @@ func (s *Server) askQuestion(req agent.QuestionRequest) (agent.QuestionAnswers, 
 	case <-timeoutCh:
 		return agent.QuestionAnswers{}, fmt.Errorf("%w: question request %s after %s", agent.ErrApprovalTimedOut, id, s.approvalTimeout)
 	case <-ctx.Done():
+		if s.isDetached() {
+			return agent.QuestionAnswers{}, agent.ErrApprovalDetached
+		}
 		return agent.QuestionAnswers{}, ctx.Err()
 	case <-s.done:
+		if s.isDetached() {
+			return agent.QuestionAnswers{}, agent.ErrApprovalDetached
+		}
 		return agent.QuestionAnswers{}, errShutdown
 	}
 }
@@ -1046,11 +1204,11 @@ func (s *Server) failQuestions(err error) {
 func (s *Server) failContinuations(err error) {
 	s.continuationsMu.Lock()
 	pending := s.continuations
-	s.continuations = map[string]chan agent.ContinuationDecision{}
+	s.continuations = map[string]continuationWait{}
 	s.continuationsMu.Unlock()
-	for _, ch := range pending {
+	for _, wait := range pending {
 		select {
-		case ch <- agent.ContinuationDecision{Outcome: agent.ContinuationDeny}:
+		case wait.err <- err:
 		default:
 		}
 	}
@@ -1383,6 +1541,7 @@ func (s *Server) doControl(req Request) {
 			s.respond(req, nil, err)
 			return
 		}
+		s.rebindReplayLog()
 		s.refreshState()
 		s.respond(req, map[string]any{"session": id}, nil)
 	case "skill":
@@ -1431,7 +1590,15 @@ func (s *Server) doControl(req Request) {
 			s.respond(req, nil, fmt.Errorf("rename_session needs {\"name\": old, \"new\": new}"))
 			return
 		}
+		owned := s.app.Store != nil && s.app.Store.Owns(req.Name)
+		if owned {
+			s.pauseReplay()
+		}
 		err := s.app.RenameSession(req.Name, req.New)
+		if owned {
+			s.refreshState()
+			s.rebindReplayLog()
+		}
 		if err != nil {
 			s.respond(req, nil, err)
 			return
@@ -1448,6 +1615,7 @@ func (s *Server) doControl(req Request) {
 			s.respond(req, nil, err)
 			return
 		}
+		s.rebindReplayLog()
 		s.refreshState()
 		s.respond(req, map[string]any{
 			"session": req.Session, "messages": n,
@@ -1466,6 +1634,7 @@ func (s *Server) doControl(req Request) {
 			s.respond(req, nil, err)
 			return
 		}
+		s.rebindReplayLog()
 		s.refreshState()
 		s.respond(req, map[string]any{
 			"session": req.Session, "messages": n, "stolen": true,
@@ -1476,8 +1645,8 @@ func (s *Server) doControl(req Request) {
 			s.respond(req, nil, fmt.Errorf("delete_session needs {\"session\": id}"))
 			return
 		}
-		if req.Session == s.app.Store.ID {
-			s.respond(req, nil, fmt.Errorf("cannot delete the current session %q (resume or start another session first)", req.Session))
+		if s.app.Store != nil && s.app.Store.Owns(req.Session) {
+			s.respond(req, nil, fmt.Errorf("cannot delete the current session %q (resume or start another session first)", s.app.Store.ID))
 			return
 		}
 		if err := session.DeleteSession(req.Session); err != nil {
@@ -1546,6 +1715,73 @@ func (s *Server) findSkill(name string) (string, bool) {
 	return "", false
 }
 
+func (s *Server) pauseReplay() {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.replayLog != nil {
+		_ = s.replayLog.close()
+		s.replayLog = nil
+	}
+	s.replayLogID = ""
+	s.replayPaused = true
+}
+
+func (s *Server) rebindReplayLog() {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.replayPaused = false
+	if s.app == nil || s.app.Store == nil {
+		s.dropReplayHoldLocked()
+		return
+	}
+	id := s.app.Store.ID
+	if s.replayLog != nil && s.replayLogID == id {
+		s.flushReplayHoldLocked()
+		return
+	}
+	if s.replayLog != nil {
+		_ = s.replayLog.close()
+		s.replayLog = nil
+	}
+	s.replayLogID = ""
+	log, err := openReplayLog(id)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "harness rpc replay log unavailable: %v\n", err)
+		s.dropReplayHoldLocked()
+		return
+	}
+	s.replayLog = log
+	s.replayLogID = id
+	s.flushReplayHoldLocked()
+}
+
+func (s *Server) dropReplayHoldLocked() {
+	if len(s.replayHold) > 0 {
+		fmt.Fprintf(os.Stderr, "harness rpc dropped %d replay events while the log was unavailable\n", len(s.replayHold))
+	}
+	s.replayHold = nil
+}
+
+func (s *Server) flushReplayHoldLocked() {
+	lines := s.replayHold
+	s.replayHold = nil
+	for _, line := range lines {
+		s.writeReplayLocked(line, true)
+	}
+}
+
+func applyApprovalTimeout(s *Server) {
+	s.approvalTimeout = time.Duration(config.DefaultApprovalTimeoutSeconds) * time.Second
+	if s.app != nil && s.app.Config != nil && s.app.Config.ApprovalTimeoutSeconds != nil {
+		s.approvalTimeout = time.Duration(*s.app.Config.ApprovalTimeoutSeconds) * time.Second
+	}
+	if raw := strings.TrimSpace(os.Getenv("HARNESS_APPROVAL_TIMEOUT_SECONDS")); raw != "" {
+		if secs, err := strconv.Atoi(raw); err == nil && secs >= 0 {
+			s.approvalTimeout = time.Duration(secs) * time.Second
+		}
+	}
+}
+
 func rpcDetachGrace() time.Duration {
 	if raw := strings.TrimSpace(os.Getenv("HARNESS_RPC_DETACH_GRACE_SECONDS")); raw != "" {
 		if secs, err := strconv.Atoi(raw); err == nil && secs >= 0 {
@@ -1576,9 +1812,9 @@ func (s *Server) detach() {
 		s.workReady.Signal()
 	}
 	s.workMu.Unlock()
-	s.failApprovals(agent.ErrApprovalTimedOut)
-	s.failContinuations(agent.ErrApprovalTimedOut)
-	s.failQuestions(agent.ErrApprovalTimedOut)
+	s.failApprovals(agent.ErrApprovalDetached)
+	s.failContinuations(agent.ErrApprovalDetached)
+	s.failQuestions(agent.ErrApprovalDetached)
 	s.turnMu.Lock()
 	active := s.turnCancel != nil
 	s.turnMu.Unlock()
@@ -1587,7 +1823,11 @@ func (s *Server) detach() {
 		s.shutdown()
 		return
 	}
-	time.AfterFunc(grace, s.shutdown)
+	time.AfterFunc(grace, func() {
+		if !s.isDone() {
+			s.shutdown()
+		}
+	})
 }
 
 func (s *Server) shutdown() {
@@ -1607,6 +1847,12 @@ func (s *Server) shutdown() {
 		s.turnCancel()
 	}
 	s.turnMu.Unlock()
+	if s.isDetached() {
+		s.failApprovals(agent.ErrApprovalDetached)
+		s.failContinuations(agent.ErrApprovalDetached)
+		s.failQuestions(agent.ErrApprovalDetached)
+		return
+	}
 	s.failApprovals(errShutdown)
 	s.failContinuations(errShutdown)
 	s.failQuestions(errShutdown)
@@ -1747,8 +1993,11 @@ func (s *Server) writeFrameLocked(v any) {
 	if _, isEvent := v.(Event); isEvent {
 		s.retainReplayEvent(b[:len(b)-1])
 	}
-	if s.output != nil {
+	if s.output != nil && s.output.usable() {
 		s.output.enqueue(b)
+		return
+	}
+	if s.output != nil {
 		return
 	}
 	// Direct, synchronous helper use in package tests. Run always installs the
@@ -1757,21 +2006,147 @@ func (s *Server) writeFrameLocked(v any) {
 }
 
 // retainReplayEvent records an encoded event while writeMu is held.
+// An oversized event is skipped by itself. Earlier history stays replayable,
+// and the sequence is reported as a gap rather than clearing the buffer.
+// Non-critical deltas never displace a retained lifecycle event.
 func (s *Server) retainReplayEvent(data []byte) {
-	if len(data) > maxReplayEventSize {
-		// Preserve a contiguous suffix and report the oversized event as a gap.
-		s.eventHistory = nil
-		s.replayBytes = 0
-		s.evictedSeq = s.sequence
+	copied := append([]byte(nil), data...)
+	critical := criticalReplayType(copied)
+	if len(copied) > maxReplayEventSize {
+		s.noteEvicted(s.sequence)
+		s.skippedSeqs = append(s.skippedSeqs, s.sequence)
+		s.appendReplayLocked(s.omissionMarker(len(copied)), true)
 		return
 	}
-	for len(s.eventHistory) >= maxReplayEvents || s.replayBytes+len(data) > maxReplayBytes {
-		oldest := s.eventHistory[0]
-		s.evictedSeq = oldest.sequence
-		s.replayBytes -= len(oldest.data)
-		s.eventHistory[0] = replayEvent{}
-		s.eventHistory = s.eventHistory[1:]
+	incoming := replayEvent{sequence: s.sequence, data: copied, critical: critical}
+	var evicted uint64
+	s.eventHistory, s.replayBytes, evicted = admitReplayEvent(s.eventHistory, s.replayBytes, incoming)
+	s.noteEvicted(evicted)
+	s.appendReplayLocked(copied, critical)
+}
+
+func (s *Server) noteEvicted(seq uint64) {
+	if seq > s.evictedSeq {
+		s.evictedSeq = seq
 	}
-	s.eventHistory = append(s.eventHistory, replayEvent{sequence: s.sequence, data: data})
-	s.replayBytes += len(data)
+}
+
+func replayLineSequence(data []byte, fallback uint64) uint64 {
+	var head struct {
+		Sequence uint64 `json:"sequence"`
+	}
+	if json.Unmarshal(data, &head) == nil && head.Sequence > 0 {
+		return head.Sequence
+	}
+	return fallback
+}
+
+func (s *Server) omissionMarker(size int) []byte {
+	marker, err := json.Marshal(map[string]any{
+		"sequence": s.sequence, "connection_id": s.connectionID,
+		"type": "replay_omitted", "bytes": size,
+	})
+	if err != nil {
+		return nil
+	}
+	return marker
+}
+
+func (s *Server) appendReplayLocked(data []byte, sync bool) {
+	if len(data) == 0 {
+		return
+	}
+	if s.replayPaused {
+		s.replayHold = append(s.replayHold, append([]byte(nil), data...))
+		return
+	}
+	s.writeReplayLocked(data, sync)
+}
+
+func (s *Server) writeReplayLocked(data []byte, sync bool) {
+	if s.replayLog == nil || s.replayLogID == "" || len(data) == 0 {
+		return
+	}
+	if err := s.replayLog.append(data, sync); err != nil {
+		if errors.Is(err, errReplayLogFull) {
+			if !s.replayLog.full {
+				marker, mErr := json.Marshal(map[string]any{
+					"type": "replay_capped", "sequence": replayLineSequence(data, s.sequence), "connection_id": s.connectionID,
+				})
+				if mErr == nil {
+					if capErr := s.replayLog.appendCap(marker); capErr != nil && !errors.Is(capErr, errReplayLogFull) {
+						fmt.Fprintf(os.Stderr, "harness rpc replay cap marker failed: %v\n", capErr)
+					}
+				}
+				fmt.Fprintf(os.Stderr, "harness rpc replay log reached its %d byte cap; older events remain readable\n", replayLogByteCap)
+			}
+			return
+		}
+		fmt.Fprintf(os.Stderr, "harness rpc replay log write failed: %v\n", err)
+		_ = s.replayLog.close()
+		s.replayLog = nil
+	}
+}
+
+func criticalReplayType(data []byte) bool {
+	var head struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &head); err != nil {
+		return false
+	}
+	switch head.Type {
+	case "turn_started", "tool_start", "tool_end", "approval_request", "agent_settled":
+		return true
+	default:
+		return false
+	}
+}
+
+// admitReplayEvent applies the replay window to one retained event.
+// Critical lifecycle events displace the oldest non-critical event. A
+// non-critical event is dropped itself before it displaces a lifecycle event.
+// The returned sequence is the highest event removed, never a regression.
+func admitReplayEvent(events []replayEvent, bytes int, ev replayEvent) ([]replayEvent, int, uint64) {
+	var evicted uint64
+	note := func(seq uint64) {
+		if seq > evicted {
+			evicted = seq
+		}
+	}
+	dropAt := func(i int) {
+		note(events[i].sequence)
+		bytes -= len(events[i].data)
+		events[i] = replayEvent{}
+		events = append(events[:i], events[i+1:]...)
+	}
+	// Prefer dropping non-critical history when either cap would be exceeded.
+	needsRoom := func() bool {
+		return len(events) >= maxReplayEvents || (len(events) > 0 && bytes+len(ev.data) > maxReplayBytes)
+	}
+	for needsRoom() {
+		dropped := false
+		for i, item := range events {
+			if item.critical {
+				continue
+			}
+			dropAt(i)
+			dropped = true
+			break
+		}
+		if dropped {
+			continue
+		}
+		if ev.critical && len(events) > 0 {
+			dropAt(0)
+			continue
+		}
+		return events, bytes, ev.sequence
+	}
+	if len(ev.data) > maxReplayBytes {
+		return events, bytes, ev.sequence
+	}
+	events = append(events, ev)
+	bytes += len(ev.data)
+	return events, bytes, evicted
 }

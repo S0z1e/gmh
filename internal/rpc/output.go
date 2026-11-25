@@ -57,6 +57,22 @@ func (p *protocolOutput) pendingFrames() int {
 	return len(p.queue)
 }
 
+// usable reports whether a producer can still send a frame. After failure the
+// connection is closed, but durable replay remains readable on the next process.
+func (p *protocolOutput) usable() bool {
+	if p == nil {
+		return true
+	}
+	select {
+	case <-p.failed:
+		return false
+	default:
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.closed && p.err == nil
+}
+
 func (p *protocolOutput) enqueue(b []byte) {
 	p.mu.Lock()
 	if p.closed || p.err != nil {

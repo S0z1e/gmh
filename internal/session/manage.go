@@ -357,7 +357,111 @@ func DeleteSession(id string) error {
 	if err != nil {
 		return err
 	}
-	return performOperation(op)
+	if err := performOperation(op); err != nil {
+		return err
+	}
+	return removeReplayBesideSession(id)
+}
+
+func replayRoot() (*os.Root, error) {
+	parent, err := os.OpenRoot(Dir())
+	if err != nil {
+		return nil, err
+	}
+	defer parent.Close()
+	observed, err := parent.Lstat("rpc-replay")
+	if err != nil {
+		return nil, err
+	}
+	if observed.Mode()&os.ModeSymlink != 0 || !observed.IsDir() {
+		return nil, fmt.Errorf("rpc replay directory must not be an alias")
+	}
+	child, err := parent.OpenRoot("rpc-replay")
+	if err != nil {
+		return nil, err
+	}
+	opened, err := child.Stat(".")
+	if err != nil || !os.SameFile(observed, opened) {
+		child.Close()
+		return nil, fmt.Errorf("rpc replay directory changed while opening")
+	}
+	return child, nil
+}
+
+func replayFileInfo(id string) (os.FileInfo, error) {
+	if err := ValidateSessionID(id); err != nil {
+		return nil, err
+	}
+	root, err := replayRoot()
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return root.Lstat(id + ".jsonl")
+}
+
+func reconcileReplay(op artifactOperation, forward bool) error {
+	if !op.Replay || op.Kind != "rename" {
+		return nil
+	}
+	from, to := op.OldID+".jsonl", op.NewID+".jsonl"
+	if !forward {
+		from, to = to, from
+	}
+	root, err := replayRoot()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer root.Close()
+	src, srcErr := root.Lstat(from)
+	dst, dstErr := root.Lstat(to)
+	if os.IsNotExist(srcErr) && (dstErr == nil || os.IsNotExist(dstErr)) {
+		return nil
+	}
+	if srcErr != nil {
+		return srcErr
+	}
+	if src.Mode()&os.ModeSymlink != 0 || !src.Mode().IsRegular() {
+		return fmt.Errorf("rpc replay log must be a regular file")
+	}
+	if dstErr == nil {
+		if dst.Mode()&os.ModeSymlink != 0 || !dst.Mode().IsRegular() {
+			return fmt.Errorf("rpc replay log must be a regular file")
+		}
+		if !forward {
+			return nil
+		}
+		return fmt.Errorf("replay log %s already exists", to)
+	}
+	if !os.IsNotExist(dstErr) {
+		return dstErr
+	}
+	if err := root.Rename(from, to); err != nil {
+		return err
+	}
+	return syncRecoveryDirectory(filepath.Join(Dir(), "rpc-replay"))
+}
+
+func removeReplayBesideSession(id string) error {
+	if err := ValidateSessionID(id); err != nil {
+		return err
+	}
+	root, err := replayRoot()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer root.Close()
+	err = root.Remove(id + ".jsonl")
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 // Rename renames the open store's session: the handles are closed,

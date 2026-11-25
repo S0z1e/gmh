@@ -185,16 +185,16 @@ func (c *Config) invalidArgs(msgs []llm.Message, tc llm.ToolCall, err error) []l
 // edited version) and whether the call may run. A denied call must
 // end the turn: the caller reports it with
 // TerminalRepeatedToolCallDenied.
-func (c *Config) checkRepeatedCall(ctx context.Context, toolName, argsJSON string) (string, bool) {
+func (c *Config) checkRepeatedCall(ctx context.Context, toolName, argsJSON string) (string, bool, error) {
 	guard := c.DoomLoop()
 	detected, det := guard.Check(toolName, argsJSON)
 	if !detected {
-		return argsJSON, true
+		return argsJSON, true, nil
 	}
 	// Headless (no one to ask, or approvals denied without asking):
 	// deny. A headless run must never assume the user would continue.
 	if c.ConfirmContinuation == nil || c.DenyInsteadOfPrompt || ctx.Err() != nil {
-		return argsJSON, false
+		return argsJSON, false, ctx.Err()
 	}
 	dec, err := c.ConfirmContinuation(ContinuationRequest{
 		Context:  ctx,
@@ -202,7 +202,7 @@ func (c *Config) checkRepeatedCall(ctx context.Context, toolName, argsJSON strin
 		Threshold: det.Threshold, InputPreview: det.InputPreview,
 	})
 	if err != nil {
-		return argsJSON, false
+		return argsJSON, false, err
 	}
 	key := det.InputKey
 	useArgs := argsJSON
@@ -213,12 +213,12 @@ func (c *Config) checkRepeatedCall(ctx context.Context, toolName, argsJSON strin
 	switch dec.Outcome {
 	case ContinuationSession:
 		guard.AllowSession(key)
-		return useArgs, true
+		return useArgs, true, nil
 	case ContinuationOnce:
 		guard.AllowOnce(key)
-		return useArgs, true
+		return useArgs, true, nil
 	default:
-		return argsJSON, false
+		return argsJSON, false, nil
 	}
 }
 
@@ -236,6 +236,12 @@ func (c *Config) askUser(ctx context.Context, argsJSON string) (string, *string,
 	}
 	req.Context = ctx
 	ans, err := c.AskQuestion(req)
+	if errors.Is(err, ErrApprovalDetached) || ctx.Err() != nil {
+		if err == nil {
+			err = ctx.Err()
+		}
+		return "", nil, err
+	}
 	if err != nil {
 		return "The questions were cancelled. Proceed with your best judgement and state the assumptions you made.", nil, nil
 	}
@@ -1399,7 +1405,13 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 			// deny), before any approval prompt — the user must
 			// not be asked twice about the same call. A denied
 			// call ends the turn with the structured reason.
-			useArgs, allowed := c.checkRepeatedCall(ctx, tc.Function.Name, argsJSON)
+			useArgs, allowed, contErr := c.checkRepeatedCall(ctx, tc.Function.Name, argsJSON)
+			if errors.Is(contErr, ErrApprovalDetached) {
+				c.rejectBudgetTools(assistant.ToolCalls[i:], contErr)
+				c.LastTerminalReason = TerminalAbort
+				c.emit(Event{Kind: EventError, Err: contErr, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+				return lastText, total, contErr
+			}
 			if err := ctx.Err(); err != nil {
 				c.rejectBudgetTools(assistant.ToolCalls[i:], err)
 				c.LastTerminalReason = TerminalAbort
@@ -1543,9 +1555,10 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 					if approver == "reviewer" || c.budgetError() != nil {
 						c.rejectBudgetTools(assistant.ToolCalls[i:], err, inv.ID)
 					}
-					c.LastTerminalReason = TerminalError
-					if ctx.Err() != nil {
+					if errors.Is(err, ErrApprovalDetached) || ctx.Err() != nil {
 						c.LastTerminalReason = TerminalAbort
+					} else {
+						c.LastTerminalReason = TerminalError
 					}
 					c.emit(Event{Kind: EventError, Err: err, Text: lastText, TerminalReason: c.LastTerminalReason})
 					closeMutation()
@@ -1620,6 +1633,15 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 			switch tc.Function.Name {
 			case "ask_user":
 				res.Text, humanAnswer, err = c.askUser(ctx, argsJSON)
+				if errors.Is(err, ErrApprovalDetached) || ctx.Err() != nil {
+					if err == nil {
+						err = ctx.Err()
+					}
+					closeMutation()
+					c.LastTerminalReason = TerminalAbort
+					c.emit(Event{Kind: EventError, Err: err, Text: lastText, Usage: total, TerminalReason: TerminalAbort})
+					return lastText, total, err
+				}
 				if humanAnswer != nil {
 					reviewIntent.Answers = append(reviewIntent.Answers, json.RawMessage(*humanAnswer))
 				}
