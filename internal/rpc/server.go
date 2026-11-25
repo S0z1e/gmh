@@ -295,11 +295,7 @@ func (s *Server) readLoop() {
 		s.writeEvent(Event{Type: "error", Error: "rpc request exceeds the size limit or input failed"})
 	}
 	if s.isDetached() {
-		select {
-		case <-s.done:
-		default:
-			<-s.done
-		}
+		<-s.done
 		return
 	}
 	s.shutdown()
@@ -734,6 +730,9 @@ func (s *Server) handleReplay(req Request) {
 		s.respond(req, nil, err)
 		return
 	}
+	if durable {
+		pendingApprovals = nil
+	}
 	page := replayPage{
 		ConnectionID: connectionID, Session: sessionID, LatestSequence: s.sequence,
 		NextAfterSequence: math.MaxUint64, Truncated: req.AfterSequence < evicted,
@@ -1021,13 +1020,17 @@ func (s *Server) confirmContinuation(req agent.ContinuationRequest) (agent.Conti
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := ctx.Err(); err != nil {
-		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
-	}
 	if s.isDetached() {
 		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, agent.ErrApprovalDetached
 	}
+	if err := ctx.Err(); err != nil {
+		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, err
+	}
 	s.continuationsMu.Lock()
+	if s.isDetached() {
+		s.continuationsMu.Unlock()
+		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, agent.ErrApprovalDetached
+	}
 	s.contSeq++
 	id := fmt.Sprintf("cont-%d", s.contSeq)
 	ch := make(chan agent.ContinuationDecision, 1)
@@ -1109,13 +1112,17 @@ func (s *Server) askQuestion(req agent.QuestionRequest) (agent.QuestionAnswers, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := ctx.Err(); err != nil {
-		return agent.QuestionAnswers{}, err
-	}
 	if s.isDetached() {
 		return agent.QuestionAnswers{}, agent.ErrApprovalDetached
 	}
+	if err := ctx.Err(); err != nil {
+		return agent.QuestionAnswers{}, err
+	}
 	s.questionsMu.Lock()
+	if s.isDetached() {
+		s.questionsMu.Unlock()
+		return agent.QuestionAnswers{}, agent.ErrApprovalDetached
+	}
 	s.questSeq++
 	id := fmt.Sprintf("quest-%d", s.questSeq)
 	ch := make(chan questionAnswer, 1)
@@ -1567,21 +1574,17 @@ func (s *Server) doControl(req Request) {
 			s.respond(req, nil, fmt.Errorf("rename_session needs {\"name\": old, \"new\": new}"))
 			return
 		}
+		owned := s.app.Store != nil && s.app.Store.Owns(req.Name)
+		if owned {
+			s.releaseReplayLog()
+		}
 		err := s.app.RenameSession(req.Name, req.New)
+		if owned {
+			s.rebindReplayLog()
+		}
 		if err != nil {
 			s.respond(req, nil, err)
 			return
-		}
-		oldID := req.Name
-		if s.app.Store != nil && s.app.Store.ID == req.New {
-			s.writeMu.Lock()
-			if s.replayLogID != "" {
-				oldID = s.replayLogID
-			}
-			s.writeMu.Unlock()
-		}
-		if err := s.moveReplayForRename(oldID, req.New); err != nil {
-			fmt.Fprintf(os.Stderr, "harness rpc replay log rename failed: %v\n", err)
 		}
 		s.refreshState()
 		s.respond(req, map[string]any{"renamed": true, "from": req.Name, "to": req.New}, nil)
@@ -1696,6 +1699,16 @@ func (s *Server) findSkill(name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func (s *Server) releaseReplayLog() {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.replayLog != nil {
+		_ = s.replayLog.close()
+		s.replayLog = nil
+	}
+	s.replayLogID = ""
 }
 
 func (s *Server) rebindReplayLog() {
@@ -2022,7 +2035,10 @@ func (s *Server) appendReplayLocked(data []byte, sync bool) {
 	}
 	if err := s.replayLog.append(data, sync); err != nil {
 		if errors.Is(err, errReplayLogFull) {
-			s.replayLog.full = true
+			marker, mErr := json.Marshal(map[string]any{"type": "replay_capped", "sequence": ^uint64(0), "connection_id": s.connectionID})
+			if mErr == nil {
+				_ = s.replayLog.appendCap(marker)
+			}
 			fmt.Fprintf(os.Stderr, "harness rpc replay log reached its %d byte cap; older events remain readable\n", maxReplayLogBytes)
 			return
 		}

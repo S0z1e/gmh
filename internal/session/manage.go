@@ -454,9 +454,6 @@ func (s *Store) Rename(newID string) error {
 		}
 		return err
 	}
-	if moveErr := moveReplayBesideSession(oldID, newID); moveErr != nil {
-		return moveErr
-	}
 	// The rename has committed: retain the new lease even if reopening fails.
 	if s.stopHeartbeat != nil {
 		s.stopHeartbeat()
