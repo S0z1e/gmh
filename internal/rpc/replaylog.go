@@ -67,10 +67,10 @@ func replayDirectory() (string, error) {
 		return "", err
 	}
 	defer root.Close()
-	if err := root.Mkdir("rpc-replay", replayDirMode()); err != nil && !os.IsExist(err) {
+	st, err := root.Lstat("rpc-replay")
+	if os.IsNotExist(err) {
 		return "", err
 	}
-	st, err := root.Lstat("rpc-replay")
 	if err != nil {
 		return "", err
 	}
@@ -80,12 +80,28 @@ func replayDirectory() (string, error) {
 	return filepath.Join(session.Dir(), "rpc-replay"), nil
 }
 
+func ensureReplayDirectory() (string, error) {
+	dir, err := replayDirectory()
+	if err == nil || !os.IsNotExist(err) {
+		return dir, err
+	}
+	root, err := os.OpenRoot(session.Dir())
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	if err := root.Mkdir("rpc-replay", replayDirMode()); err != nil && !os.IsExist(err) {
+		return "", err
+	}
+	return replayDirectory()
+}
+
 func openReplayLog(sessionID string) (*replayLog, error) {
 	path, err := replayLogPath(sessionID)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := replayDirectory(); err != nil {
+	if _, err := ensureReplayDirectory(); err != nil {
 		return nil, err
 	}
 	f, unlock, err := openReplayFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND)
@@ -191,18 +207,24 @@ func (l *replayLog) close() error {
 // loadReplayLog reads a connection's durable events. A truncated final line is
 // ignored so a crash mid-write does not drop the prefix. Events larger than
 // maxReplayEventSize are reported as gaps and do not erase earlier records.
-func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicted uint64, oversized []uint64, err error) {
+func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicted, capAt uint64, oversized []uint64, err error) {
 	path, err := replayLogPath(sessionID)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, 0, 0, nil, err
+	}
+	if _, err := replayDirectory(); err != nil {
+		if os.IsNotExist(err) {
+			return nil, 0, 0, nil, nil
+		}
+		return nil, 0, 0, nil, err
 	}
 	// O_RDWR: Windows LockFileEx rejects a read-only handle.
 	f, unlock, err := openReplayFile(path, os.O_RDWR)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, 0, nil, nil
+			return nil, 0, 0, nil, nil
 		}
-		return nil, 0, nil, err
+		return nil, 0, 0, nil, err
 	}
 	defer unlock()
 	defer f.Close()
@@ -222,7 +244,7 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 			break
 		}
 		if err != nil {
-			return events, evicted, oversized, err
+			return events, evicted, capAt, oversized, err
 		}
 		if len(line) == 0 {
 			continue
@@ -237,8 +259,8 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 			continue
 		}
 		if head.Type == "replay_capped" {
-			if head.ConnectionID == connectionID {
-				raiseEvicted(&evicted, head.Sequence)
+			if head.ConnectionID == connectionID && head.Sequence > capAt {
+				capAt = head.Sequence
 			}
 			continue
 		}
@@ -258,7 +280,7 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 		events, stored, dropped = admitReplayEvent(events, stored, replayEvent{sequence: head.Sequence, data: copied, critical: criticalReplayType(copied)})
 		raiseEvicted(&evicted, dropped)
 	}
-	return events, evicted, oversized, nil
+	return events, evicted, capAt, oversized, nil
 }
 
 func raiseEvicted(evicted *uint64, seq uint64) {

@@ -1,13 +1,16 @@
 package rpc
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -392,7 +395,7 @@ func TestReplayLogReadsLinesPastTheReadBuffer(t *testing.T) {
 	if err := log.close(); err != nil {
 		t.Fatal(err)
 	}
-	events, _, _, err := loadReplayLog(s.app.Store.ID, "wide")
+	events, _, _, _, err := loadReplayLog(s.app.Store.ID, "wide")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +428,7 @@ func TestTornReplayTailDoesNotSwallowTheNextEvent(t *testing.T) {
 	if err := log.close(); err != nil {
 		t.Fatal(err)
 	}
-	events, evicted, _, err := loadReplayLog(s.app.Store.ID, "c")
+	events, evicted, _, _, err := loadReplayLog(s.app.Store.ID, "c")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,11 +442,7 @@ func TestTornReplayTailDoesNotSwallowTheNextEvent(t *testing.T) {
 }
 
 func filepathDir(path string) string {
-	i := strings.LastIndex(path, "/")
-	if i < 0 {
-		return "."
-	}
-	return path[:i]
+	return filepath.Dir(path)
 }
 
 func TestReconnectAfterTransportFailureReplaysDurableEvents(t *testing.T) {
@@ -502,7 +501,10 @@ func TestReconnectAfterTransportFailureReplaysDurableEvents(t *testing.T) {
 	_ = inW.Close()
 	out.unblock()
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil && !errors.Is(err, errOutputBackpressure) {
+			t.Fatal(err)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("server did not exit")
 	}
@@ -517,16 +519,27 @@ func TestReconnectAfterTransportFailureReplaysDurableEvents(t *testing.T) {
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("data: [DONE]\n\n")), Header: http.Header{}}, nil
 	})}}
 	nextApp := &app.App{Root: root, Store: store, Cfg: &agent.Config{Client: client, Session: store, Exec: &tools.Executor{Root: root}, Mode: "auto"}}
-	next := &Server{app: nextApp, runner: &app.Runner{App: nextApp, Print: func(string, ...any) {}}, out: new(bytes.Buffer), connectionID: "reconnected"}
-	next.refreshState()
-	log, err := openReplayLog(sessionID)
+	nextRunner := &app.Runner{App: nextApp, Print: func(string, ...any) {}}
+	in2R, in2W := io.Pipe()
+	out2R, out2W := io.Pipe()
+	defer in2W.Close()
+	defer out2R.Close()
+	nextDone := make(chan error, 1)
+	go func() { nextDone <- Run(nextApp, nextRunner, in2R, out2W) }()
+	reader := bufio.NewReader(out2R)
+	readyLine, err := reader.ReadBytes('\n')
 	if err != nil {
 		t.Fatal(err)
 	}
-	next.replayLog = log
-	next.replayLogID = sessionID
-	t.Cleanup(func() { _ = log.close() })
-	raw, err := os.ReadFile(log.path)
+	var ready Event
+	if err := json.Unmarshal(readyLine, &ready); err != nil || ready.Type != "ready" || ready.ConnectionID == "" {
+		t.Fatalf("ready = %s err=%v", readyLine, err)
+	}
+	path, err := replayLogPath(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +549,7 @@ func TestReconnectAfterTransportFailureReplaysDurableEvents(t *testing.T) {
 			ConnectionID string `json:"connection_id"`
 			Type         string `json:"type"`
 		}
-		if json.Unmarshal(line, &head) == nil && head.Type == "turn_started" && head.ConnectionID != "" {
+		if json.Unmarshal(line, &head) == nil && head.Type == "turn_started" && head.ConnectionID != "" && head.ConnectionID != ready.ConnectionID {
 			previous = head.ConnectionID
 			break
 		}
@@ -544,14 +557,31 @@ func TestReconnectAfterTransportFailureReplaysDurableEvents(t *testing.T) {
 	if previous == "" {
 		t.Fatal("transport failure left no durable turn_started")
 	}
-	var buf bytes.Buffer
-	next.out = &buf
-	next.handleQuery(Request{ID: "again", Type: "replay", AfterSequence: 0, ConnectionID: previous, ResumeSession: sessionID})
+	if _, err := fmt.Fprintf(in2W, "{\"id\":\"again\",\"type\":\"replay\",\"after_sequence\":0,\"connection_id\":%q,\"resume_session\":%q}\n", previous, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	var respLine []byte
+	deadline := time.After(2 * time.Second)
+	for respLine == nil {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(line, []byte(`"id":"again"`)) {
+			respLine = line
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("replay response did not arrive: %s", line)
+		default:
+		}
+	}
 	var resp struct {
 		Data replayPage `json:"data"`
 	}
-	if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
-		t.Fatalf("decode %s: %v", buf.String(), err)
+	if err := json.Unmarshal(respLine, &resp); err != nil {
+		t.Fatal(err)
 	}
 	got := map[string]int{}
 	for _, raw := range resp.Data.Events {
@@ -563,6 +593,15 @@ func TestReconnectAfterTransportFailureReplaysDurableEvents(t *testing.T) {
 	}
 	if got["turn_started"] == 0 || got["agent_settled"] == 0 {
 		t.Fatalf("reconnect replay lost lifecycle events: %+v", got)
+	}
+	if !resp.Data.OutputOpen {
+		t.Fatal("the new process reported its own stdout as closed")
+	}
+	_ = in2W.Close()
+	select {
+	case <-nextDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reconnected server did not exit")
 	}
 }
 

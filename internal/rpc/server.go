@@ -731,7 +731,7 @@ func (s *Server) handleReplay(req Request) {
 
 	s.writeMu.Lock()
 	s.flushDeltaLocked()
-	history, evicted, skipped, durable, err := s.replaySourceLocked(sessionID, connectionID, liveSession)
+	history, evicted, skipped, capAt, durable, err := s.replaySourceLocked(sessionID, connectionID, liveSession)
 	if err != nil {
 		s.writeMu.Unlock()
 		s.respond(req, nil, err)
@@ -742,7 +742,7 @@ func (s *Server) handleReplay(req Request) {
 	}
 	page := replayPage{
 		ConnectionID: connectionID, Session: sessionID, LatestSequence: s.sequence,
-		NextAfterSequence: math.MaxUint64, Truncated: req.AfterSequence < evicted,
+		NextAfterSequence: math.MaxUint64, Truncated: req.AfterSequence < evicted || (capAt > 0 && req.AfterSequence >= capAt),
 		OutputOpen:       s.outputOpen(),
 		SkippedSequences: skipped,
 		Events:           []json.RawMessage{}, PendingApprovals: pendingApprovals,
@@ -806,7 +806,7 @@ func (s *Server) outputOpen() bool {
 // replaySourceLocked returns the in-memory buffer for the live connection, or
 // the durable log when the client names another connection or session.
 // writeMu is already held.
-func (s *Server) replaySourceLocked(sessionID, connectionID, liveSession string) (history []replayEvent, evicted uint64, skipped []uint64, durable bool, err error) {
+func (s *Server) replaySourceLocked(sessionID, connectionID, liveSession string) (history []replayEvent, evicted uint64, skipped []uint64, capAt uint64, durable bool, err error) {
 	sameConnection := connectionID == s.connectionID || (connectionID == "" && s.connectionID == "")
 	owner := s.replayLogID
 	if owner == "" {
@@ -815,12 +815,12 @@ func (s *Server) replaySourceLocked(sessionID, connectionID, liveSession string)
 	live := sameConnection && (sessionID == "" || sessionID == owner)
 	if live {
 		history = append([]replayEvent(nil), s.eventHistory...)
-		return history, s.evictedSeq, append([]uint64(nil), s.skippedSeqs...), false, nil
+		return history, s.evictedSeq, append([]uint64(nil), s.skippedSeqs...), 0, false, nil
 	}
 	s.writeMu.Unlock()
-	history, evicted, skipped, err = loadReplayLog(sessionID, connectionID)
+	history, evicted, capAt, skipped, err = loadReplayLog(sessionID, connectionID)
 	s.writeMu.Lock()
-	return history, evicted, skipped, true, err
+	return history, evicted, skipped, capAt, true, err
 }
 
 // pluginsList renders the registry's discovery outcome for

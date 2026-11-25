@@ -37,8 +37,11 @@ Replay is durable for the life of the session file's directory
 (`~/.minimal-harness/sessions/rpc-replay/<session>.jsonl`), keyed by
 `connection_id`, `session`, and `sequence`. It survives a process restart.
 The in-memory window, and the durable log when it is read back, keeps
-2,048 events or 16 MiB. The file itself stops growing at 64 MiB and writes one capped marker, so a later
-replay reports that tail as truncated. Events already written stay readable. One
+2,048 events or 16 MiB. The file itself stops growing at 64 MiB and writes one capped marker at the
+sequence that could not be stored. Events before that sequence stay readable.
+A replay cursor at or after the marker is `truncated`, because later events
+were not retained. Cursors before the marker are truncated only when an earlier
+event was evicted or skipped. One
 event larger than the per-event cap is skipped by itself
 (`skipped_sequences`); earlier events stay. `text_delta` and
 `thinking_delta` coalesce under backpressure. When the window is full,
