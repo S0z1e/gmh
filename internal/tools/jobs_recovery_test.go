@@ -384,8 +384,22 @@ func TestCrashRecoveryDeadProcessBecomesUnknown(t *testing.T) {
 	if len(recovered) != 1 || recovered[0].Status != JobUnknown || recovered[0].Adopted {
 		t.Fatalf("expected single unknown non-adopted job, got %+v", recovered)
 	}
+	// The job is already in this registry. Another recovery must report that
+	// same object and must not create a second writer for its record.
+	first := recoveredExec.Jobs()[0]
+	again, err := recoveredExec.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 1 || again[0].ID != recovered[0].ID || again[0].Status != JobUnknown {
+		t.Fatalf("second recovery = %+v, want the same unknown job", again)
+	}
+	jobs := recoveredExec.Jobs()
+	if len(jobs) != 1 || jobs[0] != first {
+		t.Fatalf("second recovery replaced the live job: %d jobs, same=%v", len(jobs), len(jobs) == 1 && jobs[0] == first)
+	}
 
-	job := recoveredExec.Jobs()[0]
+	job := jobs[0]
 	if job.Status() != JobUnknown {
 		t.Fatalf("job.Status() = %q, want unknown", job.Status())
 	}
