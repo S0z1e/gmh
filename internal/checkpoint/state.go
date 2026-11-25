@@ -91,15 +91,23 @@ const (
 // ID plus Started identifies a job incarnation, including registries that reuse
 // display IDs after restart. Running is only an observation at checkpoint time.
 type Job struct {
-	ID           string    `json:"id"`
-	Started      time.Time `json:"started"`
-	InvocationID string    `json:"invocation_id,omitempty"`
-	Command      string    `json:"command"`
-	OutputFile   string    `json:"output_file,omitempty"`
-	Status       JobStatus `json:"status"`
-	ExitCode     *int      `json:"exit_code,omitempty"`
-	Error        string    `json:"error,omitempty"`
-	Delivered    bool      `json:"delivered,omitempty"`
+	ID              string    `json:"id"`
+	Started         time.Time `json:"started"`
+	InvocationID    string    `json:"invocation_id,omitempty"`
+	Command         string    `json:"command"`
+	Cwd             string    `json:"cwd,omitempty"`
+	OutputFile      string    `json:"output_file,omitempty"`
+	OutputID        string    `json:"output_id,omitempty"`
+	OutputReceipt   string    `json:"output_receipt,omitempty"`
+	PID             int       `json:"pid,omitempty"`
+	PGID            int       `json:"pgid,omitempty"`
+	ProcessStarted  string    `json:"process_started,omitempty"`
+	Status          JobStatus `json:"status"`
+	ExitCode        *int      `json:"exit_code,omitempty"`
+	Error           string    `json:"error,omitempty"`
+	Delivered       bool      `json:"delivered,omitempty"`
+	AdoptionNoticed bool      `json:"adoption_noticed,omitempty"`
+	UnknownNoticed  bool      `json:"unknown_noticed,omitempty"`
 }
 
 // Artifact is a reference, never file contents or proof that a mutable path
@@ -736,19 +744,25 @@ func (s State) validate() error {
 		if j.ID == "" || j.Started.IsZero() || j.Command == "" {
 			return fmt.Errorf("checkpoint job requires identity and command")
 		}
+		if j.PID < 0 || j.PGID < 0 {
+			return fmt.Errorf("checkpoint job process identity must be non-negative")
+		}
 		switch j.Status {
 		case Running, Unknown:
-			if j.ExitCode != nil || j.Error != "" || j.Delivered {
+			if j.ExitCode != nil || j.Error != "" || j.Delivered || j.OutputReceipt != "" {
 				return fmt.Errorf("unfinished checkpoint job claims a delivered result")
 			}
 		case Done:
 			if j.ExitCode == nil && j.Error == "" {
 				return fmt.Errorf("finished checkpoint job has no result")
 			}
+			if !j.Delivered && j.OutputReceipt != "" {
+				return fmt.Errorf("undelivered checkpoint job claims an output receipt")
+			}
 		default:
 			return fmt.Errorf("unknown checkpoint job status")
 		}
-		if err := text(j.ID, j.InvocationID, j.Command, j.OutputFile, j.Error); err != nil {
+		if err := text(j.ID, j.InvocationID, j.Command, j.Cwd, j.OutputFile, j.OutputID, j.OutputReceipt, j.ProcessStarted, j.Error); err != nil {
 			return err
 		}
 		if err := unique("job", jobKey(j)); err != nil {

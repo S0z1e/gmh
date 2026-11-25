@@ -254,3 +254,49 @@ func (f *bashOutputFile) close() {
 		}
 	}
 }
+
+func (e *Executor) markActiveOutput(dir, outputPath string) {
+	if dir == "" || outputPath == "" {
+		return
+	}
+	key, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	e.outMu.Lock()
+	defer e.outMu.Unlock()
+	if e.outputBudgets == nil {
+		e.outputBudgets = make(map[string]*bashOutputBudget)
+	}
+	budget := e.outputBudgets[key]
+	if budget == nil {
+		limit := e.OutputMaxBytes
+		if limit <= 0 {
+			limit = DefaultSessionOutputMaxBytes
+		}
+		budget = &bashOutputBudget{limit: limit, active: make(map[string]bool)}
+		e.outputBudgets[key] = budget
+	}
+	budget.mu.Lock()
+	budget.active[filepath.Base(outputPath)] = true
+	budget.mu.Unlock()
+}
+
+func (e *Executor) unmarkActiveOutput(dir, outputPath string) {
+	if dir == "" || outputPath == "" {
+		return
+	}
+	key, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	e.outMu.Lock()
+	budget := e.outputBudgets[key]
+	e.outMu.Unlock()
+	if budget == nil {
+		return
+	}
+	budget.mu.Lock()
+	delete(budget.active, filepath.Base(outputPath))
+	budget.mu.Unlock()
+}

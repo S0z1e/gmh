@@ -310,9 +310,12 @@
   message gives the output file path so you can read its partial
   output, and the result is delivered at the next turn when the
   job finishes. A background job outlives its turn: it keeps
-  running after the turn settles (and after quit, orphaned) until
-  it exits on its own or its timeout kills it — so a dev server
-  started in one turn is still serving in the next. Output files
+  running after the turn settles (and after quit, orphaned) until it exits on its
+  own or is stopped, so a dev server started in one turn is still serving in the
+  next. On resume after a harness crash, verifiable live background jobs are safely
+  adopted while exited
+  processes or reused PIDs are reported as `unknown` without replaying commands;
+  use `/jobs stop <id>` to explicitly terminate an active/adopted job. Output files
   cap at 64 MiB: past that the run is killed and the call fails, so
   a spewing command cannot fill the disk.
 - Events: the agent loop emits an event stream (`text_delta`,

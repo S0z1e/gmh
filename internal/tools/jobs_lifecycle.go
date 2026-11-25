@@ -74,17 +74,26 @@ func (e *Executor) CloseJobs(ctx context.Context) error {
 		runs = append(runs, run)
 	}
 	e.jobsMu.Unlock()
+	var cancelled []*Job
+	var stops []func()
 	for _, job := range jobs {
 		job.mu.Lock()
-		if !job.finished {
+		if !job.finished && !job.unknown {
 			job.stopRequested = true
 			if job.closeCancel != nil {
-				job.closeCancel()
+				stops = append(stops, job.closeCancel)
 			} else if job.cancel != nil {
-				job.cancel()
+				stops = append(stops, job.cancel)
 			}
+			cancelled = append(cancelled, job)
 		}
 		job.mu.Unlock()
+	}
+	for _, stop := range stops {
+		stop()
+	}
+	for _, job := range cancelled {
+		job.persist()
 	}
 	for _, run := range runs {
 		run.cancel()

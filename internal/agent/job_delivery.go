@@ -177,6 +177,79 @@ func completedJobDisplay(m llm.Message, limit int) string {
 	return header + boundedJobDisplay(output, limit-len(header)-len(note)-len(notice)) + notice + note
 }
 
+func backgroundDoneEvent(job *tools.Job, res tools.JobResult, obs string, toolErr error) Event {
+	var exitCode *int
+	if !res.ExitCodeUnknown {
+		code := res.ExitCode
+		exitCode = &code
+	}
+	return Event{
+		Kind:           EventToolBackgroundDone,
+		ToolName:       "bash",
+		ToolOutput:     obs,
+		ToolErr:        toolErr,
+		JobID:          job.ID,
+		ToolCallID:     job.ToolCallID,
+		InvocationID:   job.InvocationID,
+		ToolExitCode:   exitCode,
+		ToolOutputFile: job.OutputFile,
+	}
+}
+
+func unknownJobMessage(job *tools.Job, res tools.JobResult) llm.Message {
+	snap := job.Snapshot()
+	note := snap.RecoveryNote
+	if note == "" && res.Err != nil {
+		note = res.Err.Error()
+	}
+	outInfo := ""
+	if snap.OutputFile != "" {
+		outInfo = fmt.Sprintf(" Pre-crash output file: %s.", snap.OutputFile)
+	}
+	body := fmt.Sprintf("Recovered background job %s (command: %q, cwd: %q) has status unknown: %s.%s\nDo not automatically replay this command because side effects may already have occurred; inspect the output file or workspace state and stop or confirm with the user before running anything similar.\nOutput so far:\n%s",
+		snap.ID, snap.Command, snap.Cwd, note, outInfo, capText(strings.ToValidUTF8(res.Output, "\uFFFD"), 32*1024))
+	cpJob := snapshotJob(job, false)
+	cpJob.UnknownNoticed = true
+	obs := &llm.ToolObservation{
+		Tool:        "bash",
+		Fingerprint: factDigest(fmt.Sprintf("unknown-job:%s:%d:%s", snap.ID, snap.Started.UnixNano(), snap.Command)),
+		Command:     snap.Command,
+		Cwd:         snap.Cwd,
+		OutputFile:  snap.OutputFile,
+		Recovery:    true,
+		Jobs:        []checkpoint.Job{cpJob},
+	}
+	if ex, err := checkpoint.Observe(strings.ToValidUTF8(note+"\n"+res.Output, "\uFFFD"), 4096); err == nil {
+		obs.Failure = &ex
+	}
+	return llm.Message{Role: "user", Kind: "job", InvocationID: snap.InvocationID, Content: body, ToolError: true, Observation: obs}
+}
+
+func adoptedJobNoticeMessage(job *tools.Job) llm.Message {
+	snap := job.Snapshot()
+	outInfo := ""
+	if snap.OutputFile != "" {
+		outInfo = fmt.Sprintf(" Output file: %s.", snap.OutputFile)
+	}
+	note := snap.RecoveryNote
+	if note != "" {
+		note = " (" + note + ")"
+	}
+	body := fmt.Sprintf("Recovered background job %s is still running (adopted PID %d, pgid %d, cwd: %q, command: %q).%s%s Wait for it to finish or stop it with bash kill_job_id=%q; do not replay the command.",
+		snap.ID, snap.Identity.PID, snap.Identity.PGID, snap.Cwd, snap.Command, note, outInfo, snap.ID)
+	cpJob := snapshotJob(job, false)
+	cpJob.AdoptionNoticed = true
+	obs := &llm.ToolObservation{
+		Tool:       "bash",
+		Command:    snap.Command,
+		Cwd:        snap.Cwd,
+		OutputFile: snap.OutputFile,
+		Recovery:   true,
+		Jobs:       []checkpoint.Job{cpJob},
+	}
+	return llm.Message{Role: "user", Kind: "job", InvocationID: snap.InvocationID, Content: body, Observation: obs}
+}
+
 // An append may write a complete result before Sync reports an error. Reconcile
 // that durable history before retrying delivery, including older stop records.
 func (c *Config) reconcileJobDeliveries() error {
@@ -184,14 +257,24 @@ func (c *Config) reconcileJobDeliveries() error {
 		return nil
 	}
 	jobs := c.Exec.Jobs()
-	hasUndelivered := false
+	needsReconcile := false
 	for _, job := range jobs {
-		if _, done := job.Result(); done && !job.Delivered() {
-			hasUndelivered = true
+		snap := job.Snapshot()
+		switch snap.Status {
+		case tools.JobDone, tools.JobUnknown:
+			if !snap.Delivered {
+				needsReconcile = true
+			}
+		case tools.JobRunning:
+			if snap.Adopted && !snap.AdoptionNoticed {
+				needsReconcile = true
+			}
+		}
+		if needsReconcile {
 			break
 		}
 	}
-	if !hasUndelivered {
+	if !needsReconcile {
 		return nil
 	}
 	saved, err := session.Load(c.Session.ID)
@@ -203,17 +286,28 @@ func (c *Config) reconcileJobDeliveries() error {
 		return fmt.Errorf("reconcile background deliveries: %w", err)
 	}
 	for _, job := range jobs {
-		if job.Delivered() || !delivered[jobDeliveryKey(job.ID, job.Started)] {
-			continue
-		}
-		if result, done := job.Result(); done {
+		snap := job.Snapshot()
+		rec := delivered[jobDeliveryKey(snap.ID, snap.Started)]
+		switch snap.Status {
+		case tools.JobDone:
+			if snap.Delivered || !rec.doneDelivered {
+				continue
+			}
 			job.MarkDelivered()
 			// Every path publishes completion only after a successful append.
 			// A readable but unacknowledged write still owes its event.
-			output, toolErr := jobResultMessage(job, result)
-			c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: output, ToolErr: toolErr,
-				JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID,
-				ToolExitCode: &result.ExitCode, ToolOutputFile: job.OutputFile})
+			output, toolErr := jobResultMessage(job, snap.Result)
+			c.emit(backgroundDoneEvent(job, snap.Result, output, toolErr))
+		case tools.JobUnknown:
+			if snap.Delivered || !rec.unknownNoticed {
+				continue
+			}
+			job.MarkDelivered()
+		case tools.JobRunning:
+			if snap.Adopted && !snap.AdoptionNoticed && rec.adoptionNoticed {
+				job.MarkAdoptionNoticed()
+				job.MarkReported()
+			}
 		}
 	}
 	return nil
@@ -221,17 +315,36 @@ func (c *Config) reconcileJobDeliveries() error {
 
 type jobIncarnation struct{ id, started string }
 
+type jobDeliveryState struct {
+	doneDelivered   bool
+	unknownNoticed  bool
+	adoptionNoticed bool
+}
+
 func jobDeliveryKey(id string, started time.Time) jobIncarnation {
 	return jobIncarnation{id, started.UTC().Format(time.RFC3339Nano)}
 }
 
-func recordedJobDeliveries(saved []llm.Message) (map[jobIncarnation]bool, error) {
-	delivered := make(map[jobIncarnation]bool)
-	remember := func(jobs []checkpoint.Job) {
+func recordedJobDeliveries(saved []llm.Message) (map[jobIncarnation]jobDeliveryState, error) {
+	delivered := make(map[jobIncarnation]jobDeliveryState)
+	rememberCheckpoint := func(jobs []checkpoint.Job) {
 		for _, job := range jobs {
-			if job.Status == checkpoint.Done && job.Delivered && !job.Started.IsZero() {
-				k := jobDeliveryKey(job.ID, job.Started)
-				delivered[k] = true
+			if job.Started.IsZero() {
+				continue
+			}
+			k := jobDeliveryKey(job.ID, job.Started)
+			st := delivered[k]
+			if job.Status == checkpoint.Done && job.Delivered {
+				st.doneDelivered = true
+			}
+			if job.UnknownNoticed {
+				st.unknownNoticed = true
+			}
+			if job.AdoptionNoticed {
+				st.adoptionNoticed = true
+			}
+			if st != (jobDeliveryState{}) {
+				delivered[k] = st
 			}
 		}
 	}
@@ -241,55 +354,105 @@ func recordedJobDeliveries(saved []llm.Message) (map[jobIncarnation]bool, error)
 			if err != nil {
 				return nil, err
 			}
-			remember(state.Jobs)
+			rememberCheckpoint(state.Jobs)
 		}
 		if m.Observation != nil {
-			remember(m.Observation.Jobs)
+			for _, job := range m.Observation.Jobs {
+				if job.Started.IsZero() {
+					continue
+				}
+				k := jobDeliveryKey(job.ID, job.Started)
+				st := delivered[k]
+				if job.Status == checkpoint.Done && job.Delivered {
+					st.doneDelivered = true
+				}
+				if job.UnknownNoticed || (m.Kind == "job" && job.Status == checkpoint.Unknown) {
+					st.unknownNoticed = true
+				}
+				if job.AdoptionNoticed || (m.Kind == "job" && m.Observation.Recovery && !m.ToolError && job.Status == checkpoint.Running) {
+					st.adoptionNoticed = true
+				}
+				if st != (jobDeliveryState{}) {
+					delivered[k] = st
+				}
+			}
 			for _, completed := range m.Observation.JobCompletions() {
-				remember([]checkpoint.Job{completed.Job})
+				if completed.Job.Status == checkpoint.Done && completed.Job.Delivered && !completed.Job.Started.IsZero() {
+					k := jobDeliveryKey(completed.Job.ID, completed.Job.Started)
+					st := delivered[k]
+					st.doneDelivered = true
+					delivered[k] = st
+				}
 			}
 		}
 	}
 	return delivered, nil
 }
 
-// SaveJobResults settles finished jobs while their owning session writer is
-// still open. Call between turns; it performs no model request or event callback.
+// SaveJobResults settles finished and unknown jobs while their owning session
+// writer is still open. Call between turns; it performs no model request or event callback.
 // A failed append leaves its job undelivered so shutdown can be retried.
 func SaveJobResults(store *session.Store, jobs []*tools.Job) error {
+	_, err := SaveJobResultsMessages(store, jobs)
+	return err
+}
+
+// SaveJobResultsMessages settles finished and unknown jobs like SaveJobResults
+// and returns any transcript messages newly appended to store so interactive
+// callers can synchronize in-memory history.
+func SaveJobResultsMessages(store *session.Store, jobs []*tools.Job) ([]llm.Message, error) {
 	var ready []*tools.Job
 	for _, job := range jobs {
-		if _, done := job.Result(); done && !job.Delivered() {
+		status := job.Status()
+		if (status == tools.JobDone || status == tools.JobUnknown) && !job.Delivered() {
 			ready = append(ready, job)
 		}
 	}
 	if len(ready) == 0 {
-		return nil
+		return nil, nil
 	}
 	saved, err := session.Load(store.ID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	delivered, err := recordedJobDeliveries(saved)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sort.SliceStable(ready, func(i, j int) bool {
-		iTime, _ := ready[i].FinishedAt()
-		jTime, _ := ready[j].FinishedAt()
-		return iTime.Before(jTime)
-	})
-	for _, job := range ready {
-		if !delivered[jobDeliveryKey(job.ID, job.Started)] {
-			result, _ := job.Result()
-			output, _ := jobResultMessage(job, result)
-			m := pendingStopCompletion(saved, job, result, output)
-			if err := store.Append(m); err != nil {
-				return err
-			}
-			saved = append(saved, m)
+		if !ready[i].Started.Equal(ready[j].Started) {
+			return ready[i].Started.Before(ready[j].Started)
 		}
-		job.MarkDelivered()
+		return ready[i].ID < ready[j].ID
+	})
+	var appended []llm.Message
+	for _, job := range ready {
+		rec := delivered[jobDeliveryKey(job.ID, job.Started)]
+		switch job.Status() {
+		case tools.JobDone:
+			if !rec.doneDelivered {
+				result, _ := job.Result()
+				output, _ := jobResultMessage(job, result)
+				m := pendingStopCompletion(saved, job, result, output)
+				if err := store.Append(m); err != nil {
+					return appended, err
+				}
+				saved = append(saved, m)
+				appended = append(appended, m)
+			}
+			job.MarkDelivered()
+		case tools.JobUnknown:
+			if !rec.unknownNoticed {
+				res, _ := job.UnknownResult()
+				m := unknownJobMessage(job, res)
+				if err := store.Append(m); err != nil {
+					return appended, err
+				}
+				saved = append(saved, m)
+				appended = append(appended, m)
+			}
+			job.MarkDelivered()
+		}
 	}
-	return nil
+	return appended, nil
 }

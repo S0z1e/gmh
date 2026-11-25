@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -35,10 +36,11 @@ const (
 
 // JobResult is what a finished background bash produced.
 type JobResult struct {
-	Output   string
-	Err      error
-	ExitCode int
-	Preview  *BashOutputPreview
+	Output          string
+	Err             error
+	ExitCode        int
+	ExitCodeUnknown bool
+	Preview         *BashOutputPreview
 }
 
 // Job is one background bash execution.
@@ -48,9 +50,16 @@ type Job struct {
 	ToolCallID   string
 	failureKey   string
 
-	ID      string
-	Command string
-	Cwd     string
+	ID             string
+	Command        string
+	Cwd            string
+	OutputID       string
+	OutputReceipt  string
+	PID            int
+	PGID           int
+	ProcessStarted string
+	Adopted        bool
+	RecoveryNote   string
 	// OutputFile is the per-call file holding the full stdout+stderr
 	// ("" when OutputDir was unset); it grows while the job runs.
 	OutputFile  string
@@ -59,14 +68,24 @@ type Job struct {
 	closeCancel context.CancelFunc
 	stopParent  func() bool
 
+	jobsDir   string
+	outputDir string
+	persistMu sync.Mutex
+
 	mu         sync.Mutex
 	done       chan struct{}
 	result     JobResult
 	finished   bool
+	unknown    bool
+	retained   bool
+	forgotten  bool
 	finishedAt time.Time
 	registry   *JobRegistry
 	// A later turn must not deliver a recorded result twice.
 	delivered bool
+	// adoptionNoticed ensures an adopted running job sends at most one
+	// post-restart advisory notice to the model.
+	adoptionNoticed bool
 	// A requested stop remains a delivery barrier even if context compaction
 	// no longer contains its original acknowledgement.
 	stopRequested bool
@@ -76,49 +95,226 @@ type Job struct {
 	reported bool
 }
 
-// Done closes when the command finishes (success, failure or timeout).
+// JobSnapshot is an atomic, race-free point-in-time copy of a Job's state.
+type JobSnapshot struct {
+	ID              string
+	Started         time.Time
+	InvocationID    string
+	ToolCallID      string
+	Command         string
+	Cwd             string
+	OutputFile      string
+	OutputID        string
+	OutputReceipt   string
+	Identity        ProcessIdentityInfo
+	Adopted         bool
+	RecoveryNote    string
+	Status          JobStatus
+	FinishedAt      time.Time
+	Delivered       bool
+	AdoptionNoticed bool
+	Reported        bool
+	StopRequested   bool
+	Result          JobResult
+	HasOutputDir    bool
+}
+
+// Snapshot returns an atomic thread-safe copy of j's current state.
+func (j *Job) Snapshot() JobSnapshot {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	status := JobRunning
+	if j.finished {
+		status = JobDone
+	} else if j.unknown {
+		status = JobUnknown
+	}
+	return JobSnapshot{
+		ID:              j.ID,
+		Started:         j.Started,
+		InvocationID:    j.InvocationID,
+		ToolCallID:      j.ToolCallID,
+		Command:         j.Command,
+		Cwd:             j.Cwd,
+		OutputFile:      j.OutputFile,
+		OutputID:        j.OutputID,
+		OutputReceipt:   j.OutputReceipt,
+		Identity:        ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted},
+		Adopted:         j.Adopted,
+		RecoveryNote:    j.RecoveryNote,
+		Status:          status,
+		FinishedAt:      j.finishedAt,
+		Delivered:       j.delivered,
+		AdoptionNoticed: j.adoptionNoticed,
+		Reported:        j.reported,
+		StopRequested:   j.stopRequested,
+		Result:          j.result,
+		HasOutputDir:    j.outputDir != "",
+	}
+}
+
+// Done closes when the command finishes (success, failure or timeout) or is
+// resolved to unknown status after a restart.
 func (j *Job) Done() <-chan struct{} { return j.done }
 
 // FailureKey is the immutable effective invocation captured when this job began.
 func (j *Job) FailureKey() string { return j.failureKey }
 
-// FinishedAt reports when the job finished; ok is false while running.
+// FinishedAt reports when the job finished; ok is false while running or unknown.
 func (j *Job) FinishedAt() (time.Time, bool) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.finishedAt, j.finished
 }
 
-// Status reports running or done.
+// Status reports running, done, or unknown.
 func (j *Job) Status() JobStatus {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.finished {
 		return JobDone
 	}
+	if j.unknown {
+		return JobUnknown
+	}
 	return JobRunning
 }
 
-// Result returns the outcome once finished; ok is false while running.
+// RecoveryNoteText returns the post-crash recovery note or reason if any.
+func (j *Job) RecoveryNoteText() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.RecoveryNote
+}
+
+// Result returns the outcome once finished; ok is false while running or unknown.
 func (j *Job) Result() (JobResult, bool) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.result, j.finished
 }
 
+// UnknownResult returns the diagnostic result recorded for a JobUnknown job.
+func (j *Job) UnknownResult() (JobResult, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.result, j.unknown
+}
+
 // Elapsed is how long the job has been running, or how long it ran
-// for once finished (it stops growing at completion).
+// for once finished or marked unknown.
 func (j *Job) Elapsed() time.Duration {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.finished {
+	if (j.finished || j.unknown) && !j.finishedAt.IsZero() {
 		return j.finishedAt.Sub(j.Started)
 	}
 	return time.Since(j.Started)
 }
 
+func (j *Job) snapshotForPersist() (PersistedJob, string, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	status := JobRunning
+	if j.finished {
+		status = JobDone
+	} else if j.unknown {
+		status = JobUnknown
+	}
+	var exitCode *int
+	if j.finished && !j.result.ExitCodeUnknown {
+		code := j.result.ExitCode
+		exitCode = &code
+	}
+	var errMsg string
+	if j.result.Err != nil {
+		errMsg = j.result.Err.Error()
+	}
+	return PersistedJob{
+		ID:              j.ID,
+		Started:         j.Started,
+		InvocationID:    j.InvocationID,
+		ToolCallID:      j.ToolCallID,
+		Command:         j.Command,
+		Cwd:             j.Cwd,
+		OutputFile:      j.OutputFile,
+		OutputID:        j.OutputID,
+		OutputReceipt:   j.OutputReceipt,
+		PID:             j.PID,
+		PGID:            j.PGID,
+		ProcessStarted:  j.ProcessStarted,
+		Status:          status,
+		ExitCode:        exitCode,
+		ExitCodeUnknown: j.result.ExitCodeUnknown,
+		Error:           errMsg,
+		FinishedAt:      j.finishedAt,
+		Delivered:       j.delivered,
+		StopRequested:   j.stopRequested,
+		AdoptionNoticed: j.adoptionNoticed,
+		UnknownNoticed:  status == JobUnknown && j.delivered,
+		RecoveryNote:    j.RecoveryNote,
+	}, j.jobsDir, j.retained && !j.forgotten
+}
+
+func (j *Job) persistedSnapshot() PersistedJob {
+	snap, _, _ := j.snapshotForPersist()
+	return snap
+}
+
+func (j *Job) persist() {
+	j.persistMu.Lock()
+	defer j.persistMu.Unlock()
+	snap, jobsDir, shouldPersist := j.snapshotForPersist()
+	if !shouldPersist || jobsDir == "" || snap.ID == "" {
+		return
+	}
+	_ = savePersistedJob(jobsDir, snap)
+}
+
+func (j *Job) removePersisted() {
+	j.persistMu.Lock()
+	defer j.persistMu.Unlock()
+	j.mu.Lock()
+	j.retained = false
+	j.forgotten = true
+	jobsDir, id, started := j.jobsDir, j.ID, j.Started
+	j.mu.Unlock()
+	if jobsDir != "" && id != "" {
+		removePersistedJob(jobsDir, id, started)
+	}
+}
+
+func (j *Job) markUnknown(reason, outputSummary string, preview *BashOutputPreview) {
+	j.mu.Lock()
+	if j.finished || j.unknown {
+		j.mu.Unlock()
+		return
+	}
+	if j.stopParent != nil {
+		j.stopParent()
+		j.stopParent = nil
+	}
+	j.unknown = true
+	j.RecoveryNote = reason
+	j.finishedAt = time.Now()
+	j.result = JobResult{
+		Output:          outputSummary,
+		Err:             errors.New(reason),
+		ExitCode:        -1,
+		ExitCodeUnknown: true,
+		Preview:         preview,
+	}
+	j.mu.Unlock()
+	j.persist()
+	close(j.done)
+}
+
 func (j *Job) finish(r JobResult) {
 	j.mu.Lock()
+	if j.finished || j.unknown {
+		j.mu.Unlock()
+		return
+	}
 	if j.stopParent != nil {
 		j.stopParent()
 		j.stopParent = nil
@@ -131,18 +327,20 @@ func (j *Job) finish(r JobResult) {
 	if delivered && registry != nil {
 		registry.trimDelivered()
 	}
+	j.persist()
 	close(j.done)
 }
 
-// Delivered reports whether the job's result was already fed back
-// to the model.
+// Delivered reports whether the job's terminal outcome (or unknown notice) was
+// already fed back to the model.
 func (j *Job) Delivered() bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.delivered
 }
 
-// MarkDelivered records that the result was fed back to the model.
+// MarkDelivered records that the terminal result or unknown notice was fed back
+// to the model.
 func (j *Job) MarkDelivered() {
 	j.mu.Lock()
 	if j.delivered {
@@ -150,13 +348,38 @@ func (j *Job) MarkDelivered() {
 		return
 	}
 	j.delivered = true
-	registry, finished := j.registry, j.finished
+	if j.OutputFile != "" && j.outputDir != "" && j.OutputReceipt == "" {
+		j.OutputReceipt = filepath.Base(j.OutputFile)
+	}
+	registry, settled := j.registry, j.finished || j.unknown
 	j.mu.Unlock()
 	// Registry operations lock jobs while holding the registry lock.
 	// Notify the registry only after releasing the job lock.
-	if finished && registry != nil {
+	if settled && registry != nil {
 		registry.trimDelivered()
 	}
+	j.persist()
+}
+
+// AdoptionNoticed reports whether the model was already told this adopted job
+// is running after restart.
+func (j *Job) AdoptionNoticed() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.adoptionNoticed
+}
+
+// MarkAdoptionNoticed records that the post-restart running notice was
+// delivered for this adopted job.
+func (j *Job) MarkAdoptionNoticed() {
+	j.mu.Lock()
+	if j.adoptionNoticed {
+		j.mu.Unlock()
+		return
+	}
+	j.adoptionNoticed = true
+	j.mu.Unlock()
+	j.persist()
 }
 
 // Reported reports whether a bounded drain already told the model
@@ -205,6 +428,25 @@ func (r *JobRegistry) addWithSeq(j *Job, seq int) {
 	r.evictDelivered()
 }
 
+func (r *JobRegistry) addPreserved(j *Job) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if seq := jobSequenceNumber(j.ID); seq > r.next {
+		r.next = seq
+	}
+	j.mu.Lock()
+	j.registry = r
+	j.mu.Unlock()
+	r.jobs = append(r.jobs, j)
+	r.evictDelivered()
+}
+
+func (r *JobRegistry) listLocked() []*Job {
+	out := make([]*Job, len(r.jobs))
+	copy(out, r.jobs)
+	return out
+}
+
 const (
 	recentJobsLimit        = 50
 	staleUndeliveredJobAge = time.Hour
@@ -229,7 +471,7 @@ func (r *JobRegistry) evictDelivered() {
 		}
 		job.mu.Lock()
 		defer job.mu.Unlock()
-		if !job.finished || !job.delivered {
+		if (!job.finished && !job.unknown) || !job.delivered {
 			return false
 		}
 		job.registry = nil
@@ -249,7 +491,7 @@ func (r *JobRegistry) evictDelivered() {
 		}
 		job.mu.Lock()
 		defer job.mu.Unlock()
-		if !job.finished || job.finishedAt.After(cutoff) {
+		if (!job.finished && !job.unknown) || job.finishedAt.After(cutoff) {
 			return false
 		}
 		job.registry = nil
@@ -296,8 +538,14 @@ func (r *JobRegistry) forget(j *Job) {
 	}
 }
 
-// ForgetJob removes a job from this Executor's list (see forget).
-func (e *Executor) ForgetJob(j *Job) { e.registry().forget(j) }
+// ForgetJob removes a job from this Executor's list and discards any transient
+// persisted sidecar record (see forget).
+func (e *Executor) ForgetJob(j *Job) {
+	e.registry().forget(j)
+	if j != nil {
+		j.removePersisted()
+	}
+}
 
 // IsTimeout reports whether err is a *timeoutError: a bash call
 // killed by its timeout (the whole process group, grandchildren
@@ -348,12 +596,22 @@ func (c *bashOutputCapture) Write(p []byte) (int, error) {
 
 const bashOutputDrainTimeout = 200 * time.Millisecond
 
-// The shell and its captured stdout/stderr have separate lifetimes. A short
-// bounded drain captures buffered output without waiting indefinitely for inherited
-// handles; only background:true with a live shell retains captured output.
-func (e *Executor) runBashCmd(ctx context.Context, command string, timeout, drainTimeout time.Duration, output *bashOutputFile, dir string, preview *BashOutputPreview) (string, int, error) {
-	defer output.Close()
-	outPath := output.path
+type startedBashProcess struct {
+	cmd               *exec.Cmd
+	cancel            context.CancelFunc
+	stopProcess       func(error) error
+	processContextErr *error
+	shellExited       *bool
+	processMu         *sync.Mutex
+	reader            *os.File
+	capture           *bashOutputCapture
+	copied            <-chan error
+	pid               int
+	pgid              int
+	startToken        string
+}
+
+func (e *Executor) startBashProcess(ctx context.Context, command string, timeout time.Duration, output *bashOutputFile, dir string) (*startedBashProcess, error) {
 	var runCtx context.Context
 	var cancel context.CancelFunc
 	if timeout > 0 {
@@ -361,7 +619,6 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout, drai
 	} else {
 		runCtx, cancel = context.WithCancel(ctx)
 	}
-	defer cancel()
 	var cmd *exec.Cmd
 	if e.Sandbox {
 		bwrap := e.BwrapPath
@@ -400,8 +657,6 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout, drai
 		return stopProcess(runCtx.Err())
 	}
 
-	legacy := output.legacy
-	f := output.file
 	capture := &bashOutputCapture{file: output, summary: newBashOutputSink(), stop: func() {
 		// Capture errors still stop the inherited process group during
 		// output drain, after the command deadline has been retired.
@@ -410,12 +665,16 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout, drai
 	}}
 	reader, writer, err := os.Pipe()
 	if err != nil {
-		_ = f.Close()
-		return "", -1, fmt.Errorf("create bash output pipe: %w", err)
+		cancel()
+		output.Close()
+		return nil, fmt.Errorf("create bash output pipe: %w", err)
 	}
 	cmd.Stdout, cmd.Stderr = writer, writer
 	if reviewed := bashDirectoryFromContext(ctx); reviewed != nil {
 		err = reviewed.check(dir)
+	}
+	if err == nil {
+		err = ctx.Err()
 	}
 	if err == nil {
 		err = cmd.Start()
@@ -423,8 +682,21 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout, drai
 	if err != nil {
 		_ = reader.Close()
 		_ = writer.Close()
-		_ = f.Close()
-		return "", -1, err
+		cancel()
+		output.Close()
+		return nil, err
+	}
+	pid := 0
+	pgid := 0
+	var startToken string
+	if cmd.Process != nil {
+		pid = cmd.Process.Pid
+		pgid = processGroupID(pid)
+		info := inspectProcess(pid)
+		if info.PGID > 0 {
+			pgid = info.PGID
+		}
+		startToken = info.StartToken
 	}
 	_ = writer.Close()
 	copied := make(chan error, 1)
@@ -432,6 +704,46 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout, drai
 		_, err := io.Copy(capture, reader)
 		copied <- err
 	}()
+	return &startedBashProcess{
+		cmd:               cmd,
+		cancel:            cancel,
+		stopProcess:       stopProcess,
+		processContextErr: &processContextErr,
+		shellExited:       &shellExited,
+		processMu:         &processMu,
+		reader:            reader,
+		capture:           capture,
+		copied:            copied,
+		pid:               pid,
+		pgid:              pgid,
+		startToken:        startToken,
+	}, nil
+}
+
+// The shell and its captured stdout/stderr have separate lifetimes. A short
+// bounded drain captures buffered output without waiting indefinitely for inherited
+// handles; only background:true with a live shell retains captured output.
+func (e *Executor) runBashCmd(ctx context.Context, command string, timeout, drainTimeout time.Duration, output *bashOutputFile, dir string, preview *BashOutputPreview) (string, int, error) {
+	proc, err := e.startBashProcess(ctx, command, timeout, output, dir)
+	if err != nil {
+		return "", -1, err
+	}
+	return e.waitStartedBashCmd(ctx, proc, timeout, drainTimeout, output, dir, preview)
+}
+
+func (e *Executor) waitStartedBashCmd(ctx context.Context, proc *startedBashProcess, timeout, drainTimeout time.Duration, output *bashOutputFile, dir string, preview *BashOutputPreview) (string, int, error) {
+	defer output.Close()
+	defer proc.cancel()
+	cmd := proc.cmd
+	outPath := output.path
+	legacy := output.legacy
+	stopProcess := proc.stopProcess
+	processMu := proc.processMu
+	reader := proc.reader
+	capture := proc.capture
+	copied := proc.copied
+	cancel := proc.cancel
+
 	// On supported platforms, observe shell exit without reaping it. Keeping
 	// its PID reserved lets us stop the owned group before it can be reused.
 	ownedGroup, observeErr := waitBashExit(cmd)
@@ -446,7 +758,7 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout, drai
 		runErr = cmd.Wait()
 	}
 	processMu.Lock()
-	shellExited = true
+	*proc.shellExited = true
 	processMu.Unlock()
 	// The deadline governs the shell, not the subsequent pipe drain. Its
 	// watcher now returns ErrProcessDone without changing the shell outcome.
@@ -482,7 +794,8 @@ func (e *Executor) runBashCmd(ctx context.Context, command string, timeout, drai
 	}
 	_ = reader.Close()
 	_ = capture.summary.Close()
-	closeErr := f.Close()
+	closeErr := output.file.Close()
+	processContextErr := *proc.processContextErr
 	if capture.err != nil {
 		runErr = capture.err
 	} else if copyErr != nil {
@@ -638,8 +951,23 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	}
 	identity := invocationFromContext(ctx)
 	key, _ := ctx.Value(failureKeyContext{}).(string)
-	job := &Job{InvocationID: identity.id, ToolCallID: identity.callID, failureKey: key, Command: a.Command, Cwd: dir, OutputFile: output.publicPath(), Started: time.Now(), done: make(chan struct{}), cancel: cancel,
-		closeCancel: func() { cancelCause(ErrExecutorClosed) }}
+	jobsDir := e.JobsDirPath()
+	job := &Job{
+		InvocationID: identity.id,
+		ToolCallID:   identity.callID,
+		failureKey:   key,
+		Command:      a.Command,
+		Cwd:          dir,
+		OutputID:     e.OutputID,
+		OutputFile:   output.publicPath(),
+		jobsDir:      jobsDir,
+		outputDir:    e.OutputDir,
+		retained:     !foreground || jobsDir != "",
+		Started:      time.Now(),
+		done:         make(chan struct{}),
+		cancel:       cancel,
+		closeCancel:  func() { cancelCause(ErrExecutorClosed) },
+	}
 	if foreground {
 		job.stopParent = context.AfterFunc(ctx, cancel)
 	}
@@ -648,28 +976,77 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	e.jobsMu.Lock()
 	if e.jobsClosed {
 		e.jobsMu.Unlock()
+		job.mu.Lock()
+		job.retained = false
+		job.mu.Unlock()
 		job.Cancel()
 		job.Detach()
 		output.Close()
 		return nil, ErrExecutorClosed
 	}
+	e.nextJobSeq++
+	seq := e.nextJobSeq
+	e.jobsMu.Unlock()
+
+	job.ID = fmt.Sprintf("bg-%d", seq)
+	// Close the race with an abort/cancel that already marked ctx done before
+	// starting the OS process, while populating PID/PGID/StartToken before the
+	// job is published into the registry.
+	if ctx.Err() != nil {
+		job.mu.Lock()
+		job.stopRequested = true
+		job.mu.Unlock()
+		cancel()
+	}
+	proc, startErr := e.startBashProcess(commandCtx, a.Command, timeout, output, dir)
+	if startErr == nil {
+		job.mu.Lock()
+		job.PID = proc.pid
+		job.PGID = proc.pgid
+		job.ProcessStarted = proc.startToken
+		job.mu.Unlock()
+	}
+
+	e.jobsMu.Lock()
+	if e.jobsClosed {
+		e.jobsMu.Unlock()
+		job.mu.Lock()
+		job.retained = false
+		job.mu.Unlock()
+		if startErr == nil {
+			cancel()
+			go func() {
+				defer finish()
+				_, _, _ = e.waitStartedBashCmd(commandCtx, proc, timeout, bashOutputDrainTimeout, output, dir, nil)
+			}()
+		} else {
+			cancel()
+			output.Close()
+			finish()
+		}
+		transferred = true
+		return nil, ErrExecutorClosed
+	}
 	if e.jobs == nil {
 		e.jobs = &JobRegistry{}
 	}
-	e.nextJobSeq++
-	e.jobs.addWithSeq(job, e.nextJobSeq)
+	e.jobs.addPreserved(job)
 	e.jobsMu.Unlock()
-	// Close the race with an abort that ran its registry snapshot just
-	// before this job was registered.
-	if ctx.Err() != nil {
-		job.Cancel()
-	}
+	job.persist()
 	transferred = true
 	go func() {
 		defer cancel()
 		defer finish()
 		preview := &BashOutputPreview{}
-		out, code, err := e.runBashCmd(commandCtx, a.Command, timeout, bashOutputDrainTimeout, output, dir, preview)
+		var out string
+		var code int
+		var err error
+		if startErr != nil {
+			code = -1
+			err = startErr
+		} else {
+			out, code, err = e.waitStartedBashCmd(commandCtx, proc, timeout, bashOutputDrainTimeout, output, dir, preview)
+		}
 		if audit != nil {
 			entry := AuditEntry{InvocationID: job.InvocationID, ToolCallID: job.ToolCallID, TS: time.Now(), Kind: "bash", Tool: "bash", Args: truncate(a.Command, 500), ExitCode: code}
 			if err != nil {
@@ -685,20 +1062,60 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 // Detach transfers cancellation ownership from the turn to the session.
 func (j *Job) Detach() {
 	j.mu.Lock()
-	defer j.mu.Unlock()
 	if j.stopParent != nil {
 		j.stopParent()
 		j.stopParent = nil
 	}
+	promote := !j.retained && !j.forgotten && j.ID != ""
+	if promote {
+		j.retained = true
+	}
+	j.mu.Unlock()
+	if promote {
+		j.persist()
+	}
 }
 
 func (j *Job) Cancel() {
+	_ = j.CancelErr()
+}
+
+// CancelErr explicitly stops the job's OS process group and returns any
+// non-benign OS signalling error (such as EPERM or ErrProcessIdentityMismatch).
+func (j *Job) CancelErr() error {
 	j.mu.Lock()
-	defer j.mu.Unlock()
-	j.stopRequested = true
-	if j.cancel != nil {
-		j.cancel()
+	if j.finished || j.unknown {
+		j.mu.Unlock()
+		return nil
 	}
+	j.stopRequested = true
+	adopted := j.Adopted
+	id := ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
+	cancel := j.cancel
+	outFile, cwd := j.OutputFile, j.Cwd
+	j.mu.Unlock()
+	if adopted {
+		err := stopVerifiedProcessGroup(id)
+		if errors.Is(err, ErrProcessIdentityMismatch) {
+			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
+			j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, err), summary, preview)
+			if cancel != nil {
+				cancel()
+			}
+			return err
+		}
+		if err != nil && !errors.Is(err, os.ErrProcessDone) {
+			j.persist()
+			return err
+		}
+		j.persist()
+		return nil
+	}
+	if cancel != nil {
+		cancel()
+	}
+	j.persist()
+	return nil
 }
 
 // StopRequested reports whether this live job has been explicitly cancelled.
@@ -749,7 +1166,7 @@ func (e *Executor) RunningWorkspaceJobs() int64 {
 	var running int64
 	for registry := range registries {
 		for _, job := range registry.List() {
-			if _, done := job.Result(); !done {
+			if job.Status() == JobRunning {
 				running++
 			}
 		}
@@ -797,13 +1214,14 @@ func (e *Executor) SwitchSession(id string) {
 		}
 		keep := false
 		for _, job := range reg.List() {
-			if _, done := job.Result(); !done || !job.Delivered() {
+			if job.Status() == JobRunning || !job.Delivered() {
 				keep = true
 				break
 			}
 		}
 		if !keep {
 			delete(e.sessionJobs, sid)
+			delete(e.recoveredSessions, sid)
 		}
 	}
 	e.sessionID = id
@@ -820,6 +1238,10 @@ func (e *Executor) RenameSession(oldID, newID string) {
 	if registry := e.sessionJobs[oldID]; registry != nil {
 		e.sessionJobs[newID] = registry
 		delete(e.sessionJobs, oldID)
+	}
+	if e.recoveredSessions != nil && e.recoveredSessions[oldID] {
+		e.recoveredSessions[newID] = true
+		delete(e.recoveredSessions, oldID)
 	}
 	if e.sessionID == oldID {
 		e.sessionID = newID

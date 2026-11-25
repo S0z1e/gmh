@@ -32,6 +32,7 @@ import (
 	"minimalharness/internal/config"
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
+	"minimalharness/internal/tools"
 )
 
 const (
@@ -242,6 +243,7 @@ func (s *Server) run() error {
 		Session: s.app.Store.ID, Model: s.app.Cfg.Client.Model, API: s.app.Cfg.Client.API,
 		Mode: s.app.Cfg.ApprovalMode(), Root: s.app.Root,
 		Resumed: s.app.ResumedMessage != "", Messages: len(s.app.History),
+		ResumedMessage: s.app.ResumedMessage, RecoveredJobs: s.app.RecoveredJobs,
 	})
 	go s.readLoop()
 	s.agentLoop()
@@ -307,7 +309,7 @@ func (s *Server) handleLine(line string) {
 		s.handleSteerPrompt(req)
 	case "set_approval_mode":
 		s.handleSetApprovalMode(req)
-	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "attach_file", "list_pending_files", "set_model", "rename_session", "resume_session", "steal_session", "delete_session", "set_tool_mode", "rollback", "prune_artifacts", "command":
+	case "clear", "compact", "new_session", "skill", "quit", "attach_image", "attach_file", "list_pending_files", "set_model", "rename_session", "resume_session", "steal_session", "delete_session", "set_tool_mode", "rollback", "prune_artifacts", "stop_job", "command":
 		s.enqueue(req, workControl)
 	default:
 		s.respond(req, nil, fmt.Errorf("unknown request type %q", req.Type))
@@ -339,6 +341,13 @@ func (s *Server) handlePrompt(req Request) {
 		}
 		if typ == "resume_session" {
 			ctrl = Request{ID: req.ID, Type: typ, Session: arg}
+		}
+		if typ == "stop_job" {
+			if strings.TrimSpace(arg) == "" {
+				s.respond(req, nil, fmt.Errorf("stop_job needs a job id"))
+				return
+			}
+			ctrl = Request{ID: req.ID, Type: typ, JobID: arg}
 		}
 		if typ == "rollback" {
 			n := 1
@@ -425,6 +434,9 @@ func slashRequest(line string) (typ, arg string) {
 	case line == "/rename" || strings.HasPrefix(line, "/rename "):
 		return "rename_session", strings.TrimSpace(strings.TrimPrefix(line, "/rename"))
 	default:
+		if arg, matched := app.ParseJobsStopArg(line); matched {
+			return "stop_job", arg
+		}
 		return "", ""
 	}
 }
@@ -800,16 +812,39 @@ func (s *Server) jobsList() []map[string]any {
 	jobs := s.app.Cfg.Exec.Jobs()
 	list := make([]map[string]any, 0, len(jobs))
 	for _, j := range jobs {
+		snap := j.Snapshot()
 		item := map[string]any{
-			"id": j.ID, "status": fmt.Sprintf("%s", j.Status()),
-			"elapsed": j.Elapsed().Seconds(), "command": j.Command,
+			"id": snap.ID, "status": fmt.Sprintf("%s", snap.Status),
+			"elapsed": j.Elapsed().Seconds(), "command": snap.Command,
 		}
-		if res, ok := j.Result(); ok {
-			code := res.ExitCode
-			item["exit_code"] = &code
-			if res.Err != nil {
-				item["error"] = res.Err.Error()
+		if snap.Cwd != "" {
+			item["cwd"] = snap.Cwd
+		}
+		if snap.OutputFile != "" {
+			item["output_file"] = snap.OutputFile
+		}
+		if snap.Identity.PID > 0 {
+			item["pid"] = snap.Identity.PID
+		}
+		if snap.Identity.PGID > 0 {
+			item["pgid"] = snap.Identity.PGID
+		}
+		if snap.Adopted {
+			item["adopted"] = true
+		}
+		if snap.RecoveryNote != "" {
+			item["recovery_note"] = snap.RecoveryNote
+		}
+		if snap.Status == tools.JobDone {
+			if !snap.Result.ExitCodeUnknown {
+				code := snap.Result.ExitCode
+				item["exit_code"] = &code
 			}
+			if snap.Result.Err != nil {
+				item["error"] = snap.Result.Err.Error()
+			}
+		} else if snap.Status == tools.JobUnknown && snap.RecoveryNote != "" {
+			item["error"] = snap.RecoveryNote
 		}
 		list = append(list, item)
 	}
@@ -1412,7 +1447,10 @@ func (s *Server) doControl(req Request) {
 			return
 		}
 		s.refreshState()
-		s.respond(req, map[string]any{"session": req.Session, "messages": n}, nil)
+		s.respond(req, map[string]any{
+			"session": req.Session, "messages": n,
+			"resumed_message": s.app.ResumedMessage, "recovered_jobs": s.app.RecoveredJobs,
+		}, nil)
 	case "steal_session":
 		if req.Session == "" {
 			s.respond(req, nil, fmt.Errorf("steal_session needs {\"session\": id}"))
@@ -1428,7 +1466,10 @@ func (s *Server) doControl(req Request) {
 			return
 		}
 		s.refreshState()
-		s.respond(req, map[string]any{"session": req.Session, "messages": n, "stolen": true}, nil)
+		s.respond(req, map[string]any{
+			"session": req.Session, "messages": n, "stolen": true,
+			"resumed_message": s.app.ResumedMessage, "recovered_jobs": s.app.RecoveredJobs,
+		}, nil)
 	case "delete_session":
 		if req.Session == "" {
 			s.respond(req, nil, fmt.Errorf("delete_session needs {\"session\": id}"))
@@ -1457,6 +1498,26 @@ func (s *Server) doControl(req Request) {
 		}
 		s.respond(req, map[string]any{"ok": true}, nil)
 		s.shutdown()
+	case "stop_job":
+		if req.JobID == "" {
+			s.respond(req, nil, fmt.Errorf("stop_job needs {\"job_id\": id}"))
+			return
+		}
+		res, err := s.app.Cfg.Exec.StopJob(req.JobID)
+		if s.app.Store != nil {
+			if saved, saveErr := agent.SaveJobResultsMessages(s.app.Store, s.app.Cfg.Exec.Jobs()); saveErr == nil && len(saved) > 0 {
+				s.app.History = append(s.app.History, saved...)
+			}
+		}
+		s.refreshState()
+		if err != nil {
+			s.respond(req, nil, err)
+			return
+		}
+		s.respond(req, map[string]any{
+			"job_id": req.JobID, "text": res.Text,
+			"exit_code": res.ExitCode, "output_file": res.OutputFile,
+		}, nil)
 	case "command":
 		out, err := s.runner.RunCommand(ctx, req.Name, req.Message)
 		if err != nil {

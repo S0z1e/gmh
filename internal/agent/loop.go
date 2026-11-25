@@ -363,7 +363,7 @@ func (c *Config) execBash(ctx context.Context, tc llm.ToolCall) (tools.ToolResul
 	case <-job.Done():
 		return deliver()
 	case <-timer.C:
-		if _, ok := job.Result(); ok {
+		if job.Status() != tools.JobRunning {
 			return deliver()
 		}
 		job.Detach()
@@ -387,7 +387,13 @@ func jobResultMessage(job *tools.Job, res tools.JobResult) (string, error) {
 			}
 			return fmt.Sprintf("Background job %s was killed by its timeout: %v.\nOutput:\n%s", job.ID, res.Err, capText(res.Output, 32*1024)), res.Err
 		}
+		if res.ExitCodeUnknown {
+			return fmt.Sprintf("Background job %s finished (%v; exit status unavailable).\nOutput:\n%s", job.ID, res.Err, capText(res.Output, 32*1024)), res.Err
+		}
 		return fmt.Sprintf("Background job %s finished with error: %v (exit %d).\nOutput:\n%s", job.ID, res.Err, res.ExitCode, capText(res.Output, 32*1024)), res.Err
+	}
+	if res.ExitCodeUnknown {
+		return fmt.Sprintf("Background job %s finished (exit status unavailable).\nOutput:\n%s", job.ID, capText(res.Output, 32*1024)), nil
 	}
 	return fmt.Sprintf("Background job %s finished (exit %d).\nOutput:\n%s", job.ID, res.ExitCode, capText(res.Output, 32*1024)), nil
 }
@@ -398,6 +404,7 @@ func jobResultMessage(job *tools.Job, res tools.JobResult) (string, error) {
 // pending for a later step or the turn-end drain.
 func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) ([]llm.Message, []pendingJob) {
 	var done, rest []pendingJob
+	var unknownJobs, adoptedNoticeJobs []*tools.Job
 	cutoff := time.Now()
 	if c.Exec != nil {
 		for _, job := range c.Exec.Jobs() {
@@ -407,16 +414,60 @@ func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) (
 		}
 	}
 	for _, p := range pending {
-		if p.job.Delivered() {
+		switch p.job.Status() {
+		case tools.JobUnknown:
+			if !p.job.Delivered() {
+				unknownJobs = append(unknownJobs, p.job)
+			}
 			continue
+		case tools.JobDone:
+			if p.job.Delivered() {
+				continue
+			}
+			if finished, ok := p.job.FinishedAt(); ok && !finished.After(cutoff) {
+				done = append(done, p)
+			} else if !p.job.Reported() {
+				rest = append(rest, p)
+			}
+		default: // JobRunning
+			if p.job.Adopted && !p.job.AdoptionNoticed() {
+				adoptedNoticeJobs = append(adoptedNoticeJobs, p.job)
+			}
+			if !p.job.Reported() {
+				// Already-reported running jobs remain only in the registry:
+				// they must not force another drain or discard a final answer.
+				rest = append(rest, p)
+			}
 		}
-		if finished, ok := p.job.FinishedAt(); ok && !finished.After(cutoff) {
-			done = append(done, p)
-		} else if !p.job.Reported() {
-			// Already-reported running jobs remain only in the registry:
-			// they must not force another drain or discard a final answer.
-			rest = append(rest, p)
+	}
+	for _, job := range unknownJobs {
+		res, _ := job.UnknownResult()
+		msg := unknownJobMessage(job, res)
+		msgs = append(msgs, msg)
+		if c.Session != nil {
+			c.persist(msgs[len(msgs)-1])
 		}
+		if c.persistErr != nil {
+			return msgs, pending
+		}
+		job.MarkDelivered()
+		if c.progress != nil {
+			c.progress.jobs[job.ID] = true
+		}
+		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: msg.Content, ToolErr: res.Err, JobID: job.ID, ToolCallID: job.ToolCallID, InvocationID: job.InvocationID, ToolOutputFile: job.OutputFile})
+	}
+	for _, job := range adoptedNoticeJobs {
+		msg := adoptedJobNoticeMessage(job)
+		msgs = append(msgs, msg)
+		if c.Session != nil {
+			c.persist(msgs[len(msgs)-1])
+		}
+		if c.persistErr != nil {
+			return msgs, pending
+		}
+		job.MarkAdoptionNoticed()
+		job.MarkReported()
+		rest = slices.DeleteFunc(rest, func(p pendingJob) bool { return p.job == job })
 	}
 	if len(done) == 0 {
 		return msgs, rest
@@ -438,7 +489,7 @@ func (c *Config) collectFinishedJobs(msgs []llm.Message, pending []pendingJob) (
 			return msgs, pending
 		}
 		p.job.MarkDelivered()
-		c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: obs, ToolErr: toolErr, JobID: p.job.ID, ToolCallID: p.job.ToolCallID, InvocationID: p.job.InvocationID, ToolExitCode: &res.ExitCode, ToolOutputFile: p.job.OutputFile})
+		c.emit(backgroundDoneEvent(p.job, res, obs, toolErr))
 	}
 	return msgs, rest
 }
@@ -525,7 +576,7 @@ func (c *Config) drainPending(ctx context.Context, msgs []llm.Message, pending [
 	// so they must not make the next turn pay the bound too.
 	var freshJobs []*tools.Job
 	for _, job := range jobs {
-		if _, done := job.Result(); !done && !job.Reported() {
+		if job.Status() == tools.JobRunning && !job.Reported() {
 			freshJobs = append(freshJobs, job)
 		}
 	}
@@ -871,6 +922,25 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 	var pending []pendingJob
 	c.progress = &turnProgress{ctx: ctx, jobs: make(map[string]bool)}
 	defer func() { c.progress = nil }()
+	if c.Exec != nil {
+		sessID := ""
+		if c.Session != nil {
+			sessID = c.Session.ID
+		}
+		if !c.Exec.SessionRecovered(sessID) {
+			source := msgs
+			if c.Session != nil {
+				if saved, err := session.Load(c.Session.ID); err == nil {
+					source = saved
+				}
+			}
+			if _, err := RecoverExecutorJobs(c.Exec, sessID, source); err != nil {
+				c.LastTerminalReason = TerminalError
+				c.emit(Event{Kind: EventError, Err: err, TerminalReason: TerminalError})
+				return "", total, err
+			}
+		}
+	}
 	if err := c.reconcileJobDeliveries(); err != nil {
 		c.LastTerminalReason = TerminalError
 		c.emit(Event{Kind: EventError, Err: err, TerminalReason: TerminalError})
@@ -1572,12 +1642,17 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 			if target := res.StoppedJob; target != nil && !target.Delivered() {
 				stopped = target
 				if outcome, done := target.Result(); done {
-					res.Text = fmt.Sprintf("Stopped background job %s (exit %d).", target.ID, outcome.ExitCode)
-					res.ExitCode = &outcome.ExitCode
-				} else if !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == target }) {
-					pending = append(pending, pendingJob{callID: target.ToolCallID, job: target})
-				}
-				if _, done := target.Result(); !done {
+					if outcome.ExitCodeUnknown {
+						res.Text = fmt.Sprintf("Stopped background job %s (exit status unavailable).", target.ID)
+						res.ExitCode = nil
+					} else {
+						res.Text = fmt.Sprintf("Stopped background job %s (exit %d).", target.ID, outcome.ExitCode)
+						res.ExitCode = &outcome.ExitCode
+					}
+				} else if target.Status() == tools.JobRunning {
+					if !slices.ContainsFunc(pending, func(p pendingJob) bool { return p.job == target }) {
+						pending = append(pending, pendingJob{callID: target.ToolCallID, job: target})
+					}
 					err = fmt.Errorf("stop requested for %s; completion is not confirmed yet", target.ID)
 					res.Status = tools.ResultDeferred
 				}
@@ -1667,9 +1742,7 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 					}
 					d.job.MarkDelivered()
 					pending = slices.DeleteFunc(pending, func(p pendingJob) bool { return p.job == d.job })
-					c.emit(Event{Kind: EventToolBackgroundDone, ToolName: "bash", ToolOutput: d.output, ToolErr: d.result.Err,
-						JobID: d.job.ID, ToolCallID: d.job.ToolCallID, InvocationID: d.job.InvocationID,
-						ToolExitCode: &d.result.ExitCode, ToolOutputFile: d.job.OutputFile})
+					c.emit(backgroundDoneEvent(d.job, d.result, d.output, d.result.Err))
 				}
 			}
 			deliver(deliveries)
