@@ -461,6 +461,33 @@ func TestReplayCapStaysClosedAfterReopen(t *testing.T) {
 	}
 }
 
+func TestInheritedReplayCapTruncatesAnotherConnection(t *testing.T) {
+	s, out := usageRegressionServer(t, false)
+	path, err := replayLogPath(s.app.Store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	body := "{\"sequence\":1,\"connection_id\":\"first\",\"type\":\"turn_started\"}\n" +
+		"{\"sequence\":2,\"connection_id\":\"first\",\"type\":\"replay_capped\"}\n"
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	s.handleQuery(Request{ID: "other", Type: "replay", AfterSequence: 0, ConnectionID: "second", ResumeSession: s.app.Store.ID})
+	var resp struct {
+		Data replayPage `json:"data"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Data.Truncated || len(resp.Data.Events) != 0 {
+		t.Fatalf("inherited cap: %+v", resp.Data)
+	}
+}
+
 func TestReplayLogReadsLinesPastTheReadBuffer(t *testing.T) {
 	s, _ := usageRegressionServer(t, false)
 	log, err := openReplayLog(s.app.Store.ID)

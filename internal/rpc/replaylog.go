@@ -296,6 +296,7 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 	defer unlock()
 	info, statErr := f.Stat()
 	fileFull := statErr == nil && info.Size() >= replayLogByteCap-256
+	var sealed bool
 	reader := bufio.NewReaderSize(f, 64*1024)
 	var stored int
 	var last uint64
@@ -327,6 +328,7 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 			continue
 		}
 		if head.Type == "replay_capped" {
+			sealed = true
 			if head.ConnectionID == connectionID && head.Sequence > capAt {
 				capAt = head.Sequence
 			}
@@ -348,7 +350,7 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 		events, stored, dropped = admitReplayEvent(events, stored, replayEvent{sequence: head.Sequence, data: copied, critical: criticalReplayType(copied)})
 		raiseEvicted(&evicted, dropped)
 	}
-	if fileFull && capAt == 0 {
+	if capAt == 0 && (fileFull || sealed) {
 		if last == 0 {
 			capAt = 1
 		} else if last < ^uint64(0) {

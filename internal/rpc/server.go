@@ -138,7 +138,6 @@ type Server struct {
 	evictedSeq   uint64 // highest event sequence evicted from eventHistory, guarded by writeMu
 	replayLog    *replayLog
 	replayLogID  string
-	replayCap    uint64
 	replayPaused bool
 	replayHold   [][]byte
 	skippedSeqs  []uint64 // oversized events omitted individually, guarded by writeMu
@@ -1599,7 +1598,6 @@ func (s *Server) doControl(req Request) {
 		if owned {
 			s.refreshState()
 			s.rebindReplayLog()
-			s.resumeReplay()
 		}
 		if err != nil {
 			s.respond(req, nil, err)
@@ -1725,35 +1723,20 @@ func (s *Server) pauseReplay() {
 		s.replayLog = nil
 	}
 	s.replayLogID = ""
-	s.replayCap = 0
 	s.replayPaused = true
-}
-
-func (s *Server) resumeReplay() {
-	s.writeMu.Lock()
-	s.replayPaused = false
-	s.writeMu.Unlock()
-}
-
-func (s *Server) releaseReplayLog() {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.replayLog != nil {
-		_ = s.replayLog.close()
-		s.replayLog = nil
-	}
-	s.replayLogID = ""
-	s.replayCap = 0
 }
 
 func (s *Server) rebindReplayLog() {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	s.replayPaused = false
 	if s.app == nil || s.app.Store == nil {
+		s.dropReplayHoldLocked()
 		return
 	}
 	id := s.app.Store.ID
 	if s.replayLog != nil && s.replayLogID == id {
+		s.flushReplayHoldLocked()
 		return
 	}
 	if s.replayLog != nil {
@@ -1761,10 +1744,10 @@ func (s *Server) rebindReplayLog() {
 		s.replayLog = nil
 	}
 	s.replayLogID = ""
-	s.replayCap = 0
 	log, err := openReplayLog(id)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "harness rpc replay log unavailable: %v\n", err)
+		s.dropReplayHoldLocked()
 		return
 	}
 	s.replayLog = log
@@ -1772,16 +1755,19 @@ func (s *Server) rebindReplayLog() {
 	s.flushReplayHoldLocked()
 }
 
-func (s *Server) flushReplayHoldLocked() {
-	if s.replayLog == nil {
-		return
-	}
-	for _, line := range s.replayHold {
-		if err := s.replayLog.append(line, true); err != nil {
-			break
-		}
+func (s *Server) dropReplayHoldLocked() {
+	if len(s.replayHold) > 0 {
+		fmt.Fprintf(os.Stderr, "harness rpc dropped %d replay events while the log was unavailable\n", len(s.replayHold))
 	}
 	s.replayHold = nil
+}
+
+func (s *Server) flushReplayHoldLocked() {
+	lines := s.replayHold
+	s.replayHold = nil
+	for _, line := range lines {
+		s.writeReplayLocked(line, true)
+	}
 }
 
 func applyApprovalTimeout(s *Server) {
@@ -2064,14 +2050,15 @@ func (s *Server) appendReplayLocked(data []byte, sync bool) {
 		s.replayHold = append(s.replayHold, append([]byte(nil), data...))
 		return
 	}
-	if s.replayLog == nil || s.replayLogID == "" {
+	s.writeReplayLocked(data, sync)
+}
+
+func (s *Server) writeReplayLocked(data []byte, sync bool) {
+	if s.replayLog == nil || s.replayLogID == "" || len(data) == 0 {
 		return
 	}
 	if err := s.replayLog.append(data, sync); err != nil {
 		if errors.Is(err, errReplayLogFull) {
-			if s.replayCap == 0 {
-				s.replayCap = s.sequence
-			}
 			if !s.replayLog.full {
 				marker, mErr := json.Marshal(map[string]any{
 					"type": "replay_capped", "sequence": s.sequence, "connection_id": s.connectionID,
