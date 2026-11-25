@@ -239,8 +239,15 @@ func (s *Server) run() error {
 	} else {
 		s.replayLog = log
 		s.replayLogID = s.app.Store.ID
-		defer log.close()
 	}
+	defer func() {
+		s.writeMu.Lock()
+		if s.replayLog != nil {
+			_ = s.replayLog.close()
+			s.replayLog = nil
+		}
+		s.writeMu.Unlock()
+	}()
 	s.output = newProtocolOutput(s.out, s.onOutputFailure)
 	s.app.Cfg.OnEvent = s.onEvent
 	s.app.Cfg.Ask = s.ask
@@ -724,14 +731,14 @@ func (s *Server) handleReplay(req Request) {
 
 	s.writeMu.Lock()
 	s.flushDeltaLocked()
-	history, evicted, skipped, durable, err := s.replaySourceLocked(sessionID, connectionID)
+	history, evicted, skipped, durable, err := s.replaySourceLocked(sessionID, connectionID, liveSession)
 	if err != nil {
 		s.writeMu.Unlock()
 		s.respond(req, nil, err)
 		return
 	}
 	if durable {
-		pendingApprovals = nil
+		pendingApprovals = []string{}
 	}
 	page := replayPage{
 		ConnectionID: connectionID, Session: sessionID, LatestSequence: s.sequence,
@@ -799,17 +806,13 @@ func (s *Server) outputOpen() bool {
 // replaySourceLocked returns the in-memory buffer for the live connection, or
 // the durable log when the client names another connection or session.
 // writeMu is already held.
-func (s *Server) replaySourceLocked(sessionID, connectionID string) (history []replayEvent, evicted uint64, skipped []uint64, durable bool, err error) {
+func (s *Server) replaySourceLocked(sessionID, connectionID, liveSession string) (history []replayEvent, evicted uint64, skipped []uint64, durable bool, err error) {
 	sameConnection := connectionID == s.connectionID || (connectionID == "" && s.connectionID == "")
 	owner := s.replayLogID
-	if owner == "" && s.app != nil && s.app.Store != nil {
-		owner = s.app.Store.ID
+	if owner == "" {
+		owner = liveSession
 	}
 	live := sameConnection && (sessionID == "" || sessionID == owner)
-	// A missing durable log cannot answer a resume for another connection.
-	if s.replayLogID == "" && connectionID != "" && connectionID != s.connectionID {
-		live = false
-	}
 	if live {
 		history = append([]replayEvent(nil), s.eventHistory...)
 		return history, s.evictedSeq, append([]uint64(nil), s.skippedSeqs...), false, nil
@@ -966,13 +969,13 @@ func (s *Server) ask(req agent.ApprovalRequest) (bool, error) {
 		err := ctx.Err()
 		return err == nil, err
 	}
-	if err := ctx.Err(); err != nil {
-		s.approvalsMu.Unlock()
-		return false, err
-	}
 	if s.isDetached() {
 		s.approvalsMu.Unlock()
 		return false, agent.ErrApprovalDetached
+	}
+	if err := ctx.Err(); err != nil {
+		s.approvalsMu.Unlock()
+		return false, err
 	}
 	s.apprSeq++
 	id := fmt.Sprintf("appr-%d", s.apprSeq)
@@ -1628,16 +1631,13 @@ func (s *Server) doControl(req Request) {
 			s.respond(req, nil, fmt.Errorf("delete_session needs {\"session\": id}"))
 			return
 		}
-		if req.Session == s.app.Store.ID {
-			s.respond(req, nil, fmt.Errorf("cannot delete the current session %q (resume or start another session first)", req.Session))
+		if s.app.Store != nil && s.app.Store.Owns(req.Session) {
+			s.respond(req, nil, fmt.Errorf("cannot delete the current session %q (resume or start another session first)", s.app.Store.ID))
 			return
 		}
 		if err := session.DeleteSession(req.Session); err != nil {
 			s.respond(req, nil, err)
 			return
-		}
-		if err := removeReplayLog(req.Session); err != nil {
-			fmt.Fprintf(os.Stderr, "harness rpc replay log delete failed: %v\n", err)
 		}
 		s.respond(req, map[string]any{"deleted": true, "session": req.Session}, nil)
 	case "set_tool_mode":
@@ -1725,6 +1725,7 @@ func (s *Server) rebindReplayLog() {
 		_ = s.replayLog.close()
 		s.replayLog = nil
 	}
+	s.replayLogID = ""
 	log, err := openReplayLog(id)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "harness rpc replay log unavailable: %v\n", err)
@@ -1732,29 +1733,6 @@ func (s *Server) rebindReplayLog() {
 	}
 	s.replayLog = log
 	s.replayLogID = id
-}
-
-func (s *Server) moveReplayForRename(oldID, newID string) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.replayLog != nil && (s.replayLogID == oldID || s.replayLogID == newID) {
-		_ = s.replayLog.close()
-		s.replayLog = nil
-		s.replayLogID = ""
-	}
-	if err := moveReplayLog(oldID, newID); err != nil {
-		return err
-	}
-	if s.app == nil || s.app.Store == nil || s.app.Store.ID != newID {
-		return nil
-	}
-	log, err := openReplayLog(newID)
-	if err != nil {
-		return err
-	}
-	s.replayLog = log
-	s.replayLogID = newID
-	return nil
 }
 
 func applyApprovalTimeout(s *Server) {
@@ -2035,11 +2013,15 @@ func (s *Server) appendReplayLocked(data []byte, sync bool) {
 	}
 	if err := s.replayLog.append(data, sync); err != nil {
 		if errors.Is(err, errReplayLogFull) {
-			marker, mErr := json.Marshal(map[string]any{"type": "replay_capped", "sequence": ^uint64(0), "connection_id": s.connectionID})
-			if mErr == nil {
-				_ = s.replayLog.appendCap(marker)
+			if !s.replayLog.full {
+				marker, mErr := json.Marshal(map[string]any{
+					"type": "replay_capped", "sequence": s.sequence, "connection_id": s.connectionID,
+				})
+				if mErr == nil {
+					_ = s.replayLog.appendCap(marker)
+				}
+				fmt.Fprintf(os.Stderr, "harness rpc replay log reached its %d byte cap; older events remain readable\n", maxReplayLogBytes)
 			}
-			fmt.Fprintf(os.Stderr, "harness rpc replay log reached its %d byte cap; older events remain readable\n", maxReplayLogBytes)
 			return
 		}
 		fmt.Fprintf(os.Stderr, "harness rpc replay log write failed: %v\n", err)

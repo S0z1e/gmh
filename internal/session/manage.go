@@ -187,10 +187,16 @@ func renameSessionFiles(oldID, newID string) error {
 	if err != nil {
 		return err
 	}
-	if err := performOperation(op); err != nil {
+	if err := moveReplayBesideSession(oldID, newID); err != nil {
 		return err
 	}
-	return moveReplayBesideSession(oldID, newID)
+	if err := performOperation(op); err != nil {
+		if back := moveReplayBesideSession(newID, oldID); back != nil {
+			return errors.Join(err, back)
+		}
+		return err
+	}
+	return nil
 }
 
 // RenameSession renames a session that is not currently open. For the

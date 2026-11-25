@@ -14,6 +14,10 @@ import (
 	"time"
 
 	"minimalharness/internal/agent"
+	"minimalharness/internal/app"
+	"minimalharness/internal/llm"
+	"minimalharness/internal/session"
+	"minimalharness/internal/tools"
 )
 
 func TestOversizedReplayEventPreservesEarlierHistory(t *testing.T) {
@@ -371,6 +375,194 @@ func TestSlowReaderTimesOutActiveTurnAfterDetachGrace(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("server did not exit")
+	}
+}
+
+func TestReplayLogReadsLinesPastTheReadBuffer(t *testing.T) {
+	s, _ := usageRegressionServer(t, false)
+	log, err := openReplayLog(s.app.Store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.replayLog = log
+	s.replayLogID = s.app.Store.ID
+	s.connectionID = "wide"
+	wide := strings.Repeat("w", 70<<10)
+	s.writeEvent(Event{Type: "tool_end", Output: wide})
+	if err := log.close(); err != nil {
+		t.Fatal(err)
+	}
+	events, _, _, err := loadReplayLog(s.app.Store.ID, "wide")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("wide event was not replayed: %d", len(events))
+	}
+}
+
+func TestTornReplayTailDoesNotSwallowTheNextEvent(t *testing.T) {
+	s, _ := usageRegressionServer(t, false)
+	path, err := replayLogPath(s.app.Store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepathDir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"sequence":1,"connection_id":"c","type":"turn_started"`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	log, err := openReplayLog(s.app.Store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.replayLog = log
+	s.replayLogID = s.app.Store.ID
+	s.connectionID = "c"
+	s.sequence = 1
+	s.writeEvent(Event{Type: "agent_settled", Text: "after tear"})
+	if err := log.close(); err != nil {
+		t.Fatal(err)
+	}
+	events, evicted, _, err := loadReplayLog(s.app.Store.ID, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || evicted == 0 {
+		t.Fatalf("torn tail fused with the next event: events=%d evicted=%d", len(events), evicted)
+	}
+	var ev Event
+	if err := json.Unmarshal(events[0].data, &ev); err != nil || ev.Type != "agent_settled" {
+		t.Fatalf("next event = %+v err=%v", ev, err)
+	}
+}
+
+func filepathDir(path string) string {
+	i := strings.LastIndex(path, "/")
+	if i < 0 {
+		return "."
+	}
+	return path[:i]
+}
+
+func TestReconnectAfterTransportFailureReplaysDurableEvents(t *testing.T) {
+	t.Setenv("HARNESS_RPC_DETACH_GRACE_SECONDS", "3")
+	s, _ := usageRegressionServer(t, false)
+	home := os.Getenv("HOME")
+	root := s.app.Root
+	sessionID := s.app.Store.ID
+	release := make(chan struct{})
+	started := make(chan struct{})
+	completed := make(chan struct{})
+	s.app.Cfg.Client.HTTP.Transport = usageRegressionTransport(func(r *http.Request) (*http.Response, error) {
+		close(started)
+		select {
+		case <-release:
+			close(completed)
+			body := "data: {\"choices\":[{\"delta\":{\"content\":\"reconnected\"}}]}\n\ndata: [DONE]\n\n"
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	})
+	inR, inW := io.Pipe()
+	out := newBlockingWriter()
+	done := make(chan error, 1)
+	go func() { done <- Run(s.app, s.runner, inR, out) }()
+	select {
+	case <-out.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ready was not written")
+	}
+	out.mu.Lock()
+	out.hold = make(chan struct{})
+	out.blocked = make(chan struct{})
+	out.mu.Unlock()
+	if _, err := io.WriteString(inW, "{\"type\":\"prompt\",\"message\":\"survive disconnect\"}\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn did not start")
+	}
+	select {
+	case <-out.blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stdout did not block")
+	}
+	time.Sleep(5500 * time.Millisecond)
+	close(release)
+	select {
+	case <-completed:
+	case <-time.After(4 * time.Second):
+		t.Fatal("turn did not finish during detach grace")
+	}
+	_ = inW.Close()
+	out.unblock()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not exit")
+	}
+
+	t.Setenv("HOME", home)
+	store, err := session.Open(sessionID, session.OpenOptions{Workspace: root, Existing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	client := &llm.Client{API: "chat", Model: "fake", APIKey: "fake", BaseURL: "https://example.invalid", HTTP: &http.Client{Transport: usageRegressionTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("data: [DONE]\n\n")), Header: http.Header{}}, nil
+	})}}
+	nextApp := &app.App{Root: root, Store: store, Cfg: &agent.Config{Client: client, Session: store, Exec: &tools.Executor{Root: root}, Mode: "auto"}}
+	next := &Server{app: nextApp, runner: &app.Runner{App: nextApp, Print: func(string, ...any) {}}, out: new(bytes.Buffer), connectionID: "reconnected"}
+	next.refreshState()
+	log, err := openReplayLog(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next.replayLog = log
+	next.replayLogID = sessionID
+	t.Cleanup(func() { _ = log.close() })
+	raw, err := os.ReadFile(log.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var previous string
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		var head struct {
+			ConnectionID string `json:"connection_id"`
+			Type         string `json:"type"`
+		}
+		if json.Unmarshal(line, &head) == nil && head.Type == "turn_started" && head.ConnectionID != "" {
+			previous = head.ConnectionID
+			break
+		}
+	}
+	if previous == "" {
+		t.Fatal("transport failure left no durable turn_started")
+	}
+	var buf bytes.Buffer
+	next.out = &buf
+	next.handleQuery(Request{ID: "again", Type: "replay", AfterSequence: 0, ConnectionID: previous, ResumeSession: sessionID})
+	var resp struct {
+		Data replayPage `json:"data"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
+		t.Fatalf("decode %s: %v", buf.String(), err)
+	}
+	got := map[string]int{}
+	for _, raw := range resp.Data.Events {
+		var ev Event
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			t.Fatal(err)
+		}
+		got[ev.Type]++
+	}
+	if got["turn_started"] == 0 || got["agent_settled"] == 0 {
+		t.Fatalf("reconnect replay lost lifecycle events: %+v", got)
 	}
 }
 

@@ -103,8 +103,30 @@ func openReplayLog(sessionID string) (*replayLog, error) {
 		f.Close()
 		return nil, err
 	}
+	size := info.Size()
+	if size > 0 {
+		if _, err := f.Seek(-1, io.SeekEnd); err != nil {
+			unlock()
+			f.Close()
+			return nil, err
+		}
+		var last [1]byte
+		if _, err := io.ReadFull(f, last[:]); err != nil {
+			unlock()
+			f.Close()
+			return nil, err
+		}
+		if last[0] != '\n' {
+			if _, err := f.Write([]byte{'\n'}); err != nil {
+				unlock()
+				f.Close()
+				return nil, err
+			}
+			size++
+		}
+	}
 	unlock()
-	return &replayLog{path: path, file: f, bytes: info.Size(), full: info.Size() >= maxReplayLogBytes}, nil
+	return &replayLog{path: path, file: f, bytes: size, full: size >= maxReplayLogBytes}, nil
 }
 
 func (l *replayLog) append(data []byte, syncWrite bool) error {
@@ -112,6 +134,9 @@ func (l *replayLog) append(data []byte, syncWrite bool) error {
 }
 
 func (l *replayLog) appendCap(data []byte) error {
+	if l == nil || l.file == nil {
+		return errors.New("replay log is closed")
+	}
 	err := l.appendLimited(data, true, true)
 	l.full = true
 	return err
@@ -212,7 +237,9 @@ func loadReplayLog(sessionID, connectionID string) (events []replayEvent, evicte
 			continue
 		}
 		if head.Type == "replay_capped" {
-			raiseEvicted(&evicted, head.Sequence)
+			if head.ConnectionID == connectionID {
+				raiseEvicted(&evicted, head.Sequence)
+			}
 			continue
 		}
 		if head.ConnectionID != connectionID || head.Sequence == 0 {
@@ -270,8 +297,7 @@ func readReplayLine(r *bufio.Reader) (line []byte, torn, tooLong bool, err error
 			}
 			return bytes.TrimRight(buf, "\r\n"), false, false, nil
 		}
-		if errors.Is(readErr, bufio.ErrTooLong) {
-			tooLong = true
+		if errors.Is(readErr, bufio.ErrBufferFull) {
 			continue
 		}
 		if errors.Is(readErr, io.EOF) {
@@ -285,55 +311,4 @@ func readReplayLine(r *bufio.Reader) (line []byte, torn, tooLong bool, err error
 		}
 		return nil, false, false, readErr
 	}
-}
-
-func moveReplayLog(oldID, newID string) error {
-	if err := session.ValidateSessionID(oldID); err != nil {
-		return err
-	}
-	if err := session.ValidateSessionID(newID); err != nil {
-		return err
-	}
-	oldPath, err := replayLogPath(oldID)
-	if err != nil {
-		return err
-	}
-	newPath, err := replayLogPath(newID)
-	if err != nil {
-		return err
-	}
-	oldInfo, err := os.Lstat(oldPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if err := checkReplayPath(oldPath); err != nil {
-		return err
-	}
-	if newInfo, err := os.Lstat(newPath); err == nil {
-		if os.SameFile(oldInfo, newInfo) {
-			return os.Rename(oldPath, newPath)
-		}
-		if newInfo.Mode()&os.ModeSymlink != 0 || !newInfo.Mode().IsRegular() {
-			return fmt.Errorf("replay log %s is not a regular file", newID)
-		}
-		return fmt.Errorf("replay log %s already exists", newID)
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	return os.Rename(oldPath, newPath)
-}
-
-func removeReplayLog(sessionID string) error {
-	path, err := replayLogPath(sessionID)
-	if err != nil {
-		return err
-	}
-	err = os.Remove(path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	return err
 }
