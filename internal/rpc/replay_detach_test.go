@@ -157,3 +157,59 @@ func TestRPCOutputDisconnectAllowsActiveTurnToFinishInGraceWindow(t *testing.T) 
 		t.Fatal("server did not exit after detached turn finished")
 	}
 }
+
+func TestOutputTimeoutPlusDetachGraceLetsTurnFinish(t *testing.T) {
+	t.Setenv("HARNESS_RPC_DETACH_GRACE_SECONDS", "5")
+	s, _ := usageRegressionServer(t, false)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	completed := make(chan struct{})
+	s.app.Cfg.Client.HTTP.Transport = usageRegressionTransport(func(r *http.Request) (*http.Response, error) {
+		close(started)
+		select {
+		case <-release:
+			close(completed)
+			body := "data: {\"choices\":[{\"delta\":{\"content\":\"after both intervals\"}}]}\n\ndata: [DONE]\n\n"
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	})
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	defer inW.Close()
+	defer outR.Close()
+	done := make(chan error, 1)
+	go func() { done <- Run(s.app, s.runner, inR, outW) }()
+	reader := bufio.NewReader(outR)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(inW, "{\"id\":\"p1\",\"type\":\"prompt\",\"message\":\"block then finish\"}\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider did not start")
+	}
+	outR.Close()
+	_, _ = io.WriteString(inW, "{\"type\":\"get_state\"}\n")
+	time.Sleep(1500 * time.Millisecond)
+	select {
+	case <-completed:
+		t.Fatal("turn was cancelled during the write timeout, before detach grace")
+	default:
+	}
+	close(release)
+	select {
+	case <-completed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn did not finish inside the detach grace after the write timeout")
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not exit")
+	}
+}

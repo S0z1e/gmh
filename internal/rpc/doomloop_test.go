@@ -13,7 +13,8 @@ import (
 func TestInvalidContinuationRemainsAnswerable(t *testing.T) {
 	for _, req := range []Request{{Decision: "invalid"}, {Decision: "once", UpdatedArgs: `{broken`}, {Decision: "once", UpdatedArgs: `[]`}, {Decision: "once", UpdatedArgs: `null`}} {
 		ch := make(chan agent.ContinuationDecision, 1)
-		s := &Server{out: io.Discard, continuations: map[string]chan agent.ContinuationDecision{"cont-1": ch}}
+		errCh := make(chan error, 1)
+		s := &Server{out: io.Discard, continuations: map[string]continuationWait{"cont-1": {ch: ch, err: errCh}}}
 		req.ContinuationID = "cont-1"
 		s.handleContinuationResponse(req)
 		if _, ok := s.continuations["cont-1"]; !ok {
@@ -40,7 +41,7 @@ func TestInvalidContinuationRemainsAnswerable(t *testing.T) {
 func TestContinuationRegisteredAfterAbortDoesNotWait(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	s := &Server{out: io.Discard, done: make(chan struct{}), turnCtx: ctx, continuations: map[string]chan agent.ContinuationDecision{}}
+	s := &Server{out: io.Discard, done: make(chan struct{}), turnCtx: ctx, continuations: map[string]continuationWait{}}
 	done := make(chan error, 1)
 	go func() { _, err := s.confirmContinuation(agent.ContinuationRequest{ToolName: "read"}); done <- err }()
 	select {
@@ -62,7 +63,7 @@ func TestContinuationCancellationRemovesRegisteredWaiter(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var output bytes.Buffer
-	s := &Server{out: &output, done: make(chan struct{}), turnCtx: ctx, continuations: map[string]chan agent.ContinuationDecision{}}
+	s := &Server{out: &output, done: make(chan struct{}), turnCtx: ctx, continuations: map[string]continuationWait{}}
 	done := make(chan error, 1)
 	go func() { _, err := s.confirmContinuation(agent.ContinuationRequest{ToolName: "read"}); done <- err }()
 	deadline := time.Now().Add(time.Second)
@@ -97,7 +98,7 @@ func TestContinuationCancellationRemovesRegisteredWaiter(t *testing.T) {
 func TestAbortCleanupPrecedesNextTurnRegistration(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	s := &Server{out: io.Discard, turnCtx: ctx, turnCancel: cancel, continuations: map[string]chan agent.ContinuationDecision{}}
+	s := &Server{out: io.Discard, turnCtx: ctx, turnCancel: cancel, continuations: map[string]continuationWait{}}
 	// Pause abort after cancellation, while the old turn can already exit.
 	s.approvalsMu.Lock()
 	aborted := make(chan struct{})
@@ -105,11 +106,12 @@ func TestAbortCleanupPrecedesNextTurnRegistration(t *testing.T) {
 	<-ctx.Done()
 	registered := make(chan struct{})
 	ch := make(chan agent.ContinuationDecision, 1)
+	errCh := make(chan error, 1)
 	go func() {
 		s.turnMu.Lock()
 		s.turnCtx = context.Background()
 		s.continuationsMu.Lock()
-		s.continuations["next-turn"] = ch
+		s.continuations["next-turn"] = continuationWait{ch: ch, err: errCh}
 		s.continuationsMu.Unlock()
 		s.turnMu.Unlock()
 		close(registered)

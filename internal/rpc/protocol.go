@@ -83,6 +83,12 @@ type Request struct {
 	Answers []agent.QuestionAnswer `json:"answers,omitempty"`
 	// AfterSequence requests buffered events with Sequence > AfterSequence for replay.
 	AfterSequence uint64 `json:"after_sequence,omitempty"`
+	// ConnectionID resumes a previous RPC connection's durable replay log.
+	// Empty means the current connection.
+	ConnectionID string `json:"connection_id,omitempty"`
+	// ResumeSession selects the session whose durable replay log to read when
+	// it differs from the live session, for example after a process restart.
+	ResumeSession string `json:"resume_session,omitempty"`
 	// JobID identifies a background job for stop_job.
 	JobID string `json:"job_id,omitempty"`
 }
