@@ -161,6 +161,9 @@ func TestRPCOutputDisconnectAllowsActiveTurnToFinishInGraceWindow(t *testing.T) 
 func TestOutputTimeoutPlusDetachGraceLetsTurnFinish(t *testing.T) {
 	t.Setenv("HARNESS_RPC_DETACH_GRACE_SECONDS", "5")
 	s, _ := usageRegressionServer(t, false)
+	inR, inW := io.Pipe()
+	out := newBlockingWriter()
+	defer inW.Close()
 	started := make(chan struct{})
 	release := make(chan struct{})
 	completed := make(chan struct{})
@@ -175,16 +178,17 @@ func TestOutputTimeoutPlusDetachGraceLetsTurnFinish(t *testing.T) {
 			return nil, r.Context().Err()
 		}
 	})
-	inR, inW := io.Pipe()
-	outR, outW := io.Pipe()
-	defer inW.Close()
-	defer outR.Close()
 	done := make(chan error, 1)
-	go func() { done <- Run(s.app, s.runner, inR, outW) }()
-	reader := bufio.NewReader(outR)
-	if _, err := reader.ReadString('\n'); err != nil {
-		t.Fatal(err)
+	go func() { done <- Run(s.app, s.runner, inR, out) }()
+	select {
+	case <-out.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ready was not written")
 	}
+	out.mu.Lock()
+	out.hold = make(chan struct{})
+	out.blocked = make(chan struct{})
+	out.mu.Unlock()
 	if _, err := io.WriteString(inW, "{\"id\":\"p1\",\"type\":\"prompt\",\"message\":\"block then finish\"}\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -193,8 +197,11 @@ func TestOutputTimeoutPlusDetachGraceLetsTurnFinish(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("provider did not start")
 	}
-	outR.Close()
-	_, _ = io.WriteString(inW, "{\"type\":\"get_state\"}\n")
+	select {
+	case <-out.blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stdout write did not block")
+	}
 	time.Sleep(1500 * time.Millisecond)
 	select {
 	case <-completed:
@@ -204,9 +211,11 @@ func TestOutputTimeoutPlusDetachGraceLetsTurnFinish(t *testing.T) {
 	close(release)
 	select {
 	case <-completed:
-	case <-time.After(5 * time.Second):
+	case <-time.After(6 * time.Second):
 		t.Fatal("turn did not finish inside the detach grace after the write timeout")
 	}
+	out.unblock()
+	_ = inW.Close()
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):

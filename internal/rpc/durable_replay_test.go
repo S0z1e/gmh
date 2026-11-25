@@ -1,7 +1,6 @@
 package rpc
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -55,15 +54,15 @@ func TestCriticalLifecycleSurvivesDeltaBurst(t *testing.T) {
 	s, out := usageRegressionServer(t, false)
 	s.connectionID = "conn-critical"
 	origEvents := maxReplayEvents
-	maxReplayEvents = 4
+	maxReplayEvents = 8
 	t.Cleanup(func() { maxReplayEvents = origEvents })
 
 	// Non-critical frames land first and fill the cap. Lifecycle events that
 	// follow must evict those frames instead of the earlier lifecycle events.
+	s.writeEvent(Event{Type: "turn_started", Text: "start"})
 	for i := 0; i < 6; i++ {
 		s.writeEvent(Event{Type: "text_delta", Text: "d"})
 	}
-	s.writeEvent(Event{Type: "turn_started", Text: "start"})
 	s.writeEvent(Event{Type: "tool_start", Tool: "read"})
 	s.writeEvent(Event{Type: "tool_end", Tool: "read", Output: "ok"})
 	s.writeEvent(Event{Type: "approval_request", ID: "appr-1", Tool: "write"})
@@ -84,6 +83,9 @@ func TestCriticalLifecycleSurvivesDeltaBurst(t *testing.T) {
 			t.Fatal(err)
 		}
 		got[ev.Type]++
+	}
+	if len(resp.Data.Events) > maxReplayEvents {
+		t.Fatalf("replay retained %d events, cap %d", len(resp.Data.Events), maxReplayEvents)
 	}
 	for _, typ := range []string{"turn_started", "tool_start", "tool_end", "approval_request", "agent_settled"} {
 		if got[typ] == 0 {
@@ -306,12 +308,9 @@ func TestDefaultApprovalTimeoutExpires(t *testing.T) {
 }
 
 func TestSlowReaderTimesOutActiveTurnAfterDetachGrace(t *testing.T) {
-	t.Setenv("HARNESS_RPC_DETACH_GRACE_SECONDS", "0")
+	t.Setenv("HARNESS_RPC_DETACH_GRACE_SECONDS", "1")
 	s, _ := usageRegressionServer(t, false)
 	inR, inW := io.Pipe()
-	outR, outW := io.Pipe()
-	defer inW.Close()
-	defer outR.Close()
 	started := make(chan struct{})
 	cancelled := make(chan struct{})
 	s.app.Cfg.Client.HTTP.Transport = usageRegressionTransport(func(r *http.Request) (*http.Response, error) {
@@ -320,12 +319,18 @@ func TestSlowReaderTimesOutActiveTurnAfterDetachGrace(t *testing.T) {
 		close(cancelled)
 		return nil, r.Context().Err()
 	})
+	out := newBlockingWriter()
 	done := make(chan error, 1)
-	go func() { done <- Run(s.app, s.runner, inR, outW) }()
-	reader := bufio.NewReader(outR)
-	if _, err := reader.ReadString('\n'); err != nil {
-		t.Fatal(err)
+	go func() { done <- Run(s.app, s.runner, inR, out) }()
+	select {
+	case <-out.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ready was not written")
 	}
+	out.mu.Lock()
+	out.hold = make(chan struct{})
+	out.blocked = make(chan struct{})
+	out.mu.Unlock()
 	if _, err := io.WriteString(inW, "{\"id\":\"p1\",\"type\":\"prompt\",\"message\":\"slow\"}\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -334,16 +339,65 @@ func TestSlowReaderTimesOutActiveTurnAfterDetachGrace(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("turn did not start")
 	}
-	outR.Close()
-	_, _ = io.WriteString(inW, "{\"type\":\"get_state\"}\n")
+	select {
+	case <-out.blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stdout write did not block")
+	}
 	select {
 	case <-cancelled:
-	case <-time.After(3 * time.Second):
-		t.Fatal("slow reader did not cancel the active turn after the write timeout and detach grace")
+	case <-time.After(8 * time.Second):
+		t.Fatal("blocked stdout did not cancel the active turn after the write timeout and detach grace")
 	}
+	_ = inW.Close()
+	out.unblock()
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("server did not exit")
 	}
 }
+
+type blockingWriter struct {
+	mu      sync.Mutex
+	ready   chan struct{}
+	blocked chan struct{}
+	n       int
+	hold    chan struct{}
+}
+
+func newBlockingWriter() *blockingWriter {
+	return &blockingWriter{ready: make(chan struct{}), blocked: make(chan struct{}), hold: make(chan struct{})}
+}
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.n++
+	n := w.n
+	hold := w.hold
+	blocked := w.blocked
+	w.mu.Unlock()
+	if n == 1 {
+		close(w.ready)
+		return len(p), nil
+	}
+	select {
+	case <-blocked:
+	default:
+		close(blocked)
+	}
+	<-hold
+	return len(p), nil
+}
+
+func (w *blockingWriter) unblock() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	select {
+	case <-w.hold:
+	default:
+		close(w.hold)
+	}
+}
+
+func (w *blockingWriter) Close() error { w.unblock(); return nil }

@@ -21,17 +21,17 @@ for their start/result pair. When a background result arrives in a later
 turn, `origin_turn_id`, `origin_request_id`, and `origin_step_id` identify
 the originating call if it was launched on this connection.
 
-Read stdout continuously. Two separate five-second intervals apply, and
-they add: a blocked write fails after five seconds (`outputWriteTimeout`),
-which starts a second five-second detach grace (`defaultDetachGrace`,
-overridable with `HARNESS_RPC_DETACH_GRACE_SECONDS`). During that grace an
-already-running turn may finish and persist. When the grace ends, or
-immediately when no turn is running, the server cancels the turn. A write
-that would exceed 1,024 queued frames or 16 MiB, or a failed write, also
-starts this detach. The failed stdout stream stays closed for this process:
-open a new `harness --rpc` process and `replay` the previous connection.
-The server returns an error for output failure and for input frames over
-4 MiB. Individual output frames are limited to 8 MiB.
+Read stdout continuously. A blocked write fails after five seconds.
+That starts a separate five-second detach grace (override it with
+`HARNESS_RPC_DETACH_GRACE_SECONDS`). The two intervals add. During the
+grace an already-running turn may finish and persist. When the grace
+ends, or immediately when no turn is running, the server cancels the
+turn. A write that would exceed 1,024 queued frames or 16 MiB, or a
+failed write, also starts this detach. The failed stdout stream stays
+closed for this process: open a new `harness --rpc` process and `replay`
+the previous connection. The server returns an error for output failure
+and for input frames over 4 MiB. Individual output frames are limited to
+8 MiB.
 
 Replay is durable for the life of the session file's directory
 (`~/.minimal-harness/sessions/rpc-replay/<session>.jsonl`), keyed by
@@ -236,8 +236,9 @@ Events (stdout):
   `continuation_request`, and `question_request`). It does not apply to the
   REPL or TUI. Set `approvalTimeoutSeconds` in config, or
   `HARNESS_APPROVAL_TIMEOUT_SECONDS` (the environment value wins). `0` disables
-  the deadline. A detach or shutdown is `approval cancelled: rpc client detached`,
-  not `approval timed out`. Manual
+  the deadline. Detach, including the shutdown that follows a detach, reports
+  `approval cancelled: rpc client detached`, not `approval timed out`. A
+  pending continuation or question uses the same detach error. Manual
   requests can come from `ask-for-approval`/`suggest` and from the
   protected operations still gated in legacy `auto`. Deny-without-prompt
   suppresses them.
