@@ -171,7 +171,7 @@ func (s *Store) loadUsageLocked() error {
 		return fmt.Errorf("usage journal must be a regular file: %v", err)
 	}
 	if err := recoverTail(f); err != nil {
-		return err
+		return s.damagedJournal(err.Error())
 	}
 	if _, err := f.Seek(0, 0); err != nil {
 		return err
@@ -195,17 +195,17 @@ func (s *Store) loadUsageLocked() error {
 		line := append([]byte(nil), sc.Bytes()...)
 		record, chain, _, chainErr := unwrapUsageRecord(line)
 		if chainErr != nil {
-			return fmt.Errorf("%w: %s", errUsageDamaged, chainErr.Error())
+			return s.damagedJournal(chainErr.Error())
 		}
 		if err := linkUsageChain(chain, want, previous, chainStarted); err != nil {
-			return fmt.Errorf("%w: %s", errUsageDamaged, err.Error())
+			return s.damagedJournal(err.Error())
 		}
 		var a UsageAttempt
 		if err := json.Unmarshal(record, &a); err != nil {
-			return fmt.Errorf("invalid usage journal: %w", err)
+			return s.damagedJournal(err.Error())
 		}
 		if a.Version != 1 || (first && a.ID != "") || (!first && (a.ID == "" || a.Request.ID != a.ID)) {
-			return fmt.Errorf("invalid usage journal record")
+			return s.damagedJournal("invalid usage journal record")
 		}
 		if chain != nil {
 			chainStarted = true
@@ -213,20 +213,22 @@ func (s *Store) loadUsageLocked() error {
 			want = chain.Sequence + 1
 		}
 		if a.Request.Usage != nil && (!a.Request.Usage.Valid() || !totals.Usage.CanAdd(*a.Request.Usage)) {
-			return fmt.Errorf("invalid or overflowing usage counters")
+			return s.damagedJournal("invalid or overflowing usage counters")
 		}
 		if a.InvalidUsage && (a.Request.Usage != nil || a.EstimateUSD != nil || a.ExactEstimateUSD != "") {
-			return fmt.Errorf("invalid usage marker")
+			return s.damagedJournal("invalid usage marker")
 		}
 		if err := totals.add(a); err != nil {
-			return err
+			return s.damagedJournal(err.Error())
 		}
 		if pending[a.ID] {
 			if err := s.clearPendingUsageLocked(a.ID); err != nil {
 				return err
 			}
 			delete(pending, a.ID)
+			s.rememberCommitted(a.ID)
 		}
+		first = false
 		first = false
 	}
 	if err := sc.Err(); err != nil {
@@ -505,6 +507,15 @@ func (t UsageTotals) ExactCost() *big.Rat {
 		cost.Set(t.exactEstimateUSD)
 	}
 	return cost
+}
+
+func (s *Store) rememberCommitted(id string) {
+	for _, existing := range s.usageCommitted {
+		if existing == id {
+			return
+		}
+	}
+	s.usageCommitted = append(s.usageCommitted, id)
 }
 
 func usageArtifactsLocked(journalPath string, pending map[string]bool, backups []string) []UsageArtifact {

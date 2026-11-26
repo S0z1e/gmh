@@ -39,6 +39,7 @@ type Store struct {
 	usageChainSeq    int64
 	usageChainDigest string
 	usageChainOn     bool
+	usageCommitted   []string
 }
 
 // AuditPath is the sidecar file holding approval/bash audit records

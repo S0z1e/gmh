@@ -103,6 +103,9 @@ func (s *Store) reconcileUsageLocked(action string) (UsageReconciliation, error)
 		return UsageReconciliation{}, err
 	}
 	backups, err := recoveryBackups(s.usagePathLocked())
+	if os.IsNotExist(err) {
+		backups, err = nil, nil
+	}
 	if err != nil {
 		return UsageReconciliation{}, err
 	}
@@ -130,6 +133,30 @@ func (s *Store) reconcileUsageLocked(action string) (UsageReconciliation, error)
 			continue
 		}
 		states[id] = usageStateUnknown
+	}
+	for _, id := range s.usageCommitted {
+		if _, seen := states[id]; seen {
+			continue
+		}
+		states[id] = usageStateCommitted
+		cleared = append(cleared, id)
+	}
+	notes, err := os.ReadDir(s.reconcilePathLocked())
+	if err != nil && !os.IsNotExist(err) {
+		return UsageReconciliation{}, err
+	}
+	for _, note := range notes {
+		id := strings.TrimSuffix(note.Name(), ".json")
+		if !validBackupID(id) || states[id] != "" {
+			continue
+		}
+		noted, err := s.notDispatchedUsageLocked(id)
+		if err != nil {
+			return UsageReconciliation{}, err
+		}
+		if noted {
+			states[id] = usageStateNotDispatched
+		}
 	}
 	slices.Sort(cleared)
 	report := UsageReconciliation{
@@ -293,13 +320,24 @@ func (s *Store) RepairUsage(action, artifact string) (UsageReconciliation, error
 
 var errUsageDamaged = errors.New("usage journal is damaged")
 
+// ErrUsageDamaged is a journal whose records cannot be trusted. The error
+// text also names the file and the quarantine command.
+var ErrUsageDamaged = errUsageDamaged
+
+func (s *Store) damagedJournal(reason string) error {
+	return errors.Join(ErrUsageDamaged, BlockingUsageError([]UsageArtifact{{
+		Path: s.usagePathLocked(), Kind: "damaged_journal", Reason: reason,
+	}}))
+}
+
 func (s *Store) quarantineUsageLocked(artifact string) error {
 	if artifact == "" {
 		return fmt.Errorf("quarantine needs the artifact path named by the strict error")
 	}
 	clean := filepath.Clean(artifact)
 	family := filepath.Dir(s.usagePathLocked())
-	if !strings.HasPrefix(clean, family+string(os.PathSeparator)) && clean != family {
+	rel, err := filepath.Rel(family, clean)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return fmt.Errorf("artifact %s is outside this session usage family", artifact)
 	}
 	base := filepath.Base(clean)
@@ -308,6 +346,9 @@ func (s *Store) quarantineUsageLocked(artifact string) error {
 		return fmt.Errorf("artifact %s is not a usage journal, marker, or recovery backup", artifact)
 	}
 	info, err := os.Lstat(clean)
+	if os.IsNotExist(err) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}

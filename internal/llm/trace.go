@@ -191,6 +191,9 @@ func (c *Client) traceRequest(ctx context.Context, body []byte) error {
 	}
 	settings, _ := json.Marshal(fields)
 	t.SettingsHash = hashBytes(settings)
+	// Publish the id before the persistence gate. A later failure that happens
+	// before HTTP can then record the marker as not-dispatched.
+	o.trace = t
 	if start, _ := ctx.Value(requestStartKey{}).(func(RequestTrace) error); start != nil {
 		if err := start(t); err != nil {
 			return err

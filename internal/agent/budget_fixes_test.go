@@ -238,3 +238,34 @@ func TestStrictMeteringNamesTheBlockingArtifact(t *testing.T) {
 		t.Fatalf("strict error did not name the artifact and repair: %v", err)
 	}
 }
+
+func TestUndispatchedRequestReconcilesAsNotDispatched(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	c := budgetConfig(t, nil)
+	store, err := session.Open("not-sent", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c.Session = store
+	c.Client = fakeBudgetClient(func(*http.Request) (*http.Response, error) {
+		t.Fatal("provider request left the process")
+		return nil, io.EOF
+	})
+	c.Client.BaseURL = "://bad url"
+	if _, _, err := c.Run(t.Context(), []llm.Message{{Role: "user", Content: "work"}}); err == nil {
+		t.Fatal("expected the request to fail before dispatch")
+	}
+	report, err := store.ReconcileUsage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, state := range report.States {
+		found = found || state == "not_dispatched"
+	}
+	if !found || report.RecoveryGap {
+		t.Fatalf("not-dispatched attempt was not reconciled: %+v", report)
+	}
+}

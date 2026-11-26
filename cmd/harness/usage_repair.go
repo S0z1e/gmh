@@ -25,7 +25,7 @@ func usageRepair(args []string, stdout, stderr io.Writer) error {
 	if *sessionID == "" || *artifact == "" {
 		return fmt.Errorf("usage-repair requires --session and --quarantine")
 	}
-	store, err := session.Open(*sessionID, session.OpenOptions{Workspace: *root, Existing: true})
+	store, err := session.Open(*sessionID, session.OpenOptions{Workspace: *root, Existing: true, RepairDamagedUsage: true})
 	if err != nil {
 		return err
 	}

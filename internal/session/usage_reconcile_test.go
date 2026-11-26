@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -248,5 +249,79 @@ func TestAppendFailureRecoversWriterWithoutDroppingEvidence(t *testing.T) {
 	marker := filepath.Join(filepath.Dir(s.usagePathLocked()), usagePendingPrefix+second)
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("committed marker survived recovery: %v", err)
+	}
+}
+
+func TestReconcileReportsCommittedState(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("reconcile", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "COMMITTEDID"
+	if err := s.RecordUsage(usageAttempt(id, 1)); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(filepath.Dir(s.usagePathLocked()), usagePendingPrefix+id)
+	if err := os.WriteFile(marker, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = Open("reconcile", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	report, err := s.ReconcileUsage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.States[id] != usageStateCommitted {
+		t.Fatalf("states=%v", report.States)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("committed marker still present: %v", err)
+	}
+}
+
+func TestDamagedJournalNamesArtifactAndQuarantinesIdempotently(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("damaged", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 1)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if _, err := Open("damaged", OpenOptions{Workspace: root}); err == nil || !errors.Is(err, ErrUsageDamaged) || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "usage-repair") {
+		t.Fatalf("damage error did not name the journal and repair: %v", err)
+	}
+	s, err = Open("damaged", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	report, err := s.RepairUsage(UsageRepairQuarantine, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.RecoveryGap {
+		t.Fatalf("quarantine left a gap: %+v", report)
+	}
+	again, err := s.RepairUsage(UsageRepairQuarantine, path)
+	if err != nil || again.RecoveryGap {
+		t.Fatalf("second quarantine was not idempotent: %+v %v", again, err)
 	}
 }

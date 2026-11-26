@@ -59,8 +59,7 @@ echoed in the response):
   `agent_settled`. A second prompt while a turn runs is queued (cap
   64; beyond that an error). A known slash line (`/usage`, `/jobs`,
   `/clear`, `/compact`, `/skill:<name>`, `/sessions`, `/resume <id>`,
-  `/steal <id>`, `/rename <old> <new>`, `/plugins`, `/attach [path]`, `/quit`,
-  `/usage-reconcile`) behaves as the
+  `/steal <id>`, `/rename <old> <new>`, `/plugins`, `/attach [path]`, `/quit`) behaves as the
   matching control request, exactly like the REPL; any other line,
   including an unknown `/foo`, is a task for the model.
 - `approval_response` `{"approval_id":"appr-1","approved":true}` →
