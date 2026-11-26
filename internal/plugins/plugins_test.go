@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -370,6 +371,116 @@ harness.registerTool("echo", "Echo.", {type: "object", properties: {msg: {type: 
 	}
 	if out, err := reg.Call(t.Context(), "echo", `{"msg":"ok"}`); err != nil || out != "echo:ok" {
 		t.Fatalf("plugin not callable after cancellation: %q, %v", out, err)
+	}
+}
+
+func TestAlreadyCancelledRestartStartsNoLoad(t *testing.T) {
+	reg, root := loadEcho(t)
+	p := reg.Plugins()[0]
+	entry := filepath.Join(root, ".agents", "plugins", "echo", "echo.js")
+	if err := os.WriteFile(entry, []byte("while (true) {}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	before := runtime.NumGoroutine()
+	p.mu.Lock()
+	for range 50 {
+		if p.tryRestartLocked(ctx) {
+			t.Fatal("already-cancelled restart succeeded")
+		}
+	}
+	busy := p.detachBusy()
+	p.mu.Unlock()
+	after := runtime.NumGoroutine()
+	if busy {
+		t.Fatal("an already-cancelled restart left a detached load")
+	}
+	if after-before > 5 {
+		t.Fatalf("cancelled burst started goroutines: before=%d after=%d", before, after)
+	}
+}
+
+func TestDetachedRestartIsSingleFlight(t *testing.T) {
+	reg, root := loadEcho(t)
+	p := reg.Plugins()[0]
+	entry := filepath.Join(root, ".agents", "plugins", "echo", "echo.js")
+	if err := os.WriteFile(entry, []byte(strings.Replace(echoPlugin, "echo:", "late:", 1)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	p.restartGate = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		p.restartGate = nil
+	})
+	watch := p.watchRestart()
+	before := p.rt
+	ctx, cancel := context.WithCancel(t.Context())
+	first := make(chan bool, 1)
+	go func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		first <- p.tryRestartLocked(ctx)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restart did not reach its gate")
+	}
+	cancel()
+	select {
+	case reloaded := <-first:
+		if reloaded {
+			t.Fatal("cancelled in-flight restart reported success")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight restart did not return on cancellation")
+	}
+	if !p.detachBusy() {
+		t.Fatal("cancelled restart was not tracked as the single detached load")
+	}
+	// The goroutine count covers the one load and its joiner. A burst must
+	// not add another.
+	goroutines := runtime.NumGoroutine()
+	p.mu.Lock()
+	for range 20 {
+		if p.tryRestartLocked(t.Context()) {
+			p.mu.Unlock()
+			t.Fatal("started a second rebuild while one detached load was in flight")
+		}
+	}
+	p.mu.Unlock()
+	if grew := runtime.NumGoroutine() - goroutines; grew > 5 {
+		t.Fatalf("second burst started goroutines: %+d", grew)
+	}
+	close(release)
+	select {
+	case ev := <-watch:
+		if ev.kind != restartDiscarded {
+			t.Fatalf("late success kind = %v, want discarded", ev.kind)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("detached restart did not join its late success")
+	}
+	p.mu.Lock()
+	same := p.rt == before
+	quota := len(p.restartTimes)
+	busy := p.detachBusy()
+	p.mu.Unlock()
+	if !same || quota != 0 || busy {
+		t.Fatalf("late success changed state: same=%t quota=%d busy=%t", same, quota, busy)
+	}
+	if out, err := reg.Call(t.Context(), "echo", `{"msg":"hi"}`); err != nil || out != "echo:hi" {
+		t.Fatalf("late success replaced the live runtime: %q, %v", out, err)
 	}
 }
 

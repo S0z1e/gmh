@@ -155,6 +155,10 @@ type Plugin struct {
 	// test can cancel once the result and the caller's context are both ready.
 	restartGate  func()
 	restartReady func()
+	// detachMu guards the single rebuild whose caller already returned.
+	// A second attempt is refused until that one has been joined.
+	detachMu       sync.Mutex
+	detachInFlight bool
 	// registry is the owning registry: setMode/getMode read its
 	// ModeSetter/ModeGetter, which app.Setup wires after Load.
 	registry *Registry
@@ -1238,10 +1242,12 @@ func (p *Plugin) watchRestart() <-chan restartEvent {
 // discarded instead of installed after the caller has moved on.
 // The caller holds p.mu.
 func (p *Plugin) tryRestartLocked(ctx context.Context) bool {
-	if p.Dir == "" {
+	// An already-cancelled caller has nothing to race against. Starting a
+	// load here would only add a goroutine that the caller cannot use.
+	if p.Dir == "" || ctx.Err() != nil {
 		return false
 	}
-	if p.leakedCount() >= maxLeakedRuntimes {
+	if p.leakedCount() >= maxLeakedRuntimes || p.detachBusy() {
 		return false
 	}
 	now := time.Now()
@@ -1282,12 +1288,14 @@ func (p *Plugin) tryRestartLocked(ctx context.Context) bool {
 		}
 		fresh = result.plugin
 	case <-ctx.Done():
-		// The caller is leaving, including a context that was already
-		// cancelled before the load started. Join the load without
+		// The caller left while this load was in flight. Join it without
 		// installing it. Cancel only once its own deadline passes, so a
 		// success that lands before then is discarded intact instead of
-		// being turned into an interrupt.
+		// being turned into an interrupt. Only one such load may be in
+		// flight; the caller holds p.mu, so the flag set here is the one
+		// the next attempt observes.
 		fmt.Fprintf(os.Stderr, "warning: plugin %s runtime restart stopped: %v\n", p.Name, ctx.Err())
+		p.setDetach()
 		go p.finishRestart(done, cancel, loadCtx)
 		return false
 	}
@@ -1334,7 +1342,26 @@ type reloadResult struct {
 // arrives before loadCtx's deadline is dropped as-is, including a success,
 // which is not installed. When the deadline passes first, the load is
 // interrupted and that failure is joined too.
+func (p *Plugin) detachBusy() bool {
+	p.detachMu.Lock()
+	defer p.detachMu.Unlock()
+	return p.detachInFlight
+}
+
+func (p *Plugin) setDetach() {
+	p.detachMu.Lock()
+	p.detachInFlight = true
+	p.detachMu.Unlock()
+}
+
+func (p *Plugin) clearDetach() {
+	p.detachMu.Lock()
+	p.detachInFlight = false
+	p.detachMu.Unlock()
+}
+
 func (p *Plugin) finishRestart(done <-chan reloadResult, cancel context.CancelFunc, loadCtx context.Context) {
+	defer p.clearDetach()
 	var result reloadResult
 	select {
 	case result = <-done:
