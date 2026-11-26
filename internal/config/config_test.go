@@ -343,6 +343,7 @@ func TestLoadRejectsBadValues(t *testing.T) {
 		`{"mode": "yolo"}`,
 		`{"bashTimeoutSeconds": 0}`,
 		`{"bgThresholdSeconds": -1}`,
+		`{"backgroundMaxLifetimeSeconds": -1}`,
 		`{"tuiTheme": "neon"}`,
 		`{not json`,
 	}

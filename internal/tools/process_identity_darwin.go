@@ -77,6 +77,58 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	return err
 }
 
+func stopAdoptedProcessGroupAfterExit(id ProcessIdentityInfo) error {
+	if !id.Valid() {
+		return ErrProcessIdentityMismatch
+	}
+	info := inspectProcess(id.PID)
+	if info.Alive && !id.Matches(info) {
+		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+	}
+	procs, queryErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", id.PGID)
+	if errors.Is(queryErr, unix.ESRCH) {
+		return os.ErrProcessDone
+	}
+	if queryErr == nil {
+		hasLive := false
+		for _, p := range procs {
+			if p.Proc.P_stat == 5 {
+				continue
+			}
+			if int(p.Proc.P_pid) == id.PID {
+				tok := fmt.Sprintf("%d:%d", p.Proc.P_starttime.Sec, p.Proc.P_starttime.Usec)
+				if tok != id.StartToken {
+					return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+				}
+			}
+			hasLive = true
+		}
+		if !hasLive {
+			return os.ErrProcessDone
+		}
+	}
+	err := syscall.Kill(-id.PGID, syscall.SIGKILL)
+	if errors.Is(err, syscall.ESRCH) {
+		return os.ErrProcessDone
+	}
+	if errors.Is(err, unix.EPERM) {
+		procs, queryErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", id.PGID)
+		if queryErr == nil {
+			allZombie := true
+			for _, p := range procs {
+				if p.Proc.P_stat != 5 {
+					allZombie = false
+					break
+				}
+			}
+			if allZombie {
+				return os.ErrProcessDone
+			}
+		}
+	}
+	return err
+}
+
 func verifyBeforeWait(id ProcessIdentityInfo) error {
 	if !id.Valid() {
 		return ErrProcessIdentityMismatch

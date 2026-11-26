@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"minimalharness/internal/checkpoint"
@@ -48,6 +50,8 @@ type DeliveryStatus struct {
 type PersistedJob struct {
 	ID              string    `json:"id"`
 	Started         time.Time `json:"started"`
+	Deadline        time.Time `json:"deadline,omitempty"`
+	Unlimited       bool      `json:"unlimited,omitempty"`
 	InvocationID    string    `json:"invocation_id,omitempty"`
 	ToolCallID      string    `json:"tool_call_id,omitempty"`
 	Command         string    `json:"command"`
@@ -356,6 +360,8 @@ func CheckpointJobToPersisted(cj checkpoint.Job) PersistedJob {
 	return PersistedJob{
 		ID:              cj.ID,
 		Started:         cj.Started,
+		Deadline:        cj.Deadline,
+		Unlimited:       cj.Unlimited,
 		InvocationID:    cj.InvocationID,
 		Command:         cj.Command,
 		Cwd:             cj.Cwd,
@@ -398,6 +404,12 @@ func MergeRecoveredRecord(dst *PersistedJob, src PersistedJob) {
 	}
 	if dst.Started.IsZero() && !src.Started.IsZero() {
 		dst.Started = src.Started
+	}
+	if src.Unlimited {
+		dst.Unlimited = true
+		dst.Deadline = time.Time{}
+	} else if !dst.Unlimited && dst.Deadline.IsZero() && !src.Deadline.IsZero() {
+		dst.Deadline = src.Deadline
 	}
 	if dst.InvocationID == "" {
 		dst.InvocationID = src.InvocationID
@@ -532,8 +544,30 @@ func pipeCaptureEndedNote(outputFile string) string {
 }
 
 type adoptionMonitor struct {
-	job *Job
-	ctx context.Context
+	job         *Job
+	ctx         context.Context
+	cancelCause context.CancelCauseFunc
+}
+
+func effectiveRecoveredDeadline(rec PersistedJob) (time.Time, bool) {
+	if rec.Unlimited {
+		return time.Time{}, true
+	}
+	if !rec.Deadline.IsZero() {
+		return rec.Deadline, false
+	}
+	return rec.Started.Add(DefaultBackgroundMaxLifetime), false
+}
+
+func waitForAdoptedProcessGone(id ProcessIdentityInfo, maxWait time.Duration) {
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		info := inspectProcess(id.PID)
+		if !info.Alive || info.Zombie || !id.Matches(info) {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
 }
 
 func (e *Executor) newRecoveredJobObject(rec PersistedJob, jobsDir string, status JobStatus, delivered, adoptionNoticed bool, note string, res JobResult) *Job {
@@ -564,8 +598,12 @@ func (e *Executor) newRecoveredJobObject(rec PersistedJob, jobsDir string, statu
 		RecoveryNote:    note,
 		jobsDir:         jobsDir,
 		outputDir:       e.OutputDir,
+		exec:            e,
+		audit:           e.Audit,
 		retained:        true,
 		Started:         rec.Started,
+		Deadline:        rec.Deadline,
+		Unlimited:       rec.Unlimited,
 		done:            doneCh,
 		finished:        status == JobDone,
 		unknown:         status == JobUnknown,
@@ -616,6 +654,9 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 	if rec.Started.IsZero() {
 		rec.Started = time.Now()
 	}
+	deadline, unlimited := effectiveRecoveredDeadline(rec)
+	rec.Deadline = deadline
+	rec.Unlimited = unlimited
 
 	switch rec.Status {
 	case JobDone:
@@ -678,12 +719,83 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 		id := ProcessIdentityInfo{PID: rec.PID, PGID: rec.PGID, StartToken: rec.ProcessStarted}
 		info := inspectProcess(rec.PID)
 		if id.Matches(info) {
+			extraNote := ""
+			if !rec.Unlimited && !rec.Deadline.IsZero() && !time.Now().Before(rec.Deadline) {
+				stopErr := stopVerifiedProcessGroup(id)
+				switch {
+				case errors.Is(stopErr, ErrProcessIdentityMismatch):
+					reason := fmt.Sprintf("refused to attach to PID %d: process identity, group, or start token mismatch (PID reused)", id.PID)
+					if rec.FinishedAt.IsZero() {
+						rec.FinishedAt = time.Now()
+					}
+					summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
+					job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
+						Output:          summary,
+						Err:             errors.New(reason),
+						ExitCode:        -1,
+						ExitCodeUnknown: true,
+						Preview:         preview,
+					})
+					if jobsDir != "" {
+						_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+					}
+					return job, nil
+				case stopErr == nil || errors.Is(stopErr, os.ErrProcessDone):
+					waitForAdoptedProcessGone(id, 2*time.Second)
+					_ = stopAdoptedProcessGroupAfterExit(id)
+					timeoutDur := max(0, rec.Deadline.Sub(rec.Started))
+					timeoutErr := &timeoutError{timeout: timeoutDur}
+					note := fmt.Sprintf("adopted job PID %d (pgid %d) exceeded deadline (%s) while harness was down; stopped verified process group; %s",
+						id.PID, id.PGID, rec.Deadline.UTC().Format(time.RFC3339), pipeCaptureEndedNote(rec.OutputFile))
+					summary, preview, _, hasFile := summarizeOutputFile(rec.OutputFile, rec.Cwd)
+					if !hasFile {
+						summary = fmt.Sprintf("(adopted background job stopped on adoption; %s)", note)
+					} else {
+						summary += "\n[" + note + "]"
+					}
+					if preview != nil {
+						if preview.Notice != "" {
+							preview.Notice += "\n[" + note + "]"
+						} else {
+							preview.Notice = "[" + note + "]"
+						}
+					}
+					rec.FinishedAt = time.Now()
+					rec.Error = timeoutErr.Error()
+					rec.RecoveryNote = note
+					job := e.newRecoveredJobObject(rec, jobsDir, JobDone, false, adoptionNoticed, note, JobResult{
+						Output:   summary,
+						Err:      timeoutErr,
+						ExitCode: -1,
+						Preview:  preview,
+					})
+					job.Adopted = true
+					if e.Audit != nil {
+						e.Audit(AuditEntry{
+							InvocationID: job.InvocationID,
+							ToolCallID:   job.ToolCallID,
+							TS:           time.Now(),
+							Kind:         "bash",
+							Tool:         "bash",
+							Args:         truncate(job.Command, 500),
+							ExitCode:     -1,
+							Error:        timeoutErr.Error(),
+						})
+					}
+					if jobsDir != "" {
+						_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+					}
+					return job, nil
+				default:
+					extraNote = fmt.Sprintf("deadline (%s) passed while harness was down, stop failed (%v); ", rec.Deadline.UTC().Format(time.RFC3339), stopErr)
+				}
+			}
 			waitCtx, cancelCause := context.WithCancelCause(context.Background())
-			note := fmt.Sprintf("adopted live OS process PID %d (pgid %d); %s", id.PID, id.PGID, pipeCaptureEndedNote(rec.OutputFile))
+			note := fmt.Sprintf("adopted live OS process PID %d (pgid %d); %s%s", id.PID, id.PGID, extraNote, pipeCaptureEndedNote(rec.OutputFile))
 			job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
 			job.cancel = func() { cancelCause(context.Canceled) }
 			job.closeCancel = func() {
-				_ = stopVerifiedProcessGroup(id)
+				_ = job.stopAdoptedProcess(ErrExecutorClosed, false)
 				cancelCause(ErrExecutorClosed)
 			}
 			if job.OutputFile != "" && e.OutputDir != "" {
@@ -692,7 +804,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 			if jobsDir != "" {
 				_ = savePersistedJob(jobsDir, job.persistedSnapshot())
 			}
-			return job, &adoptionMonitor{job: job, ctx: waitCtx}
+			return job, &adoptionMonitor{job: job, ctx: waitCtx, cancelCause: cancelCause}
 		}
 
 		var reason string
@@ -885,7 +997,7 @@ func (e *Executor) RecoverSessionJobs(
 
 	audit := e.Audit
 	for _, m := range monitors {
-		go e.monitorAdoptedJob(m.job, m.ctx, audit)
+		go e.monitorAdoptedJob(m, audit)
 	}
 	prunePersistedJobs(jobsDir, diskRecords)
 	return summaries, nil
@@ -916,25 +1028,126 @@ func recoveredSummaryFromJobs(reg *JobRegistry) []RecoveredJob {
 	return out
 }
 
-func (e *Executor) monitorAdoptedJob(job *Job, ctx context.Context, audit func(AuditEntry)) {
+func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) {
+	job := m.job
+	ctx := m.ctx
+	cancelCause := m.cancelCause
 	defer func() {
-		if job.OutputFile != "" && job.outputDir != "" {
+		if job.Status() != JobRunning && job.OutputFile != "" && job.outputDir != "" {
 			e.unmarkActiveOutput(job.outputDir, job.OutputFile)
 		}
 	}()
 	snap := job.Snapshot()
-	exitCode, exitKnown, err := waitAdoptedProcess(ctx, snap.Identity)
+
+	var timedOut atomic.Bool
+	var deadlineStopMu sync.Mutex
+	var deadlineStopErr error
+	if !snap.Unlimited && !snap.Deadline.IsZero() {
+		var fallbackMu sync.Mutex
+		var fallbackTimer *time.Timer
+		remaining := max(0, time.Until(snap.Deadline))
+		timer := time.AfterFunc(remaining, func() {
+			if job.Status() != JobRunning {
+				return
+			}
+			timedOut.Store(true)
+			stopErr := job.stopAdoptedProcess(nil, true)
+			if errors.Is(stopErr, ErrProcessIdentityMismatch) {
+				if cancelCause != nil {
+					cancelCause(ErrProcessIdentityMismatch)
+				}
+				return
+			}
+			if stopErr != nil {
+				timedOut.Store(false)
+				deadlineStopMu.Lock()
+				deadlineStopErr = stopErr
+				deadlineStopMu.Unlock()
+				if cancelCause != nil {
+					cancelCause(stopErr)
+				}
+				return
+			}
+			if cancelCause != nil {
+				fallbackMu.Lock()
+				fallbackTimer = time.AfterFunc(2*time.Second, func() {
+					cancelCause(&timeoutError{timeout: max(0, snap.Deadline.Sub(snap.Started))})
+				})
+				fallbackMu.Unlock()
+			}
+		})
+		stopFn := func() {
+			timer.Stop()
+			fallbackMu.Lock()
+			if fallbackTimer != nil {
+				fallbackTimer.Stop()
+			}
+			fallbackMu.Unlock()
+		}
+		job.mu.Lock()
+		if job.finished || job.unknown {
+			job.mu.Unlock()
+			stopFn()
+		} else {
+			job.stopDeadline = stopFn
+			job.mu.Unlock()
+		}
+	}
+
+	waitFn := e.waitAdopted
+	if waitFn == nil {
+		waitFn = waitAdoptedProcess
+	}
+	exitCode, exitKnown, err := waitFn(ctx, snap.Identity)
 	if errors.Is(err, ErrProcessIdentityMismatch) {
 		summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
 		job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
 		return
 	}
 	if errors.Is(context.Cause(ctx), ErrExecutorClosed) {
+		_ = stopAdoptedProcessGroupAfterExit(snap.Identity)
 		err = ErrExecutorClosed
+	} else if timedOut.Load() {
+		_ = stopAdoptedProcessGroupAfterExit(snap.Identity)
+		err = &timeoutError{timeout: max(0, snap.Deadline.Sub(snap.Started))}
+		exitCode = -1
+		exitKnown = false
+	} else if exitKnown || errors.Is(err, errAdoptedProcessExited) {
+		if !exitKnown && err == nil {
+			err = errAdoptedProcessExited
+		}
+		if gerr := stopAdoptedProcessGroupAfterExit(snap.Identity); gerr != nil && !errors.Is(gerr, os.ErrProcessDone) && !errors.Is(gerr, ErrProcessIdentityMismatch) {
+			err = errors.Join(err, fmt.Errorf("stop remaining bash processes: %w", gerr))
+		}
+	} else {
+		deadlineStopMu.Lock()
+		stopErr := deadlineStopErr
+		deadlineStopMu.Unlock()
+		waitErr := err
+		if stopErr != nil {
+			waitErr = stopErr
+		}
+		if waitErr == nil {
+			waitErr = errors.New("adopted process wait failed")
+		}
+		info := inspectProcess(snap.Identity.PID)
+		if info.Alive && !snap.Identity.Matches(info) {
+			summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
+			job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
+			return
+		}
+		job.mu.Lock()
+		if !job.finished && !job.unknown {
+			job.monitorFailed = true
+			job.WaitError = waitErr.Error()
+			job.RecoveryNote = fmt.Sprintf("adopted live OS process PID %d (pgid %d); process wait error (%v) — job remains stoppable; %s",
+				snap.Identity.PID, snap.Identity.PGID, waitErr, pipeCaptureEndedNote(job.OutputFile))
+		}
+		job.mu.Unlock()
+		job.persist()
+		return
 	}
-	if !exitKnown && err == nil {
-		err = errAdoptedProcessExited
-	}
+
 	summary, preview, _, hasFile := summarizeOutputFile(job.OutputFile, job.Cwd)
 	if !hasFile {
 		summary = fmt.Sprintf("(adopted background job exited; %s)", pipeCaptureEndedNote(job.OutputFile))
@@ -968,7 +1181,7 @@ func (e *Executor) monitorAdoptedJob(job *Job, ctx context.Context, audit func(A
 		Output:          summary,
 		Err:             err,
 		ExitCode:        exitCode,
-		ExitCodeUnknown: !exitKnown,
+		ExitCodeUnknown: !exitKnown && !timedOut.Load(),
 		Preview:         preview,
 	})
 }
@@ -1027,4 +1240,68 @@ func FormatRecoveredJobsSummary(jobs []RecoveredJob) string {
 // status is unknown) and waits briefly for confirmation.
 func (e *Executor) StopJob(id string) (ToolResult, error) {
 	return e.killJob(id)
+}
+
+// OrphanedSessionJobs describes verified live background jobs belonging to
+// another session of the same workspace that currently has no supervisor.
+type OrphanedSessionJobs struct {
+	SessionID string         `json:"session_id"`
+	Jobs      []RecoveredJob `json:"jobs"`
+}
+
+// FindOrphanedRunningJobs inspects jobsDir read-only and returns records whose
+// status is running and whose OS process identity matches a live process.
+func FindOrphanedRunningJobs(jobsDir, outputID, outputDir string) ([]RecoveredJob, error) {
+	records, err := loadPersistedJobs(jobsDir)
+	if err != nil {
+		return nil, err
+	}
+	var out []RecoveredJob
+	for _, rec := range records {
+		if rec.Status != JobRunning {
+			continue
+		}
+		id := ProcessIdentityInfo{PID: rec.PID, PGID: rec.PGID, StartToken: rec.ProcessStarted}
+		if !id.Matches(inspectProcess(rec.PID)) {
+			continue
+		}
+		outFile := rec.OutputFile
+		if !validRecoveredOutputPath(outFile, rec.OutputID, outputID, outputDir) {
+			outFile = ""
+		}
+		out = append(out, RecoveredJob{
+			ID:         rec.ID,
+			Command:    rec.Command,
+			Cwd:        rec.Cwd,
+			OutputFile: outFile,
+			Status:     JobRunning,
+			PID:        rec.PID,
+			PGID:       rec.PGID,
+		})
+	}
+	return out, nil
+}
+
+// FormatOrphanedJobsNotice formats a startup / /jobs notice naming sessions
+// with orphaned live background jobs so the user knows which session to resume.
+func FormatOrphanedJobsNotice(orphans []OrphanedSessionJobs) string {
+	if len(orphans) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Orphaned running background job(s) from other session(s) in this workspace:")
+	for _, sess := range orphans {
+		for _, j := range sess.Jobs {
+			cmd := strings.ReplaceAll(strings.TrimSpace(j.Command), "\n", " ")
+			if len(cmd) > 64 {
+				cmd = cmd[:61] + "..."
+			}
+			fmt.Fprintf(&b, "\n  - session %s: %s  pid=%d", sess.SessionID, j.ID, j.PID)
+			if cmd != "" {
+				fmt.Fprintf(&b, "  cmd=%q", cmd)
+			}
+			fmt.Fprintf(&b, "  (resume with --resume %s or /resume %s to monitor or stop)", sess.SessionID, sess.SessionID)
+		}
+	}
+	return b.String()
 }

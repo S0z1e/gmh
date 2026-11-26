@@ -17,10 +17,12 @@ func (a *App) retainOrClose(store *session.Store) {
 	if a.Cfg != nil && a.Cfg.Exec != nil {
 		for _, job := range a.Cfg.Exec.SessionJobs(store.ID) {
 			if !job.Delivered() {
+				a.orphansMu.Lock()
 				if a.retainedStores == nil {
 					a.retainedStores = make(map[*session.Store]struct{})
 				}
 				a.retainedStores[store] = struct{}{}
+				a.orphansMu.Unlock()
 				return
 			}
 		}
@@ -44,12 +46,14 @@ func (a *App) CloseContext(ctx context.Context) error {
 	}
 	closeErr := cleanupErr
 	stores := map[*session.Store]bool{}
+	a.orphansMu.Lock()
 	if a.Store != nil {
 		stores[a.Store] = true
 	}
 	for store := range a.retainedStores {
 		stores[store] = true
 	}
+	a.orphansMu.Unlock()
 	for store := range stores {
 		unfinished := false
 		if a.Cfg != nil && a.Cfg.Exec != nil {
@@ -70,7 +74,9 @@ func (a *App) CloseContext(ctx context.Context) error {
 			continue
 		}
 		closeErr = errors.Join(closeErr, store.Close())
+		a.orphansMu.Lock()
 		delete(a.retainedStores, store)
+		a.orphansMu.Unlock()
 	}
 	return closeErr
 }

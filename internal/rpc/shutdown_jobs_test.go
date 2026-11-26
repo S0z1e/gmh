@@ -89,3 +89,58 @@ func TestRPCQuitCanRetryFailedResultSave(t *testing.T) {
 		})
 	}
 }
+
+func TestRPCAbortCancelsRunningBackgroundJobs(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{
+		{kind: "text", text: "slow reply", delay: 3 * time.Second},
+	})
+	job, err := a.Cfg.Exec.BashBackground(context.Background(), tools.BashArgs{
+		Command:    "printf bg-started; exec sleep 30",
+		Background: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer job.Cancel()
+
+	d := startDriver(t, a, runner)
+	defer d.quit(t)
+	d.waitFor("ready", 2*time.Second)
+
+	d.send(map[string]any{"id": "p1", "type": "prompt", "message": "wait"})
+	d.waitFor("response", 2*time.Second)
+	d.waitFor("turn_started", 2*time.Second)
+
+	d.send(map[string]any{"id": "ab1", "type": "abort"})
+	resp := d.waitFor("response", 5*time.Second)
+	if data, _ := resp["data"].(map[string]any); data["aborted"] != true {
+		t.Fatalf("abort response = %v, want aborted true", resp)
+	}
+	d.waitFor("agent_settled", 5*time.Second)
+
+	select {
+	case <-job.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("RPC abort did not cancel the running background job")
+	}
+	if _, _, alive := tools.ProcessIdentity(job.PID); alive {
+		t.Fatalf("background job PID %d still alive after RPC abort", job.PID)
+	}
+
+	// Also verify RPC abort between turns cancels a running background job.
+	job2, err := a.Cfg.Exec.BashBackground(context.Background(), tools.BashArgs{
+		Command:    "printf bg2-started; exec sleep 30",
+		Background: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer job2.Cancel()
+	d.send(map[string]any{"id": "ab2", "type": "abort"})
+	_ = d.waitFor("response", 5*time.Second)
+	select {
+	case <-job2.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("idle RPC abort did not cancel the active session's background job")
+	}
+}

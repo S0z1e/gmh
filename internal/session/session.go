@@ -627,6 +627,17 @@ func (s *Store) OutputID() string {
 	return s.ID
 }
 
+// SnapshotIDs returns the current session ID and stable output-family ID safely.
+func (s *Store) SnapshotIDs() (id, outputID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	outputID = s.ID
+	if s.header != nil && s.header.OutputID != "" {
+		outputID = s.header.OutputID
+	}
+	return s.ID, outputID
+}
+
 // OutputDir follows the persistent output identity, including for old sessions
 // whose original directory is adopted on first open with this version.
 func (s *Store) OutputDir() string {

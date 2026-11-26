@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -581,6 +582,569 @@ func TestCrashRecoveryFailClosedSecurity(t *testing.T) {
 			t.Fatalf("expected ExitCodeUnknown=true when ExitCode is nil, got %+v", snap.Result)
 		}
 	})
+}
+
+func spawnLiveSleepGroup(t *testing.T, cmdStr string) (int, int, string) {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", cmdStr)
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	pgid := processGroupID(pid)
+	_, startToken, alive := ProcessIdentity(pid)
+	if !alive || startToken == "" {
+		_ = killProcessTree(cmd)
+		_ = cmd.Wait()
+		t.Fatalf("spawned process %d not inspectable", pid)
+	}
+	t.Cleanup(func() {
+		_ = killProcessTree(cmd)
+		_ = cmd.Wait()
+	})
+	return pid, pgid, startToken
+}
+
+func TestCrashRecoveryAdoptedShortDeadlineEnforced(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-deadline-short"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	outFile := filepath.Join(outDir, "bash-1.log")
+	if err := os.WriteFile(outFile, []byte("started\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	childPIDFile := filepath.Join(root, "child.pid")
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q; wait", childPIDFile))
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	t.Cleanup(func() {
+		_ = killProcessTree(cmd)
+	})
+	pid := cmd.Process.Pid
+	pgid := processGroupID(pid)
+	_, startToken, alive := ProcessIdentity(pid)
+	if !alive || startToken == "" {
+		t.Fatalf("process %d not inspectable", pid)
+	}
+	var childPID int
+	waitChild := time.Now().Add(3 * time.Second)
+	for time.Now().Before(waitChild) {
+		if data, err := os.ReadFile(childPIDFile); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && p > 0 {
+				childPID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if childPID == 0 {
+		t.Fatal("background child pid not written")
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	started := time.Now().Add(-500 * time.Millisecond)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	if err := savePersistedJob(jobsDir, PersistedJob{
+		ID:             "bg-1",
+		Started:        started,
+		Deadline:       deadline,
+		Command:        "sleep 30",
+		Cwd:            root,
+		OutputFile:     outFile,
+		OutputID:       outID,
+		PID:            pid,
+		PGID:           pgid,
+		ProcessStarted: startToken,
+		Status:         JobRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != 1 || recovered[0].Status != JobRunning || !recovered[0].Adopted {
+		t.Fatalf("expected adopted running job, got %+v", recovered)
+	}
+	job := exec2.Jobs()[0]
+	if !job.Snapshot().Deadline.Equal(deadline) {
+		t.Fatalf("adopted deadline = %v, want %v", job.Snapshot().Deadline, deadline)
+	}
+
+	// Simulate a second crash check: the persisted record must retain the exact deadline.
+	persisted, err := loadPersistedJobs(jobsDir)
+	if err != nil || len(persisted) != 1 || !persisted[0].Deadline.Equal(deadline) {
+		t.Fatalf("persisted deadline after adoption = %+v, err=%v, want %v", persisted, err, deadline)
+	}
+
+	select {
+	case <-job.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("adopted job was not stopped when persisted deadline expired")
+	}
+	select {
+	case <-waitDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed-out adopted process did not exit")
+	}
+	res, ok := job.Result()
+	if !ok || !IsTimeout(res.Err) {
+		t.Fatalf("adopted deadline result = %+v (ok=%t), want timeoutError", res, ok)
+	}
+	pollDead := time.Now().Add(3 * time.Second)
+	for time.Now().Before(pollDead) {
+		if _, _, childAlive := ProcessIdentity(childPID); !childAlive {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, _, childAlive := ProcessIdentity(childPID); childAlive {
+		t.Fatalf("child pid %d survived adopted job deadline timeout", childPID)
+	}
+}
+
+func TestCrashRecoveryExpiredDeadlineStoppedOnAdoption(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-deadline-expired"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	outFile := filepath.Join(outDir, "bash-1.log")
+	if err := os.WriteFile(outFile, []byte("ran before crash\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", "sleep 30")
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	t.Cleanup(func() { _ = killProcessTree(cmd) })
+
+	pid := cmd.Process.Pid
+	pgid := processGroupID(pid)
+	_, startToken, alive := ProcessIdentity(pid)
+	if !alive || startToken == "" {
+		t.Fatalf("process %d not inspectable", pid)
+	}
+
+	// Also spawn an explicitly unlimited job that started >2h ago; it must stay running.
+	unlimCmd := exec.CommandContext(t.Context(), "bash", "-c", "sleep 30")
+	configureProcess(unlimCmd)
+	if err := unlimCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = killProcessTree(unlimCmd)
+		_ = unlimCmd.Wait()
+	})
+	unlimPID := unlimCmd.Process.Pid
+	unlimPGID := processGroupID(unlimPID)
+	_, unlimToken, unlimAlive := ProcessIdentity(unlimPID)
+	if !unlimAlive || unlimToken == "" {
+		t.Fatalf("unlimited process %d not inspectable", unlimPID)
+	}
+
+	if err := savePersistedJob(jobsDir, PersistedJob{
+		ID:             "bg-1",
+		Started:        time.Now().Add(-5 * time.Minute),
+		Deadline:       time.Now().Add(-1 * time.Minute),
+		Command:        "sleep 30",
+		Cwd:            root,
+		OutputFile:     outFile,
+		OutputID:       outID,
+		PID:            pid,
+		PGID:           pgid,
+		ProcessStarted: startToken,
+		Status:         JobRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := savePersistedJob(jobsDir, PersistedJob{
+		ID:             "bg-2",
+		Started:        time.Now().Add(-3 * time.Hour),
+		Unlimited:      true,
+		Command:        "sleep 30",
+		Cwd:            root,
+		OutputID:       outID,
+		PID:            unlimPID,
+		PGID:           unlimPGID,
+		ProcessStarted: unlimToken,
+		Status:         JobRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != 2 {
+		t.Fatalf("recovered len = %d, want 2: %+v", len(recovered), recovered)
+	}
+	var expiredRJ, unlimRJ RecoveredJob
+	for _, rj := range recovered {
+		if rj.ID == "bg-1" {
+			expiredRJ = rj
+		} else if rj.ID == "bg-2" {
+			unlimRJ = rj
+		}
+	}
+	if expiredRJ.Status != JobDone || !expiredRJ.Adopted || !strings.Contains(expiredRJ.Reason, "exceeded deadline") {
+		t.Fatalf("expired job not stopped on adoption with clear recovery note: %+v", expiredRJ)
+	}
+	if unlimRJ.Status != JobRunning || !unlimRJ.Adopted {
+		t.Fatalf("unlimited job should stay running on adoption: %+v", unlimRJ)
+	}
+	select {
+	case <-waitDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("expired process was not killed during RecoverSessionJobs")
+	}
+	if _, _, stillAlive := ProcessIdentity(pid); stillAlive {
+		t.Fatalf("expired PID %d still alive after adoption", pid)
+	}
+	res, ok := exec2.Jobs()[0].Result()
+	if expiredJob := exec2.registry().Get("bg-1"); expiredJob == nil {
+		t.Fatal("missing bg-1")
+	} else {
+		res, ok = expiredJob.Result()
+		if !ok || !IsTimeout(res.Err) || !strings.Contains(res.Output, "exceeded deadline") {
+			t.Fatalf("expired job result = %+v (ok=%t), want timeoutError + recovery note", res, ok)
+		}
+	}
+}
+
+func TestCrashRecoveryLegacyRecordWithoutDeadlineUsesDefaultLifetime(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-legacy-deadline"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+
+	// Case 1: recent legacy record without Deadline -> Deadline = Started + DefaultBackgroundMaxLifetime.
+	cmd1 := exec.CommandContext(t.Context(), "bash", "-c", "sleep 30")
+	configureProcess(cmd1)
+	if err := cmd1.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = killProcessTree(cmd1)
+		_ = cmd1.Wait()
+	})
+	pid1 := cmd1.Process.Pid
+	pgid1 := processGroupID(pid1)
+	_, tok1, alive1 := ProcessIdentity(pid1)
+	if !alive1 {
+		t.Fatalf("process %d not alive", pid1)
+	}
+	started1 := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+
+	// Case 2: old legacy record (> DefaultBackgroundMaxLifetime ago) -> stopped on adoption.
+	cmd2 := exec.CommandContext(t.Context(), "bash", "-c", "sleep 30")
+	configureProcess(cmd2)
+	if err := cmd2.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitDone2 := make(chan error, 1)
+	go func() { waitDone2 <- cmd2.Wait() }()
+	t.Cleanup(func() { _ = killProcessTree(cmd2) })
+	pid2 := cmd2.Process.Pid
+	pgid2 := processGroupID(pid2)
+	_, tok2, alive2 := ProcessIdentity(pid2)
+	if !alive2 {
+		t.Fatalf("process %d not alive", pid2)
+	}
+	started2 := time.Now().Add(-(DefaultBackgroundMaxLifetime + time.Minute)).UTC().Truncate(time.Second)
+
+	if err := savePersistedJob(jobsDir, PersistedJob{
+		ID:             "bg-1",
+		Started:        started1,
+		Command:        "sleep 30",
+		Cwd:            root,
+		OutputID:       outID,
+		PID:            pid1,
+		PGID:           pgid1,
+		ProcessStarted: tok1,
+		Status:         JobRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := savePersistedJob(jobsDir, PersistedJob{
+		ID:             "bg-2",
+		Started:        started2,
+		Command:        "sleep 30",
+		Cwd:            root,
+		OutputID:       outID,
+		PID:            pid2,
+		PGID:           pgid2,
+		ProcessStarted: tok2,
+		Status:         JobRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != 2 {
+		t.Fatalf("recovered len = %d, want 2", len(recovered))
+	}
+	j1 := exec2.registry().Get("bg-1")
+	if j1 == nil || j1.Status() != JobRunning {
+		t.Fatalf("recent legacy job = %v, want running", j1)
+	}
+	wantDeadline := started1.Add(DefaultBackgroundMaxLifetime)
+	if !j1.Snapshot().Deadline.Equal(wantDeadline) {
+		t.Fatalf("legacy job deadline = %v, want %v", j1.Snapshot().Deadline, wantDeadline)
+	}
+	j2 := exec2.registry().Get("bg-2")
+	if j2 == nil || j2.Status() != JobDone {
+		t.Fatalf("expired legacy job status = %v, want done", j2)
+	}
+	select {
+	case <-waitDone2:
+	case <-time.After(3 * time.Second):
+		t.Fatal("expired legacy job process was not stopped on adoption")
+	}
+}
+
+func TestCrashRecoveryWaitErrorKeepsJobRunningAndStoppable(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-wait-err"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	outFile := filepath.Join(outDir, "bash-wait.log")
+	if err := os.WriteFile(outFile, []byte("wait-err-log\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", "sleep 30")
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	t.Cleanup(func() { _ = killProcessTree(cmd) })
+
+	pid := cmd.Process.Pid
+	pgid := processGroupID(pid)
+	_, startToken, alive := ProcessIdentity(pid)
+	if !alive {
+		t.Fatalf("process %d not alive", pid)
+	}
+	if err := savePersistedJob(jobsDir, PersistedJob{
+		ID:             "bg-1",
+		Started:        time.Now().Add(-time.Second),
+		Deadline:       time.Now().Add(time.Minute),
+		Command:        "sleep 30",
+		Cwd:            root,
+		OutputFile:     outFile,
+		OutputID:       outID,
+		PID:            pid,
+		PGID:           pgid,
+		ProcessStarted: startToken,
+		Status:         JobRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitCalled := make(chan struct{})
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		waitAdopted: func(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {
+			close(waitCalled)
+			return -1, false, errors.New("injected kevent EACCES")
+		},
+	}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != 1 || recovered[0].Status != JobRunning {
+		t.Fatalf("recovered = %+v, want running", recovered)
+	}
+	<-waitCalled
+
+	job := exec2.registry().Get("bg-1")
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if job.Snapshot().WaitError != "" {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	snap := job.Snapshot()
+	if snap.Status != JobRunning {
+		t.Fatalf("job status after wait error = %q, want running (must never mark done)", snap.Status)
+	}
+	if !strings.Contains(snap.WaitError, "injected kevent EACCES") || !strings.Contains(snap.RecoveryNote, "injected kevent EACCES") {
+		t.Fatalf("wait error not reported in snapshot: %+v", snap)
+	}
+	select {
+	case <-job.Done():
+		t.Fatal("job.Done() closed after wait error")
+	default:
+	}
+
+	// Active output mark must remain while the job is still running.
+	absOutDir, _ := filepath.Abs(outDir)
+	exec2.outMu.Lock()
+	budget := exec2.outputBudgets[absOutDir]
+	exec2.outMu.Unlock()
+	if budget == nil {
+		t.Fatal("expected active output budget entry")
+	}
+	budget.mu.Lock()
+	activeStillMarked := budget.active[filepath.Base(outFile)]
+	budget.mu.Unlock()
+	if !activeStillMarked {
+		t.Fatal("active output mark was removed despite wait error")
+	}
+
+	// Process must still be alive, and StopJob must succeed and kill it cleanly.
+	if _, _, stillAlive := ProcessIdentity(pid); !stillAlive {
+		t.Fatalf("process %d exited unexpectedly", pid)
+	}
+	stopRes, stopErr := exec2.StopJob("bg-1")
+	if stopErr != nil {
+		t.Fatalf("StopJob after wait error failed: %v (%s)", stopErr, stopRes.Text)
+	}
+	select {
+	case <-waitDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("process was not killed by StopJob after wait error")
+	}
+	if job.Status() != JobDone {
+		t.Fatalf("job status after StopJob = %q, want done", job.Status())
+	}
+	budget.mu.Lock()
+	activeAfterStop := budget.active[filepath.Base(outFile)]
+	budget.mu.Unlock()
+	if activeAfterStop {
+		t.Fatal("active output mark was not cleared after StopJob")
+	}
+}
+
+func TestCrashRecoveryAdoptedLeaderExitStopsBackgroundChild(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-child-cleanup"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childPIDFile := filepath.Join(root, "child.pid")
+	releaseFile := filepath.Join(root, "release")
+
+	helperCmd, meta := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "CHILD-READY",
+		"GMH_HELPER_CMD": fmt.Sprintf(
+			"sleep 30 & echo $! > %q; printf 'CHILD-READY\\n'; while [ ! -f %q ]; do sleep 0.05; done; exit 0",
+			childPIDFile, releaseFile,
+		),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	pidBytes, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil || childPID <= 0 {
+		t.Fatalf("invalid child pid %q: %v", string(pidBytes), err)
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+	if _, _, childAlive := ProcessIdentity(childPID); !childAlive {
+		t.Fatalf("child pid %d not alive before adoption", childPID)
+	}
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != 1 || recovered[0].Status != JobRunning {
+		t.Fatalf("recovered = %+v, want 1 running", recovered)
+	}
+
+	// Let the adopted leader exit cleanly.
+	if err := os.WriteFile(releaseFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	job := exec2.registry().Get(meta.JobID)
+	select {
+	case <-job.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("adopted job did not finish after leader exit")
+	}
+
+	// The background child spawned by the adopted leader must be stopped.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, childAlive := ProcessIdentity(childPID); !childAlive {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("background child pid %d stayed alive after adopted leader %d exited", childPID, meta.PID)
 }
 
 var _ = errors.New

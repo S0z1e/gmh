@@ -267,12 +267,16 @@ func (s *Server) run() error {
 	}
 	s.refreshState()
 	fmt.Fprintf(os.Stderr, "harness rpc ready: session %s (stdin/stdout JSONL)\n", s.app.Store.ID)
+	if s.app.OrphanedJobsNotice != "" {
+		fmt.Fprintln(os.Stderr, s.app.OrphanedJobsNotice)
+	}
 	s.writeEvent(Event{
 		Type: "ready", Protocol: protocolVersion,
 		Session: s.app.Store.ID, Model: s.app.Cfg.Client.Model, API: s.app.Cfg.Client.API,
 		Mode: s.app.Cfg.ApprovalMode(), Root: s.app.Root,
 		Resumed: s.app.ResumedMessage != "", Messages: len(s.app.History),
 		ResumedMessage: s.app.ResumedMessage, RecoveredJobs: s.app.RecoveredJobs,
+		OrphanedJobs: s.app.OrphanedJobs, OrphanedJobsNotice: s.app.OrphanedJobsNotice,
 	})
 	go s.readLoop()
 	s.agentLoop()
@@ -549,6 +553,10 @@ func (s *Server) handleSetApprovalMode(req Request) {
 // waiting on a dialog: the loop blocks in ask(), which no context
 // cancellation can reach, so the approval must be failed directly.
 func (s *Server) handleAbort(req Request) {
+	var cancelJobs func()
+	if s.app != nil && s.app.Cfg != nil && s.app.Cfg.Exec != nil {
+		cancelJobs = s.app.Cfg.Exec.SessionCanceller()
+	}
 	s.turnMu.Lock()
 	cancel := s.turnCancel
 	if cancel != nil {
@@ -562,6 +570,9 @@ func (s *Server) handleAbort(req Request) {
 	// Keep the next queued runTurn from registering new waiters until every
 	// waiter owned by the cancelled turn has been detached.
 	s.turnMu.Unlock()
+	if cancelJobs != nil {
+		cancelJobs()
+	}
 	s.respond(req, map[string]any{"aborted": cancel != nil}, nil)
 }
 
@@ -649,7 +660,13 @@ func (s *Server) handleQuery(req Request) {
 		}
 		s.respond(req, data, nil)
 	case "jobs":
-		s.respond(req, map[string]any{"jobs": s.jobsList()}, nil)
+		orphans, notice := s.app.RefreshOrphanedJobs()
+		resp := map[string]any{"jobs": s.jobsList()}
+		if len(orphans) > 0 {
+			resp["orphaned_jobs"] = orphans
+			resp["orphaned_jobs_notice"] = notice
+		}
+		s.respond(req, resp, nil)
 	case "list_sessions":
 		list, err := session.List()
 		if err != nil {
@@ -952,6 +969,10 @@ func (s *Server) jobsList() []map[string]any {
 		}
 		if snap.RecoveryNote != "" {
 			item["recovery_note"] = snap.RecoveryNote
+		}
+		if snap.WaitError != "" {
+			item["wait_error"] = snap.WaitError
+			item["error"] = snap.WaitError
 		}
 		if snap.Status == tools.JobDone {
 			if !snap.Result.ExitCodeUnknown {

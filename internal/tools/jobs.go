@@ -62,23 +62,30 @@ type Job struct {
 	RecoveryNote   string
 	// OutputFile is the per-call file holding the full stdout+stderr
 	// ("" when OutputDir was unset); it grows while the job runs.
-	OutputFile  string
-	Started     time.Time
-	cancel      context.CancelFunc
-	closeCancel context.CancelFunc
-	stopParent  func() bool
+	OutputFile   string
+	Started      time.Time
+	Deadline     time.Time
+	Unlimited    bool
+	WaitError    string
+	cancel       context.CancelFunc
+	closeCancel  context.CancelFunc
+	stopParent   func() bool
+	stopDeadline func()
 
 	jobsDir   string
 	outputDir string
+	exec      *Executor
+	audit     func(AuditEntry)
 	persistMu sync.Mutex
 
-	mu         sync.Mutex
-	done       chan struct{}
-	result     JobResult
-	finished   bool
-	unknown    bool
-	retained   bool
-	forgotten  bool
+	mu            sync.Mutex
+	done          chan struct{}
+	result        JobResult
+	finished      bool
+	unknown       bool
+	monitorFailed bool
+	retained      bool
+	forgotten     bool
 	finishedAt time.Time
 	registry   *JobRegistry
 	// A later turn must not deliver a recorded result twice.
@@ -99,6 +106,8 @@ type Job struct {
 type JobSnapshot struct {
 	ID              string
 	Started         time.Time
+	Deadline        time.Time
+	Unlimited       bool
 	InvocationID    string
 	ToolCallID      string
 	Command         string
@@ -109,6 +118,7 @@ type JobSnapshot struct {
 	Identity        ProcessIdentityInfo
 	Adopted         bool
 	RecoveryNote    string
+	WaitError       string
 	Status          JobStatus
 	FinishedAt      time.Time
 	Delivered       bool
@@ -132,6 +142,8 @@ func (j *Job) Snapshot() JobSnapshot {
 	return JobSnapshot{
 		ID:              j.ID,
 		Started:         j.Started,
+		Deadline:        j.Deadline,
+		Unlimited:       j.Unlimited,
 		InvocationID:    j.InvocationID,
 		ToolCallID:      j.ToolCallID,
 		Command:         j.Command,
@@ -142,6 +154,7 @@ func (j *Job) Snapshot() JobSnapshot {
 		Identity:        ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted},
 		Adopted:         j.Adopted,
 		RecoveryNote:    j.RecoveryNote,
+		WaitError:       j.WaitError,
 		Status:          status,
 		FinishedAt:      j.finishedAt,
 		Delivered:       j.delivered,
@@ -233,6 +246,8 @@ func (j *Job) snapshotForPersist() (PersistedJob, string, bool) {
 	return PersistedJob{
 		ID:              j.ID,
 		Started:         j.Started,
+		Deadline:        j.Deadline,
+		Unlimited:       j.Unlimited,
 		InvocationID:    j.InvocationID,
 		ToolCallID:      j.ToolCallID,
 		Command:         j.Command,
@@ -294,6 +309,10 @@ func (j *Job) markUnknown(reason, outputSummary string, preview *BashOutputPrevi
 		j.stopParent()
 		j.stopParent = nil
 	}
+	if j.stopDeadline != nil {
+		j.stopDeadline()
+		j.stopDeadline = nil
+	}
 	j.unknown = true
 	j.RecoveryNote = reason
 	j.finishedAt = time.Now()
@@ -318,6 +337,10 @@ func (j *Job) finish(r JobResult) {
 	if j.stopParent != nil {
 		j.stopParent()
 		j.stopParent = nil
+	}
+	if j.stopDeadline != nil {
+		j.stopDeadline()
+		j.stopDeadline = nil
 	}
 	j.result = r
 	j.finished = true
@@ -952,6 +975,14 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	identity := invocationFromContext(ctx)
 	key, _ := ctx.Value(failureKeyContext{}).(string)
 	jobsDir := e.JobsDirPath()
+	started := time.Now()
+	var deadline time.Time
+	unlimited := false
+	if timeout > 0 {
+		deadline = started.Add(timeout)
+	} else {
+		unlimited = true
+	}
 	job := &Job{
 		InvocationID: identity.id,
 		ToolCallID:   identity.callID,
@@ -963,7 +994,9 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		jobsDir:      jobsDir,
 		outputDir:    e.OutputDir,
 		retained:     !foreground || jobsDir != "",
-		Started:      time.Now(),
+		Started:      started,
+		Deadline:     deadline,
+		Unlimited:    unlimited,
 		done:         make(chan struct{}),
 		cancel:       cancel,
 		closeCancel:  func() { cancelCause(ErrExecutorClosed) },
@@ -1090,29 +1123,109 @@ func (j *Job) CancelErr() error {
 	}
 	j.stopRequested = true
 	adopted := j.Adopted
-	id := ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
 	cancel := j.cancel
-	outFile, cwd := j.OutputFile, j.Cwd
 	j.mu.Unlock()
 	if adopted {
-		err := stopVerifiedProcessGroup(id)
-		if errors.Is(err, ErrProcessIdentityMismatch) {
-			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
-			j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, err), summary, preview)
-			if cancel != nil {
-				cancel()
-			}
-			return err
+		err := j.stopAdoptedProcess(context.Canceled, false)
+		if errors.Is(err, ErrProcessIdentityMismatch) && cancel != nil {
+			cancel()
 		}
-		if err != nil && !errors.Is(err, os.ErrProcessDone) {
-			j.persist()
-			return err
-		}
-		j.persist()
-		return nil
+		return err
 	}
 	if cancel != nil {
 		cancel()
+	}
+	j.persist()
+	return nil
+}
+
+func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
+	j.mu.Lock()
+	if j.finished || j.unknown {
+		j.mu.Unlock()
+		return nil
+	}
+	id := ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
+	outFile, cwd, monitorFailed := j.OutputFile, j.Cwd, j.monitorFailed
+	execRef, outputDir, auditFn := j.exec, j.outputDir, j.audit
+	started, deadline := j.Started, j.Deadline
+	j.mu.Unlock()
+
+	err := stopVerifiedProcessGroup(id)
+	if errors.Is(err, ErrProcessIdentityMismatch) {
+		summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
+		j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, err), summary, preview)
+		return err
+	}
+	if errors.Is(err, os.ErrProcessDone) {
+		gerr := stopAdoptedProcessGroupAfterExit(id)
+		if errors.Is(gerr, ErrProcessIdentityMismatch) {
+			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
+			j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr), summary, preview)
+			return gerr
+		}
+		if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
+			j.persist()
+			return gerr
+		}
+	} else if err != nil {
+		j.persist()
+		return err
+	} else if monitorFailed {
+		waitForAdoptedProcessGone(id, 2*time.Second)
+		_ = stopAdoptedProcessGroupAfterExit(id)
+	}
+	if monitorFailed {
+		summary, preview, _, hasFile := summarizeOutputFile(outFile, cwd)
+		note := pipeCaptureEndedNote(outFile)
+		if !hasFile {
+			summary = fmt.Sprintf("(adopted background job stopped; %s)", note)
+		} else {
+			summary += "\n[" + note + "]"
+		}
+		if preview != nil {
+			if preview.Notice != "" {
+				preview.Notice += "\n[" + note + "]"
+			} else {
+				preview.Notice = "[" + note + "]"
+			}
+		}
+		resErr := cause
+		var exitCode int
+		var exitUnknown bool
+		if isTimeout {
+			resErr = &timeoutError{timeout: max(0, deadline.Sub(started))}
+			exitCode = -1
+		} else {
+			exitCode = -1
+			exitUnknown = true
+		}
+		if execRef != nil && outFile != "" && outputDir != "" {
+			execRef.unmarkActiveOutput(outputDir, outFile)
+		}
+		if auditFn != nil {
+			entry := AuditEntry{
+				InvocationID: j.InvocationID,
+				ToolCallID:   j.ToolCallID,
+				TS:           time.Now(),
+				Kind:         "bash",
+				Tool:         "bash",
+				Args:         truncate(j.Command, 500),
+				ExitCode:     -1,
+			}
+			if resErr != nil {
+				entry.Error = resErr.Error()
+			}
+			auditFn(entry)
+		}
+		j.finish(JobResult{
+			Output:          summary,
+			Err:             resErr,
+			ExitCode:        exitCode,
+			ExitCodeUnknown: exitUnknown,
+			Preview:         preview,
+		})
+		return nil
 	}
 	j.persist()
 	return nil

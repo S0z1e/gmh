@@ -438,6 +438,10 @@ func TestJobIdentityFieldsAndValidation(t *testing.T) {
 			name: "unknown marked delivered",
 			job:  Job{ID: "bg-1", Started: started, Command: "x", Status: Unknown, Delivered: true},
 		},
+		{
+			name: "deadline and unlimited both set",
+			job:  Job{ID: "bg-1", Started: started, Deadline: started.Add(time.Minute), Unlimited: true, Command: "x", Status: Running},
+		},
 	}
 	for _, tc := range invalidCases {
 		t.Run(tc.name, func(t *testing.T) {

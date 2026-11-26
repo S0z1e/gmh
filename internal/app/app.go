@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"minimalharness/internal/agent"
@@ -66,6 +67,11 @@ type Params struct {
 	// the loop backgrounds it: -1 = unset (env OPENAI_BG_THRESHOLD_SECONDS
 	// or the 120s default), 0 = never background, >0 = seconds.
 	BackgroundThresholdSeconds int
+	// BackgroundMaxLifetimeSeconds caps background:true jobs when no per-call
+	// timeout is given: 0 = unset (env OPENAI_BACKGROUND_MAX_LIFETIME_SECONDS,
+	// config backgroundMaxLifetimeSeconds, or 7200s default), >0 = seconds,
+	// <0 = unlimited.
+	BackgroundMaxLifetimeSeconds int
 	// DisableBackground turns backgrounding off entirely. -p print
 	// mode sets it: a one-shot run stays synchronous.
 	DisableBackground bool
@@ -101,6 +107,10 @@ type App struct {
 	// RecoveredJobs summarizes any retained background jobs inspected while
 	// reopening the current session.
 	RecoveredJobs []tools.RecoveredJob
+	// OrphanedJobs summarizes running background jobs in other unsupervised
+	// sessions of the same workspace, and OrphanedJobsNotice formats them.
+	OrphanedJobs       []tools.OrphanedSessionJobs
+	OrphanedJobsNotice string
 	// TUITheme is the resolved TUI theme name: HARNESS_TUI_THEME,
 	// else the config file, else "" (the default theme).
 	TUITheme string
@@ -127,6 +137,7 @@ type App struct {
 	pendingReminder string
 	// Writers with undelivered jobs remain owned across session switches.
 	retainedStores map[*session.Store]struct{}
+	orphansMu      sync.Mutex
 }
 
 // Setup builds the client, session and agent config. The caller sets
@@ -362,6 +373,31 @@ func Setup(p Params) (*App, error) {
 	}
 	executor.BackgroundThreshold = bgThreshold
 
+	// Background max lifetime: flag wins, else env, else config, else 2h default.
+	// 0 in env/config (or <0 in Params) disables the cap.
+	var bgMaxLifetime time.Duration
+	if p.BackgroundMaxLifetimeSeconds < 0 {
+		bgMaxLifetime = -1
+	} else if p.BackgroundMaxLifetimeSeconds > 0 {
+		bgMaxLifetime = time.Duration(p.BackgroundMaxLifetimeSeconds) * time.Second
+	} else if v := os.Getenv("OPENAI_BACKGROUND_MAX_LIFETIME_SECONDS"); v != "" {
+		var secs int
+		if _, err := fmt.Sscanf(v, "%d", &secs); err == nil {
+			if secs == 0 {
+				bgMaxLifetime = -1
+			} else if secs > 0 {
+				bgMaxLifetime = time.Duration(secs) * time.Second
+			}
+		}
+	} else if cfg.BackgroundMaxLifetimeSeconds != nil {
+		if *cfg.BackgroundMaxLifetimeSeconds == 0 {
+			bgMaxLifetime = -1
+		} else {
+			bgMaxLifetime = time.Duration(*cfg.BackgroundMaxLifetimeSeconds) * time.Second
+		}
+	}
+	executor.BackgroundMaxLifetime = bgMaxLifetime
+
 	// Sandbox: flag wins, else env, else config. bwrap is located and
 	// probed now so a broken sandbox fails at startup, not on the
 	// first bash call.
@@ -474,6 +510,7 @@ func Setup(p Params) (*App, error) {
 			return nil, err
 		}
 	}
+	a.RefreshOrphanedJobs()
 	// -image attachments fail the run when a file cannot be loaded.
 	for _, p := range p.Images {
 		if _, err := a.AttachImage(p); err != nil {
@@ -505,6 +542,66 @@ func (a *App) recoverSessionJobs(store *session.Store, history []llm.Message) er
 	}
 	return nil
 }
+
+// RefreshOrphanedJobs scans other unsupervised sessions in the same workspace
+// for live background jobs and updates OrphanedJobs and OrphanedJobsNotice.
+func (a *App) RefreshOrphanedJobs() ([]tools.OrphanedSessionJobs, string) {
+	if a == nil || a.Root == "" {
+		return nil, ""
+	}
+	a.orphansMu.Lock()
+	owned := map[string]bool{}
+	if a.Store != nil {
+		id, outID := a.Store.SnapshotIDs()
+		owned[id] = true
+		owned[outID] = true
+	}
+	for retained := range a.retainedStores {
+		if retained != nil {
+			id, outID := retained.SnapshotIDs()
+			owned[id] = true
+			owned[outID] = true
+		}
+	}
+	a.orphansMu.Unlock()
+
+	sessions, err := session.ListWorkspaceSessions(a.Root)
+	var orphans []tools.OrphanedSessionJobs
+	if err == nil {
+		for _, ws := range sessions {
+			if ws.Busy || owned[ws.ID] || owned[ws.OutputID] {
+				continue
+			}
+			jobs, jerr := tools.FindOrphanedRunningJobs(ws.JobsDir, ws.OutputID, ws.OutputDir)
+			if jerr != nil || len(jobs) == 0 {
+				continue
+			}
+			orphans = append(orphans, tools.OrphanedSessionJobs{
+				SessionID: ws.ID,
+				Jobs:      jobs,
+			})
+		}
+	}
+	notice := tools.FormatOrphanedJobsNotice(orphans)
+
+	a.orphansMu.Lock()
+	a.OrphanedJobs = orphans
+	a.OrphanedJobsNotice = notice
+	a.orphansMu.Unlock()
+	return orphans, notice
+}
+
+// OrphanedNotice returns the latest formatted notice of orphaned workspace jobs.
+func (a *App) OrphanedNotice() string {
+	if a == nil {
+		return ""
+	}
+	a.orphansMu.Lock()
+	defer a.orphansMu.Unlock()
+	return a.OrphanedJobsNotice
+}
+
+// CloseContext stops commands and saves finished results...
 
 // AttachImage loads one image file and queues it for the next turn.
 // At most MaxImagesPerMessage wait for a turn.
@@ -878,12 +975,14 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	a.orphansMu.Lock()
 	old := a.Store
 	oldID := ""
 	if old != nil {
 		oldID = old.ID
 	}
 	a.Store = store
+	a.orphansMu.Unlock()
 	a.History = nil
 	a.PendingImages = nil
 	a.PendingFiles = nil
@@ -908,6 +1007,7 @@ func (a *App) newSession(fire bool) (*session.Store, error) {
 		}
 	}
 	a.retainOrClose(old)
+	a.RefreshOrphanedJobs()
 	if fire {
 		a.fireSessionEvents(oldID, store.ID)
 	}
@@ -933,6 +1033,7 @@ func (a *App) loadSession(id string, steal, rebind bool) ([]llm.Message, error) 
 	if err := session.ValidateSessionID(id); err != nil {
 		return nil, err
 	}
+	a.orphansMu.Lock()
 	old := a.Store
 	store := old
 	reuse := old != nil && old.Owns(id)
@@ -944,6 +1045,7 @@ func (a *App) loadSession(id string, steal, rebind bool) ([]llm.Message, error) 
 			}
 		}
 	}
+	a.orphansMu.Unlock()
 	if reuse {
 		if err := store.CheckWorkspace(a.Root); err != nil {
 			return nil, err
@@ -1009,8 +1111,10 @@ func (a *App) loadSession(id string, steal, rebind bool) ([]llm.Message, error) 
 			resumedMsg += "\n" + summary
 		}
 	}
+	a.orphansMu.Lock()
 	a.Store = store
 	delete(a.retainedStores, store)
+	a.orphansMu.Unlock()
 	a.hydrateImages(history)
 	a.History = history
 	a.PendingImages = nil
@@ -1036,6 +1140,7 @@ func (a *App) loadSession(id string, steal, rebind bool) ([]llm.Message, error) 
 	if old != store {
 		a.retainOrClose(old)
 	}
+	a.RefreshOrphanedJobs()
 	a.fireSessionEvents(oldID, store.ID)
 	return history, nil
 }
@@ -1043,6 +1148,7 @@ func (a *App) loadSession(id string, steal, rebind bool) ([]llm.Message, error) 
 // RenameSession keeps the executor and plugin state under the transcript's id.
 func (a *App) RenameSession(oldID, newID string) error {
 	var err error
+	a.orphansMu.Lock()
 	current := a.Store != nil && a.Store.Owns(oldID)
 	owner := a.Store
 	if !current {
@@ -1054,6 +1160,7 @@ func (a *App) RenameSession(oldID, newID string) error {
 			}
 		}
 	}
+	a.orphansMu.Unlock()
 	if owner != nil {
 		// A filesystem alias can select this writer, but registries and
 		// plugin ownership use the actual ID captured at launch.
@@ -1543,9 +1650,13 @@ func ParseJobsStopArg(line string) (string, bool) {
 // printJobs lists the background bash jobs of this process, oldest
 // first: id, status, elapsed time, command, and exit code once done.
 func (r *Runner) printJobs() {
+	r.App.RefreshOrphanedJobs()
 	jobs := r.App.Cfg.Exec.Jobs()
 	if len(jobs) == 0 {
 		r.Print("No background jobs.")
+		if notice := r.App.OrphanedNotice(); notice != "" {
+			r.Print("%s", notice)
+		}
 		return
 	}
 	for _, j := range jobs {
@@ -1576,10 +1687,13 @@ func (r *Runner) printJobs() {
 			if snap.Result.Err != nil {
 				line += fmt.Sprintf("  (%v)", snap.Result.Err)
 			}
-		} else if snap.Status == tools.JobUnknown && snap.RecoveryNote != "" {
+		} else if (snap.Status == tools.JobUnknown || snap.WaitError != "") && snap.RecoveryNote != "" {
 			line += fmt.Sprintf("  (%s)", snap.RecoveryNote)
 		}
 		r.Print("%s", line)
+	}
+	if notice := r.App.OrphanedNotice(); notice != "" {
+		r.Print("%s", notice)
 	}
 }
 

@@ -111,6 +111,23 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	return os.ErrProcessDone
 }
 
+func stopAdoptedProcessGroupAfterExit(id ProcessIdentityInfo) error {
+	if !id.Valid() {
+		return ErrProcessIdentityMismatch
+	}
+	info := inspectProcess(id.PID)
+	if info.Alive && !id.Matches(info) {
+		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+	}
+	if kerr := syscall.Kill(-id.PGID, syscall.SIGKILL); kerr == nil {
+		return nil
+	} else if errors.Is(kerr, syscall.ESRCH) {
+		return os.ErrProcessDone
+	} else {
+		return kerr
+	}
+}
+
 func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {
 	if !id.Valid() {
 		return -1, false, ErrProcessIdentityMismatch

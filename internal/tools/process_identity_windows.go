@@ -75,6 +75,10 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	return nil
 }
 
+func stopAdoptedProcessGroupAfterExit(id ProcessIdentityInfo) error {
+	return stopVerifiedProcessGroup(id)
+}
+
 func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {
 	if !id.Valid() {
 		return -1, false, ErrProcessIdentityMismatch

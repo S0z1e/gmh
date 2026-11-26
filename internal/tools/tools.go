@@ -122,6 +122,9 @@ type Executor struct {
 
 	cacheOnce  sync.Once
 	fetchCache *webfetchCache
+
+	// waitAdopted overrides waitAdoptedProcess in tests.
+	waitAdopted func(context.Context, ProcessIdentityInfo) (int, bool, error)
 }
 
 // webfetchCache returns the executor's page cache, creating it on
