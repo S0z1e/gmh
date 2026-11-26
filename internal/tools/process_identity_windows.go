@@ -162,3 +162,7 @@ func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool,
 	}
 	return 0, true, nil
 }
+
+func inspectProcessErr(pid int) (processInfo, error) {
+	return inspectProcess(pid), nil
+}

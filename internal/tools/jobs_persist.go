@@ -1194,24 +1194,28 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		if waitErr == nil {
 			waitErr = errors.New("adopted process wait failed")
 		}
-		info := inspectProcess(snap.Identity.PID)
-		if !info.Alive {
+		info, ierr := inspectProcessErr(snap.Identity.PID)
+		if ierr == nil && !info.Alive {
 			// Leader has already exited. Clean up remaining processes in group and finish.
 			if job.cleanupAdoptedGroupAfterExit() {
 				return
 			}
-		} else if !snap.Identity.Matches(info) {
+			err = nil
+			exitCode = 0
+			exitKnown = false
+		} else if ierr == nil && info.Alive && !snap.Identity.Matches(info) {
 			summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
 			job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
 			return
 		} else {
-			// Leader is still alive and verified. Keep WaitError visible and
-			// continue supervising via fallback polling so the child group is
-			// automatically cleaned up when the leader exits.
-			job.proofFDMu.Lock()
-			job.refreshVerifiedGroupMembersLocked()
-			job.proofFDMu.Unlock()
-
+			// Leader is still alive or inspection failed with a transient error (such as EMFILE/ENFILE).
+			// Keep WaitError visible and continue supervising via fallback polling so the child group
+			// is not mistakenly killed under descriptor exhaustion.
+			if ierr == nil && snap.Identity.Matches(info) {
+				job.proofFDMu.Lock()
+				job.refreshVerifiedGroupMembersLocked()
+				job.proofFDMu.Unlock()
+			}
 			job.mu.Lock()
 			if !job.finished && !job.unknown {
 				job.WaitError = waitErr.Error()
@@ -1227,25 +1231,84 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 			for !leaderExited {
 				select {
 				case <-ctx.Done():
-					return
+					leaderExited = true
+					break
 				case <-ticker.C:
-					pinfo := inspectProcess(snap.Identity.PID)
-					if !pinfo.Alive {
+					pinfo, perr := inspectProcessErr(snap.Identity.PID)
+					if isFDLimitErr(perr) {
+						// Descriptor exhaustion: cannot inspect /proc safely. Retry on next tick;
+						// do not assume process exited.
+						continue
+					}
+					if perr == nil && !pinfo.Alive {
+						// Positively established exit.
 						leaderExited = true
 						break
 					}
-					if !snap.Identity.Matches(pinfo) {
+					if perr == nil && pinfo.Alive && !snap.Identity.Matches(pinfo) {
 						summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
 						job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
 						return
 					}
-					job.proofFDMu.Lock()
-					job.refreshVerifiedGroupMembersLocked()
-					job.proofFDMu.Unlock()
+					if perr == nil && pinfo.Alive {
+						job.proofFDMu.Lock()
+						job.refreshVerifiedGroupMembersLocked()
+						job.proofFDMu.Unlock()
+					}
 				}
 			}
-			if job.cleanupAdoptedGroupAfterExit() {
-				return
+
+			// Funnel fallback exit and cancellation through terminal handling,
+			// reading the stop and timeout outcome when polling ends.
+			deadlineStopMu.Lock()
+			isTimedOut = timedOut
+			if deadlineStopErr != nil {
+				stopErr = deadlineStopErr
+			}
+			deadlineStopMu.Unlock()
+
+			cause := context.Cause(ctx)
+			if errors.Is(cause, ErrExecutorClosed) {
+				if job.cleanupAdoptedGroupAfterExit() {
+					return
+				}
+				err = ErrExecutorClosed
+				exitCode = -1
+				exitKnown = false
+			} else if isTimedOut {
+				if job.cleanupAdoptedGroupAfterExit() {
+					return
+				}
+				err = &timeoutError{timeout: max(0, snap.Deadline.Sub(snap.Started))}
+				exitCode = -1
+				exitKnown = false
+			} else if cause != nil && !errors.Is(cause, context.Canceled) {
+				if job.cleanupAdoptedGroupAfterExit() {
+					return
+				}
+				err = cause
+				exitCode = -1
+				exitKnown = false
+			} else if ctx.Err() != nil {
+				job.mu.Lock()
+				settled := job.finished || job.unknown
+				job.mu.Unlock()
+				if settled {
+					return
+				}
+				if job.cleanupAdoptedGroupAfterExit() {
+					return
+				}
+				err = ctx.Err()
+				exitCode = -1
+				exitKnown = false
+			} else {
+				if job.cleanupAdoptedGroupAfterExit() {
+					return
+				}
+				err = nil
+				exitCode = 0
+				exitKnown = false
 			}
 		}
 	}
@@ -1290,24 +1353,27 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 
 func (j *Job) cleanupAdoptedGroupAfterExit() bool {
 	j.proofFDMu.Lock()
-	defer j.proofFDMu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			j.proofFDMu.Unlock()
+		}
+	}()
 	j.mu.Lock()
 	if j.finished || j.unknown {
 		j.mu.Unlock()
 		return false
 	}
 	proof := j.snapshotGroupProofLocked()
-	execRef := j.exec
 	outFile, cwd := j.OutputFile, j.Cwd
 	j.mu.Unlock()
 
 	proof.ExitObservedAt = time.Now()
-	stopGroupAfterExitFn := stopAdoptedProcessGroupAfterExit
-	if execRef != nil && execRef.stopAdoptedGroupAfterExit != nil {
-		stopGroupAfterExitFn = execRef.stopAdoptedGroupAfterExit
-	}
+	stopGroupAfterExitFn := j.stopGroupAfterExitFn()
 	gerr := stopGroupAfterExitFn(proof)
 	if errors.Is(gerr, ErrProcessIdentityMismatch) {
+		locked = false
+		j.proofFDMu.Unlock()
 		summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
 		j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", proof.Leader.PID, gerr), summary, preview)
 		return true

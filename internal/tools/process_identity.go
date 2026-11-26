@@ -2,6 +2,7 @@ package tools
 
 import (
 	"errors"
+	"syscall"
 	"time"
 )
 
@@ -93,4 +94,11 @@ func mergeGroupMembers(dst, src map[int]string) map[int]string {
 func ProcessIdentity(pid int) (pgid int, startToken string, alive bool) {
 	info := inspectProcess(pid)
 	return info.PGID, info.StartToken, info.Alive && !info.Zombie && info.PGID > 0 && info.StartToken != ""
+}
+
+func isFDLimitErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
 }

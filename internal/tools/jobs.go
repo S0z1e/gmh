@@ -1252,6 +1252,13 @@ func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
 	return out
 }
 
+func (j *Job) stopGroupAfterExitFn() func(processGroupProof) error {
+	if j.exec != nil && j.exec.stopAdoptedGroupAfterExit != nil {
+		return j.exec.stopAdoptedGroupAfterExit
+	}
+	return stopAdoptedProcessGroupAfterExit
+}
+
 func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	j.proofFDMu.Lock()
 	j.mu.Lock()
@@ -1275,10 +1282,7 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	mustFinalize := monitorFailed || monitorDone
 	j.mu.Unlock()
 
-	stopGroupAfterExitFn := stopAdoptedProcessGroupAfterExit
-	if execRef != nil && execRef.stopAdoptedGroupAfterExit != nil {
-		stopGroupAfterExitFn = execRef.stopAdoptedGroupAfterExit
-	}
+	stopGroupAfterExitFn := j.stopGroupAfterExitFn()
 
 	// Refresh verified PGID members while the leader may still be alive so any
 	// reparented children remain verifiable if the leader exits or wait fails.

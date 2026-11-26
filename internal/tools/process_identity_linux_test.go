@@ -176,16 +176,21 @@ func TestStopAdoptedProcessGroupAfterExitRefusesEqualIDReusedSessionLinux(t *tes
 	// once-verified proof from an earlier job whose numeric IDs match is checked.
 	// Because the surviving child has no matching token/ancestry and lacks JobToken,
 	// Linux stopAdoptedProcessGroupAfterExit MUST refuse to signal the child.
+	childBoot, _, _ := parseLinuxStartToken(childInfo.StartToken)
+	olderTok := "1"
+	if childBoot != "" {
+		olderTok = childBoot + ":1"
+	}
 	staleEqualProof := processGroupProof{
 		Leader: ProcessIdentityInfo{
 			PID:        leaderPID,
 			PGID:       leaderPID,
-			StartToken: "stale-boot:1",
+			StartToken: olderTok,
 		},
 		UID:            childInfo.UID,
 		HasUID:         childInfo.HasUID,
 		SID:            leaderPID,
-		KnownMembers:   map[int]string{leaderPID: "stale-boot:1"},
+		KnownMembers:   map[int]string{leaderPID: olderTok},
 		VerifiedAt:     time.Now().Add(-time.Minute),
 		JobToken:       "stale-secret-token-not-matching-child",
 		ExitObservedAt: time.Now(),

@@ -122,10 +122,6 @@ func parseLinuxStartToken(token string) (bootID string, ticks uint64, ok bool) {
 	return "", v, true
 }
 
-func isFDLimitErr(err error) bool {
-	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
-}
-
 func linuxBootUnixSec() (int64, bool) {
 	data, err := os.ReadFile("/proc/stat")
 	if err != nil {
@@ -444,8 +440,9 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	verifiedMembers := 0
 	groupVerified := false
 	var verifiedFDs []int
+	var openedFDs []int
 	defer func() {
-		for _, fd := range verifiedFDs {
+		for _, fd := range openedFDs {
 			_ = unix.Close(fd)
 		}
 	}()
@@ -508,8 +505,23 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 		}
 		if memberVerified {
 			groupVerified = true
-			if fd, ferr := unix.PidfdOpen(pid, 0); ferr == nil {
-				verifiedFDs = append(verifiedFDs, fd)
+			if entry, ok := proof.verifiedFDs[pid]; ok && entry.fd > 0 && entry.startToken == meta.info.StartToken {
+				verifiedFDs = append(verifiedFDs, entry.fd)
+			} else {
+				fd, ferr := unix.PidfdOpen(pid, 0)
+				if isFDLimitErr(ferr) {
+					return stopKnownMembersFDFree(proof, ferr)
+				}
+				if ferr == nil {
+					// Revalidate opened pidfd handle before accepting it.
+					meta2, merr := inspectLinuxProcMeta(pid)
+					if merr == nil && meta2.info.Alive && meta2.info.StartToken == meta.info.StartToken && meta2.info.PGID == id.PGID {
+						openedFDs = append(openedFDs, fd)
+						verifiedFDs = append(verifiedFDs, fd)
+					} else {
+						_ = unix.Close(fd)
+					}
+				}
 			}
 		}
 		verifiedMembers++
@@ -520,36 +532,26 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	if !groupVerified {
 		return fmt.Errorf("refusing to signal unverified pgid %d after leader disappeared: %w", id.PGID, ErrProcessIdentityMismatch)
 	}
-
-	// Bind signalling to the verified surviving group: ensure at least one
-	// verified member handle is still alive in the target PGID before signalling,
-	// so numeric PGID recycling cannot redirect the signal to an unrelated group.
-	if len(verifiedFDs) > 0 {
-		hasLiveVerified := false
-		for _, fd := range verifiedFDs {
-			if kerr := unix.PidfdSendSignal(fd, 0, nil, 0); kerr == nil {
-				hasLiveVerified = true
-				break
-			}
-		}
-		if !hasLiveVerified {
-			// All verified members exited before signalling; refuse to signal
-			// the bare numeric PGID as it may have been recycled.
-			return os.ErrProcessDone
-		}
+	if len(verifiedFDs) == 0 {
+		return fmt.Errorf("refusing to signal pgid %d: no verified process handles: %w", id.PGID, ErrProcessIdentityMismatch)
 	}
 
-	kerr := syscall.Kill(-id.PGID, syscall.SIGKILL)
+	var lastErr error
+	anySignalled := false
 	for _, fd := range verifiedFDs {
-		_ = unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
+		if kerr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); kerr == nil {
+			anySignalled = true
+		} else if !errors.Is(kerr, unix.ESRCH) {
+			lastErr = kerr
+		}
 	}
-	if kerr == nil {
-		return nil
-	} else if errors.Is(kerr, syscall.ESRCH) {
+	if lastErr != nil {
+		return lastErr
+	}
+	if !anySignalled {
 		return os.ErrProcessDone
-	} else {
-		return kerr
 	}
+	return nil
 }
 
 func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {

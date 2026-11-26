@@ -52,6 +52,10 @@ func inspectProcess(pid int) processInfo {
 	}
 }
 
+func inspectProcessErr(pid int) (processInfo, error) {
+	return inspectProcess(pid), nil
+}
+
 func parseDarwinStartTime(token string) (sec int64, usec int32, ok bool) {
 	secStr, usecStr, found := strings.Cut(token, ":")
 	if !found {

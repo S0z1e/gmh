@@ -8,6 +8,8 @@ func processGroupID(pid int) int { return pid }
 
 func inspectProcess(pid int) processInfo { return processInfo{} }
 
+func inspectProcessErr(pid int) (processInfo, error) { return processInfo{}, nil }
+
 func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	return ErrProcessIdentityMismatch
 }
