@@ -17,7 +17,7 @@ func (r *Runner) RefreshUsage() error {
 		r.runAccountingIncomplete = true
 		return fmt.Errorf("load usage: %w", err)
 	}
-	if r.usageStore != r.App.Store {
+	if r.usageStore != r.App.Store || r.runAccountingIncomplete {
 		r.usageStore = r.App.Store
 		r.RunUsage, r.RunCost = llm.Usage{}, 0
 		r.runBaseline = totals

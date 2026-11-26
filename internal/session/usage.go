@@ -18,8 +18,10 @@ import (
 	"minimalharness/internal/llm"
 )
 
-// usageAppendFault, when set by a test, fails an append after the record is
-// sealed and before it is written. The journal bytes stay unchanged.
+// SetUsageAppendFault installs a test fault that fails an append after the
+// record is sealed and before it is written. Nil restores normal writes.
+func SetUsageAppendFault(fault func() error) { usageAppendFault = fault }
+
 var usageAppendFault func() error
 
 // UsageAttempt is a content-free ledger entry for one actual provider request.

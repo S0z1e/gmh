@@ -70,3 +70,29 @@ func TestUsageRegressionLedgerFailureAllowsResume(t *testing.T) {
 	}
 	r.App.Close()
 }
+
+func TestUsageRecoveryUnlatchesTheNextTurn(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	store, err := session.Open("recover", session.OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	r := &Runner{App: &App{Root: root, Store: store, Cfg: &agent.Config{Client: &llm.Client{}, Session: store, Exec: &tools.Executor{Root: root}}}, Print: func(string, ...any) {}}
+	if err := r.RefreshUsage(); err != nil {
+		t.Fatal(err)
+	}
+	session.SetUsageAppendFault(func() error { return os.ErrPermission })
+	defer session.SetUsageAppendFault(nil)
+	if err := store.RecordUsage(session.UsageAttempt{ID: "SECONDID", Request: llm.RequestTrace{ID: "SECONDID"}}); err == nil {
+		t.Fatal("expected append failure")
+	}
+	if err := r.RefreshUsage(); err == nil {
+		t.Fatal("failed turn published complete accounting")
+	}
+	session.SetUsageAppendFault(nil)
+	if err := r.RefreshUsage(); err != nil {
+		t.Fatalf("next turn stayed latched after the journal reopened: %v", err)
+	}
+}
