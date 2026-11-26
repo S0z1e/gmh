@@ -252,6 +252,36 @@ func TestBudgetMetersFailedAttemptsAndStopsRetryAtCap(t *testing.T) {
 	}
 }
 
+func TestActiveCostCapWithoutRatesIsVisibleAndNotEnforced(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(1), MaxSessionCostUSD: capUSD(1)})
+	store, err := session.Open("unenforced-cost", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c.Session = store
+	events, bodies, err := runVerification(t, c, budgetSSE("done", nil, newInt(10), true))
+	if err != nil || len(bodies) != 1 || c.LastTerminalReason != TerminalEndTurn || c.LastTaskOutcome != "" {
+		t.Fatalf("unenforced cap looked like a failure: reason=%s outcome=%s err=%v", c.LastTerminalReason, c.LastTaskOutcome, err)
+	}
+	if c.LastTurnBudget == nil || c.LastTurnBudget.CostCapEnforced || c.LastTurnBudget.SessionCostCapEnforced || !c.LastTurnBudget.LowerBound || c.LastTurnBudget.CostComplete {
+		t.Fatalf("status presented the cap as enforced: %+v", c.LastTurnBudget)
+	}
+	if countKind(events, EventDone) != 1 {
+		t.Fatal("turn did not finish")
+	}
+	history, err := session.Load(store.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range history {
+		if m.Kind == "task_outcome" && strings.Contains(m.Content, `"outcome":"completed"`) {
+			t.Fatalf("unenforced cap was saved as complete: %s", m.Content)
+		}
+	}
+}
+
 func TestBudgetGraceUsageAndUnavailablePrices(t *testing.T) {
 	c := budgetConfig(t, &turnbudget.Policy{MaxTokens: capInt(15)})
 	c.MaxSteps = 1

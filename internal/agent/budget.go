@@ -23,6 +23,7 @@ type turnResources struct {
 	parent            context.Context
 	failure           error
 	recorded, emitted bool
+	warned            bool
 	settled           bool
 	text              string
 }
@@ -82,12 +83,35 @@ func (c *Config) startBudgetWithPolicy(parent context.Context, policy *turnbudge
 			fmt.Fprintf(os.Stderr, "warning: session %s metering baseline is incomplete; enforcing budgets against recorded lower-bound usage\n", c.Session.ID)
 		}
 	}
+	c.warnUnenforcedCostCap(b.State())
 	c.resources.tracker = b
+	c.LastTurnBudget = nil
 	if deadline, ok := b.Deadline(); ok {
 		ctx, cancel := context.WithDeadline(parent, deadline)
 		return ctx, cancel, nil
 	}
 	return parent, func() {}, nil
+}
+
+func (c *Config) warnUnenforcedCostCap(state turnbudget.State) {
+	if c.resources != nil && c.resources.warned {
+		return
+	}
+	if state.CostCapEnforced && state.SessionCostCapEnforced {
+		return
+	}
+	if c.resources != nil {
+		c.resources.warned = true
+	}
+	reason := state.CostCapUnenforcedReason
+	if reason == "" {
+		reason = "recorded cost is a lower bound"
+	}
+	session := ""
+	if c.Session != nil {
+		session = " " + c.Session.ID
+	}
+	fmt.Fprintf(os.Stderr, "warning: cost cap is not enforced%s: %s\n", session, reason)
 }
 
 // budgetError checks exhaustion, not equality: an exact-cap final response is
@@ -154,6 +178,7 @@ func (c *Config) recordBudgetUsage(usage *llm.Usage, started time.Time, tokensCo
 	if err := r.tracker.RecordUsage(measured); err != nil && r.failure == nil {
 		r.failure = err
 	}
+	c.warnUnenforcedCostCap(r.tracker.State())
 }
 
 func (c *Config) budgetTerminal(e Event) Event {
@@ -163,7 +188,10 @@ func (c *Config) budgetTerminal(e Event) Event {
 		// Time spent publishing this outcome cannot change the settled result.
 		c.resources.settled = true
 	}
-	if err == nil || c.persistErr != nil {
+	if err == nil {
+		return e
+	}
+	if c.persistErr != nil && !persistErrIsQuarantine(c.persistErr) {
 		return e
 	}
 	r := c.resources
@@ -195,7 +223,7 @@ func (c *Config) budgetTerminal(e Event) Event {
 			c.persist(llm.Message{Role: "user", Kind: "task_outcome", Content: "[harness task outcome]\n" + string(data)})
 		}
 	}
-	if c.persistErr != nil {
+	if c.persistErr != nil && !persistErrIsQuarantine(c.persistErr) {
 		err, reason = c.persistErr, TerminalError
 	}
 	text := fmt.Sprintf("Task incomplete: %v. Completed actions have not been rolled back; check the current state before resuming.", err)

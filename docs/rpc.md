@@ -329,6 +329,11 @@ are never executed. History messages may carry `kind`, `tool_error` and
 `finish_reason` metadata; these fields are not forwarded as provider inputs.
 
 Turn budgets also settle with `reason: "budget_exceeded"` or
-`reason: "budget_unavailable"`, `outcome: "incomplete"`, and an error. A resource
-deadline is not a user abort. Expired approval/question/continuation requests no
+`reason: "budget_unavailable"`, `outcome: "incomplete"`, and an error.
+`agent_settled.budget` is the turn snapshot. `cost_cap_enforced: false` or
+`session_cost_cap_enforced: false` means an active dollar cap lacked pricing
+or usage evidence. `lower_bound: true` means non-strict enforcement used a
+recorded subtotal that can be below real spend. Neither state is a successful
+or complete cap. `get_state` and `usage` carry the same `budget` label.
+A resource deadline is not a user abort. Expired approval/question/continuation requests no
 longer accept replies; the client should dismiss pending prompts on settlement.

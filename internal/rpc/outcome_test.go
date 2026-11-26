@@ -37,6 +37,33 @@ func TestSettledBudgetStopsWithIncompleteOutcome(t *testing.T) {
 	}
 }
 
+func TestSettledMissingRatesDoesNotLookLikeAnEnforcedCap(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{{kind: "text", text: "an answer"}})
+	cost := 1.0
+	a.Cfg.TurnBudget = &turnbudget.Policy{MaxCostUSD: &cost, MaxSessionCostUSD: &cost}
+	a.Cfg.UsageRates = a.Rates
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 5*time.Second)
+	d.send(map[string]any{"id": "p", "type": "prompt", "message": "work"})
+	d.waitFor("response", 5*time.Second)
+	settled := d.waitFor("agent_settled", 10*time.Second)
+	if settled["reason"] != "end_turn" || settled["outcome"] != nil || settled["error"] != nil {
+		t.Fatalf("unenforced cap changed the outcome: %v", settled)
+	}
+	budget, _ := settled["budget"].(map[string]any)
+	if budget["cost_cap_enforced"] != false || budget["session_cost_cap_enforced"] != false || budget["lower_bound"] != true || budget["cost_complete"] != false {
+		t.Fatalf("settled budget looked enforced: %v", settled["budget"])
+	}
+	d.send(map[string]any{"id": "state", "type": "get_state"})
+	state := d.waitFor("response", 5*time.Second)
+	data, _ := state["data"].(map[string]any)
+	label, _ := data["budget"].(map[string]any)
+	if label["cost_cap_enforced"] != false || label["lower_bound"] != true {
+		t.Fatalf("get_state hid the unenforced cap: %v", state)
+	}
+	d.quit(t)
+}
+
 func TestSettledStepCapCarriesIncompleteOutcome(t *testing.T) {
 	a, runner, _ := setupTestApp(t, "auto", []fakeStep{
 		{kind: "tool", tool: "read", args: map[string]any{"path": "missing"}},

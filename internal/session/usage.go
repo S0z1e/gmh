@@ -18,6 +18,10 @@ import (
 	"minimalharness/internal/llm"
 )
 
+// ErrInvalidProviderUsage means a provider report was quarantined as unknown.
+// It is not journal corruption: the record was written, with the counters omitted.
+var ErrInvalidProviderUsage = errors.New("invalid or overflowing provider usage recorded as unknown")
+
 // SetUsageAppendFault installs a test fault that fails an append after the
 // record is sealed and before it is written. Nil restores normal writes.
 func SetUsageAppendFault(fault func() error) { usageAppendFault = fault }
@@ -450,7 +454,7 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 	s.usageTotals = nextTotals
 	recorded = true
 	if a.InvalidUsage {
-		return fmt.Errorf("invalid or overflowing provider usage recorded as unknown")
+		return ErrInvalidProviderUsage
 	}
 	return nil
 }

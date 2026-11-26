@@ -114,9 +114,13 @@ per-model, so switching models with `/model` (or RPC `set_model`)
 carries each model's own effort. `maxTokens` is sent by
 all three modes (chat: `max_tokens`, responses: `max_output_tokens`,
 anthropic: `max_tokens`). `cost` (USD per million tokens, all four
-rates required when present, plus optional `tiers`) is parsed and
-stored only — the cost estimate still comes from the `OPENAI_PRICE_*`
-environment rates. `input` declares what the model accepts
+rates required when present, plus optional `tiers`) is the model's
+price schedule. Estimates and `turnBudget` dollar caps use it.
+`OPENAI_PRICE_*` overrides the matching model rate and still requires
+the three base rates, including explicit zeros, when the model has no
+`cost` schedule. An active dollar cap with neither schedule is not
+enforced unless `strictMetering` is true, in which case the turn stops
+with `budget_unavailable`. `input` declares what the model accepts
 (`["text"]`, or `["text", "image"]` for image input — see
 [images](images.md)).
 

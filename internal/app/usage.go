@@ -56,6 +56,9 @@ func (r *Runner) usageCoverage() string {
 }
 
 func (r *Runner) sessionCostLine() string {
+	if note := r.unenforcedCostNote(); note != "" {
+		return note
+	}
 	if r.SessionMetering.PricedAttempts == 0 {
 		return "fee: " + r.App.Cfg.Client.ProviderName() + " price unverified"
 	}
@@ -78,10 +81,30 @@ func (r *Runner) CurrentRunCost() *float64 {
 	return &cost
 }
 func (r *Runner) runCostLine() string {
+	if note := r.unenforcedCostNote(); note != "" {
+		return note
+	}
 	if r.CurrentRunCost() == nil {
 		return "fee: provider price unverified (current-run pricing incomplete)"
 	}
 	return r.costLine(r.RunCost)
+}
+
+// unenforcedCostNote says an active dollar cap was not priced. A recorded
+// subtotal must not be presented as if that cap was enforced.
+func (r *Runner) unenforcedCostNote() string {
+	if r.App == nil || r.App.Cfg == nil || r.App.Cfg.LastTurnBudget == nil {
+		return ""
+	}
+	state := r.App.Cfg.LastTurnBudget
+	if state.CostCapEnforced && state.SessionCostCapEnforced {
+		return ""
+	}
+	reason := state.CostCapUnenforcedReason
+	if reason == "" {
+		reason = "recorded cost is a lower bound"
+	}
+	return "cost cap not enforced: " + reason
 }
 
 func (r *Runner) SessionUsageComplete() bool {

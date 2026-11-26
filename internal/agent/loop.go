@@ -132,9 +132,11 @@ func (c *Config) emit(e Event) {
 	e.StepID = c.stepID
 	if e.Kind == EventDone || e.Kind == EventError {
 		e = c.budgetTerminal(e)
-		if c.persistErr != nil {
+		if c.persistErr != nil && !persistErrIsQuarantine(c.persistErr) {
 			// A storage failure takes priority and is published once, even when
 			// it occurred while the budget adapter was saving its outcome.
+			// A budget stop stays visible: quarantined provider usage is not a
+			// journal failure, and replacing it hides budget_unavailable.
 			e.Kind, e.Err, e.TerminalReason, e.TaskOutcome = EventError, c.persistErr, TerminalError, OutcomeIncomplete
 			c.LastTerminalReason = TerminalError
 			c.persistErrEmitted = true
@@ -779,11 +781,13 @@ func (c *Config) streamStep(ctx context.Context, operation string, apiMsgs []llm
 			}
 		}
 		err = c.Client.Stream(requestCtx, apiMsgs, tools, wrappedText, wrappedDone, wrappedThinking)
-		if c.persistErr != nil {
-			return attempt, spent, c.persistErr
-		}
 		if budgetErr := c.budgetError(); budgetErr != nil {
 			return attempt, spent, budgetErr
+		}
+		if c.persistErr != nil {
+			// A quarantined provider report is already on disk. Retrying it would
+			// record the same unknown usage again; the step ends with that report.
+			return attempt, spent, c.persistErr
 		}
 		if err == nil {
 			return attempt, spent, nil
@@ -865,7 +869,7 @@ func (c *Config) RunTask(ctx context.Context, history []llm.Message, task string
 		c.verifier = &verificationRun{policy: c.Verification, latest: map[string]verification.Evidence{}}
 	}
 	defer func() {
-		if c.persistErr != nil {
+		if c.persistErr != nil && !persistErrIsQuarantine(c.persistErr) {
 			runErr = c.persistErr
 			c.LastTerminalReason = TerminalError
 			if !c.persistErrEmitted {

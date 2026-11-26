@@ -16,6 +16,7 @@ import (
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
 	"minimalharness/internal/tools"
+	"minimalharness/internal/turnbudget"
 )
 
 // Request is one line from the GUI. ID is echoed in the response when
@@ -157,6 +158,9 @@ type Event struct {
 	RunUsageComplete     *bool                `json:"current_run_usage_complete,omitempty"`
 	SessionUsageComplete *bool                `json:"session_usage_complete,omitempty"`
 	MeteringAvailable    *bool                `json:"metering_available,omitempty"`
+	// Budget is the turn snapshot. CostCapEnforced false means an active
+	// dollar cap was not priced and must not be read as enforced.
+	Budget *turnbudget.State `json:"budget,omitempty"`
 	// agent_settled cost: null when no rates are configured.
 	CostUSD        *float64 `json:"cost_usd,omitempty"`
 	SessionCostUSD *float64 `json:"session_cost_usd,omitempty"`

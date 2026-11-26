@@ -72,11 +72,26 @@ func TestInvalidLimitsAndMissingRates(t *testing.T) {
 		}
 	}
 	b, err := New(&Policy{MaxCostUSD: dollars(1)}, time.Now(), false)
-	if err != nil || !b.State().BaselineIncomplete || b.State().CostComplete {
-		t.Fatalf("best-effort missing rates failed: state=%+v err=%v", b, err)
+	if err != nil || !b.State().BaselineIncomplete || b.State().CostComplete || b.State().CostCapEnforced || b.State().CostCapUnenforcedReason == "" {
+		t.Fatalf("best-effort missing rates failed: state=%+v err=%v", b.State(), err)
+	}
+	if err := b.RecordUsage(Usage{Tokens: number(1)}); err != nil {
+		t.Fatal("unenforced cap stopped a request:", err)
+	}
+	if err := b.CheckRequest(b.State().Started); err != nil || b.State().CostCapEnforced {
+		t.Fatal("recorded zero looked like an enforced cap:", err, b.State().CostCapEnforced)
+	}
+	sessionOnly, err := New(&Policy{MaxSessionCostUSD: dollars(1)}, time.Now(), false)
+	if err != nil || sessionOnly.State().SessionCostCapEnforced || sessionOnly.State().CostCapEnforced == false && sessionOnly.State().Limits.CostUSD != 0 {
+		t.Fatalf("session cap enforcement=%+v err=%v", sessionOnly.State(), err)
+	}
+	if sessionOnly.State().CostCapEnforced != true || sessionOnly.State().SessionCostCapEnforced {
+		t.Fatalf("session-only gap marked the turn cap: %+v", sessionOnly.State())
 	}
 	_, err = New(&Policy{MaxCostUSD: dollars(1), StrictMetering: boolPtr(true)}, time.Now(), false)
 	unavailable(t, err, "cost_usd")
+	_, err = New(&Policy{MaxSessionCostUSD: dollars(1), StrictMetering: boolPtr(true)}, time.Now(), false)
+	unavailable(t, err, "session_cost_usd")
 	if _, err := New(nil, time.Now(), false); err != nil {
 		t.Fatal("disabled dollar cap required rates")
 	}
@@ -196,12 +211,17 @@ func TestInvalidUsageCannotRefundOrEraseOtherConsumption(t *testing.T) {
 	if s.ReportedTokens != 10 || s.RecordedCostUSD != 1 || s.TokensComplete {
 		t.Fatalf("bad usage erased consumption: %+v", s)
 	}
+	disabled := tracker(t, &Policy{MaxTokens: number(0), MaxSessionTokens: number(0)})
+	if err := disabled.RecordUsage(Usage{Tokens: number(-10)}); err != nil || disabled.State().TokensComplete || !disabled.State().LowerBound {
+		t.Fatalf("disabled token caps stopped on a quarantined report: %+v %v", disabled.State(), err)
+	}
 	for _, bad := range []float64{-1, math.Inf(1), math.NaN()} {
 		c := tracker(t, nil)
-		unavailable(t, c.RecordUsage(Usage{Tokens: number(3), CostUSD: dollars(bad)}), "cost_usd")
-		if c.State().ReportedTokens != 3 || c.State().CostComplete {
-			t.Fatal("valid tokens lost with invalid price")
+		if err := c.RecordUsage(Usage{Tokens: number(3), CostUSD: dollars(bad)}); err != nil || c.State().ReportedTokens != 3 || c.State().CostComplete {
+			t.Fatalf("invalid price without a dollar cap stopped the meter: %+v %v", c.State(), err)
 		}
+		priced := tracker(t, &Policy{MaxCostUSD: dollars(1)})
+		unavailable(t, priced.RecordUsage(Usage{Tokens: number(3), CostUSD: dollars(bad)}), "cost_usd")
 	}
 	c := tracker(t, &Policy{MaxToolCalls: number(0)})
 	if err := c.ReserveTools(math.MaxInt64); err != nil {
@@ -214,9 +234,8 @@ func TestInvalidUsageCannotRefundOrEraseOtherConsumption(t *testing.T) {
 	if err := d.RecordUsage(Usage{Tokens: number(math.MaxInt64), CostUSD: dollars(math.MaxFloat64)}); err != nil {
 		t.Fatal(err)
 	}
-	unavailable(t, d.RecordUsage(Usage{Tokens: number(1), CostUSD: dollars(math.MaxFloat64)}), "tokens")
-	if d.State().TokensComplete || d.State().CostComplete {
-		t.Fatal("overflowed counters remained exact")
+	if err := d.RecordUsage(Usage{Tokens: number(1), CostUSD: dollars(math.MaxFloat64)}); err != nil || d.State().TokensComplete || d.State().CostComplete || !d.State().LowerBound {
+		t.Fatalf("disabled caps treated overflow as a stop: %+v %v", d.State(), err)
 	}
 }
 
@@ -249,6 +268,22 @@ func TestDecimalCostBoundaries(t *testing.T) {
 	}
 }
 
+func TestIncompleteUsageStillStopsAtTheRecordedCost(t *testing.T) {
+	b := tracker(t, &Policy{MaxCostUSD: dollars(1)})
+	if err := b.RecordUsage(Usage{CostUSD: dollars(.25)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.RecordUsage(Usage{Tokens: number(1)}); err != nil || !b.State().LowerBound || !b.State().CostCapEnforced {
+		t.Fatalf("a missing price disabled a schedule that can still grow: %+v %v", b.State(), err)
+	}
+	exhausted(t, b.RecordUsage(Usage{CostUSD: dollars(1)}), "cost_usd")
+	session := tracker(t, &Policy{MaxSessionCostUSD: dollars(1)})
+	if err := session.SeedSessionUsage(0, big.NewRat(3, 4), true, false); err != nil {
+		t.Fatal(err)
+	}
+	exhausted(t, session.RecordUsage(Usage{CostUSD: dollars(.5)}), "session_cost_usd")
+}
+
 func TestExactPriceAmountsAreCopiedAndNeverRoundedForEnforcement(t *testing.T) {
 	b := tracker(t, &Policy{MaxCostUSD: dollars(.11)})
 	cost := big.NewRat(11, 100)
@@ -263,7 +298,7 @@ func TestExactPriceAmountsAreCopiedAndNeverRoundedForEnforcement(t *testing.T) {
 	tiny, _ := new(big.Rat).SetString("1e-300")
 	exhausted(t, b.RecordUsage(Usage{ExactCostUSD: tiny}), "cost_usd")
 	for _, u := range []Usage{{ExactCostUSD: big.NewRat(-1, 10)}, {CostUSD: dollars(1), ExactCostUSD: big.NewRat(1, 1)}} {
-		c := tracker(t, nil)
+		c := tracker(t, &Policy{MaxCostUSD: dollars(1)})
 		unavailable(t, c.RecordUsage(u), "cost_usd")
 		if c.State().CostComplete || c.State().RecordedCostUSD != 0 {
 			t.Fatal("invalid cost accepted")

@@ -110,6 +110,48 @@ func budgetResponse(body string) *http.Response {
 	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}
 }
 
+func TestManualCompactionAppliesTurnCostAndStrictMetering(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	c := budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(0.05), StrictMetering: capBool(false)})
+	c.UsageRates = llm.Rates{InputPerMTok: 1000, OutputPerMTok: 1000, CachedPerMTok: 1000, Configured: true, Complete: true}
+	store, err := session.Open("compact-cost", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c.Session = store
+	calls := 0
+	c.Client = fakeBudgetClient(func(*http.Request) (*http.Response, error) {
+		calls++
+		return budgetResponse(budgetSSE("summary", nil, newInt(100), true)), nil
+	})
+	history := []llm.Message{{Role: "user", Content: "work"}}
+	_, _, err = c.Compact(t.Context(), history)
+	var exceeded *turnbudget.Exceeded
+	if !errors.As(err, &exceeded) || exceeded.Resource != "cost_usd" || calls != 1 || c.LastTurnBudget == nil || !c.LastTurnBudget.CostCapEnforced {
+		t.Fatalf("maxCostUSD-only compact was not enforced: calls=%d err=%v state=%+v", calls, err, c.LastTurnBudget)
+	}
+
+	c = budgetConfig(t, &turnbudget.Policy{MaxCostUSD: capUSD(1), StrictMetering: capBool(true)})
+	store, err = session.Open("compact-strict", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c.Session = store
+	c.UsageRates = llm.Rates{}
+	c.Client = fakeBudgetClient(func(*http.Request) (*http.Response, error) {
+		t.Fatal("strict compact dispatched without rates")
+		return nil, io.EOF
+	})
+	_, _, err = c.Compact(t.Context(), history)
+	var unavailable *turnbudget.Unavailable
+	if !errors.As(err, &unavailable) || unavailable.Resource != "cost_usd" {
+		t.Fatalf("strict compact did not stop before a provider attempt: %v", err)
+	}
+}
+
 func TestManualCompactionHonorsExactSessionCostAfterReopen(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("USERPROFILE", t.TempDir())
@@ -271,5 +313,51 @@ func TestUndispatchedRequestReconcilesAsNotDispatched(t *testing.T) {
 	totals, err := store.UsageTotals()
 	if err != nil || totals.Attempts != 0 || totals.UnreportedAttempts != 0 {
 		t.Fatalf("undispatched request was recorded as usage: %+v %v", totals, err)
+	}
+}
+
+func TestMalformedProviderUsageDoesNotKillAnUncappedTurn(t *testing.T) {
+	for _, strict := range []bool{false, true} {
+		t.Run(fmt.Sprint(strict), func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("USERPROFILE", t.TempDir())
+			var policy *turnbudget.Policy
+			if strict {
+				policy = &turnbudget.Policy{MaxTokens: capInt(100), StrictMetering: capBool(true)}
+			} else {
+				zero := int64(0)
+				policy = &turnbudget.Policy{MaxTokens: &zero, MaxSessionTokens: &zero, MaxToolCalls: &zero, MaxDurationSeconds: &zero}
+			}
+			c := budgetConfig(t, policy)
+			store, err := session.Open("bad-usage", session.OpenOptions{Workspace: c.Exec.Root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			c.Session = store
+			c.Client = fakeBudgetClient(func(*http.Request) (*http.Response, error) {
+				usage := `{"prompt_tokens":-1,"completion_tokens":0,"total_tokens":-1}`
+				if !strict {
+					usage = `{"prompt_tokens":9223372036854775807,"completion_tokens":1,"total_tokens":9223372036854775807}`
+				}
+				body := "data: {\"choices\":[{\"delta\":{\"content\":\"kept\"}}],\"usage\":" + usage + "}\n\ndata: [DONE]\n\n"
+				return budgetResponse(body), nil
+			})
+			text, _, err := c.Run(t.Context(), []llm.Message{{Role: "user", Content: "work"}})
+			totals, totalsErr := store.UsageTotals()
+			if totalsErr != nil || totals.InvalidAttempts != 1 {
+				t.Fatalf("invalid usage was not quarantined: %+v %v", totals, totalsErr)
+			}
+			if strict {
+				var unavailable *turnbudget.Unavailable
+				if !errors.As(err, &unavailable) || c.LastTerminalReason != TerminalBudgetUnavailable {
+					t.Fatalf("strict mode accepted malformed usage: %v reason=%s", err, c.LastTerminalReason)
+				}
+				return
+			}
+			if err != nil || text != "kept" || c.LastTerminalReason != TerminalEndTurn {
+				t.Fatalf("non-strict uncapped turn died on malformed usage: text=%q reason=%s err=%v", text, c.LastTerminalReason, err)
+			}
+		})
 	}
 }

@@ -65,8 +65,11 @@
   all three base `OPENAI_PRICE_*_PER_MTOK` rates, including explicit zeros,
   when the model has no configured `cost` schedule. Environment rates override
   the corresponding model rates. Anthropic also requires a cache-write rate.
-  By default, missing usage or pricing leaves a metering gap and caps use only
-  recorded subtotals. A damaged usage journal, torn-tail backup, or unmatched
+  By default, missing usage leaves a metering gap. Token and dollar caps still
+  stop at the recorded subtotal and label it a lower bound; they do not treat
+  that partial sum as a complete bill. An active dollar cap with no price
+  schedule at all is not enforced: status, `/usage`, and the turn outcome say
+  the cap is not enforced and must not present a zero subtotal as a met cap. A damaged usage journal, torn-tail backup, or unmatched
   pending marker keeps that gap until it is quarantined:
   `harness usage-repair --root <project> --session <id> --quarantine <artifact>`.
   The strict error names the artifact. Quarantine moves it aside and keeps the
@@ -75,8 +78,15 @@
   upgrading. Strict mode stops with `budget_unavailable` when metering required
   by an active cap is incomplete. Exhaustion stops with `budget_exceeded`. Both save an
   `incomplete` task outcome with the budget snapshot and send no extra grace call.
-  Unreported usage is recorded as unknown rather than zero. Ordinary UI usage
-  totals remain separate from this per-attempt budget evidence.
+  Manual `/compact` uses the same turn token cap, dollar cap, and strict-metering
+  setting as a model turn, plus the session caps. It does not apply the turn's
+  wall-clock deadline. Negative, malformed, or overflowing provider usage is
+  recorded as unknown. That report does not end a non-strict turn unless an active
+  cap needs complete evidence; strict mode stops with `budget_unavailable` before
+  another provider attempt. A damaged journal is a different failure and still
+  blocks accounting until it is quarantined. Unreported usage is recorded as
+  unknown rather than zero. Ordinary UI usage totals remain separate from this
+  per-attempt budget evidence.
 - Required verification is opt-in in global, explicit or trusted project config:
 
   ```json
