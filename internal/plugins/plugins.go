@@ -1338,10 +1338,6 @@ type reloadResult struct {
 	err    error
 }
 
-// finishRestart joins a rebuild whose caller already returned. A result that
-// arrives before loadCtx's deadline is dropped as-is, including a success,
-// which is not installed. When the deadline passes first, the load is
-// interrupted and that failure is joined too.
 func (p *Plugin) detachBusy() bool {
 	p.detachMu.Lock()
 	defer p.detachMu.Unlock()
@@ -1360,8 +1356,13 @@ func (p *Plugin) clearDetach() {
 	p.detachMu.Unlock()
 }
 
+// finishRestart joins a rebuild whose caller already returned. A result that
+// arrives before loadCtx's deadline is dropped as-is, including a success,
+// which is not installed. When the deadline passes first, the load is
+// interrupted and that failure is joined too. The single-flight flag is
+// cleared before the outcome is published, so a waiter that starts another
+// rebuild is not refused for a load that has already finished.
 func (p *Plugin) finishRestart(done <-chan reloadResult, cancel context.CancelFunc, loadCtx context.Context) {
-	defer p.clearDetach()
 	var result reloadResult
 	select {
 	case result = <-done:
@@ -1370,6 +1371,7 @@ func (p *Plugin) finishRestart(done <-chan reloadResult, cancel context.CancelFu
 		result = <-done
 	}
 	cancel()
+	p.clearDetach()
 	if result.err != nil {
 		p.failRestart(result.err)
 		return
