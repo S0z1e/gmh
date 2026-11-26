@@ -146,6 +146,15 @@ func abortRequestTrace(ctx context.Context) {
 	}
 	abort(o.trace.ID)
 }
+
+// suppressRequestTrace drops a prepared attempt that never left the process,
+// so the completed-attempt observer cannot record it as usage.
+func suppressRequestTrace(ctx context.Context) {
+	o, _ := ctx.Value(traceKey{}).(*requestObservation)
+	if o != nil {
+		o.trace = RequestTrace{}
+	}
+}
 func (c *Client) traceRequest(ctx context.Context, body []byte) error {
 	o, _ := ctx.Value(traceKey{}).(*requestObservation)
 	if o == nil {
@@ -196,6 +205,8 @@ func (c *Client) traceRequest(ctx context.Context, body []byte) error {
 	o.trace = t
 	if start, _ := ctx.Value(requestStartKey{}).(func(RequestTrace) error); start != nil {
 		if err := start(t); err != nil {
+			// The gate failed before dispatch. Do not observe this attempt.
+			o.trace = RequestTrace{}
 			return err
 		}
 	}

@@ -268,4 +268,8 @@ func TestUndispatchedRequestReconcilesAsNotDispatched(t *testing.T) {
 	if !found || report.RecoveryGap {
 		t.Fatalf("not-dispatched attempt was not reconciled: %+v", report)
 	}
+	totals, err := store.UsageTotals()
+	if err != nil || totals.Attempts != 0 || totals.UnreportedAttempts != 0 {
+		t.Fatalf("undispatched request was recorded as usage: %+v %v", totals, err)
+	}
 }

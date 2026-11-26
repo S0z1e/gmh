@@ -309,6 +309,7 @@ func (s *Store) RepairUsage(action, artifact string) (UsageReconciliation, error
 			return UsageReconciliation{}, err
 		}
 		s.usageLoaded = false
+		s.usageInfo = nil
 		if err := s.loadUsageLocked(); err != nil && !errors.Is(err, errUsageDamaged) {
 			return UsageReconciliation{}, err
 		}
@@ -337,7 +338,7 @@ func (s *Store) quarantineUsageLocked(artifact string) error {
 	clean := filepath.Clean(artifact)
 	family := filepath.Dir(s.usagePathLocked())
 	rel, err := filepath.Rel(family, clean)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+	if err != nil || rel == "." || rel == ".." || strings.Contains(rel, string(os.PathSeparator)) {
 		return fmt.Errorf("artifact %s is outside this session usage family", artifact)
 	}
 	base := filepath.Base(clean)

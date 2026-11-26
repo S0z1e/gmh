@@ -229,10 +229,24 @@ func (s *Store) loadUsageLocked() error {
 			s.rememberCommitted(a.ID)
 		}
 		first = false
-		first = false
 	}
 	if err := sc.Err(); err != nil {
 		return err
+	}
+	// A marker removed before dispatch is not missing usage. Clear it on open
+	// so a crash cannot leave RecoveryGap set for a request that never left.
+	for id := range pending {
+		noted, err := s.notDispatchedUsageLocked(id)
+		if err != nil {
+			return err
+		}
+		if !noted {
+			continue
+		}
+		if err := s.clearPendingUsageLocked(id); err != nil {
+			return err
+		}
+		delete(pending, id)
 	}
 	if first {
 		totals.LegacyHistory = true

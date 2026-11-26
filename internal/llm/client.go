@@ -535,6 +535,7 @@ func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[str
 	if err != nil {
 		cancel()
 		abortRequestTrace(ctx)
+		suppressRequestTrace(ctx)
 		return nil, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")

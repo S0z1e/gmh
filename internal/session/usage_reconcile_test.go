@@ -285,6 +285,40 @@ func TestReconcileReportsCommittedState(t *testing.T) {
 	}
 }
 
+func TestNotDispatchedMarkerClearsOnReopen(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("reconcile", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "NOTDISPATCHED"
+	if err := s.BeginUsageAttempt(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkUsageNotDispatched(id); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = Open("reconcile", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	totals, err := s.UsageTotals()
+	if err != nil || totals.RecoveryGap || totals.Attempts != 0 {
+		t.Fatalf("%+v %v", totals, err)
+	}
+	marker := filepath.Join(filepath.Dir(s.usagePathLocked()), usagePendingPrefix+id)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("not-dispatched marker survived reopen: %v", err)
+	}
+	report, err := s.ReconcileUsage()
+	if err != nil || report.States[id] != usageStateNotDispatched || report.RecoveryGap {
+		t.Fatalf("%+v %v", report, err)
+	}
+}
+
 func TestDamagedJournalNamesArtifactAndQuarantinesIdempotently(t *testing.T) {
 	setTestHome(t, t.TempDir())
 	root := t.TempDir()
