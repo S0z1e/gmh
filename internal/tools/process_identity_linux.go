@@ -170,7 +170,7 @@ func verifyPreCapturedMemberFD(proof processGroupProof, pid int, expectedToken s
 	return true, true, nil
 }
 
-func signalVerifiedGroupByFD(proof processGroupProof, origErr error, members map[int]string) error {
+func signalVerifiedGroupByFD(proof processGroupProof, origErr error, members map[int]string, allowDoneOnAllExited bool) error {
 	anyVerifiedHandle := false
 	verifiedAlive := false
 	for pid, tok := range members {
@@ -190,7 +190,10 @@ func signalVerifiedGroupByFD(proof processGroupProof, origErr error, members map
 		return origErr
 	}
 	if !verifiedAlive {
-		return os.ErrProcessDone
+		if allowDoneOnAllExited {
+			return os.ErrProcessDone
+		}
+		return origErr
 	}
 	if kerr := syscall.Kill(-proof.Leader.PGID, syscall.SIGKILL); kerr == nil {
 		return nil
@@ -236,7 +239,7 @@ func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
 	// upfront, so descriptor exhaustion (EMFILE) does not block stopping.
 	info, err := inspectProcessErr(id.PID)
 	if isFDLimitErr(err) {
-		return signalVerifiedGroupByFD(proof, err, map[int]string{id.PID: id.StartToken})
+		return signalVerifiedGroupByFD(proof, err, map[int]string{id.PID: id.StartToken}, true)
 	}
 	if err != nil {
 		return err
@@ -254,7 +257,7 @@ func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
 	}
 	info2, err2 := inspectProcessErr(id.PID)
 	if isFDLimitErr(err2) {
-		return signalVerifiedGroupByFD(proof, err2, map[int]string{id.PID: id.StartToken})
+		return signalVerifiedGroupByFD(proof, err2, map[int]string{id.PID: id.StartToken}, true)
 	}
 	if err2 != nil {
 		return err2
@@ -271,7 +274,7 @@ func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
 			return os.ErrProcessDone
 		}
 		if isFDLimitErr(fdErr) {
-			return signalVerifiedGroupByFD(proof, fdErr, map[int]string{id.PID: id.StartToken})
+			return signalVerifiedGroupByFD(proof, fdErr, map[int]string{id.PID: id.StartToken}, true)
 		}
 		return fdErr
 	}
@@ -344,6 +347,9 @@ func captureVerifiedGroupProof(proof *processGroupProof) {
 		return
 	}
 	proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, members)
+	if proof.KnownMembers[proof.Leader.PID] == proof.Leader.StartToken {
+		proof.VerifiedAt = time.Now()
+	}
 	for pid, tok := range members {
 		if existing, ok := proof.verifiedFDs[pid]; ok && existing.fd > 0 && existing.startToken == tok {
 			continue
@@ -397,40 +403,11 @@ func processHasJobToken(pid int, token string) bool {
 	return false
 }
 
-func processHasMarkerFile(pid int, markerPath string) bool {
-	if pid <= 0 || markerPath == "" {
-		return false
-	}
-	fi, err := os.Stat(markerPath)
-	if err != nil {
-		return false
-	}
-	wantSt, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok || wantSt.Ino == 0 {
-		return false
-	}
-	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
-	entries, err := os.ReadDir(fdDir)
-	if err != nil {
-		return false
-	}
-	for _, entry := range entries {
-		var st syscall.Stat_t
-		if err := syscall.Stat(fdDir+"/"+entry.Name(), &st); err != nil {
-			continue
-		}
-		if st.Dev == wantSt.Dev && st.Ino == wantSt.Ino {
-			return true
-		}
-	}
-	return false
-}
-
 func stopKnownMembersFDFree(proof processGroupProof, origErr error) error {
 	if len(proof.KnownMembers) == 0 {
 		return origErr
 	}
-	return signalVerifiedGroupByFD(proof, origErr, proof.KnownMembers)
+	return signalVerifiedGroupByFD(proof, origErr, proof.KnownMembers, false)
 }
 
 func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
@@ -520,7 +497,7 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 				groupVerified = true
 			}
 		} else if (proof.JobToken != "" && processHasJobToken(pid, proof.JobToken)) ||
-			(proof.MarkerFile != "" && processHasMarkerFile(pid, proof.MarkerFile)) {
+			(!proof.VerifiedAt.IsZero() && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken) {
 			groupVerified = true
 		}
 		verifiedMembers++

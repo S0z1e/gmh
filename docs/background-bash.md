@@ -42,8 +42,11 @@ processes or reused PIDs are marked `unknown` without signalling or automatic
 command replay. Adopted jobs retain their persisted absolute deadline (records
 written without one fall back to `Started` + 2 hours): remaining time is
 enforced on adoption, deadlines that expired while the harness was down stop the
-verified process group immediately on adoption with a recovery note, remaining
-process-group members are cleaned up when an adopted leader exits, and wait
+verified process group immediately on adoption with a recovery note, on Unix
+(macOS and Linux) remaining process-group members are cleaned up when an adopted
+leader exits (on Windows, process-tree termination stops descendants while the
+adopted leader is alive, as Windows has no kernel process-group table once the
+leader exits), and wait
 errors keep the job stoppable rather than marking it done. On Linux, post-crash
 adoption detects process exit via `pidfd` or `/proc` polling and therefore
 reports `exit status unavailable` (`ExitCodeUnknown: true`) instead of the

@@ -56,8 +56,8 @@ type processGroupProof struct {
 	SID            int
 	Sess           uintptr
 	JobToken       string
-	MarkerFile     string
 	KnownMembers   map[int]string
+	VerifiedAt     time.Time
 	verifiedFDs    map[int]verifiedProcFD
 	ExitObservedAt time.Time
 }

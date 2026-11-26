@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"sync"
 	"time"
@@ -60,7 +59,6 @@ type Job struct {
 	PGID           int
 	ProcessStarted string
 	JobToken       string
-	MarkerFile     string
 	groupProof     processGroupProof
 	proofFDMu      sync.Mutex
 	Adopted        bool
@@ -266,7 +264,6 @@ func (j *Job) snapshotForPersist() (PersistedJob, string, bool) {
 		PGID:            j.PGID,
 		ProcessStarted:  j.ProcessStarted,
 		JobToken:        j.JobToken,
-		MarkerFile:      j.MarkerFile,
 		Status:          status,
 		ExitCode:        exitCode,
 		ExitCodeUnknown: j.result.ExitCodeUnknown,
@@ -369,13 +366,6 @@ func (j *Job) closeProofFDs() {
 	j.proofFDMu.Lock()
 	defer j.proofFDMu.Unlock()
 	closeVerifiedGroupProof(&j.groupProof)
-	j.mu.Lock()
-	marker := j.MarkerFile
-	outFile := j.OutputFile
-	j.mu.Unlock()
-	if marker != "" && marker != outFile {
-		_ = os.Remove(marker)
-	}
 }
 
 // Delivered reports whether the job's terminal outcome (or unknown notice) was
@@ -677,7 +667,7 @@ type startedBashProcess struct {
 	startToken        string
 }
 
-func (e *Executor) startBashProcess(ctx context.Context, command string, timeout time.Duration, output *bashOutputFile, dir string, markerPath string, extraEnv ...string) (*startedBashProcess, error) {
+func (e *Executor) startBashProcess(ctx context.Context, command string, timeout time.Duration, output *bashOutputFile, dir string, extraEnv ...string) (*startedBashProcess, error) {
 	var runCtx context.Context
 	var cancel context.CancelFunc
 	if timeout > 0 {
@@ -740,13 +730,6 @@ func (e *Executor) startBashProcess(ctx context.Context, command string, timeout
 		return nil, fmt.Errorf("create bash output pipe: %w", err)
 	}
 	cmd.Stdout, cmd.Stderr = writer, writer
-	var markerFile *os.File
-	if markerPath != "" && runtime.GOOS != "windows" {
-		if mf, merr := os.OpenFile(markerPath, os.O_CREATE|os.O_RDONLY, 0600); merr == nil {
-			markerFile = mf
-			cmd.ExtraFiles = append(cmd.ExtraFiles, mf)
-		}
-	}
 	if reviewed := bashDirectoryFromContext(ctx); reviewed != nil {
 		err = reviewed.check(dir)
 	}
@@ -755,9 +738,6 @@ func (e *Executor) startBashProcess(ctx context.Context, command string, timeout
 	}
 	if err == nil {
 		err = cmd.Start()
-	}
-	if markerFile != nil {
-		_ = markerFile.Close()
 	}
 	if err != nil {
 		_ = reader.Close()
@@ -804,7 +784,7 @@ func (e *Executor) startBashProcess(ctx context.Context, command string, timeout
 // bounded drain captures buffered output without waiting indefinitely for inherited
 // handles; only background:true with a live shell retains captured output.
 func (e *Executor) runBashCmd(ctx context.Context, command string, timeout, drainTimeout time.Duration, output *bashOutputFile, dir string, preview *BashOutputPreview) (string, int, error) {
-	proc, err := e.startBashProcess(ctx, command, timeout, output, dir, "")
+	proc, err := e.startBashProcess(ctx, command, timeout, output, dir)
 	if err != nil {
 		return "", -1, err
 	}
@@ -1041,12 +1021,6 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		unlimited = true
 	}
 	jobToken := randomHexToken(16)
-	markerPath := output.publicPath()
-	if markerPath == "" && jobsDir != "" {
-		if err := os.MkdirAll(jobsDir, 0700); err == nil {
-			markerPath = filepath.Join(jobsDir, ".tok-"+jobToken)
-		}
-	}
 	job := &Job{
 		InvocationID: identity.id,
 		ToolCallID:   identity.callID,
@@ -1056,7 +1030,6 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		OutputID:     e.OutputID,
 		OutputFile:   output.publicPath(),
 		JobToken:     jobToken,
-		MarkerFile:   markerPath,
 		jobsDir:      jobsDir,
 		outputDir:    e.OutputDir,
 		retained:     !foreground || jobsDir != "",
@@ -1102,7 +1075,7 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		job.mu.Unlock()
 		cancel()
 	}
-	proc, startErr := e.startBashProcess(commandCtx, a.Command, timeout, output, dir, markerPath, jobTokenEnvVar+"="+jobToken)
+	proc, startErr := e.startBashProcess(commandCtx, a.Command, timeout, output, dir, jobTokenEnvVar+"="+jobToken)
 	if startErr == nil {
 		job.mu.Lock()
 		job.PID = proc.pid
@@ -1244,12 +1217,6 @@ func (j *Job) snapshotGroupProofLocked() processGroupProof {
 	if proof.JobToken == "" {
 		proof.JobToken = j.JobToken
 	}
-	if proof.MarkerFile == "" {
-		proof.MarkerFile = j.MarkerFile
-		if proof.MarkerFile == "" {
-			proof.MarkerFile = j.OutputFile
-		}
-	}
 	return proof
 }
 
@@ -1273,6 +1240,9 @@ func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
 
 	j.mu.Lock()
 	j.groupProof.KnownMembers = mergeGroupMembers(j.groupProof.KnownMembers, proof.KnownMembers)
+	if !proof.VerifiedAt.IsZero() {
+		j.groupProof.VerifiedAt = proof.VerifiedAt
+	}
 	if len(proof.verifiedFDs) > 0 {
 		j.groupProof.verifiedFDs = proof.verifiedFDs
 	}

@@ -1382,7 +1382,7 @@ func TestCrashRecoveryChildForkedAfterWaitErrorStillStopsOnLeaderExit(t *testing
 		"GMH_HELPER_OUTID":     outID,
 		"GMH_HELPER_WAIT_TEXT": "NO-CHILD-YET",
 		"GMH_HELPER_CMD": fmt.Sprintf(
-			"printf 'NO-CHILD-YET\\n'; while [ ! -f %q ]; do sleep 0.05; done; sleep 30 & echo $! > %q; exit 0",
+			"printf 'NO-CHILD-YET\\n'; while [ ! -f %q ]; do sleep 0.05; done; (exec 3>&-; sleep 30) & echo $! > %q; exit 0",
 			triggerFile, childPIDFile,
 		),
 	})
@@ -1494,7 +1494,7 @@ func TestCrashRecoveryChildForkedAfterAdoptionStillStopsOnNormalExit(t *testing.
 		"GMH_HELPER_OUTID":     outID,
 		"GMH_HELPER_WAIT_TEXT": "NO-CHILD-YET",
 		"GMH_HELPER_CMD": fmt.Sprintf(
-			"printf 'NO-CHILD-YET\\n'; while [ ! -f %q ]; do sleep 0.05; done; sleep 30 & echo $! > %q; exit 0",
+			"printf 'NO-CHILD-YET\\n'; while [ ! -f %q ]; do sleep 0.05; done; (exec 3>&-; sleep 30) & echo $! > %q; exit 0",
 			triggerFile, childPIDFile,
 		),
 	})

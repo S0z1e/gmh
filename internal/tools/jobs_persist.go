@@ -62,7 +62,6 @@ type PersistedJob struct {
 	PGID            int       `json:"pgid,omitempty"`
 	ProcessStarted  string    `json:"process_started,omitempty"`
 	JobToken        string    `json:"job_token,omitempty"`
-	MarkerFile      string    `json:"marker_file,omitempty"`
 	Status          JobStatus `json:"status"`
 	ExitCode        *int      `json:"exit_code,omitempty"`
 	ExitCodeUnknown bool      `json:"exit_code_unknown,omitempty"`
@@ -596,7 +595,6 @@ func (e *Executor) newRecoveredJobObject(rec PersistedJob, jobsDir string, statu
 		PGID:            rec.PGID,
 		ProcessStarted:  rec.ProcessStarted,
 		JobToken:        rec.JobToken,
-		MarkerFile:      rec.MarkerFile,
 		Adopted:         status == JobRunning,
 		RecoveryNote:    note,
 		jobsDir:         jobsDir,
@@ -722,18 +720,13 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 		id := ProcessIdentityInfo{PID: rec.PID, PGID: rec.PGID, StartToken: rec.ProcessStarted}
 		info := inspectProcess(rec.PID)
 		if id.Matches(info) {
-			markerFile := rec.MarkerFile
-			if markerFile == "" {
-				markerFile = rec.OutputFile
-			}
 			proof := processGroupProof{
-				Leader:     id,
-				UID:        info.UID,
-				HasUID:     info.HasUID,
-				SID:        info.SID,
-				Sess:       info.Sess,
-				JobToken:   rec.JobToken,
-				MarkerFile: markerFile,
+				Leader:   id,
+				UID:      info.UID,
+				HasUID:   info.HasUID,
+				SID:      info.SID,
+				Sess:     info.Sess,
+				JobToken: rec.JobToken,
 			}
 			captureVerifiedGroupProof(&proof)
 			extraNote := ""

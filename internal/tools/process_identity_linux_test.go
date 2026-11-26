@@ -125,4 +125,14 @@ func TestStopVerifiedProcessGroupUnderEMFILELinux(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("process survived stopVerifiedProcessGroupWithProof under EMFILE")
 	}
+
+	// Post-exit EMFILE fallback must preserve EMFILE rather than returning
+	// os.ErrProcessDone when captured members have exited and /proc cannot be read
+	// to rule out later-forked descendants occupying the PGID.
+	cleanupFDsAfterExit := exhaustFDsUntilEMFILE(t)
+	postExitErr := stopAdoptedProcessGroupAfterExit(proof)
+	cleanupFDsAfterExit()
+	if !isFDLimitErr(postExitErr) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExit after leader exit under EMFILE err = %v, want EMFILE/ENFILE", postExitErr)
+	}
 }
