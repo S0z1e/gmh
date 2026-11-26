@@ -5,8 +5,12 @@ package tools
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -134,5 +138,62 @@ func TestStopVerifiedProcessGroupUnderEMFILELinux(t *testing.T) {
 	cleanupFDsAfterExit()
 	if !isFDLimitErr(postExitErr) {
 		t.Fatalf("stopAdoptedProcessGroupAfterExit after leader exit under EMFILE err = %v, want EMFILE/ENFILE", postExitErr)
+	}
+}
+
+func TestStopAdoptedProcessGroupAfterExitRefusesEqualIDReusedSessionLinux(t *testing.T) {
+	root := t.TempDir()
+	childPIDFile := filepath.Join(root, "child.pid")
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q", childPIDFile))
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	_ = cmd.Wait()
+
+	pidBytes, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil || childPID <= 0 {
+		t.Fatalf("invalid child pid %q: %v", string(pidBytes), err)
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	childInfo := inspectProcess(childPID)
+	if !childInfo.Alive || childInfo.PGID <= 0 {
+		t.Fatalf("child pid %d not inspectable: %+v", childPID, childInfo)
+	}
+
+	// Simulates Linux ID recycling where a replacement session has equal PID, PGID,
+	// and SID (due to Setsid: true), the replacement leader exited, and an old
+	// once-verified proof from an earlier job whose numeric IDs match is checked.
+	// Because the surviving child has no matching token/ancestry and lacks JobToken,
+	// Linux stopAdoptedProcessGroupAfterExit MUST refuse to signal the child.
+	staleEqualProof := processGroupProof{
+		Leader: ProcessIdentityInfo{
+			PID:        leaderPID,
+			PGID:       leaderPID,
+			StartToken: "stale-boot:1",
+		},
+		UID:            childInfo.UID,
+		HasUID:         childInfo.HasUID,
+		SID:            leaderPID,
+		KnownMembers:   map[int]string{leaderPID: "stale-boot:1"},
+		VerifiedAt:     time.Now().Add(-time.Minute),
+		JobToken:       "stale-secret-token-not-matching-child",
+		ExitObservedAt: time.Now(),
+	}
+	if err := stopAdoptedProcessGroupAfterExit(staleEqualProof); !errors.Is(err, ErrProcessIdentityMismatch) {
+		t.Fatalf("equal-ID recycled session proof err = %v, want ErrProcessIdentityMismatch", err)
+	}
+	if !inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d was killed by stale equal-ID proof", childPID)
 	}
 }

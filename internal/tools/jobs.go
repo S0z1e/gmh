@@ -1264,7 +1264,21 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	outFile, cwd, monitorFailed := j.OutputFile, j.Cwd, j.monitorFailed
 	execRef, outputDir, auditFn := j.exec, j.outputDir, j.audit
 	started, deadline := j.Started, j.Deadline
+	monitorDone := false
+	if j.monitorDone != nil {
+		select {
+		case <-j.monitorDone:
+			monitorDone = true
+		default:
+		}
+	}
+	mustFinalize := monitorFailed || monitorDone
 	j.mu.Unlock()
+
+	stopGroupAfterExitFn := stopAdoptedProcessGroupAfterExit
+	if execRef != nil && execRef.stopAdoptedGroupAfterExit != nil {
+		stopGroupAfterExitFn = execRef.stopAdoptedGroupAfterExit
+	}
 
 	// Refresh verified PGID members while the leader may still be alive so any
 	// reparented children remain verifiable if the leader exits or wait fails.
@@ -1279,7 +1293,7 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	}
 	if errors.Is(err, os.ErrProcessDone) {
 		proof.ExitObservedAt = time.Time{}
-		gerr := stopAdoptedProcessGroupAfterExit(proof)
+		gerr := stopGroupAfterExitFn(proof)
 		j.proofFDMu.Unlock()
 		if errors.Is(gerr, ErrProcessIdentityMismatch) {
 			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
@@ -1294,7 +1308,7 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 		j.proofFDMu.Unlock()
 		j.recordStopError(err)
 		return err
-	} else if monitorFailed {
+	} else if mustFinalize {
 		j.proofFDMu.Unlock()
 		waitForAdoptedProcessGone(id, 2*time.Second)
 		j.proofFDMu.Lock()
@@ -1309,7 +1323,7 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 			return nil
 		}
 		proof.ExitObservedAt = time.Now()
-		gerr := stopAdoptedProcessGroupAfterExit(proof)
+		gerr := stopGroupAfterExitFn(proof)
 		j.proofFDMu.Unlock()
 		if errors.Is(gerr, ErrProcessIdentityMismatch) {
 			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
@@ -1323,7 +1337,7 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	} else {
 		j.proofFDMu.Unlock()
 	}
-	if monitorFailed {
+	if mustFinalize {
 		summary, preview, _, hasFile := summarizeOutputFile(outFile, cwd)
 		note := pipeCaptureEndedNote(outFile)
 		if !hasFile {

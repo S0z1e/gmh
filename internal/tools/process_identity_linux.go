@@ -443,6 +443,12 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	}
 	verifiedMembers := 0
 	groupVerified := false
+	var verifiedFDs []int
+	defer func() {
+		for _, fd := range verifiedFDs {
+			_ = unix.Close(fd)
+		}
+	}()
 	for _, entry := range entries {
 		name := entry.Name()
 		if !entry.IsDir() || len(name) == 0 || name[0] < '0' || name[0] > '9' {
@@ -462,11 +468,12 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 		if !meta.info.Alive || meta.info.PGID != id.PGID {
 			continue
 		}
+		memberVerified := false
 		if pid == id.PID {
 			if meta.info.StartToken != id.StartToken {
 				return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 			}
-			groupVerified = true
+			memberVerified = true
 		}
 		if proof.HasUID && meta.info.HasUID && meta.info.UID != proof.UID {
 			return fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
@@ -488,17 +495,22 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 			}
 		}
 		if proof.KnownMembers[pid] == meta.info.StartToken {
-			groupVerified = true
+			memberVerified = true
 		} else if meta.ppid == id.PID {
-			groupVerified = true
+			memberVerified = true
 		} else if parentTok, ok := proof.KnownMembers[meta.ppid]; ok {
 			pBoot, pTicks, parsed := parseLinuxStartToken(parentTok)
 			if parsed && (leaderBoot == "" || pBoot == "" || pBoot == leaderBoot) && meta.startTicks >= pTicks {
-				groupVerified = true
+				memberVerified = true
 			}
-		} else if (proof.JobToken != "" && processHasJobToken(pid, proof.JobToken)) ||
-			(!proof.VerifiedAt.IsZero() && proof.SID > 0 && proof.SID == id.PID && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken) {
+		} else if proof.JobToken != "" && processHasJobToken(pid, proof.JobToken) {
+			memberVerified = true
+		}
+		if memberVerified {
 			groupVerified = true
+			if fd, ferr := unix.PidfdOpen(pid, 0); ferr == nil {
+				verifiedFDs = append(verifiedFDs, fd)
+			}
 		}
 		verifiedMembers++
 	}
@@ -508,7 +520,30 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	if !groupVerified {
 		return fmt.Errorf("refusing to signal unverified pgid %d after leader disappeared: %w", id.PGID, ErrProcessIdentityMismatch)
 	}
-	if kerr := syscall.Kill(-id.PGID, syscall.SIGKILL); kerr == nil {
+
+	// Bind signalling to the verified surviving group: ensure at least one
+	// verified member handle is still alive in the target PGID before signalling,
+	// so numeric PGID recycling cannot redirect the signal to an unrelated group.
+	if len(verifiedFDs) > 0 {
+		hasLiveVerified := false
+		for _, fd := range verifiedFDs {
+			if kerr := unix.PidfdSendSignal(fd, 0, nil, 0); kerr == nil {
+				hasLiveVerified = true
+				break
+			}
+		}
+		if !hasLiveVerified {
+			// All verified members exited before signalling; refuse to signal
+			// the bare numeric PGID as it may have been recycled.
+			return os.ErrProcessDone
+		}
+	}
+
+	kerr := syscall.Kill(-id.PGID, syscall.SIGKILL)
+	for _, fd := range verifiedFDs {
+		_ = unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
+	}
+	if kerr == nil {
 		return nil
 	} else if errors.Is(kerr, syscall.ESRCH) {
 		return os.ErrProcessDone

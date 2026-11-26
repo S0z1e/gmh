@@ -1375,14 +1375,26 @@ func TestCrashRecoveryPostExitCleanupFailureRetryFinalizesJob(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	failCleanup := true
+	var cleanupMu sync.Mutex
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		stopAdoptedGroupAfterExit: func(proof processGroupProof) error {
+			cleanupMu.Lock()
+			fail := failCleanup
+			cleanupMu.Unlock()
+			if fail {
+				return fmt.Errorf("injected transient EMFILE")
+			}
+			return stopAdoptedProcessGroupAfterExit(proof)
+		},
+	}
 	exec2.SwitchSession(outID)
 	defer exec2.CloseJobs(context.Background())
 
-	// Simulate the state left when monitorAdoptedJob exits early on a transient
-	// post-exit cleanup failure after recording WaitError via recordStopError.
-	waitCtx, cancelCause := context.WithCancelCause(context.Background())
-	defer cancelCause(nil)
 	recJobs, err := loadPersistedJobs(jobsDir)
 	if err != nil || len(recJobs) != 1 {
 		t.Fatalf("loadPersistedJobs = %+v, err=%v", recJobs, err)
@@ -1398,20 +1410,28 @@ func TestCrashRecoveryPostExitCleanupFailureRetryFinalizesJob(t *testing.T) {
 	captureVerifiedGroupProof(&proof)
 	job := exec2.newRecoveredJobObject(recJobs[0], jobsDir, JobRunning, false, false, "adopted", JobResult{})
 	job.groupProof = proof
-	job.monitorDone = make(chan struct{})
-	job.cancel = func() { cancelCause(context.Canceled) }
 	exec2.registry().addPreserved(job)
 
-	// Mimic monitor exiting early via recordStopError on transient cleanup error.
-	job.recordStopError(fmt.Errorf("stop remaining bash processes: %w", errors.New("injected transient EMFILE")))
-	close(job.monitorDone)
+	// Exercise the REAL cleanup path: call cleanupAdoptedGroupAfterExit directly
+	// (as monitorAdoptedJob does on post-exit). It must record StopError, set
+	// monitorFailed = true under proofFDMu, and return true.
+	if !job.cleanupAdoptedGroupAfterExit() {
+		t.Fatal("cleanupAdoptedGroupAfterExit returned false on failure, want true")
+	}
 	if job.Status() != JobRunning {
 		t.Fatalf("status after transient cleanup error = %q, want running", job.Status())
 	}
-	_ = waitCtx
+	if job.Snapshot().WaitError == "" {
+		t.Fatal("WaitError was not recorded on transient cleanup error")
+	}
 
-	// Retry via CancelErr: must succeed AND finalize job to JobDone rather than
-	// leaving it stuck running in the registry.
+	// Resolve the transient failure.
+	cleanupMu.Lock()
+	failCleanup = false
+	cleanupMu.Unlock()
+
+	// Retry via CancelErr: serialized against cleanupAdoptedGroupAfterExit,
+	// must succeed AND finalize the job to JobDone.
 	if err := job.CancelErr(); err != nil {
 		t.Fatalf("retry CancelErr failed: %v", err)
 	}
@@ -1515,17 +1535,20 @@ func TestCrashRecoveryWaitErrorFollowedByNormalLeaderExitStillStopsChild(t *test
 	if _, _, leaderAlive := ProcessIdentity(meta.PID); leaderAlive {
 		t.Fatalf("leader PID %d did not exit after release", meta.PID)
 	}
-	if _, _, childAlive := ProcessIdentity(childPID); !childAlive {
-		t.Fatalf("child PID %d exited unexpectedly before StopJob", childPID)
-	}
 
-	// StopJob must still kill the reparented child rather than marking unknown.
-	res, stopErr := exec2.StopJob(meta.JobID)
-	if stopErr != nil {
-		t.Fatalf("StopJob after wait error + leader exit failed: %v (%s)", stopErr, res.Text)
+	// Automatic fallback observation on normal leader exit must clean up the child
+	// process group and finalize the job without requiring manual StopJob.
+	select {
+	case <-job.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("adopted job did not finish after leader exited normally")
 	}
 	if job.Status() != JobDone {
-		t.Fatalf("job status after StopJob = %q, want done", job.Status())
+		t.Fatalf("job status after normal leader exit = %q, want done", job.Status())
+	}
+	snap := job.Snapshot()
+	if !strings.Contains(snap.WaitError, "injected kevent EACCES") {
+		t.Fatalf("wait error was lost after normal leader exit cleanup: %+v", snap)
 	}
 	childDeadBy := time.Now().Add(3 * time.Second)
 	for time.Now().Before(childDeadBy) {
@@ -1534,7 +1557,7 @@ func TestCrashRecoveryWaitErrorFollowedByNormalLeaderExitStillStopsChild(t *test
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("reparented child PID %d survived StopJob after wait error + leader exit", childPID)
+	t.Fatalf("reparented child PID %d survived normal leader exit cleanup", childPID)
 }
 
 func TestCrashRecoveryChildForkedAfterWaitErrorStillStopsOnLeaderExit(t *testing.T) {
@@ -1628,16 +1651,16 @@ func TestCrashRecoveryChildForkedAfterWaitErrorStillStopsOnLeaderExit(t *testing
 	if _, _, leaderAlive := ProcessIdentity(meta.PID); leaderAlive {
 		t.Fatalf("leader PID %d did not exit", meta.PID)
 	}
-	if _, _, childAlive := ProcessIdentity(childPID); !childAlive {
-		t.Fatalf("child PID %d exited unexpectedly before StopJob", childPID)
-	}
 
-	res, stopErr := exec2.StopJob(meta.JobID)
-	if stopErr != nil {
-		t.Fatalf("StopJob failed: %v (%s)", stopErr, res.Text)
+	// Automatic fallback observation on normal leader exit must clean up the child
+	// forked after wait error and finalize the job without requiring manual StopJob.
+	select {
+	case <-job.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("adopted job did not finish after leader exit")
 	}
 	if job.Status() != JobDone {
-		t.Fatalf("job status after StopJob = %q, want done", job.Status())
+		t.Fatalf("job status after normal leader exit = %q, want done", job.Status())
 	}
 	childDeadBy := time.Now().Add(3 * time.Second)
 	for time.Now().Before(childDeadBy) {
@@ -1646,7 +1669,7 @@ func TestCrashRecoveryChildForkedAfterWaitErrorStillStopsOnLeaderExit(t *testing
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("child PID %d forked after wait error survived StopJob", childPID)
+	t.Fatalf("child PID %d forked after wait error survived normal leader exit cleanup", childPID)
 }
 
 func TestCrashRecoveryChildForkedAfterAdoptionStillStopsOnNormalExit(t *testing.T) {

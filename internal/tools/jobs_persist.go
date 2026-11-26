@@ -1195,28 +1195,59 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 			waitErr = errors.New("adopted process wait failed")
 		}
 		info := inspectProcess(snap.Identity.PID)
-		if info.Alive && !snap.Identity.Matches(info) {
+		if !info.Alive {
+			// Leader has already exited. Clean up remaining processes in group and finish.
+			if job.cleanupAdoptedGroupAfterExit() {
+				return
+			}
+		} else if !snap.Identity.Matches(info) {
 			summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
 			job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
 			return
-		}
-		// Keep verified PGID member evidence fresh across the wait error so
-		// later stops remain safe even if the leader exits before StopJob.
-		if snap.Identity.Matches(info) {
+		} else {
+			// Leader is still alive and verified. Keep WaitError visible and
+			// continue supervising via fallback polling so the child group is
+			// automatically cleaned up when the leader exits.
 			job.proofFDMu.Lock()
 			job.refreshVerifiedGroupMembersLocked()
 			job.proofFDMu.Unlock()
+
+			job.mu.Lock()
+			if !job.finished && !job.unknown {
+				job.WaitError = waitErr.Error()
+				job.RecoveryNote = fmt.Sprintf("adopted live OS process PID %d (pgid %d); process wait error (%v) — supervising via fallback polling; %s",
+					snap.Identity.PID, snap.Identity.PGID, waitErr, pipeCaptureEndedNote(job.OutputFile))
+			}
+			job.mu.Unlock()
+			job.persist()
+
+			ticker := time.NewTicker(50 * time.Millisecond)
+			defer ticker.Stop()
+			leaderExited := false
+			for !leaderExited {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					pinfo := inspectProcess(snap.Identity.PID)
+					if !pinfo.Alive {
+						leaderExited = true
+						break
+					}
+					if !snap.Identity.Matches(pinfo) {
+						summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
+						job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
+						return
+					}
+					job.proofFDMu.Lock()
+					job.refreshVerifiedGroupMembersLocked()
+					job.proofFDMu.Unlock()
+				}
+			}
+			if job.cleanupAdoptedGroupAfterExit() {
+				return
+			}
 		}
-		job.mu.Lock()
-		if !job.finished && !job.unknown {
-			job.monitorFailed = true
-			job.WaitError = waitErr.Error()
-			job.RecoveryNote = fmt.Sprintf("adopted live OS process PID %d (pgid %d); process wait error (%v) — job remains stoppable; %s",
-				snap.Identity.PID, snap.Identity.PGID, waitErr, pipeCaptureEndedNote(job.OutputFile))
-		}
-		job.mu.Unlock()
-		job.persist()
-		return
 	}
 
 	summary, preview, _, hasFile := summarizeOutputFile(job.OutputFile, job.Cwd)
@@ -1259,19 +1290,25 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 
 func (j *Job) cleanupAdoptedGroupAfterExit() bool {
 	j.proofFDMu.Lock()
+	defer j.proofFDMu.Unlock()
 	j.mu.Lock()
 	if j.finished || j.unknown {
 		j.mu.Unlock()
-		j.proofFDMu.Unlock()
 		return false
 	}
 	proof := j.snapshotGroupProofLocked()
+	execRef := j.exec
+	outFile, cwd := j.OutputFile, j.Cwd
 	j.mu.Unlock()
+
 	proof.ExitObservedAt = time.Now()
-	gerr := stopAdoptedProcessGroupAfterExit(proof)
-	j.proofFDMu.Unlock()
+	stopGroupAfterExitFn := stopAdoptedProcessGroupAfterExit
+	if execRef != nil && execRef.stopAdoptedGroupAfterExit != nil {
+		stopGroupAfterExitFn = execRef.stopAdoptedGroupAfterExit
+	}
+	gerr := stopGroupAfterExitFn(proof)
 	if errors.Is(gerr, ErrProcessIdentityMismatch) {
-		summary, preview, _, _ := summarizeOutputFile(j.OutputFile, j.Cwd)
+		summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
 		j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", proof.Leader.PID, gerr), summary, preview)
 		return true
 	}
