@@ -94,6 +94,10 @@ func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
 	return nil
 }
 
+func captureVerifiedGroupProof(proof *processGroupProof) {}
+
+func closeVerifiedGroupProof(proof *processGroupProof) {}
+
 func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	return stopVerifiedProcessGroup(proof.Leader)
 }

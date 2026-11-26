@@ -75,13 +75,37 @@ func TestStopVerifiedProcessGroupUnderEMFILELinux(t *testing.T) {
 		HasUID: info.HasUID,
 		SID:    info.SID,
 	}
-	proof.KnownMembers = captureVerifiedGroupMembers(proof)
+	captureVerifiedGroupProof(&proof)
+	defer closeVerifiedGroupProof(&proof)
 
 	cleanupFDs := exhaustFDsUntilEMFILE(t)
 	_, _, waitErr := waitAdoptedProcess(context.Background(), proof.Leader)
 	if !errors.Is(waitErr, syscall.EMFILE) {
 		cleanupFDs()
 		t.Fatalf("waitAdoptedProcess under EMFILE err = %v, want EMFILE", waitErr)
+	}
+
+	// Same PID, PGID, SID, and UID, but stale leader StartToken must be rejected.
+	staleLeader := proof
+	staleLeader.Leader.StartToken = "stale-boot:1"
+	if mismatchErr := stopVerifiedProcessGroupWithProof(staleLeader); !errors.Is(mismatchErr, ErrProcessIdentityMismatch) {
+		cleanupFDs()
+		t.Fatalf("stale leader token under EMFILE err = %v, want ErrProcessIdentityMismatch", mismatchErr)
+	}
+
+	// Same PID, PGID, SID, and UID, but stale KnownMembers token in post-exit fallback must be rejected.
+	staleMember := proof
+	staleMember.KnownMembers = map[int]string{pid: "stale-boot:1"}
+	if mismatchErr := stopAdoptedProcessGroupAfterExit(staleMember); !errors.Is(mismatchErr, ErrProcessIdentityMismatch) {
+		cleanupFDs()
+		t.Fatalf("stale KnownMembers token under EMFILE err = %v, want ErrProcessIdentityMismatch", mismatchErr)
+	}
+
+	// Unbacked proof with no verified FD must fail with EMFILE rather than signalling blindly.
+	unbacked := processGroupProof{Leader: proof.Leader, UID: proof.UID, HasUID: proof.HasUID, SID: proof.SID}
+	if unbackedErr := stopVerifiedProcessGroupWithProof(unbacked); !isFDLimitErr(unbackedErr) {
+		cleanupFDs()
+		t.Fatalf("unbacked stop under EMFILE err = %v, want EMFILE/ENFILE", unbackedErr)
 	}
 
 	wrongProof := proof

@@ -205,11 +205,11 @@ type File struct {
 	Verification                 *verification.Policy `json:"verification"`
 	BgThresholdSeconds           *int                 `json:"bgThresholdSeconds"`
 	BackgroundMaxLifetimeSeconds *int                 `json:"backgroundMaxLifetimeSeconds"`
-	DenyInsteadOfPrompt    *bool                `json:"denyInsteadOfPrompt"`
-	Sandbox                *bool                `json:"sandbox"`
-	ContextLimit           *int                 `json:"contextLimit"`
-	AnthropicMaxTokens     *int                 `json:"anthropicMaxTokens"`
-	TUITheme               string               `json:"tuiTheme"`
+	DenyInsteadOfPrompt          *bool                `json:"denyInsteadOfPrompt"`
+	Sandbox                      *bool                `json:"sandbox"`
+	ContextLimit                 *int                 `json:"contextLimit"`
+	AnthropicMaxTokens           *int                 `json:"anthropicMaxTokens"`
+	TUITheme                     string               `json:"tuiTheme"`
 	// Plugins is the optional plugins section (nil = unset: nothing
 	// is disabled). A project file's section replaces the global
 	// one, like a provider's models list.

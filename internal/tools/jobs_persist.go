@@ -61,6 +61,8 @@ type PersistedJob struct {
 	PID             int       `json:"pid,omitempty"`
 	PGID            int       `json:"pgid,omitempty"`
 	ProcessStarted  string    `json:"process_started,omitempty"`
+	JobToken        string    `json:"job_token,omitempty"`
+	MarkerFile      string    `json:"marker_file,omitempty"`
 	Status          JobStatus `json:"status"`
 	ExitCode        *int      `json:"exit_code,omitempty"`
 	ExitCodeUnknown bool      `json:"exit_code_unknown,omitempty"`
@@ -593,6 +595,8 @@ func (e *Executor) newRecoveredJobObject(rec PersistedJob, jobsDir string, statu
 		PID:             rec.PID,
 		PGID:            rec.PGID,
 		ProcessStarted:  rec.ProcessStarted,
+		JobToken:        rec.JobToken,
+		MarkerFile:      rec.MarkerFile,
 		Adopted:         status == JobRunning,
 		RecoveryNote:    note,
 		jobsDir:         jobsDir,
@@ -718,19 +722,26 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 		id := ProcessIdentityInfo{PID: rec.PID, PGID: rec.PGID, StartToken: rec.ProcessStarted}
 		info := inspectProcess(rec.PID)
 		if id.Matches(info) {
-			proof := processGroupProof{
-				Leader: id,
-				UID:    info.UID,
-				HasUID: info.HasUID,
-				SID:    info.SID,
-				Sess:   info.Sess,
+			markerFile := rec.MarkerFile
+			if markerFile == "" {
+				markerFile = rec.OutputFile
 			}
-			proof.KnownMembers = captureVerifiedGroupMembers(proof)
+			proof := processGroupProof{
+				Leader:     id,
+				UID:        info.UID,
+				HasUID:     info.HasUID,
+				SID:        info.SID,
+				Sess:       info.Sess,
+				JobToken:   rec.JobToken,
+				MarkerFile: markerFile,
+			}
+			captureVerifiedGroupProof(&proof)
 			extraNote := ""
 			if !rec.Unlimited && !rec.Deadline.IsZero() && !time.Now().Before(rec.Deadline) {
 				stopErr := stopVerifiedProcessGroupWithProof(proof)
 				switch {
 				case errors.Is(stopErr, ErrProcessIdentityMismatch):
+					closeVerifiedGroupProof(&proof)
 					reason := fmt.Sprintf("refused to attach to PID %d: process identity, group, or start token mismatch (PID reused)", id.PID)
 					if rec.FinishedAt.IsZero() {
 						rec.FinishedAt = time.Now()
@@ -754,6 +765,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 						groupProof.ExitObservedAt = time.Now()
 					}
 					if gerr := stopAdoptedProcessGroupAfterExit(groupProof); errors.Is(gerr, ErrProcessIdentityMismatch) {
+						closeVerifiedGroupProof(&proof)
 						reason := fmt.Sprintf("refused to attach to PID %d: %v", id.PID, gerr)
 						if rec.FinishedAt.IsZero() {
 							rec.FinishedAt = time.Now()
@@ -774,6 +786,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 						extraNote = fmt.Sprintf("deadline (%s) passed while harness was down, group stop failed (%v); ", rec.Deadline.UTC().Format(time.RFC3339), gerr)
 						break
 					}
+					closeVerifiedGroupProof(&proof)
 					timeoutDur := max(0, rec.Deadline.Sub(rec.Started))
 					timeoutErr := &timeoutError{timeout: timeoutDur}
 					note := fmt.Sprintf("adopted job PID %d (pgid %d) exceeded deadline (%s) while harness was down; stopped verified process group; %s",
@@ -825,6 +838,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 			note := fmt.Sprintf("adopted live OS process PID %d (pgid %d); %s%s", id.PID, id.PGID, extraNote, pipeCaptureEndedNote(rec.OutputFile))
 			job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
 			job.groupProof = cloneGroupProof(proof)
+			job.groupProof.verifiedFDs = proof.verifiedFDs
 			job.monitorDone = make(chan struct{})
 			job.cancel = func() { cancelCause(context.Canceled) }
 			job.closeStop = func() error {
@@ -985,6 +999,7 @@ func (e *Executor) RecoverSessionJobs(
 		e.jobsMu.Unlock()
 		for _, m := range monitors {
 			m.job.Cancel()
+			m.job.closeProofFDs()
 			if m.job.OutputFile != "" && e.OutputDir != "" {
 				e.unmarkActiveOutput(e.OutputDir, m.job.OutputFile)
 			}
@@ -1160,12 +1175,12 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 	deadlineStopMu.Unlock()
 
 	if errors.Is(context.Cause(ctx), ErrExecutorClosed) {
-		if job.cleanupAdoptedGroupAfterExit(job.snapshotGroupProof()) {
+		if job.cleanupAdoptedGroupAfterExit() {
 			return
 		}
 		err = ErrExecutorClosed
 	} else if isTimedOut {
-		if job.cleanupAdoptedGroupAfterExit(job.snapshotGroupProof()) {
+		if job.cleanupAdoptedGroupAfterExit() {
 			return
 		}
 		err = &timeoutError{timeout: max(0, snap.Deadline.Sub(snap.Started))}
@@ -1175,7 +1190,7 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		if !exitKnown && err == nil {
 			err = errAdoptedProcessExited
 		}
-		if job.cleanupAdoptedGroupAfterExit(job.snapshotGroupProof()) {
+		if job.cleanupAdoptedGroupAfterExit() {
 			return
 		}
 	} else {
@@ -1195,7 +1210,9 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		// Keep verified PGID member evidence fresh across the wait error so
 		// later stops remain safe even if the leader exits before StopJob.
 		if snap.Identity.Matches(info) {
-			job.refreshVerifiedGroupMembers()
+			job.proofFDMu.Lock()
+			job.refreshVerifiedGroupMembersLocked()
+			job.proofFDMu.Unlock()
 		}
 		job.mu.Lock()
 		if !job.finished && !job.unknown {
@@ -1247,9 +1264,19 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 	})
 }
 
-func (j *Job) cleanupAdoptedGroupAfterExit(proof processGroupProof) bool {
+func (j *Job) cleanupAdoptedGroupAfterExit() bool {
+	j.proofFDMu.Lock()
+	j.mu.Lock()
+	if j.finished || j.unknown {
+		j.mu.Unlock()
+		j.proofFDMu.Unlock()
+		return false
+	}
+	proof := j.snapshotGroupProofLocked()
+	j.mu.Unlock()
 	proof.ExitObservedAt = time.Now()
 	gerr := stopAdoptedProcessGroupAfterExit(proof)
+	j.proofFDMu.Unlock()
 	if errors.Is(gerr, ErrProcessIdentityMismatch) {
 		summary, preview, _, _ := summarizeOutputFile(j.OutputFile, j.Cwd)
 		j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", proof.Leader.PID, gerr), summary, preview)

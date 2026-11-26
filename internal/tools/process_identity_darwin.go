@@ -131,6 +131,30 @@ func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
 	return members
 }
 
+func captureVerifiedGroupProof(proof *processGroupProof) {
+	if proof == nil {
+		return
+	}
+	proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, captureVerifiedGroupMembers(*proof))
+}
+
+func closeVerifiedGroupProof(proof *processGroupProof) {}
+
+func processHasMarkerFile(pid int, markerPath string) bool {
+	if pid <= 0 || markerPath == "" {
+		return false
+	}
+	fi, err := os.Stat(markerPath)
+	if err != nil {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st.Ino == 0 {
+		return false
+	}
+	return darwinProcessHasFile(pid, uint64(st.Dev), uint64(st.Ino))
+}
+
 func darwinResolveGroupKillError(pgid int, err error) error {
 	if errors.Is(err, syscall.ESRCH) {
 		return os.ErrProcessDone
@@ -216,6 +240,8 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 			if parsed && !darwinStartTimeBefore(pSec, pUsec, parentSec, parentUsec) {
 				groupVerified = true
 			}
+		} else if proof.MarkerFile != "" && processHasMarkerFile(pid, proof.MarkerFile) {
+			groupVerified = true
 		}
 		verifiedMembers++
 	}

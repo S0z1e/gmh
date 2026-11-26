@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 	"time"
@@ -58,7 +59,10 @@ type Job struct {
 	PID            int
 	PGID           int
 	ProcessStarted string
+	JobToken       string
+	MarkerFile     string
 	groupProof     processGroupProof
+	proofFDMu      sync.Mutex
 	Adopted        bool
 	RecoveryNote   string
 	// OutputFile is the per-call file holding the full stdout+stderr
@@ -89,8 +93,8 @@ type Job struct {
 	monitorFailed bool
 	retained      bool
 	forgotten     bool
-	finishedAt time.Time
-	registry   *JobRegistry
+	finishedAt    time.Time
+	registry      *JobRegistry
 	// A later turn must not deliver a recorded result twice.
 	delivered bool
 	// adoptionNoticed ensures an adopted running job sends at most one
@@ -261,6 +265,8 @@ func (j *Job) snapshotForPersist() (PersistedJob, string, bool) {
 		PID:             j.PID,
 		PGID:            j.PGID,
 		ProcessStarted:  j.ProcessStarted,
+		JobToken:        j.JobToken,
+		MarkerFile:      j.MarkerFile,
 		Status:          status,
 		ExitCode:        exitCode,
 		ExitCodeUnknown: j.result.ExitCodeUnknown,
@@ -327,6 +333,7 @@ func (j *Job) markUnknown(reason, outputSummary string, preview *BashOutputPrevi
 		Preview:         preview,
 	}
 	j.mu.Unlock()
+	j.closeProofFDs()
 	j.persist()
 	close(j.done)
 }
@@ -350,11 +357,25 @@ func (j *Job) finish(r JobResult) {
 	j.finishedAt = time.Now()
 	registry, delivered := j.registry, j.delivered
 	j.mu.Unlock()
+	j.closeProofFDs()
 	if delivered && registry != nil {
 		registry.trimDelivered()
 	}
 	j.persist()
 	close(j.done)
+}
+
+func (j *Job) closeProofFDs() {
+	j.proofFDMu.Lock()
+	defer j.proofFDMu.Unlock()
+	closeVerifiedGroupProof(&j.groupProof)
+	j.mu.Lock()
+	marker := j.MarkerFile
+	outFile := j.OutputFile
+	j.mu.Unlock()
+	if marker != "" && marker != outFile {
+		_ = os.Remove(marker)
+	}
 }
 
 // Delivered reports whether the job's terminal outcome (or unknown notice) was
@@ -656,7 +677,7 @@ type startedBashProcess struct {
 	startToken        string
 }
 
-func (e *Executor) startBashProcess(ctx context.Context, command string, timeout time.Duration, output *bashOutputFile, dir string) (*startedBashProcess, error) {
+func (e *Executor) startBashProcess(ctx context.Context, command string, timeout time.Duration, output *bashOutputFile, dir string, markerPath string, extraEnv ...string) (*startedBashProcess, error) {
 	var runCtx context.Context
 	var cancel context.CancelFunc
 	if timeout > 0 {
@@ -676,7 +697,11 @@ func (e *Executor) startBashProcess(ctx context.Context, command string, timeout
 		cmd = exec.CommandContext(runCtx, "bash", "-c", command)
 		cmd.Dir = dir
 	}
-	cmd.Env = bashEnvironment(e.BashEnv)
+	env := bashEnvironment(e.BashEnv)
+	if len(extraEnv) > 0 {
+		env = append(append([]string(nil), env...), extraEnv...)
+	}
+	cmd.Env = env
 	// Own process group, killed as a whole on timeout/abort (see
 	// Cancel below). Without this, only the direct bash child died
 	// and grandchildren lingered as orphans.
@@ -715,6 +740,13 @@ func (e *Executor) startBashProcess(ctx context.Context, command string, timeout
 		return nil, fmt.Errorf("create bash output pipe: %w", err)
 	}
 	cmd.Stdout, cmd.Stderr = writer, writer
+	var markerFile *os.File
+	if markerPath != "" && runtime.GOOS != "windows" {
+		if mf, merr := os.OpenFile(markerPath, os.O_CREATE|os.O_RDONLY, 0600); merr == nil {
+			markerFile = mf
+			cmd.ExtraFiles = append(cmd.ExtraFiles, mf)
+		}
+	}
 	if reviewed := bashDirectoryFromContext(ctx); reviewed != nil {
 		err = reviewed.check(dir)
 	}
@@ -723,6 +755,9 @@ func (e *Executor) startBashProcess(ctx context.Context, command string, timeout
 	}
 	if err == nil {
 		err = cmd.Start()
+	}
+	if markerFile != nil {
+		_ = markerFile.Close()
 	}
 	if err != nil {
 		_ = reader.Close()
@@ -769,7 +804,7 @@ func (e *Executor) startBashProcess(ctx context.Context, command string, timeout
 // bounded drain captures buffered output without waiting indefinitely for inherited
 // handles; only background:true with a live shell retains captured output.
 func (e *Executor) runBashCmd(ctx context.Context, command string, timeout, drainTimeout time.Duration, output *bashOutputFile, dir string, preview *BashOutputPreview) (string, int, error) {
-	proc, err := e.startBashProcess(ctx, command, timeout, output, dir)
+	proc, err := e.startBashProcess(ctx, command, timeout, output, dir, "")
 	if err != nil {
 		return "", -1, err
 	}
@@ -1005,6 +1040,13 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	} else {
 		unlimited = true
 	}
+	jobToken := randomHexToken(16)
+	markerPath := output.publicPath()
+	if markerPath == "" && jobsDir != "" {
+		if err := os.MkdirAll(jobsDir, 0700); err == nil {
+			markerPath = filepath.Join(jobsDir, ".tok-"+jobToken)
+		}
+	}
 	job := &Job{
 		InvocationID: identity.id,
 		ToolCallID:   identity.callID,
@@ -1013,6 +1055,8 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		Cwd:          dir,
 		OutputID:     e.OutputID,
 		OutputFile:   output.publicPath(),
+		JobToken:     jobToken,
+		MarkerFile:   markerPath,
 		jobsDir:      jobsDir,
 		outputDir:    e.OutputDir,
 		retained:     !foreground || jobsDir != "",
@@ -1058,7 +1102,7 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		job.mu.Unlock()
 		cancel()
 	}
-	proc, startErr := e.startBashProcess(commandCtx, a.Command, timeout, output, dir)
+	proc, startErr := e.startBashProcess(commandCtx, a.Command, timeout, output, dir, markerPath, jobTokenEnvVar+"="+jobToken)
 	if startErr == nil {
 		job.mu.Lock()
 		job.PID = proc.pid
@@ -1191,34 +1235,58 @@ func (j *Job) recordStopError(err error) {
 	j.persist()
 }
 
-func (j *Job) snapshotGroupProof() processGroupProof {
-	j.mu.Lock()
-	defer j.mu.Unlock()
+func (j *Job) snapshotGroupProofLocked() processGroupProof {
 	proof := cloneGroupProof(j.groupProof)
+	proof.verifiedFDs = j.groupProof.verifiedFDs
 	if proof.Leader == (ProcessIdentityInfo{}) {
 		proof.Leader = ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
 	}
-	return proof
-}
-
-func (j *Job) refreshVerifiedGroupMembers() processGroupProof {
-	proof := j.snapshotGroupProof()
-	if members := captureVerifiedGroupMembers(proof); len(members) > 0 {
-		j.mu.Lock()
-		j.groupProof.KnownMembers = mergeGroupMembers(j.groupProof.KnownMembers, members)
-		proof = cloneGroupProof(j.groupProof)
-		if proof.Leader == (ProcessIdentityInfo{}) {
-			proof.Leader = ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
+	if proof.JobToken == "" {
+		proof.JobToken = j.JobToken
+	}
+	if proof.MarkerFile == "" {
+		proof.MarkerFile = j.MarkerFile
+		if proof.MarkerFile == "" {
+			proof.MarkerFile = j.OutputFile
 		}
-		j.mu.Unlock()
 	}
 	return proof
 }
 
+func (j *Job) snapshotGroupProof() processGroupProof {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.snapshotGroupProofLocked()
+}
+
+func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
+	j.mu.Lock()
+	if j.finished || j.unknown {
+		proof := j.snapshotGroupProofLocked()
+		j.mu.Unlock()
+		return proof
+	}
+	proof := j.snapshotGroupProofLocked()
+	j.mu.Unlock()
+
+	captureVerifiedGroupProof(&proof)
+
+	j.mu.Lock()
+	j.groupProof.KnownMembers = mergeGroupMembers(j.groupProof.KnownMembers, proof.KnownMembers)
+	if len(proof.verifiedFDs) > 0 {
+		j.groupProof.verifiedFDs = proof.verifiedFDs
+	}
+	out := j.snapshotGroupProofLocked()
+	j.mu.Unlock()
+	return out
+}
+
 func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
+	j.proofFDMu.Lock()
 	j.mu.Lock()
 	if j.finished || j.unknown {
 		j.mu.Unlock()
+		j.proofFDMu.Unlock()
 		return nil
 	}
 	id := ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
@@ -1229,10 +1297,11 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 
 	// Refresh verified PGID members while the leader may still be alive so any
 	// reparented children remain verifiable if the leader exits or wait fails.
-	proof := j.refreshVerifiedGroupMembers()
+	proof := j.refreshVerifiedGroupMembersLocked()
 
 	err := stopVerifiedProcessGroupWithProof(proof)
 	if errors.Is(err, ErrProcessIdentityMismatch) {
+		j.proofFDMu.Unlock()
 		summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
 		j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, err), summary, preview)
 		return err
@@ -1240,6 +1309,7 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	if errors.Is(err, os.ErrProcessDone) {
 		proof.ExitObservedAt = time.Time{}
 		gerr := stopAdoptedProcessGroupAfterExit(proof)
+		j.proofFDMu.Unlock()
 		if errors.Is(gerr, ErrProcessIdentityMismatch) {
 			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
 			j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr), summary, preview)
@@ -1250,12 +1320,26 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 			return gerr
 		}
 	} else if err != nil {
+		j.proofFDMu.Unlock()
 		j.recordStopError(err)
 		return err
 	} else if monitorFailed {
+		j.proofFDMu.Unlock()
 		waitForAdoptedProcessGone(id, 2*time.Second)
+		j.proofFDMu.Lock()
+		j.mu.Lock()
+		stillActive := !j.finished && !j.unknown
+		if stillActive {
+			proof = j.snapshotGroupProofLocked()
+		}
+		j.mu.Unlock()
+		if !stillActive {
+			j.proofFDMu.Unlock()
+			return nil
+		}
 		proof.ExitObservedAt = time.Now()
 		gerr := stopAdoptedProcessGroupAfterExit(proof)
+		j.proofFDMu.Unlock()
 		if errors.Is(gerr, ErrProcessIdentityMismatch) {
 			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
 			j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr), summary, preview)
@@ -1265,6 +1349,8 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 			j.recordStopError(gerr)
 			return gerr
 		}
+	} else {
+		j.proofFDMu.Unlock()
 	}
 	if monitorFailed {
 		summary, preview, _, hasFile := summarizeOutputFile(outFile, cwd)

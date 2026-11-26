@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+const jobTokenEnvVar = "GMH_JOB_TOKEN"
+
 // ErrProcessIdentityMismatch reports that an OS process ID no longer matches the
 // recorded process group or OS start token (such as after PID reuse).
 var ErrProcessIdentityMismatch = errors.New("process identity mismatch")
@@ -42,13 +44,21 @@ type processInfo struct {
 	Sess       uintptr
 }
 
+type verifiedProcFD struct {
+	fd         int
+	startToken string
+}
+
 type processGroupProof struct {
 	Leader         ProcessIdentityInfo
 	UID            uint32
 	HasUID         bool
 	SID            int
 	Sess           uintptr
+	JobToken       string
+	MarkerFile     string
 	KnownMembers   map[int]string
+	verifiedFDs    map[int]verifiedProcFD
 	ExitObservedAt time.Time
 }
 

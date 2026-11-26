@@ -1366,6 +1366,195 @@ func TestCrashRecoveryWaitErrorFollowedByNormalLeaderExitStillStopsChild(t *test
 	t.Fatalf("reparented child PID %d survived StopJob after wait error + leader exit", childPID)
 }
 
+func TestCrashRecoveryChildForkedAfterWaitErrorStillStopsOnLeaderExit(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-fork-after-wait-err"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childPIDFile := filepath.Join(root, "child.pid")
+	triggerFile := filepath.Join(root, "fork-and-exit")
+
+	helperCmd, meta := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "NO-CHILD-YET",
+		"GMH_HELPER_CMD": fmt.Sprintf(
+			"printf 'NO-CHILD-YET\\n'; while [ ! -f %q ]; do sleep 0.05; done; sleep 30 & echo $! > %q; exit 0",
+			triggerFile, childPIDFile,
+		),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	waitCalled := make(chan struct{})
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		waitAdopted: func(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {
+			close(waitCalled)
+			return -1, false, errors.New("injected kevent EACCES")
+		},
+	}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 || recovered[0].Status != JobRunning {
+		t.Fatalf("recovered = %+v, err=%v", recovered, err)
+	}
+	<-waitCalled
+
+	job := exec2.registry().Get(meta.JobID)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if job.Snapshot().WaitError != "" {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if job.Snapshot().WaitError == "" || job.Status() != JobRunning {
+		t.Fatalf("expected WaitError and JobRunning, got %+v", job.Snapshot())
+	}
+
+	// Fork a child AFTER the wait error and let the adopted shell exit immediately.
+	if err := os.WriteFile(triggerFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var childPID int
+	childPoll := time.Now().Add(3 * time.Second)
+	for time.Now().Before(childPoll) {
+		if b, rerr := os.ReadFile(childPIDFile); rerr == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				childPID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		t.Fatal("child PID file was not written after trigger")
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	leaderDeadBy := time.Now().Add(3 * time.Second)
+	for time.Now().Before(leaderDeadBy) {
+		if _, _, leaderAlive := ProcessIdentity(meta.PID); !leaderAlive {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if _, _, leaderAlive := ProcessIdentity(meta.PID); leaderAlive {
+		t.Fatalf("leader PID %d did not exit", meta.PID)
+	}
+	if _, _, childAlive := ProcessIdentity(childPID); !childAlive {
+		t.Fatalf("child PID %d exited unexpectedly before StopJob", childPID)
+	}
+
+	res, stopErr := exec2.StopJob(meta.JobID)
+	if stopErr != nil {
+		t.Fatalf("StopJob failed: %v (%s)", stopErr, res.Text)
+	}
+	if job.Status() != JobDone {
+		t.Fatalf("job status after StopJob = %q, want done", job.Status())
+	}
+	childDeadBy := time.Now().Add(3 * time.Second)
+	for time.Now().Before(childDeadBy) {
+		if _, _, childAlive := ProcessIdentity(childPID); !childAlive {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("child PID %d forked after wait error survived StopJob", childPID)
+}
+
+func TestCrashRecoveryChildForkedAfterAdoptionStillStopsOnNormalExit(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-fork-after-adopt"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childPIDFile := filepath.Join(root, "child.pid")
+	triggerFile := filepath.Join(root, "fork-and-exit")
+
+	helperCmd, meta := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "NO-CHILD-YET",
+		"GMH_HELPER_CMD": fmt.Sprintf(
+			"printf 'NO-CHILD-YET\\n'; while [ ! -f %q ]; do sleep 0.05; done; sleep 30 & echo $! > %q; exit 0",
+			triggerFile, childPIDFile,
+		),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 || recovered[0].Status != JobRunning {
+		t.Fatalf("recovered = %+v, err=%v", recovered, err)
+	}
+
+	// Fork a child AFTER adoption/normal waiter start and let the shell exit immediately.
+	if err := os.WriteFile(triggerFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var childPID int
+	childPoll := time.Now().Add(3 * time.Second)
+	for time.Now().Before(childPoll) {
+		if b, rerr := os.ReadFile(childPIDFile); rerr == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				childPID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		t.Fatal("child PID file was not written after trigger")
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	job := exec2.registry().Get(meta.JobID)
+	select {
+	case <-job.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("adopted job did not finish after leader exit")
+	}
+	if job.Status() != JobDone {
+		t.Fatalf("job status after normal leader exit = %q, want done", job.Status())
+	}
+	childDeadBy := time.Now().Add(3 * time.Second)
+	for time.Now().Before(childDeadBy) {
+		if _, _, childAlive := ProcessIdentity(childPID); !childAlive {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("child PID %d forked after adoption survived normal leader exit", childPID)
+}
+
 func TestCrashRecoveryCloseJobsStopFailureRemainsRunningAndRetryable(t *testing.T) {
 	root := t.TempDir()
 	sessionBase := t.TempDir()
