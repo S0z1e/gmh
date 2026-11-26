@@ -3,6 +3,7 @@ package plugins
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -134,22 +135,232 @@ func TestRuntimeRebuildCountsFailuresAndStopsAtLeakedRuntimeLimit(t *testing.T) 
 			t.Fatal("invalid plugin reloaded")
 		}
 	}
+	if len(p.restartTimes) != 0 {
+		t.Fatalf("failed reloads consumed %d successful-restart slots", len(p.restartTimes))
+	}
 	if err := os.WriteFile(entry, []byte(echoPlugin), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if p.tryRestartLocked(t.Context()) {
-		t.Fatal("failed reloads did not exhaust the restart budget")
+	// Failed initialization must not consume the successful-rebuild allowance.
+	if !p.tryRestartLocked(t.Context()) {
+		t.Fatal("failed reloads exhausted the successful restart budget")
 	}
-	for i := range p.restartTimes {
-		p.restartTimes[i] = time.Now().Add(-2 * pluginRestartWindow)
+	if len(p.restartTimes) != 1 {
+		t.Fatalf("successful restarts = %d, want 1", len(p.restartTimes))
 	}
+	// The leaked cap blocks only while those calls are still wedged.
 	p.leaked = maxLeakedRuntimes
 	if p.tryRestartLocked(t.Context()) {
 		t.Fatal("reloaded with the maximum number of leaked runtimes")
 	}
+	if len(p.restartTimes) != 1 {
+		t.Fatal("a leaked-cap refusal consumed a successful restart")
+	}
 	p.leaked--
 	if !p.tryRestartLocked(t.Context()) {
-		t.Fatal("reload did not recover when both limits cleared")
+		t.Fatal("reload did not recover when the leaked cap cleared")
+	}
+}
+
+func TestRuntimeRebuildSuccessfulQuotaIsIndependentOfFailures(t *testing.T) {
+	reg, root := loadEcho(t)
+	p := reg.Plugins()[0]
+	entry := filepath.Join(root, ".agents", "plugins", "echo", "echo.js")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for range maxPluginRestarts {
+		if !p.tryRestartLocked(t.Context()) {
+			t.Fatal("identical plugin could not be rebuilt")
+		}
+	}
+	if p.tryRestartLocked(t.Context()) {
+		t.Fatal("successful rebuilds did not exhaust the restart budget")
+	}
+	if err := os.WriteFile(entry, []byte("function {"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// A failed attempt while the successful budget is spent still does not
+	// count, and ageing the successful restarts out of the window restores it.
+	if p.tryRestartLocked(t.Context()) {
+		t.Fatal("invalid plugin reloaded inside a spent budget")
+	}
+	for i := range p.restartTimes {
+		p.restartTimes[i] = time.Now().Add(-2 * pluginRestartWindow)
+	}
+	if err := os.WriteFile(entry, []byte(echoPlugin), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !p.tryRestartLocked(t.Context()) {
+		t.Fatal("reload did not recover after the successful-restart window elapsed")
+	}
+	if len(p.restartTimes) != 1 {
+		t.Fatalf("restarts in window = %d, want 1", len(p.restartTimes))
+	}
+}
+
+func TestRuntimeRebuildJoinsLateResultAfterCancellation(t *testing.T) {
+	reg, root := loadEcho(t)
+	p := reg.Plugins()[0]
+	entry := filepath.Join(root, ".agents", "plugins", "echo", "echo.js")
+	// A tight loop at top level ignores the load context until Interrupt,
+	// so cancellation returns while loadOne is still running.
+	if err := os.WriteFile(entry, []byte("while (true) {}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	watch := p.watchRestart(0)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	p.mu.Lock()
+	reloaded := p.tryRestartLocked(ctx)
+	quota := len(p.restartTimes)
+	installed := p.restarts
+	p.mu.Unlock()
+	if reloaded {
+		t.Fatal("cancelled rebuild reported success")
+	}
+	if quota != 0 || installed != 0 {
+		t.Fatalf("cancelled rebuild consumed quota=%d installed=%d", quota, installed)
+	}
+	select {
+	case ev := <-watch:
+		if ev.kind != restartFailed && ev.kind != restartDiscarded {
+			t.Fatalf("late restart kind = %v, want failed or discarded", ev.kind)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("cancelled rebuild never joined its late result")
+	}
+	p.mu.Lock()
+	quota = len(p.restartTimes)
+	installed = p.restarts
+	sameRuntime := p.rt != nil
+	p.mu.Unlock()
+	if quota != 0 || installed != 0 || !sameRuntime {
+		t.Fatalf("late result mutated plugin state: quota=%d installed=%d runtime=%t", quota, installed, sameRuntime)
+	}
+	if out, err := reg.Call(t.Context(), "echo", `{"msg":"hi"}`); err != nil || out != "echo:hi" {
+		t.Fatalf("plugin not callable after a discarded late restart: %q, %v", out, err)
+	}
+}
+
+func TestWedgedCallsRecoverWhenTheyUnwind(t *testing.T) {
+	reg, _ := loadEcho(t)
+	p := reg.Plugins()[0]
+	done := make(chan callResult)
+	p.mu.Lock()
+	for range maxLeakedRuntimes {
+		p.noteLeaked(p.rt, done)
+	}
+	if p.tryRestartLocked(t.Context()) {
+		p.mu.Unlock()
+		t.Fatal("reloaded while four calls were still wedged")
+	}
+	if !p.broken {
+		// The cap itself is not a permanent break: mark the state the
+		// interrupt path would after a failed replacement, then recover.
+		p.broken = true
+	}
+	p.mu.Unlock()
+	watch := p.watchRestart(0)
+	close(done)
+	deadline := time.After(2 * time.Second)
+	freed := 0
+	for freed < maxLeakedRuntimes {
+		select {
+		case ev := <-watch:
+			if ev.kind != restartLeakedFreed {
+				t.Fatalf("unwind event = %+v", ev)
+			}
+			freed++
+		case <-deadline:
+			t.Fatalf("wedged calls did not unwind; freed=%d leaked=%d", freed, p.leakedCount())
+		}
+	}
+	if p.leakedCount() != 0 {
+		t.Fatalf("leaked = %d after unwind, want 0", p.leakedCount())
+	}
+	// Age every successful restart out of the window. Recovery must not
+	// depend on the window still being open.
+	p.mu.Lock()
+	for range maxPluginRestarts {
+		p.restartTimes = append(p.restartTimes, time.Now().Add(-2*pluginRestartWindow))
+	}
+	if !p.tryRestartLocked(t.Context()) {
+		p.mu.Unlock()
+		t.Fatal("reload stayed blocked after wedged calls unwound and the window elapsed")
+	}
+	p.broken = false
+	p.mu.Unlock()
+	if out, err := reg.Call(t.Context(), "echo", `{"msg":"back"}`); err != nil || out != "echo:back" {
+		t.Fatalf("plugin not callable after wedge recovery: %q, %v", out, err)
+	}
+}
+
+func TestResponsiveCancellationDoesNotMarkPluginBroken(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "spin", "", "s.js", `
+harness.registerTool("spin", "Loop until interrupted.", {type: "object", properties: {}}, () => { for (;;) {} });
+harness.registerTool("echo", "Echo.", {type: "object", properties: {msg: {type: "string"}}}, (args) => "echo:" + args.msg);
+`)
+	reg, errs := Load(root, nil)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+	<-started
+	if _, err := reg.Call(ctx, "spin", `{}`); err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel err = %v, want context.Canceled", err)
+	}
+	p := reg.Plugins()[0]
+	p.mu.Lock()
+	broken := p.broken
+	restarts := len(p.restartTimes)
+	p.mu.Unlock()
+	if broken {
+		t.Fatal("responsive cancellation marked the plugin broken")
+	}
+	if restarts != 0 {
+		t.Fatalf("responsive cancellation rebuilt the runtime %d times", restarts)
+	}
+	if out, err := reg.Call(t.Context(), "echo", `{"msg":"ok"}`); err != nil || out != "echo:ok" {
+		t.Fatalf("plugin not callable after cancellation: %q, %v", out, err)
+	}
+}
+
+func TestCancellationRaceWithRestartCompletion(t *testing.T) {
+	reg, root := loadEcho(t)
+	p := reg.Plugins()[0]
+	entry := filepath.Join(root, ".agents", "plugins", "echo", "echo.js")
+	if err := os.WriteFile(entry, []byte(strings.Replace(echoPlugin, "echo:", "raced:", 1)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	p.mu.Lock()
+	watch := p.watchRestart(0)
+	reloaded := p.tryRestartLocked(ctx)
+	quota := len(p.restartTimes)
+	p.mu.Unlock()
+	if reloaded || quota != 0 {
+		t.Fatalf("already-cancelled restart installed a runtime: reloaded=%t quota=%d", reloaded, quota)
+	}
+	// The load may still finish after the caller observed failure. Its result
+	// must be joined and discarded, leaving the previously installed runtime.
+	select {
+	case ev := <-watch:
+		if ev.kind != restartDiscarded && ev.kind != restartFailed {
+			t.Fatalf("race result = %+v", ev)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("restart that raced cancellation was not joined")
+	}
+	if out, err := reg.Call(t.Context(), "echo", `{"msg":"hi"}`); err != nil || out != "echo:hi" {
+		t.Fatalf("cancellation race replaced the live runtime: %q, %v", out, err)
 	}
 }
 
