@@ -1690,7 +1690,9 @@ func (r *Runner) runOnce(ctx context.Context, task string) {
 	// reverse their order in Bubble Tea v2 (verified), so the turn
 	// and session lines must travel as a single print.
 	turnLine := fmt.Sprintf("[usage] turn: %s", usage)
-	if r.MeteringAvailable && r.App.Rates.Configured && r.SessionMetering.UnpricedAttempts() == previousMetering.UnpricedAttempts() {
+	if note := r.unenforcedCostNote(); note != "" {
+		turnLine += " | " + note
+	} else if r.MeteringAvailable && r.App.Rates.Configured && r.SessionMetering.UnpricedAttempts() == previousMetering.UnpricedAttempts() {
 		turnLine += " | " + r.costLine(turnCost)
 	}
 	if !r.MeteringAvailable {
@@ -1758,7 +1760,13 @@ func (r *Runner) doCompact(ctx context.Context) {
 	if err != nil {
 		r.LastErr = err
 		r.Print("[compact] failed: %v (history unchanged)", err)
+		if note := r.unenforcedCostNote(); note != "" {
+			r.Print("[compact] %s", note)
+		}
 		return
+	}
+	if note := r.unenforcedCostNote(); note != "" {
+		r.Print("[compact] %s", note)
 	}
 	r.App.Cfg.LastPromptTokens = 0
 }

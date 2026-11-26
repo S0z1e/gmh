@@ -183,6 +183,18 @@ type State struct {
 	SessionCostComplete    bool      `json:"session_cost_complete,omitempty"`
 	BaselineIncomplete     bool      `json:"baseline_incomplete,omitempty"`
 	UnmeteredAttempts      int       `json:"unmetered_attempts,omitempty"`
+	// CostCapEnforced is false when an active dollar cap cannot be priced.
+	// RecordedCostUSD is then a lower bound, not evidence the cap was met.
+	// Zero-dollar policies stay enforced: there is no cap to bypass.
+	CostCapEnforced bool `json:"cost_cap_enforced"`
+	// SessionCostCapEnforced is the same label for the cumulative dollar cap.
+	SessionCostCapEnforced bool `json:"session_cost_cap_enforced"`
+	// CostCapUnenforcedReason explains why an active dollar cap is not enforced.
+	// Empty when every active dollar cap has pricing evidence.
+	CostCapUnenforcedReason string `json:"cost_cap_unenforced_reason,omitempty"`
+	// LowerBound records that a non-strict active cap is compared against an
+	// incomplete journal or missing usage. The recorded totals can be below spend.
+	LowerBound bool `json:"lower_bound,omitempty"`
 }
 
 // Tracker is owned by the serial agent loop. Every provider attempt, including
@@ -206,7 +218,10 @@ func New(policy *Policy, started time.Time, ratesAvailable bool) (*Tracker, erro
 	}
 	costComplete := true
 	baselineIncomplete := false
-	if (limits.CostUSD > 0 || limits.SessionCostUSD > 0) && !ratesAvailable {
+	costEnforced := limits.CostUSD == 0 || ratesAvailable
+	sessionCostEnforced := limits.SessionCostUSD == 0 || ratesAvailable
+	unenforcedReason := ""
+	if !costEnforced || !sessionCostEnforced {
 		if limits.StrictMetering {
 			resource := "cost_usd"
 			if limits.CostUSD == 0 {
@@ -216,8 +231,21 @@ func New(policy *Policy, started time.Time, ratesAvailable bool) (*Tracker, erro
 		}
 		costComplete = false
 		baselineIncomplete = true
+		unenforcedReason = "no configured rates; recorded cost is a lower bound"
 	}
-	b := &Tracker{state: State{Started: started, Limits: limits, TokensComplete: true, CostComplete: costComplete, SessionTokensComplete: true, SessionCostComplete: costComplete, BaselineIncomplete: baselineIncomplete}}
+	b := &Tracker{state: State{
+		Started:                 started,
+		Limits:                  limits,
+		TokensComplete:          true,
+		CostComplete:            costComplete,
+		SessionTokensComplete:   true,
+		SessionCostComplete:     costComplete,
+		BaselineIncomplete:      baselineIncomplete,
+		CostCapEnforced:         costEnforced,
+		SessionCostCapEnforced:  sessionCostEnforced,
+		CostCapUnenforcedReason: unenforcedReason,
+		LowerBound:              baselineIncomplete,
+	}}
 	b.costLimit.Set(decimal(limits.CostUSD))
 	b.sessionCostLimit.Set(decimal(limits.SessionCostUSD))
 	return b, nil
@@ -245,6 +273,7 @@ func (b *Tracker) SeedSessionUsage(tokens int64, costUSD *big.Rat, tokensComplet
 	b.state.SessionCostComplete = b.state.SessionCostComplete && costComplete
 	if (b.state.Limits.SessionTokens > 0 && !tokensComplete) || (b.state.Limits.SessionCostUSD > 0 && !b.state.SessionCostComplete) {
 		b.state.BaselineIncomplete = true
+		b.state.LowerBound = true
 	}
 	if b.state.Limits.StrictMetering {
 		if b.state.Limits.SessionTokens > 0 && !tokensComplete {
@@ -287,10 +316,10 @@ func (b *Tracker) CheckRequest(now time.Time) error {
 	if l.SessionTokens > 0 && s.SessionReportedTokens >= l.SessionTokens {
 		return &Exceeded{Resource: "session_tokens", Limit: float64(l.SessionTokens), Used: float64(s.SessionReportedTokens)}
 	}
-	if l.CostUSD > 0 && b.cost.Cmp(&b.costLimit) >= 0 {
+	if l.CostUSD > 0 && s.CostCapEnforced && b.cost.Cmp(&b.costLimit) >= 0 {
 		return &Exceeded{Resource: "cost_usd", Limit: l.CostUSD, Used: s.RecordedCostUSD}
 	}
-	if l.SessionCostUSD > 0 && b.sessionCost.Cmp(&b.sessionCostLimit) >= 0 {
+	if l.SessionCostUSD > 0 && s.SessionCostCapEnforced && b.sessionCost.Cmp(&b.sessionCostLimit) >= 0 {
 		return &Exceeded{Resource: "session_cost_usd", Limit: l.SessionCostUSD, Used: s.SessionRecordedCostUSD}
 	}
 	return nil
@@ -336,12 +365,20 @@ func (b *Tracker) RecordUsage(u Usage) error {
 	} else if *u.Tokens < 0 || *u.Tokens > math.MaxInt64-b.state.ReportedTokens {
 		b.state.TokensComplete = false
 		b.state.SessionTokensComplete = false
-		b.unmetered("tokens", "invalid or overflowing usage")
+		if b.usageEvidenceRequired("tokens") {
+			b.unmetered("tokens", "invalid or overflowing usage")
+		} else {
+			b.state.LowerBound = true
+		}
 	} else {
 		b.state.ReportedTokens += *u.Tokens
 		if *u.Tokens > math.MaxInt64-b.state.SessionReportedTokens {
 			b.state.SessionTokensComplete = false
-			b.unmetered("session_tokens", "invalid or overflowing session usage")
+			if b.usageEvidenceRequired("session_tokens") {
+				b.unmetered("session_tokens", "invalid or overflowing session usage")
+			} else {
+				b.state.LowerBound = true
+			}
 		} else {
 			b.state.SessionReportedTokens += *u.Tokens
 		}
@@ -367,7 +404,11 @@ func (b *Tracker) RecordUsage(u Usage) error {
 	if invalidCost {
 		b.state.CostComplete = false
 		b.state.SessionCostComplete = false
-		b.unmetered("cost_usd", "invalid or ambiguous usage")
+		if b.usageEvidenceRequired("cost_usd") {
+			b.unmetered("cost_usd", "invalid or ambiguous usage")
+		} else {
+			b.noteMeteringGap(false, true)
+		}
 	} else if cost == nil {
 		b.state.CostComplete = false
 		b.state.SessionCostComplete = false
@@ -377,7 +418,11 @@ func (b *Tracker) RecordUsage(u Usage) error {
 		amount, _ := next.Float64()
 		if !finiteNonnegative(amount) {
 			b.state.CostComplete = false
-			b.unmetered("cost_usd", "invalid or overflowing usage")
+			if b.usageEvidenceRequired("cost_usd") {
+				b.unmetered("cost_usd", "invalid or overflowing usage")
+			} else {
+				b.noteMeteringGap(false, true)
+			}
 		} else {
 			b.cost.Set(next)
 			// State is a float for reporting; only the exact decimal sum
@@ -388,7 +433,11 @@ func (b *Tracker) RecordUsage(u Usage) error {
 		sessionAmount, _ := nextSession.Float64()
 		if !finiteNonnegative(sessionAmount) {
 			b.state.SessionCostComplete = false
-			b.unmetered("session_cost_usd", "invalid or overflowing session usage")
+			if b.usageEvidenceRequired("session_cost_usd") {
+				b.unmetered("session_cost_usd", "invalid or overflowing session usage")
+			} else {
+				b.noteMeteringGap(false, true)
+			}
 		} else {
 			b.sessionCost.Set(nextSession)
 			b.state.SessionRecordedCostUSD = sessionAmount
@@ -396,6 +445,7 @@ func (b *Tracker) RecordUsage(u Usage) error {
 	}
 	if missingTokens || missingCost {
 		b.state.UnmeteredAttempts++
+		b.noteMeteringGap(missingTokens, missingCost)
 	}
 	l, s := b.state.Limits, b.state
 	if l.StrictMetering {
@@ -421,13 +471,58 @@ func (b *Tracker) RecordUsage(u Usage) error {
 	if l.SessionTokens > 0 && s.SessionReportedTokens > l.SessionTokens {
 		return &Exceeded{Resource: "session_tokens", Limit: float64(l.SessionTokens), Used: float64(s.SessionReportedTokens)}
 	}
-	if l.CostUSD > 0 && b.cost.Cmp(&b.costLimit) > 0 {
+	if l.CostUSD > 0 && s.CostCapEnforced && b.cost.Cmp(&b.costLimit) > 0 {
 		return &Exceeded{Resource: "cost_usd", Limit: l.CostUSD, Used: s.RecordedCostUSD}
 	}
-	if l.SessionCostUSD > 0 && b.sessionCost.Cmp(&b.sessionCostLimit) > 0 {
+	if l.SessionCostUSD > 0 && s.SessionCostCapEnforced && b.sessionCost.Cmp(&b.sessionCostLimit) > 0 {
 		return &Exceeded{Resource: "session_cost_usd", Limit: l.SessionCostUSD, Used: s.SessionRecordedCostUSD}
 	}
 	return nil
+}
+
+// noteMeteringGap labels an incomplete non-strict meter as a lower bound.
+// Recorded totals still stop the turn. Only a cap with no price schedule is
+// unenforced, because that subtotal cannot grow.
+func (b *Tracker) noteMeteringGap(tokens, cost bool) {
+	l := b.state.Limits
+	if l.StrictMetering {
+		return
+	}
+	if tokens && (l.Tokens > 0 || l.SessionTokens > 0) {
+		b.state.LowerBound = true
+	}
+	if cost && (l.CostUSD > 0 || l.SessionCostUSD > 0) {
+		b.state.LowerBound = true
+	}
+}
+
+func (b *Tracker) noteUnenforced(reason string) {
+	if b.state.CostCapUnenforcedReason == "" {
+		b.state.CostCapUnenforcedReason = reason
+	}
+}
+
+// usageEvidenceRequired is true when strict mode, or an active cap, cannot
+// continue on a quarantined provider report. An explicit zero cap does not,
+// unless strict metering is on: strict mode refuses another attempt on any
+// malformed report, even when that individual cap is disabled.
+func (b *Tracker) usageEvidenceRequired(resource string) bool {
+	l := b.state.Limits
+	if l.StrictMetering {
+		return true
+	}
+	switch resource {
+	case "tokens":
+		return l.Tokens > 0
+	case "session_tokens":
+		return l.SessionTokens > 0
+	case "cost_usd":
+		return l.CostUSD > 0 || l.SessionCostUSD > 0
+	case "session_cost_usd":
+		return l.SessionCostUSD > 0
+	default:
+		return l.Tokens > 0 || l.SessionTokens > 0 || l.CostUSD > 0 || l.SessionCostUSD > 0
+	}
 }
 func (b *Tracker) unmetered(resource, reason string) error {
 	if b.unavailable == nil {

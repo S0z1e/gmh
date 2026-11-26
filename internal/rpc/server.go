@@ -33,6 +33,7 @@ import (
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
 	"minimalharness/internal/tools"
+	"minimalharness/internal/turnbudget"
 )
 
 const (
@@ -66,6 +67,7 @@ type serverState struct {
 	sessionUsageComplete        bool
 	runUsageComplete            bool
 	metering                    session.UsageTotals
+	turnBudget                  *turnbudget.State
 	sessionCost                 float64
 	messages                    int
 	sessionID                   string
@@ -611,6 +613,7 @@ func (s *Server) handleQuery(req Request) {
 			"metering_available":         st.meteringAvailable,
 			"session_usage_complete":     st.sessionUsageComplete,
 			"current_run_usage_complete": st.runUsageComplete,
+			"budget":                     budgetStatus(st.turnBudget),
 			// The effective window and output cap for the current
 			// model (Setup/SwitchModel resolved flag/env/model/
 			// config/default), so the GUI can meter context against
@@ -630,6 +633,7 @@ func (s *Server) handleQuery(req Request) {
 			"session_usage_complete":     st.sessionUsageComplete,
 			"current_run_usage_complete": st.runUsageComplete,
 			"current_run":                usageJSON(st.runUsage),
+			"budget":                     budgetStatus(st.turnBudget),
 			"fee":                        s.feeLabel(), "turns": st.turns,
 		}
 		if st.meteringAvailable {
@@ -1349,6 +1353,7 @@ func (s *Server) refreshState() {
 	s.state.meteringAvailable = s.runner.MeteringAvailable
 	s.state.sessionUsageComplete = s.runner.SessionUsageComplete()
 	s.state.runUsageComplete = s.runner.RunUsageComplete()
+	s.state.turnBudget = s.app.Cfg.LastTurnBudget
 	s.state.sessionCost = s.runner.SessionCost
 	s.state.toolMode = string(s.runner.App.ToolMode())
 	s.state.model, s.state.api = s.app.Cfg.Client.Model, s.app.Cfg.Client.API
@@ -1450,6 +1455,7 @@ func (s *Server) runTurn(req Request) {
 		Reason:   string(reason),
 		Outcome:  string(outcome),
 		ToolMode: st.toolMode,
+		Budget:   st.turnBudget,
 	}
 	if st.meteringAvailable && s.app.Rates.Configured && st.metering.UnpricedAttempts() == previousMetering.UnpricedAttempts() {
 		c := st.sessionCost - previousCost
@@ -1871,6 +1877,23 @@ func (s *Server) feeLabel() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.state.fee
+}
+
+// budgetStatus is the user-visible enforcement label. A successful outcome with
+// cost_cap_enforced false is a recorded lower bound, not a met cap.
+func budgetStatus(state *turnbudget.State) any {
+	if state == nil {
+		return nil
+	}
+	return map[string]any{
+		"cost_cap_enforced":          state.CostCapEnforced,
+		"session_cost_cap_enforced":  state.SessionCostCapEnforced,
+		"cost_cap_unenforced_reason": state.CostCapUnenforcedReason,
+		"lower_bound":                state.LowerBound,
+		"cost_complete":              state.CostComplete,
+		"tokens_complete":            state.TokensComplete,
+		"baseline_incomplete":        state.BaselineIncomplete,
+	}
 }
 
 func usageJSON(u llm.Usage) *UsageJSON {

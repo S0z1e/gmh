@@ -450,16 +450,16 @@ func (c *Config) pruneCheckpoint(msgs []llm.Message, defs []llm.ToolDef) ([]llm.
 func (c *Config) Compact(ctx context.Context, history []llm.Message) ([]llm.Message, llm.Usage, error) {
 	c.stepID = ""
 	c.persistErr, c.persistErrEmitted = nil, false
-	if c.TurnBudget != nil && (c.TurnBudget.MaxSessionTokens != nil || c.TurnBudget.MaxSessionCostUSD != nil) {
-		var noDeadline int64
-		policy := &turnbudget.Policy{
-			MaxDurationSeconds: &noDeadline,
-			MaxSessionTokens:   c.TurnBudget.MaxSessionTokens,
-			MaxSessionCostUSD:  c.TurnBudget.MaxSessionCostUSD,
-		}
+	if policy := manualCompactionPolicy(c.TurnBudget); policy != nil {
 		budgetCtx, cancel, err := c.startBudgetWithPolicy(ctx, policy)
 		defer cancel()
-		defer func() { c.resources = nil }()
+		defer func() {
+			if c.resources != nil && c.resources.tracker != nil {
+				s := c.resources.tracker.State()
+				c.LastTurnBudget = &s
+			}
+			c.resources = nil
+		}()
 		if err != nil {
 			return nil, llm.Usage{}, err
 		}
@@ -469,6 +469,25 @@ func (c *Config) Compact(ctx context.Context, history []llm.Message) ([]llm.Mess
 		ctx = budgetCtx
 	}
 	return c.compactMessages(ctx, history, false)
+}
+
+// manualCompactionPolicy carries turn cost, token, and strict-metering limits
+// into /compact. Session caps already applied; omitting the turn-only fields
+// let a manual compaction spend past maxCostUSD and ignore strictMetering.
+// Duration stays disabled: compaction is one request, not a user turn.
+func manualCompactionPolicy(p *turnbudget.Policy) *turnbudget.Policy {
+	if p == nil || (p.MaxSessionTokens == nil && p.MaxSessionCostUSD == nil && p.MaxCostUSD == nil && p.MaxTokens == nil && p.StrictMetering == nil) {
+		return nil
+	}
+	var noDeadline int64
+	return &turnbudget.Policy{
+		MaxDurationSeconds: &noDeadline,
+		MaxTokens:          p.MaxTokens,
+		MaxCostUSD:         p.MaxCostUSD,
+		MaxSessionTokens:   p.MaxSessionTokens,
+		MaxSessionCostUSD:  p.MaxSessionCostUSD,
+		StrictMetering:     p.StrictMetering,
+	}
 }
 
 func (c *Config) compactMessages(ctx context.Context, msgs []llm.Message, keepTask bool) ([]llm.Message, llm.Usage, error) {
@@ -554,8 +573,9 @@ func (c *Config) compactMessagesPrepared(ctx context.Context, msgs []llm.Message
 		}
 		if budgetErr := c.budgetError(); budgetErr != nil {
 			err = budgetErr
-		}
-		if c.persistErr != nil {
+		} else if c.persistErr != nil && !persistErrIsQuarantine(c.persistErr) {
+			err = c.persistErr
+		} else if c.persistErr != nil && err == nil {
 			err = c.persistErr
 		}
 	} else {

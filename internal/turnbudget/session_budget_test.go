@@ -35,8 +35,11 @@ func TestSessionBudgetIncompleteBaselineBestEffortVsStrict(t *testing.T) {
 	if err := b.SeedSessionUsage(80, big.NewRat(3, 4), false, false); err != nil {
 		t.Fatalf("best-effort rejected incomplete baseline: %v", err)
 	}
-	if !b.State().BaselineIncomplete || b.State().SessionTokensComplete || b.State().SessionCostComplete {
+	if !b.State().BaselineIncomplete || b.State().SessionTokensComplete || b.State().SessionCostComplete || !b.State().SessionCostCapEnforced || !b.State().LowerBound {
 		t.Fatalf("unexpected baseline state: %+v", b.State())
+	}
+	if err := b.CheckRequest(b.State().Started); err != nil {
+		t.Fatal("incomplete baseline blocked spend below the recorded cap:", err)
 	}
 	if err := b.RecordUsage(Usage{Tokens: number(10)}); err != nil {
 		t.Fatalf("best-effort rejected partial metering: %v", err)

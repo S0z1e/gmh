@@ -2,8 +2,11 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"os"
+	"strings"
 
 	"minimalharness/internal/llm"
 	"minimalharness/internal/session"
@@ -14,9 +17,6 @@ import (
 func (c *Config) recordAttempt(operation string, attempt int, trace llm.RequestTrace) {
 	c.usageAttempts++
 	invalid := trace.Usage != nil && !trace.Usage.Valid()
-	if invalid && c.persistErr == nil {
-		c.persistErr = fmt.Errorf("invalid provider usage counters")
-	}
 	if !trace.RejectedBeforeInference() {
 		c.recordBudgetUsage(trace.Usage, trace.StartedAt, trace.TokensComplete, trace.PriceCountsComplete)
 	}
@@ -34,8 +34,38 @@ func (c *Config) recordAttempt(operation string, attempt int, trace llm.RequestT
 		}
 	}
 	if err := c.Session.RecordUsage(record); err != nil && c.persistErr == nil {
-		c.persistErr = fmt.Errorf("save provider usage: %w", err)
+		if errors.Is(err, session.ErrInvalidProviderUsage) && !c.invalidUsageStopsTurn() {
+			fmt.Fprintf(os.Stderr, "warning: provider usage was invalid and was recorded as unknown; the turn continues because no active cap requires complete evidence\n")
+		} else {
+			c.persistErr = fmt.Errorf("save provider usage: %w", err)
+		}
 	}
+}
+
+// invalidUsageStopsTurn keeps a malformed provider report from ending a
+// non-strict turn whose caps are all disabled. Defaults still include token
+// caps, and those need complete evidence. Strict mode always stops.
+func (c *Config) invalidUsageStopsTurn() bool {
+	if c.resources == nil || c.resources.tracker == nil {
+		return true
+	}
+	limits := c.resources.tracker.State().Limits
+	if limits.StrictMetering {
+		return true
+	}
+	return limits.Tokens > 0 || limits.SessionTokens > 0 || limits.CostUSD > 0 || limits.SessionCostUSD > 0
+}
+
+func isQuarantinedProviderUsage(err error) bool {
+	return errors.Is(err, session.ErrInvalidProviderUsage)
+}
+
+func persistErrIsQuarantine(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	return isQuarantinedProviderUsage(err) || strings.Contains(text, session.ErrInvalidProviderUsage.Error()) || strings.Contains(text, "invalid or overflowing provider usage") || strings.Contains(text, "invalid provider usage counters")
 }
 
 // Preserve a valid measured subtotal if provider counters exceed the range of
@@ -45,7 +75,7 @@ func (c *Config) addObservedUsage(total *llm.Usage, usage llm.Usage) {
 		total.Add(usage)
 		return
 	}
-	if c.persistErr == nil {
+	if c.persistErr == nil && c.invalidUsageStopsTurn() {
 		c.persistErr = fmt.Errorf("invalid or overflowing turn usage")
 	}
 }
@@ -54,7 +84,7 @@ func (c *Config) requestContext(ctx context.Context, operation string, attempt i
 	requestCtx := llm.WithRequestObserver(ctx, func(trace llm.RequestTrace) {
 		if trace.Usage != nil && trace.Usage.Valid() && spent.CanAdd(*trace.Usage) {
 			spent.Add(*trace.Usage)
-		} else if trace.Usage != nil && c.persistErr == nil {
+		} else if trace.Usage != nil && !trace.Usage.Valid() && c.persistErr == nil && c.invalidUsageStopsTurn() {
 			c.persistErr = fmt.Errorf("invalid or overflowing provider usage")
 		}
 		c.recordAttempt(operation, attempt, trace)
