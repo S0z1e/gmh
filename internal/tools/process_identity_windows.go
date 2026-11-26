@@ -86,6 +86,14 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	return nil
 }
 
+func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
+	return stopVerifiedProcessGroup(proof.Leader)
+}
+
+func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
+	return nil
+}
+
 func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	return stopVerifiedProcessGroup(proof.Leader)
 }

@@ -1191,6 +1191,30 @@ func (j *Job) recordStopError(err error) {
 	j.persist()
 }
 
+func (j *Job) snapshotGroupProof() processGroupProof {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	proof := cloneGroupProof(j.groupProof)
+	if proof.Leader == (ProcessIdentityInfo{}) {
+		proof.Leader = ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
+	}
+	return proof
+}
+
+func (j *Job) refreshVerifiedGroupMembers() processGroupProof {
+	proof := j.snapshotGroupProof()
+	if members := captureVerifiedGroupMembers(proof); len(members) > 0 {
+		j.mu.Lock()
+		j.groupProof.KnownMembers = mergeGroupMembers(j.groupProof.KnownMembers, members)
+		proof = cloneGroupProof(j.groupProof)
+		if proof.Leader == (ProcessIdentityInfo{}) {
+			proof.Leader = ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
+		}
+		j.mu.Unlock()
+	}
+	return proof
+}
+
 func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	j.mu.Lock()
 	if j.finished || j.unknown {
@@ -1198,16 +1222,16 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 		return nil
 	}
 	id := ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
-	proof := j.groupProof
-	if proof.Leader == (ProcessIdentityInfo{}) {
-		proof.Leader = id
-	}
 	outFile, cwd, monitorFailed := j.OutputFile, j.Cwd, j.monitorFailed
 	execRef, outputDir, auditFn := j.exec, j.outputDir, j.audit
 	started, deadline := j.Started, j.Deadline
 	j.mu.Unlock()
 
-	err := stopVerifiedProcessGroup(id)
+	// Refresh verified PGID members while the leader may still be alive so any
+	// reparented children remain verifiable if the leader exits or wait fails.
+	proof := j.refreshVerifiedGroupMembers()
+
+	err := stopVerifiedProcessGroupWithProof(proof)
 	if errors.Is(err, ErrProcessIdentityMismatch) {
 		summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
 		j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, err), summary, preview)

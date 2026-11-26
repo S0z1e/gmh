@@ -1197,12 +1197,31 @@ func TestStopAdoptedProcessGroupAfterExitRefusesUnverifiedReusedGroup(t *testing
 		t.Fatalf("child pid %d was killed despite unverified proof", childPID)
 	}
 
-	// Case 2: ExitObservedAt is set, but a member predates the leader's start time.
+	// Case 2: ExitObservedAt is set with a valid platform start token, and a
+	// member predates the leader's start time.
+	var futureTok, olderTok string
+	switch runtime.GOOS {
+	case "darwin":
+		futureTok = fmt.Sprintf("%d:0", time.Now().Add(time.Hour).Unix())
+		olderTok = fmt.Sprintf("%d:0", time.Now().Add(-time.Hour).Unix())
+	case "linux":
+		olderTok = "1"
+		futureTok = "999999999999"
+		if data, rerr := os.ReadFile("/proc/sys/kernel/random/boot_id"); rerr == nil {
+			if boot := strings.TrimSpace(string(data)); boot != "" {
+				olderTok = boot + ":1"
+				futureTok = boot + ":999999999999"
+			}
+		}
+	default:
+		futureTok = info.StartToken
+		olderTok = info.StartToken
+	}
 	predatedProof := processGroupProof{
 		Leader: ProcessIdentityInfo{
 			PID:        leaderPID,
 			PGID:       info.PGID,
-			StartToken: time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+			StartToken: futureTok,
 		},
 		UID:            info.UID,
 		HasUID:         info.HasUID,
@@ -1216,6 +1235,135 @@ func TestStopAdoptedProcessGroupAfterExitRefusesUnverifiedReusedGroup(t *testing
 	if !inspectProcess(childPID).Alive {
 		t.Fatalf("child pid %d was killed despite predating leader start token", childPID)
 	}
+
+	// Case 3: Valid older leader start token + nonzero ExitObservedAt, but the
+	// surviving group/members have no verified tie to the adopted job (simulates
+	// a same-user/same-session replacement PGID started before cleanup ran).
+	reusedProof := processGroupProof{
+		Leader: ProcessIdentityInfo{
+			PID:        leaderPID + 999999,
+			PGID:       info.PGID,
+			StartToken: olderTok,
+		},
+		UID:            info.UID,
+		HasUID:         info.HasUID,
+		SID:            info.SID,
+		Sess:           info.Sess,
+		ExitObservedAt: time.Now(),
+	}
+	if err := stopAdoptedProcessGroupAfterExit(reusedProof); !errors.Is(err, ErrProcessIdentityMismatch) {
+		t.Fatalf("valid older leader + nonzero cutoff without verified members err = %v, want ErrProcessIdentityMismatch", err)
+	}
+	if !inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d was killed despite lacking verified membership", childPID)
+	}
+}
+
+func TestCrashRecoveryWaitErrorFollowedByNormalLeaderExitStillStopsChild(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-wait-err-reparent"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childPIDFile := filepath.Join(root, "child.pid")
+	releaseFile := filepath.Join(root, "release")
+
+	helperCmd, meta := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "CHILD-READY",
+		"GMH_HELPER_CMD": fmt.Sprintf(
+			"sleep 30 & echo $! > %q; printf 'CHILD-READY\\n'; while [ ! -f %q ]; do sleep 0.05; done; exit 0",
+			childPIDFile, releaseFile,
+		),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	pidBytes, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil || childPID <= 0 {
+		t.Fatalf("invalid child pid %q: %v", string(pidBytes), err)
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	waitCalled := make(chan struct{})
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		waitAdopted: func(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {
+			close(waitCalled)
+			return -1, false, errors.New("injected kevent EACCES")
+		},
+	}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 || recovered[0].Status != JobRunning {
+		t.Fatalf("recovered = %+v, err=%v", recovered, err)
+	}
+	<-waitCalled
+
+	job := exec2.registry().Get(meta.JobID)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if job.Snapshot().WaitError != "" {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if job.Snapshot().WaitError == "" || job.Status() != JobRunning {
+		t.Fatalf("expected WaitError and JobRunning, got %+v", job.Snapshot())
+	}
+
+	// Now let the adopted shell exit normally so the child is reparented to PID 1.
+	if err := os.WriteFile(releaseFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	leaderDeadBy := time.Now().Add(3 * time.Second)
+	for time.Now().Before(leaderDeadBy) {
+		if _, _, leaderAlive := ProcessIdentity(meta.PID); !leaderAlive {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, _, leaderAlive := ProcessIdentity(meta.PID); leaderAlive {
+		t.Fatalf("leader PID %d did not exit after release", meta.PID)
+	}
+	if _, _, childAlive := ProcessIdentity(childPID); !childAlive {
+		t.Fatalf("child PID %d exited unexpectedly before StopJob", childPID)
+	}
+
+	// StopJob must still kill the reparented child rather than marking unknown.
+	res, stopErr := exec2.StopJob(meta.JobID)
+	if stopErr != nil {
+		t.Fatalf("StopJob after wait error + leader exit failed: %v (%s)", stopErr, res.Text)
+	}
+	if job.Status() != JobDone {
+		t.Fatalf("job status after StopJob = %q, want done", job.Status())
+	}
+	childDeadBy := time.Now().Add(3 * time.Second)
+	for time.Now().Before(childDeadBy) {
+		if _, _, childAlive := ProcessIdentity(childPID); !childAlive {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("reparented child PID %d survived StopJob after wait error + leader exit", childPID)
 }
 
 func TestCrashRecoveryCloseJobsStopFailureRemainsRunningAndRetryable(t *testing.T) {

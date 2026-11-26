@@ -725,9 +725,10 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 				SID:    info.SID,
 				Sess:   info.Sess,
 			}
+			proof.KnownMembers = captureVerifiedGroupMembers(proof)
 			extraNote := ""
 			if !rec.Unlimited && !rec.Deadline.IsZero() && !time.Now().Before(rec.Deadline) {
-				stopErr := stopVerifiedProcessGroup(id)
+				stopErr := stopVerifiedProcessGroupWithProof(proof)
 				switch {
 				case errors.Is(stopErr, ErrProcessIdentityMismatch):
 					reason := fmt.Sprintf("refused to attach to PID %d: process identity, group, or start token mismatch (PID reused)", id.PID)
@@ -823,7 +824,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 			waitCtx, cancelCause := context.WithCancelCause(context.Background())
 			note := fmt.Sprintf("adopted live OS process PID %d (pgid %d); %s%s", id.PID, id.PGID, extraNote, pipeCaptureEndedNote(rec.OutputFile))
 			job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
-			job.groupProof = proof
+			job.groupProof = cloneGroupProof(proof)
 			job.monitorDone = make(chan struct{})
 			job.cancel = func() { cancelCause(context.Canceled) }
 			job.closeStop = func() error {
@@ -1082,13 +1083,6 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		}
 	}()
 	snap := job.Snapshot()
-	job.mu.Lock()
-	snapProof := job.groupProof
-	if snapProof.Leader == (ProcessIdentityInfo{}) {
-		snapProof.Leader = snap.Identity
-	}
-	job.mu.Unlock()
-
 	var timedOut bool
 	var deadlineStopMu sync.Mutex
 	var deadlineStopErr error
@@ -1166,12 +1160,12 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 	deadlineStopMu.Unlock()
 
 	if errors.Is(context.Cause(ctx), ErrExecutorClosed) {
-		if job.cleanupAdoptedGroupAfterExit(snapProof) {
+		if job.cleanupAdoptedGroupAfterExit(job.snapshotGroupProof()) {
 			return
 		}
 		err = ErrExecutorClosed
 	} else if isTimedOut {
-		if job.cleanupAdoptedGroupAfterExit(snapProof) {
+		if job.cleanupAdoptedGroupAfterExit(job.snapshotGroupProof()) {
 			return
 		}
 		err = &timeoutError{timeout: max(0, snap.Deadline.Sub(snap.Started))}
@@ -1181,7 +1175,7 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		if !exitKnown && err == nil {
 			err = errAdoptedProcessExited
 		}
-		if job.cleanupAdoptedGroupAfterExit(snapProof) {
+		if job.cleanupAdoptedGroupAfterExit(job.snapshotGroupProof()) {
 			return
 		}
 	} else {
@@ -1197,6 +1191,11 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 			summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
 			job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
 			return
+		}
+		// Keep verified PGID member evidence fresh across the wait error so
+		// later stops remain safe even if the leader exits before StopJob.
+		if snap.Identity.Matches(info) {
+			job.refreshVerifiedGroupMembers()
 		}
 		job.mu.Lock()
 		if !job.finished && !job.unknown {

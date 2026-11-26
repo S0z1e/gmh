@@ -68,6 +68,11 @@ func darwinStartTimeBefore(sec int64, usec int32, otherSec int64, otherUsec int3
 }
 
 func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
+	return stopVerifiedProcessGroupWithProof(processGroupProof{Leader: id})
+}
+
+func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
+	id := proof.Leader
 	if !id.Valid() {
 		return ErrProcessIdentityMismatch
 	}
@@ -79,6 +84,51 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 	}
 	return darwinResolveGroupKillError(id.PGID, syscall.Kill(-id.PGID, syscall.SIGKILL))
+}
+
+func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
+	id := proof.Leader
+	if !id.Valid() {
+		return nil
+	}
+	leaderSec, leaderUsec, hasLeaderStart := parseDarwinStartTime(id.StartToken)
+	if !hasLeaderStart {
+		return nil
+	}
+	info := inspectProcess(id.PID)
+	if !id.Matches(info) {
+		return nil
+	}
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.pgrp", id.PGID)
+	if err != nil {
+		return map[int]string{id.PID: id.StartToken}
+	}
+	members := map[int]string{id.PID: id.StartToken}
+	for _, p := range procs {
+		if p.Proc.P_stat == 5 {
+			continue
+		}
+		pid := int(p.Proc.P_pid)
+		if pid <= 0 {
+			continue
+		}
+		if proof.HasUID && p.Eproc.Ucred.Uid != proof.UID {
+			continue
+		}
+		if proof.Sess != 0 && p.Eproc.Sess != proof.Sess {
+			continue
+		}
+		pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
+		if darwinStartTimeBefore(pSec, pUsec, leaderSec, leaderUsec) {
+			continue
+		}
+		tok := fmt.Sprintf("%d:%d", pSec, pUsec)
+		if pid == id.PID && tok != id.StartToken {
+			continue
+		}
+		members[pid] = tok
+	}
+	return members
 }
 
 func darwinResolveGroupKillError(pgid int, err error) error {
@@ -128,42 +178,51 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	}
 
 	verifiedMembers := 0
-	directTied := false
+	groupVerified := false
 	for _, p := range procs {
 		if p.Proc.P_stat == 5 {
 			continue
 		}
-		if int(p.Proc.P_pid) == id.PID {
-			tok := fmt.Sprintf("%d:%d", p.Proc.P_starttime.Sec, p.Proc.P_starttime.Usec)
+		pid := int(p.Proc.P_pid)
+		pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
+		tok := fmt.Sprintf("%d:%d", pSec, pUsec)
+		if pid == id.PID {
 			if tok != id.StartToken {
 				return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 			}
-			directTied = true
+			groupVerified = true
 		}
 		if proof.HasUID && p.Eproc.Ucred.Uid != proof.UID {
-			return fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, p.Proc.P_pid, ErrProcessIdentityMismatch)
+			return fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 		}
 		if proof.Sess != 0 && p.Eproc.Sess != proof.Sess {
-			return fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, p.Proc.P_pid, ErrProcessIdentityMismatch)
+			return fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 		}
-		pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
 		if darwinStartTimeBefore(pSec, pUsec, leaderSec, leaderUsec) {
-			return fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, p.Proc.P_pid, ErrProcessIdentityMismatch)
+			return fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 		}
 		if !proof.ExitObservedAt.IsZero() {
 			memberStart := time.Unix(pSec, int64(pUsec)*1000)
 			if memberStart.After(proof.ExitObservedAt.Add(10 * time.Millisecond)) {
-				return fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, p.Proc.P_pid, ErrProcessIdentityMismatch)
+				return fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 			}
+		}
+		if proof.KnownMembers[pid] == tok {
+			groupVerified = true
 		} else if int(p.Eproc.Ppid) == id.PID {
-			directTied = true
+			groupVerified = true
+		} else if parentTok, ok := proof.KnownMembers[int(p.Eproc.Ppid)]; ok {
+			parentSec, parentUsec, parsed := parseDarwinStartTime(parentTok)
+			if parsed && !darwinStartTimeBefore(pSec, pUsec, parentSec, parentUsec) {
+				groupVerified = true
+			}
 		}
 		verifiedMembers++
 	}
 	if verifiedMembers == 0 {
 		return os.ErrProcessDone
 	}
-	if proof.ExitObservedAt.IsZero() && !directTied {
+	if !groupVerified {
 		return fmt.Errorf("refusing to signal unverified pgid %d after leader disappeared: %w", id.PGID, ErrProcessIdentityMismatch)
 	}
 	return darwinResolveGroupKillError(id.PGID, syscall.Kill(-id.PGID, syscall.SIGKILL))

@@ -12,6 +12,14 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	return ErrProcessIdentityMismatch
 }
 
+func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
+	return ErrProcessIdentityMismatch
+}
+
+func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
+	return nil
+}
+
 func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	return ErrProcessIdentityMismatch
 }

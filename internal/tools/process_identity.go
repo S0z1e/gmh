@@ -48,7 +48,34 @@ type processGroupProof struct {
 	HasUID         bool
 	SID            int
 	Sess           uintptr
+	KnownMembers   map[int]string
 	ExitObservedAt time.Time
+}
+
+func cloneGroupProof(p processGroupProof) processGroupProof {
+	if len(p.KnownMembers) == 0 {
+		p.KnownMembers = nil
+		return p
+	}
+	cloned := make(map[int]string, len(p.KnownMembers))
+	for k, v := range p.KnownMembers {
+		cloned[k] = v
+	}
+	p.KnownMembers = cloned
+	return p
+}
+
+func mergeGroupMembers(dst, src map[int]string) map[int]string {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[int]string, len(src))
+	}
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 // ProcessIdentity returns the live OS process group and start token for pid when
