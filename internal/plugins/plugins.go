@@ -60,12 +60,16 @@ const (
 	// interruptGrace is how long Call waits for a runaway call to stop
 	// after Interrupt before giving up on the runtime.
 	interruptGrace = 5 * time.Second
-	// maxPluginRestarts bounds automatic runtime rebuilds within pluginRestartWindow
-	// before marking the plugin broken.
+	// maxPluginRestarts bounds successful runtime rebuilds within pluginRestartWindow
+	// before marking the plugin broken. A rebuild that never installs a runtime
+	// (compile, load, registration mismatch, or a cancelled attempt) does not
+	// consume this allowance; those failures are bounded by the call itself.
 	maxPluginRestarts = 3
-	// pluginRestartWindow is the sliding window over which restarts are counted.
+	// pluginRestartWindow is the sliding window over which successful restarts are counted.
 	pluginRestartWindow = 10 * time.Minute
 	// maxLeakedRuntimes caps concurrent abandoned wedged goroutines per plugin.
+	// The cap applies only while those goroutines are still unwinding: once they
+	// finish, the count drops and rebuilds are allowed again even if the window expired.
 	maxLeakedRuntimes = 4
 	// MaxStoreBytes caps one file in a plugin's data dir, read or written.
 	MaxStoreBytes = 1 << 20
@@ -137,11 +141,24 @@ type Plugin struct {
 	rt           *moejs.Runtime
 	mu           sync.Mutex // serialises calls into this runtime (a runtime runs on one goroutine; only Interrupt is concurrent-safe)
 	loading      bool       // true while the entry's top level runs: registerTool is only valid then
-	broken       bool       // true when a call never stopped after Interrupt and restarts are exhausted
+	broken       bool       // true when a call never stopped after Interrupt and restarts are exhausted; user cancellation never sets this
 	restarts     int        // total successful runtime restarts (diagnostics)
 	restartTimes []time.Time
 	leakedMu     sync.Mutex
 	leaked       int // abandoned wedged call goroutines still unwinding
+	// observeMu publishes restart outcomes to tests. Production never waits on it.
+	observeMu sync.Mutex
+	observers []chan restartEvent
+	// restartGate and restartReady are test hooks. Production leaves both nil.
+	// restartGate runs in the restart goroutine before loadOne. restartReady
+	// runs after a load has been received and before it is installed, so a
+	// test can cancel once the result and the caller's context are both ready.
+	restartGate  func()
+	restartReady func()
+	// detachMu guards the single rebuild whose caller already returned.
+	// A second attempt is refused until that one has been joined.
+	detachMu       sync.Mutex
+	detachInFlight bool
 	// registry is the owning registry: setMode/getMode read its
 	// ModeSetter/ModeGetter, which app.Setup wires after Load.
 	registry *Registry
@@ -932,6 +949,10 @@ func (p *Plugin) ensureReadyLocked(ctx context.Context) error {
 	return fmt.Errorf("plugin %s is unusable after a call that never stopped; restart the harness", p.Name)
 }
 
+// errPluginCancelled is a responsive user or harness cancellation. It is not
+// evidence that the runtime is wedged, so it must not mark the plugin broken.
+var errPluginCancelled = errors.New("plugin call cancelled")
+
 func (p *Plugin) call(ctx context.Context, t *Tool, argsJSON string, timeout time.Duration) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1056,8 +1077,9 @@ func (p *Plugin) runWithTimeout(ctx context.Context, timeout time.Duration, run 
 		return cr, nil
 	case <-ctx.Done():
 		// The turn was aborted (or the harness is shutting down):
-		// stop the call the same way a timeout does.
-		p.interruptAndWait(ctx, done, ctx.Err())
+		// stop the call the same way a timeout does, but a responsive
+		// stop is cancellation, not a wedged runtime.
+		p.interruptAndWait(ctx, done, errPluginCancelled)
 		return callResult{}, ctx.Err()
 	case <-timer.C:
 		p.interruptAndWait(ctx, done, errors.New("plugin call timed out"))
@@ -1098,12 +1120,10 @@ func promiseStateName(state moejs.PromiseState) string {
 	return "unknown"
 }
 
-// interruptAndWait stops a runaway call, then waits for it to
-// actually stop. The runtime is only reused once the call has
-// returned: a limit hit or an interrupt leaves a pending interrupt
-// and spent accounting on the realm (spike finding 1), so both are
-// cleared here. If the call never stops, the runtime is wedged and
-// the plugin is marked broken instead of hanging every later call.
+// closeRuntime releases a runtime when the pinned build grows a Close
+// method. Today's runtime has none, so an abandoned runtime is reclaimed
+// by the garbage collector once its call returns; this still drops the
+// reference the recovery goroutine was holding.
 func closeRuntime(rt any) {
 	switch c := rt.(type) {
 	case interface{ Close() error }:
@@ -1120,35 +1140,116 @@ func (p *Plugin) leakedCount() int {
 	return n
 }
 
+// noteLeaked tracks an abandoned call until it unwinds. The count dropping
+// below the cap is what lets the next call rebuild: nothing retries on its
+// own when the goroutine finishes, including after pluginRestartWindow has
+// elapsed. The caller holds p.mu, so the goroutine must not take it.
+func (p *Plugin) noteLeaked(rt *moejs.Runtime, done chan callResult) {
+	p.leakedMu.Lock()
+	p.leaked++
+	p.leakedMu.Unlock()
+	go func() {
+		<-done
+		closeRuntime(rt)
+		p.leakedMu.Lock()
+		p.leaked--
+		p.leakedMu.Unlock()
+		p.publishRestart(restartEvent{kind: restartLeakedFreed})
+	}()
+}
+
+// interruptAndWait stops a runaway call, then waits for it to
+// actually stop. The runtime is only reused once the call has
+// returned: a limit hit or an interrupt leaves a pending interrupt
+// and spent accounting on the realm (spike finding 1), so both are
+// cleared here. If the call never stops, the runtime is wedged.
+// A responsive cancellation (the call stops inside interruptGrace)
+// is not a wedge: the runtime is cleared and reused, and the plugin
+// is not marked broken. Only a call that is still running after the
+// grace period abandons the runtime; the plugin is marked broken
+// only when that abandoned runtime cannot be replaced.
 func (p *Plugin) interruptAndWait(ctx context.Context, done chan callResult, cause error) {
 	oldRT := p.rt
 	oldRT.Interrupt(cause)
+	timer := time.NewTimer(interruptGrace)
+	defer timer.Stop()
 	select {
 	case <-done:
 		oldRT.ClearInterrupt()
 		oldRT.ResetAllocation()
-	case <-time.After(interruptGrace):
-		p.leakedMu.Lock()
-		p.leaked++
-		p.leakedMu.Unlock()
-		// Reclaim the abandoned runtime once the stuck call eventually unwinds.
-		go func(rt *moejs.Runtime, ch chan callResult) {
-			<-ch
-			closeRuntime(rt)
-			p.leakedMu.Lock()
-			p.leaked--
-			p.leakedMu.Unlock()
-		}(oldRT, done)
+	case <-timer.C:
+		// Still running after the grace period: the runtime is wedged.
+		// User cancellation that already returned above is not this case.
+		p.noteLeaked(oldRT, done)
 		if !p.tryRestartLocked(ctx) {
 			p.broken = true
 		}
 	}
 }
 
-// tryRestartLocked abandons a wedged runtime and rebuilds a fresh instance up
-// to maxPluginRestarts times within pluginRestartWindow so a single runaway
-// call does not permanently disable the plugin in long-running sessions.
+// restartKind is the outcome of one rebuild attempt or one abandoned call
+// unwinding. Tests subscribe; production publishes and moves on.
+type restartKind int
+
+const (
+	restartFailed restartKind = iota
+	restartInstalled
+	restartDiscarded
+	restartLeakedFreed
+)
+
+type restartEvent struct {
+	kind restartKind
+}
+
+func (p *Plugin) publishRestart(ev restartEvent) {
+	p.observeMu.Lock()
+	defer p.observeMu.Unlock()
+	kept := p.observers[:0]
+	for _, ch := range p.observers {
+		select {
+		case ch <- ev:
+			// Leaked-cap watchers outlive one unwind. Every other outcome is
+			// one-shot, so that subscriber is dropped once it has its event.
+			if ev.kind == restartLeakedFreed {
+				kept = append(kept, ch)
+			}
+		default:
+			// A full buffer means this subscriber already holds every event
+			// it asked to see. Drop it instead of blocking the publisher
+			// (the caller may hold p.mu).
+		}
+	}
+	p.observers = kept
+}
+
+// watchRestart reports restart outcomes. The buffer holds one event per
+// abandoned runtime so concurrent unwinds are not lost. Test-only:
+// production callers publish and return.
+func (p *Plugin) watchRestart() <-chan restartEvent {
+	ch := make(chan restartEvent, maxLeakedRuntimes)
+	p.observeMu.Lock()
+	p.observers = append(p.observers, ch)
+	p.observeMu.Unlock()
+	return ch
+}
+
+// tryRestartLocked abandons a wedged runtime and rebuilds a fresh instance.
+// Only a rebuild that installs a runtime consumes the successful-restart
+// allowance (maxPluginRestarts within pluginRestartWindow). Compile, load,
+// and registration failures do not. A cancelled attempt returns without
+// consuming it either; its goroutine is still joined and a late success is
+// discarded instead of installed after the caller has moved on.
+// The caller holds p.mu.
 func (p *Plugin) tryRestartLocked(ctx context.Context) bool {
+	// An already-cancelled caller has nothing to race against. Starting a
+	// load here would only add a goroutine that the caller cannot use.
+	if p.Dir == "" || ctx.Err() != nil {
+		return false
+	}
+	if p.leakedCount() >= maxLeakedRuntimes || p.detachBusy() {
+		return false
+	}
 	now := time.Now()
 	cutoff := now.Add(-pluginRestartWindow)
 	kept := p.restartTimes[:0]
@@ -1158,39 +1259,128 @@ func (p *Plugin) tryRestartLocked(ctx context.Context) bool {
 		}
 	}
 	p.restartTimes = kept
-	if len(p.restartTimes) >= maxPluginRestarts || p.leakedCount() >= maxLeakedRuntimes || p.Dir == "" || ctx.Err() != nil {
+	if len(p.restartTimes) >= maxPluginRestarts {
 		return false
 	}
-	p.restartTimes = append(p.restartTimes, now)
-	ctx, cancel := context.WithTimeout(ctx, interruptGrace)
-	defer cancel()
-	type reload struct {
-		plugin *Plugin
-		err    error
-	}
-	done := make(chan reload, 1)
+	// The load has its own deadline. It does not inherit the caller's
+	// context: a caller that is already cancelled, or that cancels while
+	// the load is in flight, still lets the load finish so a late success
+	// can be joined and discarded instead of installed. finishRestart is
+	// the only thing that cancels this context, and only after the result
+	// has been received, so the deadline is not cut short by the caller.
+	loadCtx, cancel := context.WithTimeout(context.Background(), interruptGrace)
+	done := make(chan reloadResult, 1)
 	reg, dir := p.registry, p.Dir
 	go func() {
-		fresh, err := loadOne(ctx, reg, dir)
-		done <- reload{fresh, err}
+		if p.restartGate != nil {
+			p.restartGate()
+		}
+		fresh, err := loadOne(loadCtx, reg, dir)
+		done <- reloadResult{fresh, err}
 	}()
 	var fresh *Plugin
 	select {
 	case result := <-done:
-		if result.err != nil || ctx.Err() != nil {
-			fmt.Fprintf(os.Stderr, "warning: plugin %s runtime restart failed: %v\n", p.Name, errors.Join(result.err, ctx.Err()))
+		cancel()
+		if result.err != nil {
+			p.failRestart(result.err)
 			return false
 		}
 		fresh = result.plugin
 	case <-ctx.Done():
+		// The caller left while this load was in flight. Join it without
+		// installing it. Cancel only once its own deadline passes, so a
+		// success that lands before then is discarded intact instead of
+		// being turned into an interrupt. Only one such load may be in
+		// flight; the caller holds p.mu, so the flag set here is the one
+		// the next attempt observes.
 		fmt.Fprintf(os.Stderr, "warning: plugin %s runtime restart stopped: %v\n", p.Name, ctx.Err())
+		p.setDetach()
+		go p.finishRestart(done, cancel, loadCtx)
 		return false
+	}
+	if p.restartReady != nil {
+		p.restartReady()
 	}
 	if !p.sameRegistrations(fresh) {
 		closeRuntime(fresh.rt)
-		fmt.Fprintf(os.Stderr, "warning: plugin %s runtime restart changed registrations\n", p.Name)
+		p.failRestart(errors.New("registrations changed"))
 		return false
 	}
+	if ctx.Err() != nil {
+		// Completed in the same instant the caller cancelled. Installing now
+		// would race the caller's view of failure, so discard it.
+		p.discardRestart(fresh)
+		return false
+	}
+	p.installRestartLocked(fresh, now)
+	p.publishRestart(restartEvent{kind: restartInstalled})
+	return true
+}
+
+func (p *Plugin) failRestart(err error) {
+	p.publishRestart(restartEvent{kind: restartFailed})
+	fmt.Fprintf(os.Stderr, "warning: plugin %s runtime restart failed: %v\n", p.Name, err)
+}
+
+func (p *Plugin) discardRestart(fresh *Plugin) {
+	if fresh != nil {
+		closeRuntime(fresh.rt)
+	}
+	p.publishRestart(restartEvent{kind: restartDiscarded})
+	fmt.Fprintf(os.Stderr, "warning: plugin %s runtime restart discarded after cancellation\n", p.Name)
+}
+
+// reloadResult is one loadOne attempt. The caller and the late joiner share
+// this type so a cancelled rebuild can still be received.
+type reloadResult struct {
+	plugin *Plugin
+	err    error
+}
+
+func (p *Plugin) detachBusy() bool {
+	p.detachMu.Lock()
+	defer p.detachMu.Unlock()
+	return p.detachInFlight
+}
+
+func (p *Plugin) setDetach() {
+	p.detachMu.Lock()
+	p.detachInFlight = true
+	p.detachMu.Unlock()
+}
+
+func (p *Plugin) clearDetach() {
+	p.detachMu.Lock()
+	p.detachInFlight = false
+	p.detachMu.Unlock()
+}
+
+// finishRestart joins a rebuild whose caller already returned. A result that
+// arrives before loadCtx's deadline is dropped as-is, including a success,
+// which is not installed. When the deadline passes first, the load is
+// interrupted and that failure is joined too. The single-flight flag is
+// cleared before the outcome is published, so a waiter that starts another
+// rebuild is not refused for a load that has already finished.
+func (p *Plugin) finishRestart(done <-chan reloadResult, cancel context.CancelFunc, loadCtx context.Context) {
+	var result reloadResult
+	select {
+	case result = <-done:
+	case <-loadCtx.Done():
+		cancel()
+		result = <-done
+	}
+	cancel()
+	p.clearDetach()
+	if result.err != nil {
+		p.failRestart(result.err)
+		return
+	}
+	p.discardRestart(result.plugin)
+}
+
+func (p *Plugin) installRestartLocked(fresh *Plugin, now time.Time) {
+	p.restartTimes = append(p.restartTimes, now)
 	p.restarts++
 	p.rt = fresh.rt
 	for _, t := range p.tools {
@@ -1205,7 +1395,6 @@ func (p *Plugin) tryRestartLocked(ctx context.Context) bool {
 	p.sessionSwitchHook, p.sessionRenameHook = fresh.sessionSwitchHook, fresh.sessionRenameHook
 	p.stopHook = fresh.stopHook
 	fmt.Fprintf(os.Stderr, "warning: plugin %s wedged; restarted runtime (%d/%d in %s)\n", p.Name, len(p.restartTimes), maxPluginRestarts, pluginRestartWindow)
-	return true
 }
 
 func (p *Plugin) sameRegistrations(fresh *Plugin) bool {

@@ -39,8 +39,19 @@ adds the lifecycle hooks (also below).
 A plugin tool runs JS only, inside its own runtime (16 MiB memory
 limit, 10 s call timeout with interrupt — a timed-out or
 memory-limited call leaves the runtime usable for the next call),
-so it needs no approval in suggest mode. A bad plugin is skipped
-with a warning on stderr and never fails startup; a missing
+so it needs no approval in suggest mode. Cancelling a call that
+stops within five seconds reuses that runtime and does not mark the
+plugin broken. A call still running after those five seconds is
+wedged: the harness abandons it and rebuilds the runtime. Only a
+rebuild that actually installs counts toward the allowance of three
+successful rebuilds per ten minutes. Compile, load, and registration
+failures do not count, and nothing else bounds how often they are
+retried. At most four abandoned calls may be unwinding at once, and
+that cap lifts as soon as one of them finishes, even after the
+ten-minute window has elapsed.
+
+A bad plugin is skipped with a warning on stderr and never fails
+startup; a missing
 plugins directory loads nothing, no error. Kill switch:
 `HARNESS_PLUGINS=0` (or `false`) disables plugin loading entirely.
 
