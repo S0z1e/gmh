@@ -95,6 +95,44 @@ func BackgroundMaxLifetimeSecondsFromFlag(flagVal int) int {
 	return 0
 }
 
+func resolveSecondsSetting(flagVal int, flagZeroDisables bool, envName string, cfgVal *int, defaultVal, disableVal time.Duration) time.Duration {
+	parseNonNeg := func(secs int) (time.Duration, bool) {
+		if secs == 0 {
+			return disableVal, true
+		}
+		if secs > 0 {
+			return time.Duration(secs) * time.Second, true
+		}
+		return 0, false
+	}
+	if flagZeroDisables {
+		if d, ok := parseNonNeg(flagVal); ok {
+			return d
+		}
+	} else {
+		if flagVal < 0 {
+			return disableVal
+		}
+		if flagVal > 0 {
+			return time.Duration(flagVal) * time.Second
+		}
+	}
+	if v := os.Getenv(envName); v != "" {
+		var secs int
+		if _, err := fmt.Sscanf(v, "%d", &secs); err == nil {
+			if d, ok := parseNonNeg(secs); ok {
+				return d
+			}
+		}
+	}
+	if cfgVal != nil {
+		if d, ok := parseNonNeg(*cfgVal); ok {
+			return d
+		}
+	}
+	return defaultVal
+}
+
 type App struct {
 	WorkspaceTrusted bool
 	Cfg              *agent.Config
@@ -357,29 +395,16 @@ func Setup(p Params) (*App, error) {
 	}
 	executor.Audit = func(e tools.AuditEntry) { _ = store.Audit(e) }
 
-	// Background threshold: flag wins, else env, else the 120s default.
+	// Background threshold: flag wins, else env, else config, else 120s default.
 	// 0 disables backgrounding; -p disables it outright.
-	bgThreshold := tools.DefaultBackgroundThreshold
-	if p.BackgroundThresholdSeconds == 0 {
-		bgThreshold = 0
-	} else if p.BackgroundThresholdSeconds > 0 {
-		bgThreshold = time.Duration(p.BackgroundThresholdSeconds) * time.Second
-	} else if v := os.Getenv("OPENAI_BG_THRESHOLD_SECONDS"); v != "" {
-		var secs int
-		if _, err := fmt.Sscanf(v, "%d", &secs); err == nil {
-			if secs == 0 {
-				bgThreshold = 0
-			} else if secs > 0 {
-				bgThreshold = time.Duration(secs) * time.Second
-			}
-		}
-	} else if cfg.BgThresholdSeconds != nil {
-		if *cfg.BgThresholdSeconds == 0 {
-			bgThreshold = 0
-		} else {
-			bgThreshold = time.Duration(*cfg.BgThresholdSeconds) * time.Second
-		}
-	}
+	bgThreshold := resolveSecondsSetting(
+		p.BackgroundThresholdSeconds,
+		true,
+		"OPENAI_BG_THRESHOLD_SECONDS",
+		cfg.BgThresholdSeconds,
+		tools.DefaultBackgroundThreshold,
+		0,
+	)
 	if p.DisableBackground {
 		bgThreshold = 0
 	}
@@ -387,28 +412,14 @@ func Setup(p Params) (*App, error) {
 
 	// Background max lifetime: flag wins, else env, else config, else 2h default.
 	// 0 in env/config (or <0 in Params) disables the cap.
-	var bgMaxLifetime time.Duration
-	if p.BackgroundMaxLifetimeSeconds < 0 {
-		bgMaxLifetime = -1
-	} else if p.BackgroundMaxLifetimeSeconds > 0 {
-		bgMaxLifetime = time.Duration(p.BackgroundMaxLifetimeSeconds) * time.Second
-	} else if v := os.Getenv("OPENAI_BACKGROUND_MAX_LIFETIME_SECONDS"); v != "" {
-		var secs int
-		if _, err := fmt.Sscanf(v, "%d", &secs); err == nil {
-			if secs == 0 {
-				bgMaxLifetime = -1
-			} else if secs > 0 {
-				bgMaxLifetime = time.Duration(secs) * time.Second
-			}
-		}
-	} else if cfg.BackgroundMaxLifetimeSeconds != nil {
-		if *cfg.BackgroundMaxLifetimeSeconds == 0 {
-			bgMaxLifetime = -1
-		} else {
-			bgMaxLifetime = time.Duration(*cfg.BackgroundMaxLifetimeSeconds) * time.Second
-		}
-	}
-	executor.BackgroundMaxLifetime = bgMaxLifetime
+	executor.BackgroundMaxLifetime = resolveSecondsSetting(
+		p.BackgroundMaxLifetimeSeconds,
+		false,
+		"OPENAI_BACKGROUND_MAX_LIFETIME_SECONDS",
+		cfg.BackgroundMaxLifetimeSeconds,
+		0,
+		-1,
+	)
 
 	// Sandbox: flag wins, else env, else config. bwrap is located and
 	// probed now so a broken sandbox fails at startup, not on the

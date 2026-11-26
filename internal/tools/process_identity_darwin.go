@@ -40,12 +40,14 @@ func inspectProcess(pid int) processInfo {
 	if proc.Proc.P_starttime.Sec <= 0 && proc.Proc.P_starttime.Usec <= 0 {
 		return processInfo{}
 	}
+	sid, _ := unix.Getsid(pid)
 	return processInfo{
 		Alive:      true,
 		PGID:       int(proc.Eproc.Pgid),
 		StartToken: fmt.Sprintf("%d:%d", proc.Proc.P_starttime.Sec, proc.Proc.P_starttime.Usec),
 		UID:        proc.Eproc.Ucred.Uid,
 		HasUID:     true,
+		SID:        sid,
 		Sess:       proc.Eproc.Sess,
 	}
 }
@@ -117,6 +119,11 @@ func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
 		}
 		if proof.Sess != 0 && p.Eproc.Sess != proof.Sess {
 			continue
+		}
+		if proof.SID > 0 {
+			if msid, serr := unix.Getsid(pid); serr == nil && msid != proof.SID {
+				continue
+			}
 		}
 		pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
 		if darwinStartTimeBefore(pSec, pUsec, leaderSec, leaderUsec) {
@@ -213,6 +220,11 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 		if proof.Sess != 0 && p.Eproc.Sess != proof.Sess {
 			return fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 		}
+		if proof.SID > 0 {
+			if msid, serr := unix.Getsid(pid); serr == nil && msid != proof.SID {
+				return fmt.Errorf("refusing to signal pgid %d: member pid %d sid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+			}
+		}
 		if darwinStartTimeBefore(pSec, pUsec, leaderSec, leaderUsec) {
 			return fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 		}
@@ -231,7 +243,7 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 			if parsed && !darwinStartTimeBefore(pSec, pUsec, parentSec, parentUsec) {
 				groupVerified = true
 			}
-		} else if !proof.VerifiedAt.IsZero() && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken {
+		} else if !proof.VerifiedAt.IsZero() && proof.SID > 0 && proof.SID == id.PID && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken {
 			groupVerified = true
 		}
 		verifiedMembers++

@@ -497,7 +497,7 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 				groupVerified = true
 			}
 		} else if (proof.JobToken != "" && processHasJobToken(pid, proof.JobToken)) ||
-			(!proof.VerifiedAt.IsZero() && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken) {
+			(!proof.VerifiedAt.IsZero() && proof.SID > 0 && proof.SID == id.PID && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken) {
 			groupVerified = true
 		}
 		verifiedMembers++

@@ -1200,6 +1200,7 @@ func (j *Job) recordStopError(err error) {
 	}
 	j.mu.Lock()
 	if !j.finished && !j.unknown {
+		j.monitorFailed = true
 		j.WaitError = err.Error()
 		j.RecoveryNote = fmt.Sprintf("adopted live OS process PID %d (pgid %d); stop error (%v) — job remains stoppable; %s",
 			j.PID, j.PGID, err, pipeCaptureEndedNote(j.OutputFile))

@@ -13,6 +13,10 @@ func configureProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
 }
 
+func configureSharedSessionProcess(cmd *exec.Cmd) {
+	configureProcess(cmd)
+}
+
 func killProcessTree(cmd *exec.Cmd) error {
 	if cmd.Process == nil {
 		return os.ErrProcessDone

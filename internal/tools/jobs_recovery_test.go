@@ -1257,6 +1257,177 @@ func TestStopAdoptedProcessGroupAfterExitRefusesUnverifiedReusedGroup(t *testing
 	if !inspectProcess(childPID).Alive {
 		t.Fatalf("child pid %d was killed despite lacking verified membership", childPID)
 	}
+
+	// Case 4: Once-verified stale proof from an exited group (VerifiedAt set and
+	// KnownMembers containing the old leader) must still refuse an unrelated
+	// replacement sharing UID/session without dedicated session ownership.
+	sharedCmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q", filepath.Join(root, "shared.pid")))
+	configureSharedSessionProcess(sharedCmd)
+	if err := sharedCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	sharedLeaderPID := sharedCmd.Process.Pid
+	_ = sharedCmd.Wait()
+	sharedBytes, err := os.ReadFile(filepath.Join(root, "shared.pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedChildPID, err := strconv.Atoi(strings.TrimSpace(string(sharedBytes)))
+	if err != nil || sharedChildPID <= 0 {
+		t.Fatalf("invalid shared child pid %q: %v", string(sharedBytes), err)
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(sharedChildPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+	sharedInfo := inspectProcess(sharedChildPID)
+	if !sharedInfo.Alive || sharedInfo.PGID <= 0 {
+		t.Fatalf("shared child not inspectable: %+v", sharedInfo)
+	}
+	staleOnceVerifiedShared := processGroupProof{
+		Leader: ProcessIdentityInfo{
+			PID:        sharedLeaderPID,
+			PGID:       sharedInfo.PGID,
+			StartToken: olderTok,
+		},
+		UID:          sharedInfo.UID,
+		HasUID:       sharedInfo.HasUID,
+		SID:          sharedInfo.SID,
+		Sess:         sharedInfo.Sess,
+		KnownMembers: map[int]string{sharedLeaderPID: olderTok},
+		VerifiedAt:   time.Now().Add(-time.Minute),
+	}
+	if err := stopAdoptedProcessGroupAfterExit(staleOnceVerifiedShared); !errors.Is(err, ErrProcessIdentityMismatch) {
+		t.Fatalf("once-verified stale shared-session proof err = %v, want ErrProcessIdentityMismatch", err)
+	}
+	if !inspectProcess(sharedChildPID).Alive {
+		t.Fatalf("shared-session child pid %d was killed by stale proof", sharedChildPID)
+	}
+
+	// Also verify a once-verified proof captured from a real Setsid leader refuses
+	// an unrelated Setsid replacement group even if its PGID is tested directly.
+	oldCmd := exec.CommandContext(t.Context(), "bash", "-c", "sleep 30")
+	configureProcess(oldCmd)
+	if err := oldCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	oldPID := oldCmd.Process.Pid
+	oldInfo := inspectProcess(oldPID)
+	oldProof := processGroupProof{
+		Leader: ProcessIdentityInfo{PID: oldPID, PGID: oldInfo.PGID, StartToken: oldInfo.StartToken},
+		UID:    oldInfo.UID,
+		HasUID: oldInfo.HasUID,
+		SID:    oldInfo.SID,
+		Sess:   oldInfo.Sess,
+	}
+	captureVerifiedGroupProof(&oldProof)
+	defer closeVerifiedGroupProof(&oldProof)
+	_ = oldCmd.Process.Kill()
+	_ = oldCmd.Wait()
+	staleCrossSession := oldProof
+	staleCrossSession.Leader.PGID = info.PGID
+	if err := stopAdoptedProcessGroupAfterExit(staleCrossSession); !errors.Is(err, ErrProcessIdentityMismatch) {
+		t.Fatalf("once-verified stale Setsid proof against unrelated group err = %v, want ErrProcessIdentityMismatch", err)
+	}
+	if !inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d was killed by once-verified stale Setsid proof", childPID)
+	}
+}
+
+func TestCrashRecoveryPostExitCleanupFailureRetryFinalizesJob(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-cleanup-retry"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", "sleep 30")
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	t.Cleanup(func() { _ = killProcessTree(cmd) })
+
+	pid := cmd.Process.Pid
+	pgid := processGroupID(pid)
+	_, startToken, alive := ProcessIdentity(pid)
+	if !alive {
+		t.Fatalf("process %d not alive", pid)
+	}
+	if err := savePersistedJob(jobsDir, PersistedJob{
+		ID:             "bg-1",
+		Started:        time.Now().Add(-time.Second),
+		Deadline:       time.Now().Add(time.Minute),
+		Command:        "sleep 30",
+		Cwd:            root,
+		OutputID:       outID,
+		PID:            pid,
+		PGID:           pgid,
+		ProcessStarted: startToken,
+		Status:         JobRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	// Simulate the state left when monitorAdoptedJob exits early on a transient
+	// post-exit cleanup failure after recording WaitError via recordStopError.
+	waitCtx, cancelCause := context.WithCancelCause(context.Background())
+	defer cancelCause(nil)
+	recJobs, err := loadPersistedJobs(jobsDir)
+	if err != nil || len(recJobs) != 1 {
+		t.Fatalf("loadPersistedJobs = %+v, err=%v", recJobs, err)
+	}
+	info := inspectProcess(pid)
+	proof := processGroupProof{
+		Leader: ProcessIdentityInfo{PID: pid, PGID: pgid, StartToken: startToken},
+		UID:    info.UID,
+		HasUID: info.HasUID,
+		SID:    info.SID,
+		Sess:   info.Sess,
+	}
+	captureVerifiedGroupProof(&proof)
+	job := exec2.newRecoveredJobObject(recJobs[0], jobsDir, JobRunning, false, false, "adopted", JobResult{})
+	job.groupProof = proof
+	job.monitorDone = make(chan struct{})
+	job.cancel = func() { cancelCause(context.Canceled) }
+	exec2.registry().addPreserved(job)
+
+	// Mimic monitor exiting early via recordStopError on transient cleanup error.
+	job.recordStopError(fmt.Errorf("stop remaining bash processes: %w", errors.New("injected transient EMFILE")))
+	close(job.monitorDone)
+	if job.Status() != JobRunning {
+		t.Fatalf("status after transient cleanup error = %q, want running", job.Status())
+	}
+	_ = waitCtx
+
+	// Retry via CancelErr: must succeed AND finalize job to JobDone rather than
+	// leaving it stuck running in the registry.
+	if err := job.CancelErr(); err != nil {
+		t.Fatalf("retry CancelErr failed: %v", err)
+	}
+	select {
+	case <-job.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("job.Done() remained open after successful CancelErr retry")
+	}
+	if job.Status() != JobDone {
+		t.Fatalf("job status after CancelErr retry = %q, want done", job.Status())
+	}
+	select {
+	case <-waitDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("process was not stopped by CancelErr retry")
+	}
 }
 
 func TestCrashRecoveryWaitErrorFollowedByNormalLeaderExitStillStopsChild(t *testing.T) {
