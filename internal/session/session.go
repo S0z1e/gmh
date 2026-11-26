@@ -35,6 +35,10 @@ type Store struct {
 	usageLoaded      bool
 	usageTotals      UsageTotals
 	usageInfo        os.FileInfo
+	usageRecovery    UsageReconciliation
+	usageChainSeq    int64
+	usageChainDigest string
+	usageChainOn     bool
 }
 
 // AuditPath is the sidecar file holding approval/bash audit records
@@ -49,6 +53,10 @@ func (s *Store) AuditPath() string {
 func (s *Store) Audit(v any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.auditLocked(v)
+}
+
+func (s *Store) auditLocked(v any) error {
 	unlock, err := lockManagement()
 	if err != nil {
 		return err

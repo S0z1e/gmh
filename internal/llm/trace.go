@@ -78,6 +78,7 @@ func (t RequestTrace) TransientFailure() bool {
 }
 
 type requestStartKey struct{}
+type requestAbortKey struct{}
 type traceKey struct{}
 type requestObservation struct {
 	trace   RequestTrace
@@ -129,6 +130,21 @@ func hashBytes(data []byte) string {
 // A failed gate prevents both dispatch and the completed-attempt observation.
 func WithRequestStart(ctx context.Context, start func(RequestTrace) error) context.Context {
 	return context.WithValue(ctx, requestStartKey{}, start)
+}
+
+// WithRequestAbort records that a prepared request never left the process.
+// The callback receives the attempt id when one was assigned.
+func WithRequestAbort(ctx context.Context, abort func(id string)) context.Context {
+	return context.WithValue(ctx, requestAbortKey{}, abort)
+}
+
+func abortRequestTrace(ctx context.Context) {
+	o, _ := ctx.Value(traceKey{}).(*requestObservation)
+	abort, _ := ctx.Value(requestAbortKey{}).(func(string))
+	if abort == nil || o == nil || o.trace.ID == "" {
+		return
+	}
+	abort(o.trace.ID)
 }
 func (c *Client) traceRequest(ctx context.Context, body []byte) error {
 	o, _ := ctx.Value(traceKey{}).(*requestObservation)

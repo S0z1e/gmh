@@ -51,6 +51,10 @@ func main() {
 	flag.Var(&images, "image", "attach an image file to the first turn (repeatable; png, jpg, gif, webp; the model must declare image input)")
 	flag.Var(&files, "attach", "attach a UTF-8 text file to the first turn (repeatable)")
 	flag.Parse()
+	if len(flag.Args()) > 0 && flag.Arg(0) == "usage-repair" {
+		runUsageRepair(flag.Args()[1:])
+		return
+	}
 	if *viewSessionID != "" {
 		if *rpcMode || *printMode != "" || *resume != "" || *steal || *sessionID != "" || *rebindSession || len(files) > 0 {
 			fatal(fmt.Errorf("--view-session conflicts with --rpc, -p, --resume, --steal, --session and -attach"))

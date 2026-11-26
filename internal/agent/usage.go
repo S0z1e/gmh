@@ -80,5 +80,13 @@ func (c *Config) requestContext(ctx context.Context, operation string, attempt i
 		}
 		return nil
 	})
+	// A gate failure happens before HTTP. Record that explicitly so the marker
+	// can later be reconciled as not-dispatched instead of unknown usage.
+	requestCtx = llm.WithRequestAbort(requestCtx, func(id string) {
+		if c.Session == nil || id == "" {
+			return
+		}
+		_ = c.Session.MarkUsageNotDispatched(id)
+	})
 	return requestCtx
 }

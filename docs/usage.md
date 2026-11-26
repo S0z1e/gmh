@@ -189,7 +189,9 @@
   directory creation identity, each reopen requires explicit rebind; new sessions
   and the read-only viewer remain available. Repository metadata is discovered
   from `.git` directories/files without running Git or loading its configuration.
-- REPL commands: `/usage` shows session token totals, `/clear` drops
+- REPL commands: `/usage` shows session token totals, `/usage-reconcile`
+  matches pending markers to the journal and names any artifact still blocking
+  strict metering, `/clear` drops
   the conversation context (a marker is written to the session file;
   `--resume` starts from the clear point, older messages stay in the
   file). `/plugins` lists the discovered plugins with their tools

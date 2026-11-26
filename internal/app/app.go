@@ -1385,6 +1385,22 @@ func (r *Runner) Handle(ctx context.Context, line string) bool {
 		}
 		r.Print("[usage] session: %s | %s | %s\n[usage] current run: %s | %s", r.sessionUsageLine(), r.sessionCostLine(), r.usageCoverage(), r.runUsageLine(), r.runCostLine())
 		return false
+	case "/usage-reconcile":
+		if r.App.Store == nil {
+			r.Print("[error] no session")
+			return false
+		}
+		report, err := r.App.Store.ReconcileUsage()
+		if err != nil {
+			r.LastErr = err
+			r.Print("[error] %v", err)
+			return false
+		}
+		r.Print("[usage] reconciled %d marker(s); recovery_gap=%t", len(report.Cleared), report.RecoveryGap)
+		for _, item := range report.Artifacts {
+			r.Print("[usage] blocking %s (%s): %s", item.Path, item.Kind, item.Reason)
+		}
+		return false
 	case "/prune-artifacts":
 		report, err := session.PruneArtifacts(ctx, time.Now())
 		r.Print("[retention] removed %d unreferenced image blobs (%d bytes)", report.DeletedBlobs, report.ReclaimedBytes)

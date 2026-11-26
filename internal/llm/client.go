@@ -523,6 +523,7 @@ func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[str
 		return nil, nil, err
 	}
 	if err := c.traceRequest(ctx, body); err != nil {
+		abortRequestTrace(ctx)
 		return nil, nil, err
 	}
 	// The request runs on a derived context so the first-byte idle

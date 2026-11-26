@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -190,5 +192,49 @@ func TestApprovalTimeoutDeniesSingleCallWithoutKillingTurn(t *testing.T) {
 	events, bodies, err := runVerification(t, c, budgetSSE("", calls, newInt(5), true), budgetSSE("continued after timeout", nil, newInt(5), true))
 	if err != nil || c.LastTerminalReason != TerminalEndTurn || len(bodies) != 2 || countKind(events, EventDone) != 1 {
 		t.Fatalf("approval timeout killed turn: reason=%s bodies=%d err=%v", c.LastTerminalReason, len(bodies), err)
+	}
+}
+
+func TestStrictMeteringNamesTheBlockingArtifact(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	c := budgetConfig(t, &turnbudget.Policy{MaxSessionTokens: capInt(100), StrictMetering: capBool(true)})
+	store, err := session.Open("strict-gap", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "FIRSTID"
+	if err := store.RecordUsage(session.UsageAttempt{ID: id, Request: llm.RequestTrace{ID: id, Usage: &llm.Usage{TotalTokens: 1}, TokensComplete: true}}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(session.Dir(), store.OutputID(), "usage.jsonl")
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"version":1,"id":"torn`); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	store, err = session.Open("strict-gap", session.OpenOptions{Workspace: c.Exec.Root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	recovery, err := store.UsageRecovery()
+	if err != nil || len(recovery.Artifacts) != 1 {
+		t.Fatalf("%+v %v", recovery, err)
+	}
+	c.Session = store
+	c.Client = fakeBudgetClient(func(*http.Request) (*http.Response, error) {
+		t.Error("strict metering dispatched a provider request")
+		return budgetResponse(budgetSSE("nope", nil, newInt(1), true)), nil
+	})
+	_, _, err = c.Run(t.Context(), []llm.Message{{Role: "user", Content: "work"}})
+	if err == nil || !strings.Contains(err.Error(), recovery.Artifacts[0].Path) || !strings.Contains(err.Error(), "usage-repair") {
+		t.Fatalf("strict error did not name the artifact and repair: %v", err)
 	}
 }
