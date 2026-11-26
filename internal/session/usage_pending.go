@@ -18,6 +18,7 @@ func (s *Store) BeginUsageAttempt(id string) (beginErr error) {
 	defer func() {
 		if beginErr != nil {
 			s.usageWriteFailed = true
+			s.usageFailureReported = false
 		}
 	}()
 	if s.closed {
@@ -27,7 +28,9 @@ func (s *Store) BeginUsageAttempt(id string) (beginErr error) {
 		return fmt.Errorf("invalid pending usage identity")
 	}
 	if s.usageWriteFailed {
-		return fmt.Errorf("usage persistence already failed")
+		if err := s.reopenUsageAfterWriteFailureLocked(); err != nil {
+			return err
+		}
 	}
 	if err := s.loadUsageLocked(); err != nil {
 		return err

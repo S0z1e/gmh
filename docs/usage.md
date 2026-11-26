@@ -66,7 +66,11 @@
   when the model has no configured `cost` schedule. Environment rates override
   the corresponding model rates. Anthropic also requires a cache-write rate.
   By default, missing usage or pricing leaves a metering gap and caps use only
-  recorded subtotals. If you relied on an existing cap stopping whenever usage
+  recorded subtotals. A damaged usage journal, torn-tail backup, or unmatched
+  pending marker keeps that gap until it is quarantined:
+  `harness usage-repair --root <project> --session <id> --quarantine <artifact>`.
+  The strict error names the artifact. Quarantine moves it aside and keeps the
+  bytes; it does not delete evidence. If you relied on an existing cap stopping whenever usage
   or pricing was incomplete, set `strictMetering: true` in `turnBudget` when
   upgrading. Strict mode stops with `budget_unavailable` when metering required
   by an active cap is incomplete. Exhaustion stops with `budget_exceeded`. Both save an

@@ -11,11 +11,18 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
 	"minimalharness/internal/llm"
 )
+
+// SetUsageAppendFault installs a test fault that fails an append after the
+// record is sealed and before it is written. Nil restores normal writes.
+func SetUsageAppendFault(fault func() error) { usageAppendFault = fault }
+
+var usageAppendFault func() error
 
 // UsageAttempt is a content-free ledger entry for one actual provider request.
 // Nil Usage records missing metering, never a fabricated zero-token request.
@@ -132,6 +139,7 @@ func (s *Store) loadUsageLocked() error {
 	f, err := s.openUsageLocked(false)
 	if os.IsNotExist(err) {
 		// Existing histories predate metering. Keep that coverage gap visible.
+		s.usageTotals = UsageTotals{}
 		r, err := os.Open(s.Path)
 		if err != nil {
 			return err
@@ -149,7 +157,13 @@ func (s *Store) loadUsageLocked() error {
 		if err != nil {
 			return err
 		}
-		s.usageTotals.RecoveryGap = len(pending) > 0
+		backups, err := recoveryBackups(s.usagePathLocked())
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		artifacts := usageArtifactsLocked(s.usagePathLocked(), pending, backups)
+		s.usageTotals.RecoveryGap = len(artifacts) > 0
+		s.usageRecovery = UsageReconciliation{SessionID: s.ID, Artifacts: artifacts, RecoveryGap: s.usageTotals.RecoveryGap}
 		s.usageLoaded = true
 		return nil
 	}
@@ -164,7 +178,7 @@ func (s *Store) loadUsageLocked() error {
 		return fmt.Errorf("usage journal must be a regular file: %v", err)
 	}
 	if err := recoverTail(f); err != nil {
-		return err
+		return s.damagedJournal(err.Error())
 	}
 	if _, err := f.Seek(0, 0); err != nil {
 		return err
@@ -177,37 +191,91 @@ func (s *Store) loadUsageLocked() error {
 	if err != nil {
 		return err
 	}
-	totals := UsageTotals{RecoveryGap: len(backups) > 0}
+	totals := UsageTotals{}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 4096), 64<<10)
 	first := true
+	var previous string
+	var want int64 = 1
+	var chainStarted bool
 	for sc.Scan() {
+		line := append([]byte(nil), sc.Bytes()...)
+		record, chain, _, chainErr := unwrapUsageRecord(line)
+		if chainErr != nil {
+			return s.damagedJournal(chainErr.Error())
+		}
+		if err := linkUsageChain(chain, want, previous, chainStarted); err != nil {
+			return s.damagedJournal(err.Error())
+		}
 		var a UsageAttempt
-		if err := json.Unmarshal(sc.Bytes(), &a); err != nil {
-			return fmt.Errorf("invalid usage journal: %w", err)
+		if err := json.Unmarshal(record, &a); err != nil {
+			return s.damagedJournal(err.Error())
 		}
 		if a.Version != 1 || (first && a.ID != "") || (!first && (a.ID == "" || a.Request.ID != a.ID)) {
-			return fmt.Errorf("invalid usage journal record")
+			return s.damagedJournal("invalid usage journal record")
+		}
+		if chain != nil {
+			chainStarted = true
+			previous = hashUsageRecord(append(append([]byte(nil), line...), '\n'))
+			want = chain.Sequence + 1
 		}
 		if a.Request.Usage != nil && (!a.Request.Usage.Valid() || !totals.Usage.CanAdd(*a.Request.Usage)) {
-			return fmt.Errorf("invalid or overflowing usage counters")
+			return s.damagedJournal("invalid or overflowing usage counters")
 		}
 		if a.InvalidUsage && (a.Request.Usage != nil || a.EstimateUSD != nil || a.ExactEstimateUSD != "") {
-			return fmt.Errorf("invalid usage marker")
+			return s.damagedJournal("invalid usage marker")
 		}
 		if err := totals.add(a); err != nil {
-			return err
+			return s.damagedJournal(err.Error())
 		}
-		delete(pending, a.ID)
+		if pending[a.ID] {
+			if err := s.clearPendingUsageLocked(a.ID); err != nil {
+				return err
+			}
+			delete(pending, a.ID)
+			s.rememberCommitted(a.ID)
+		}
 		first = false
 	}
 	if err := sc.Err(); err != nil {
 		return err
 	}
-	if first {
-		totals.LegacyHistory = true
+	// A marker removed before dispatch is not missing usage. Clear it on open
+	// so a crash cannot leave RecoveryGap set for a request that never left.
+	for id := range pending {
+		noted, err := s.notDispatchedUsageLocked(id)
+		if err != nil {
+			return err
+		}
+		if !noted {
+			continue
+		}
+		if err := s.clearPendingUsageLocked(id); err != nil {
+			return err
+		}
+		delete(pending, id)
 	}
-	totals.RecoveryGap = totals.RecoveryGap || len(pending) > 0
+	if first {
+		// An empty file is not history. It is created before the first request
+		// and must not look like a session that predates metering.
+		if info, statErr := f.Stat(); statErr == nil && info.Size() > 0 {
+			totals.LegacyHistory = true
+		}
+	}
+	s.usageChainOn = chainStarted
+	s.usageChainDigest = previous
+	if chainStarted {
+		s.usageChainSeq = want - 1
+	} else if !first && totals.Attempts == 0 {
+		// A header written before the first attempt is not a legacy journal.
+		// Keep chaining so the next record is sequence 1.
+		s.usageChainOn = true
+		s.usageChainSeq = 0
+		s.usageChainDigest = ""
+	}
+	artifacts := usageArtifactsLocked(f.Name(), pending, backups)
+	totals.RecoveryGap = len(artifacts) > 0
+	s.usageRecovery = UsageReconciliation{SessionID: s.ID, Artifacts: artifacts, RecoveryGap: totals.RecoveryGap, ChainSequences: s.usageChainSeq}
 	s.usageInfo, err = f.Stat()
 	if err != nil {
 		return err
@@ -224,7 +292,13 @@ func (s *Store) UsageTotals() (UsageTotals, error) {
 	// Keep this writer's accounting unavailable, even if reconciliation can read
 	// its previous valid prefix. Loading a different writer starts a new run.
 	if s.usageWriteFailed {
-		return UsageTotals{}, fmt.Errorf("provider usage persistence failed; accounting incomplete for this writer")
+		if !s.usageFailureReported {
+			s.usageFailureReported = true
+			return UsageTotals{}, fmt.Errorf("provider usage persistence failed; accounting incomplete for this writer")
+		}
+		if err := s.reopenUsageAfterWriteFailureLocked(); err != nil {
+			return UsageTotals{}, err
+		}
 	}
 	if s.closed {
 		return UsageTotals{}, os.ErrClosed
@@ -245,8 +319,14 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 		if writeErr != nil && !recorded {
 			s.usageLoaded = false
 			s.usageWriteFailed = true
+			s.usageFailureReported = false
 		}
 	}()
+	if s.usageWriteFailed {
+		if err := s.reopenUsageAfterWriteFailureLocked(); err != nil {
+			return err
+		}
+	}
 	if s.closed {
 		return os.ErrClosed
 	}
@@ -308,9 +388,32 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 		if _, err := f.Write(append(header, '\n')); err != nil {
 			return err
 		}
+		// The header is not an attempt. The next record starts the chain.
+		s.usageChainSeq = 0
+		s.usageChainOn = true
+		s.usageChainDigest = ""
 	}
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		return err
+	}
+	// Journals that already contain unchained records stay unchained. Sealing
+	// only the new tail would look like a deleted middle record on reopen.
+	// info.Size is the size before the header write, so a brand-new journal is
+	// zero here even after the header lands.
+	if s.usageChainOn || info.Size() == 0 {
+		sealed, _, err := sealUsageRecord(data, s.usageChainSeq+1, s.usageChainDigest)
+		if err != nil {
+			return err
+		}
+		data = sealed
+	}
+	if usageAppendFault != nil {
+		if err := usageAppendFault(); err != nil {
+			// The bytes were not written. Reload will see the previous prefix.
+			s.usageLoaded = false
+			s.usageInfo = nil
+			return err
+		}
 	}
 	if _, err := f.Write(append(data, '\n')); err != nil {
 		return err
@@ -327,6 +430,22 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 	}
 	if err := s.clearPendingUsageLocked(a.ID); err != nil {
 		return err
+	}
+	if s.usageRecovery.Artifacts != nil {
+		kept := s.usageRecovery.Artifacts[:0]
+		for _, artifact := range s.usageRecovery.Artifacts {
+			if !strings.HasSuffix(artifact.Path, usagePendingPrefix+a.ID) {
+				kept = append(kept, artifact)
+			}
+		}
+		s.usageRecovery.Artifacts = kept
+		s.usageRecovery.RecoveryGap = len(kept) > 0
+		nextTotals.RecoveryGap = s.usageRecovery.RecoveryGap
+	}
+	if s.usageChainOn || info.Size() == 0 {
+		s.usageChainSeq++
+		s.usageChainDigest = hashUsageRecord(append(append([]byte(nil), data...), '\n'))
+		s.usageChainOn = true
 	}
 	s.usageTotals = nextTotals
 	recorded = true
@@ -420,4 +539,52 @@ func (t UsageTotals) ExactCost() *big.Rat {
 		cost.Set(t.exactEstimateUSD)
 	}
 	return cost
+}
+
+func (s *Store) rememberCommitted(id string) {
+	for _, existing := range s.usageCommitted {
+		if existing == id {
+			return
+		}
+	}
+	s.usageCommitted = append(s.usageCommitted, id)
+}
+
+func usageArtifactsLocked(journalPath string, pending map[string]bool, backups []string) []UsageArtifact {
+	var artifacts []UsageArtifact
+	for id := range pending {
+		artifacts = append(artifacts, UsageArtifact{
+			Path:   filepath.Join(filepath.Dir(journalPath), usagePendingPrefix+id),
+			Kind:   "pending_marker",
+			Reason: "unmatched crash or discontinuity marker; usage may have been spent",
+		})
+	}
+	for _, path := range backups {
+		artifacts = append(artifacts, UsageArtifact{
+			Path: path, Kind: "recovery_backup", Reason: "torn tail retained as evidence; RecoveryGap stays until quarantine",
+		})
+	}
+	slices.SortFunc(artifacts, func(a, b UsageArtifact) int { return strings.Compare(a.Path, b.Path) })
+	return artifacts
+}
+
+// reopenUsageAfterWriteFailureLocked keeps the failed attempt's evidence and
+// lets a later call use a fresh descriptor. The pending marker, or a torn tail
+// recovered on the next open, is what proves the attempt was not discarded.
+func (s *Store) reopenUsageAfterWriteFailureLocked() error {
+	if !s.usageWriteFailed {
+		return nil
+	}
+	s.usageLoaded = false
+	s.usageInfo = nil
+	s.usageWriteFailed = false
+	s.usageFailureReported = false
+	if err := s.loadUsageLocked(); err != nil {
+		s.usageWriteFailed = true
+		s.usageFailureReported = true
+		return fmt.Errorf("provider usage persistence failed; accounting incomplete for this writer: %w", err)
+	}
+	// The failed call may have cleared the loaded flag without refreshing the
+	// totals. A successful reopen replaces both.
+	return nil
 }

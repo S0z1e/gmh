@@ -78,6 +78,7 @@ func (t RequestTrace) TransientFailure() bool {
 }
 
 type requestStartKey struct{}
+type requestAbortKey struct{}
 type traceKey struct{}
 type requestObservation struct {
 	trace   RequestTrace
@@ -130,6 +131,30 @@ func hashBytes(data []byte) string {
 func WithRequestStart(ctx context.Context, start func(RequestTrace) error) context.Context {
 	return context.WithValue(ctx, requestStartKey{}, start)
 }
+
+// WithRequestAbort records that a prepared request never left the process.
+// The callback receives the attempt id when one was assigned.
+func WithRequestAbort(ctx context.Context, abort func(id string)) context.Context {
+	return context.WithValue(ctx, requestAbortKey{}, abort)
+}
+
+func abortRequestTrace(ctx context.Context) {
+	o, _ := ctx.Value(traceKey{}).(*requestObservation)
+	abort, _ := ctx.Value(requestAbortKey{}).(func(string))
+	if abort == nil || o == nil || o.trace.ID == "" {
+		return
+	}
+	abort(o.trace.ID)
+}
+
+// suppressRequestTrace drops a prepared attempt that never left the process,
+// so the completed-attempt observer cannot record it as usage.
+func suppressRequestTrace(ctx context.Context) {
+	o, _ := ctx.Value(traceKey{}).(*requestObservation)
+	if o != nil {
+		o.trace = RequestTrace{}
+	}
+}
 func (c *Client) traceRequest(ctx context.Context, body []byte) error {
 	o, _ := ctx.Value(traceKey{}).(*requestObservation)
 	if o == nil {
@@ -175,8 +200,13 @@ func (c *Client) traceRequest(ctx context.Context, body []byte) error {
 	}
 	settings, _ := json.Marshal(fields)
 	t.SettingsHash = hashBytes(settings)
+	// Publish the id before the persistence gate. A later failure that happens
+	// before HTTP can then record the marker as not-dispatched.
+	o.trace = t
 	if start, _ := ctx.Value(requestStartKey{}).(func(RequestTrace) error); start != nil {
 		if err := start(t); err != nil {
+			// The gate failed before dispatch. Do not observe this attempt.
+			o.trace = RequestTrace{}
 			return err
 		}
 	}

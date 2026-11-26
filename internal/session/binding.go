@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -40,6 +41,10 @@ type OpenOptions struct {
 	// Rebind is a direct user choice to adopt legacy history or move a session to
 	// this workspace. Never set it from project config or an automatic resume.
 	Rebind bool
+	// RepairDamagedUsage keeps the writer open when the usage journal is damaged
+	// so an audited quarantine can move that journal aside. Ordinary opens still
+	// fail, and the error names the journal plus the repair command.
+	RepairDamagedUsage bool
 }
 
 // New opens a session bound to the current working directory. Frontends with an
@@ -199,8 +204,10 @@ func openLocked(id string, opts OpenOptions, replaceHeader func(*Store, *Header,
 	}
 	s.header = header
 	if _, err := s.UsageTotals(); err != nil {
-		s.Close()
-		return nil, fmt.Errorf("load session usage: %w", err)
+		if !(opts.RepairDamagedUsage && errors.Is(err, ErrUsageDamaged)) {
+			s.Close()
+			return nil, fmt.Errorf("load session usage: %w", err)
+		}
 	}
 	if !fresh {
 		if err := s.promoteArchive(); err != nil {

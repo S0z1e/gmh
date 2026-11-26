@@ -523,6 +523,7 @@ func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[str
 		return nil, nil, err
 	}
 	if err := c.traceRequest(ctx, body); err != nil {
+		abortRequestTrace(ctx)
 		return nil, nil, err
 	}
 	// The request runs on a derived context so the first-byte idle
@@ -533,6 +534,8 @@ func (c *Client) doPostHeaders(ctx context.Context, body []byte, headers map[str
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.endpoint(), bytes.NewReader(body))
 	if err != nil {
 		cancel()
+		abortRequestTrace(ctx)
+		suppressRequestTrace(ctx)
 		return nil, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")

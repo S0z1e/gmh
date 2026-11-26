@@ -105,7 +105,9 @@ func recoveryBackups(path string) ([]string, error) {
 		return nil, err
 	}
 	transcript, err := os.Stat(path)
-	if err != nil {
+	if os.IsNotExist(err) {
+		transcript = nil
+	} else if err != nil {
 		return nil, err
 	}
 	base := filepath.Base(path)
@@ -126,7 +128,7 @@ func recoveryBackups(path string) ([]string, error) {
 				continue
 			}
 			alias, err := os.Stat(filepath.Join(dir, owner))
-			if os.IsNotExist(err) {
+			if os.IsNotExist(err) || transcript == nil {
 				continue
 			}
 			if err != nil {

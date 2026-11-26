@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"minimalharness/internal/llm"
+	"minimalharness/internal/session"
 	"minimalharness/internal/turnbudget"
 )
 
@@ -55,6 +56,24 @@ func (c *Config) startBudgetWithPolicy(parent context.Context, policy *turnbudge
 			return parent, func() {}, unavail
 		}
 		costComplete := totals.UnpricedAttempts() == 0 && !totals.LegacyHistory && !totals.RecoveryGap
+		if totals.RecoveryGap {
+			recovery, recErr := c.Session.UsageRecovery()
+			if recErr != nil {
+				unavail := &turnbudget.Unavailable{Resource: "session_tokens", Reason: recErr.Error()}
+				c.resources.failure = unavail
+				return parent, func() {}, unavail
+			}
+			if limits.StrictMetering && (limits.SessionTokens > 0 || limits.SessionCostUSD > 0) {
+				blocked := session.BlockingUsageError(recovery.Artifacts)
+				resource := "session_tokens"
+				if limits.SessionTokens == 0 {
+					resource = "session_cost_usd"
+				}
+				unavail := &turnbudget.Unavailable{Resource: resource, Reason: blocked.Error()}
+				c.resources.failure = unavail
+				return parent, func() {}, unavail
+			}
+		}
 		if err := b.SeedSessionUsage(int64(totals.Usage.TotalTokens), totals.ExactCost(), totals.TokenCountsComplete(), costComplete); err != nil {
 			c.resources.failure = err
 			return parent, func() {}, err

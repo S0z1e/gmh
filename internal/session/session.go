@@ -32,9 +32,17 @@ type Store struct {
 	mu               sync.Mutex
 	closed           bool
 	usageWriteFailed bool
-	usageLoaded      bool
-	usageTotals      UsageTotals
-	usageInfo        os.FileInfo
+	// usageFailureReported is set after the failed turn has already been told
+	// that accounting is incomplete. The next read may reopen the writer.
+	usageFailureReported bool
+	usageLoaded          bool
+	usageTotals          UsageTotals
+	usageInfo            os.FileInfo
+	usageRecovery        UsageReconciliation
+	usageChainSeq        int64
+	usageChainDigest     string
+	usageChainOn         bool
+	usageCommitted       []string
 }
 
 // AuditPath is the sidecar file holding approval/bash audit records
@@ -49,6 +57,10 @@ func (s *Store) AuditPath() string {
 func (s *Store) Audit(v any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.auditLocked(v)
+}
+
+func (s *Store) auditLocked(v any) error {
 	unlock, err := lockManagement()
 	if err != nil {
 		return err
