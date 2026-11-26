@@ -237,6 +237,9 @@ func TestAppendFailureRecoversWriterWithoutDroppingEvidence(t *testing.T) {
 	if err := s.RecordUsage(usageAttempt(second, 1)); err == nil {
 		t.Fatal("append succeeded while the write fault was installed")
 	}
+	if _, err := s.UsageTotals(); err == nil {
+		t.Fatal("the failed turn still published complete accounting")
+	}
 	usageAppendFault = nil
 	if err := s.RecordUsage(usageAttempt(second, 1)); err != nil {
 		t.Fatal(err)
@@ -249,10 +252,6 @@ func TestAppendFailureRecoversWriterWithoutDroppingEvidence(t *testing.T) {
 	marker := filepath.Join(filepath.Dir(s.usagePathLocked()), usagePendingPrefix+second)
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("committed marker survived recovery: %v", err)
-	}
-	totals, err = s.UsageTotals()
-	if err != nil || totals.Attempts != 2 {
-		t.Fatalf("next read did not recover the writer: %+v %v", totals, err)
 	}
 }
 

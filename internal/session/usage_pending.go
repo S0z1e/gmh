@@ -18,7 +18,7 @@ func (s *Store) BeginUsageAttempt(id string) (beginErr error) {
 	defer func() {
 		if beginErr != nil {
 			s.usageWriteFailed = true
-			s.usageFailedTurn = false
+			s.usageFailureReported = false
 		}
 	}()
 	if s.closed {

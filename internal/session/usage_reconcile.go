@@ -189,8 +189,10 @@ func (s *Store) reconcileUsageLocked(action string) (UsageReconciliation, error)
 	}
 	slices.SortFunc(report.Artifacts, func(a, b UsageArtifact) int { return strings.Compare(a.Path, b.Path) })
 	report.RecoveryGap = len(report.Artifacts) > 0
-	if err := s.auditUsageActionLocked(action, report); err != nil {
-		return UsageReconciliation{}, err
+	if action != usageRepairQuarantine {
+		if err := s.auditUsageActionLocked(action, report); err != nil {
+			return UsageReconciliation{}, err
+		}
 	}
 	s.usageRecovery = report
 	s.usageTotals.RecoveryGap = report.RecoveryGap
@@ -338,7 +340,8 @@ func (s *Store) RepairUsage(action, artifact string) (UsageReconciliation, error
 	}
 	switch action {
 	case usageRepairQuarantine:
-		if err := s.quarantineUsageLocked(artifact); err != nil {
+		moved, err := s.quarantineUsageLocked(artifact)
+		if err != nil {
 			return UsageReconciliation{}, err
 		}
 		s.usageLoaded = false
@@ -351,7 +354,9 @@ func (s *Store) RepairUsage(action, artifact string) (UsageReconciliation, error
 		if err != nil {
 			return UsageReconciliation{}, err
 		}
-		report.Quarantined = append(report.Quarantined, artifact)
+		if moved {
+			report.Quarantined = append(report.Quarantined, artifact)
+		}
 		if err := s.auditUsageActionLocked(action, report); err != nil {
 			return UsageReconciliation{}, err
 		}
@@ -373,43 +378,43 @@ func (s *Store) damagedJournal(reason string) error {
 	}}))
 }
 
-func (s *Store) quarantineUsageLocked(artifact string) error {
+func (s *Store) quarantineUsageLocked(artifact string) (bool, error) {
 	if artifact == "" {
-		return fmt.Errorf("quarantine needs the artifact path named by the strict error")
+		return false, fmt.Errorf("quarantine needs the artifact path named by the strict error")
 	}
 	clean := filepath.Clean(artifact)
 	family := filepath.Dir(s.usagePathLocked())
 	rel, err := filepath.Rel(family, clean)
 	if err != nil || rel == "." || rel == ".." || strings.Contains(rel, string(os.PathSeparator)) {
-		return fmt.Errorf("artifact %s is outside this session usage family", artifact)
+		return false, fmt.Errorf("artifact %s is outside this session usage family", artifact)
 	}
 	base := filepath.Base(clean)
 	allowed := base == "usage.jsonl" || strings.HasPrefix(base, usagePendingPrefix) || strings.Contains(base, ".jsonl-torn-")
 	if !allowed || strings.Contains(base, "..") {
-		return fmt.Errorf("artifact %s is not a usage journal, marker, or recovery backup", artifact)
+		return false, fmt.Errorf("artifact %s is not a usage journal, marker, or recovery backup", artifact)
 	}
 	info, err := os.Lstat(clean)
 	if os.IsNotExist(err) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("artifact %s is not a regular file", artifact)
+		return false, fmt.Errorf("artifact %s is not a regular file", artifact)
 	}
 	destDir := s.quarantinePathLocked()
 	if err := os.MkdirAll(destDir, 0700); err != nil {
-		return err
+		return false, err
 	}
 	dest := filepath.Join(destDir, time.Now().UTC().Format("20060102T150405.000000000Z")+"-"+rand.Text()+"-"+base)
 	if err := os.Rename(clean, dest); err != nil {
-		return err
+		return false, err
 	}
 	if err := syncRecoveryDirectory(destDir); err != nil {
-		return err
+		return false, err
 	}
-	return syncRecoveryDirectory(family)
+	return true, syncRecoveryDirectory(family)
 }
 
 func (s *Store) auditUsageActionLocked(action string, report UsageReconciliation) error {

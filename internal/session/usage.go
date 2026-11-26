@@ -290,7 +290,8 @@ func (s *Store) UsageTotals() (UsageTotals, error) {
 	// Keep this writer's accounting unavailable, even if reconciliation can read
 	// its previous valid prefix. Loading a different writer starts a new run.
 	if s.usageWriteFailed {
-		if !s.usageFailedTurn {
+		if !s.usageFailureReported {
+			s.usageFailureReported = true
 			return UsageTotals{}, fmt.Errorf("provider usage persistence failed; accounting incomplete for this writer")
 		}
 		if err := s.reopenUsageAfterWriteFailureLocked(); err != nil {
@@ -316,7 +317,7 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 		if writeErr != nil && !recorded {
 			s.usageLoaded = false
 			s.usageWriteFailed = true
-			s.usageFailedTurn = false
+			s.usageFailureReported = false
 		}
 	}()
 	if s.usageWriteFailed {
@@ -575,9 +576,10 @@ func (s *Store) reopenUsageAfterWriteFailureLocked() error {
 	s.usageLoaded = false
 	s.usageInfo = nil
 	s.usageWriteFailed = false
-	s.usageFailedTurn = true
+	s.usageFailureReported = false
 	if err := s.loadUsageLocked(); err != nil {
 		s.usageWriteFailed = true
+		s.usageFailureReported = true
 		return fmt.Errorf("provider usage persistence failed; accounting incomplete for this writer: %w", err)
 	}
 	// The failed call may have cleared the loaded flag without refreshing the

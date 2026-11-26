@@ -32,15 +32,17 @@ type Store struct {
 	mu               sync.Mutex
 	closed           bool
 	usageWriteFailed bool
-	usageFailedTurn  bool
-	usageLoaded      bool
-	usageTotals      UsageTotals
-	usageInfo        os.FileInfo
-	usageRecovery    UsageReconciliation
-	usageChainSeq    int64
-	usageChainDigest string
-	usageChainOn     bool
-	usageCommitted   []string
+	// usageFailureReported is set after the failed turn has already been told
+	// that accounting is incomplete. The next read may reopen the writer.
+	usageFailureReported bool
+	usageLoaded          bool
+	usageTotals          UsageTotals
+	usageInfo            os.FileInfo
+	usageRecovery        UsageReconciliation
+	usageChainSeq        int64
+	usageChainDigest     string
+	usageChainOn         bool
+	usageCommitted       []string
 }
 
 // AuditPath is the sidecar file holding approval/bash audit records
