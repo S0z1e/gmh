@@ -1,6 +1,9 @@
 package tools
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // ErrProcessIdentityMismatch reports that an OS process ID no longer matches the
 // recorded process group or OS start token (such as after PID reuse).
@@ -33,6 +36,19 @@ type processInfo struct {
 	Zombie     bool
 	PGID       int
 	StartToken string
+	UID        uint32
+	HasUID     bool
+	SID        int
+	Sess       uintptr
+}
+
+type processGroupProof struct {
+	Leader         ProcessIdentityInfo
+	UID            uint32
+	HasUID         bool
+	SID            int
+	Sess           uintptr
+	ExitObservedAt time.Time
 }
 
 // ProcessIdentity returns the live OS process group and start token for pid when

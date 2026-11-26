@@ -130,7 +130,7 @@ func main() {
 		Sandbox:                    *sandbox,
 		BashTimeoutSeconds:           *bashTO,
 		BackgroundThresholdSeconds:   *bgThresh,
-		BackgroundMaxLifetimeSeconds: bgMaxLifetimeParam(*bgMaxLifetime),
+		BackgroundMaxLifetimeSeconds: app.BackgroundMaxLifetimeSecondsFromFlag(*bgMaxLifetime),
 		DisableBackground:            *printMode != "",
 		Images:                     images,
 		Files:                      files,
@@ -382,16 +382,6 @@ func askQuestionFromScanner(scanner *input.Lines) func(agent.QuestionRequest) (a
 		}
 		return agent.QuestionAnswers{Answers: answers}, nil
 	}
-}
-
-func bgMaxLifetimeParam(flagVal int) int {
-	if flagVal == 0 {
-		return -1
-	}
-	if flagVal > 0 {
-		return flagVal
-	}
-	return 0
 }
 
 // execTUI replaces this process with the sibling harness-tui binary,

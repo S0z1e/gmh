@@ -1147,4 +1147,182 @@ func TestCrashRecoveryAdoptedLeaderExitStopsBackgroundChild(t *testing.T) {
 	t.Fatalf("background child pid %d stayed alive after adopted leader %d exited", childPID, meta.PID)
 }
 
+func TestStopAdoptedProcessGroupAfterExitRefusesUnverifiedReusedGroup(t *testing.T) {
+	root := t.TempDir()
+	childPIDFile := filepath.Join(root, "child.pid")
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q", childPIDFile))
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	_ = cmd.Wait()
+
+	pidBytes, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil || childPID <= 0 {
+		t.Fatalf("invalid child pid %q: %v", string(pidBytes), err)
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	info := inspectProcess(childPID)
+	if !info.Alive || info.PGID <= 0 {
+		t.Fatalf("child pid %d not inspectable: %+v", childPID, info)
+	}
+
+	// Case 1: ExitObservedAt is zero and no surviving member is directly tied by
+	// PID or PPID to the original leader (simulating a stale PGID after reuse).
+	unverifiedProof := processGroupProof{
+		Leader: ProcessIdentityInfo{
+			PID:        leaderPID + 999999,
+			PGID:       info.PGID,
+			StartToken: info.StartToken,
+		},
+		UID:    info.UID,
+		HasUID: info.HasUID,
+		SID:    info.SID,
+		Sess:   info.Sess,
+	}
+	if err := stopAdoptedProcessGroupAfterExit(unverifiedProof); !errors.Is(err, ErrProcessIdentityMismatch) {
+		t.Fatalf("unverified post-exit proof err = %v, want ErrProcessIdentityMismatch", err)
+	}
+	if !inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d was killed despite unverified proof", childPID)
+	}
+
+	// Case 2: ExitObservedAt is set, but a member predates the leader's start time.
+	predatedProof := processGroupProof{
+		Leader: ProcessIdentityInfo{
+			PID:        leaderPID,
+			PGID:       info.PGID,
+			StartToken: time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		},
+		UID:            info.UID,
+		HasUID:         info.HasUID,
+		SID:            info.SID,
+		Sess:           info.Sess,
+		ExitObservedAt: time.Now(),
+	}
+	if err := stopAdoptedProcessGroupAfterExit(predatedProof); !errors.Is(err, ErrProcessIdentityMismatch) {
+		t.Fatalf("predated member proof err = %v, want ErrProcessIdentityMismatch", err)
+	}
+	if !inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d was killed despite predating leader start token", childPID)
+	}
+}
+
+func TestCrashRecoveryCloseJobsStopFailureRemainsRunningAndRetryable(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-close-stop-fail"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", "sleep 30")
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	t.Cleanup(func() { _ = killProcessTree(cmd) })
+
+	pid := cmd.Process.Pid
+	pgid := processGroupID(pid)
+	_, startToken, alive := ProcessIdentity(pid)
+	if !alive {
+		t.Fatalf("process %d not alive", pid)
+	}
+	if err := savePersistedJob(jobsDir, PersistedJob{
+		ID:             "bg-1",
+		Started:        time.Now().Add(-time.Second),
+		Deadline:       time.Now().Add(time.Minute),
+		Command:        "sleep 30",
+		Cwd:            root,
+		OutputID:       outID,
+		PID:            pid,
+		PGID:           pgid,
+		ProcessStarted: startToken,
+		Status:         JobRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitReady := make(chan struct{})
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		waitAdopted: func(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {
+			close(waitReady)
+			<-ctx.Done()
+			return -1, false, context.Cause(ctx)
+		},
+	}
+	exec2.SwitchSession(outID)
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 {
+		t.Fatalf("RecoverSessionJobs = %+v, err=%v", recovered, err)
+	}
+	<-waitReady
+
+	job := exec2.registry().Get("bg-1")
+	origCloseStop := job.closeStop
+	injectedErr := errors.New("injected stop EPERM")
+	failFirst := true
+	job.mu.Lock()
+	job.closeStop = func() error {
+		if failFirst {
+			failFirst = false
+			job.recordStopError(injectedErr)
+			return injectedErr
+		}
+		return origCloseStop()
+	}
+	job.mu.Unlock()
+
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelClose()
+	if err := exec2.CloseJobs(closeCtx); !errors.Is(err, injectedErr) {
+		t.Fatalf("CloseJobs err = %v, want injectedErr (and must not return nil or hang)", err)
+	}
+	if job.Status() != JobRunning {
+		t.Fatalf("job status after failed shutdown stop = %q, want running", job.Status())
+	}
+	if !strings.Contains(job.Snapshot().WaitError, "injected stop EPERM") {
+		t.Fatalf("WaitError = %q, want injected stop EPERM", job.Snapshot().WaitError)
+	}
+	select {
+	case <-job.Done():
+		t.Fatal("job.Done() must remain open when shutdown stop failed")
+	default:
+	}
+
+	// Retry CloseJobs after transient failure clears: must now stop the process cleanly.
+	retryCtx, cancelRetry := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelRetry()
+	if err := exec2.CloseJobs(retryCtx); err != nil {
+		t.Fatalf("retry CloseJobs failed: %v", err)
+	}
+	if job.Status() != JobDone {
+		t.Fatalf("job status after retry CloseJobs = %q, want done", job.Status())
+	}
+	select {
+	case <-waitDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("process was not stopped on CloseJobs retry")
+	}
+}
+
 var _ = errors.New

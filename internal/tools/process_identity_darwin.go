@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -41,7 +44,27 @@ func inspectProcess(pid int) processInfo {
 		Alive:      true,
 		PGID:       int(proc.Eproc.Pgid),
 		StartToken: fmt.Sprintf("%d:%d", proc.Proc.P_starttime.Sec, proc.Proc.P_starttime.Usec),
+		UID:        proc.Eproc.Ucred.Uid,
+		HasUID:     true,
+		Sess:       proc.Eproc.Sess,
 	}
+}
+
+func parseDarwinStartTime(token string) (sec int64, usec int32, ok bool) {
+	secStr, usecStr, found := strings.Cut(token, ":")
+	if !found {
+		return 0, 0, false
+	}
+	s, err1 := strconv.ParseInt(secStr, 10, 64)
+	u, err2 := strconv.ParseInt(usecStr, 10, 32)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return s, int32(u), true
+}
+
+func darwinStartTimeBefore(sec int64, usec int32, otherSec int64, otherUsec int32) bool {
+	return sec < otherSec || (sec == otherSec && usec < otherUsec)
 }
 
 func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
@@ -55,30 +78,41 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	if !id.Matches(info) {
 		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 	}
-	err := syscall.Kill(-id.PGID, syscall.SIGKILL)
+	return darwinResolveGroupKillError(id.PGID, syscall.Kill(-id.PGID, syscall.SIGKILL))
+}
+
+func darwinResolveGroupKillError(pgid int, err error) error {
 	if errors.Is(err, syscall.ESRCH) {
 		return os.ErrProcessDone
 	}
-	if errors.Is(err, unix.EPERM) {
-		procs, queryErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", id.PGID)
-		if queryErr == nil {
-			allZombie := true
-			for _, p := range procs {
-				if p.Proc.P_stat != 5 {
-					allZombie = false
-					break
-				}
-			}
-			if allZombie {
-				return os.ErrProcessDone
-			}
+	if !errors.Is(err, unix.EPERM) {
+		return err
+	}
+	// On XNU, signalling a process group whose remaining members just entered
+	// teardown or were reaped can fail with EPERM instead of ESRCH.
+	procs, queryErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", pgid)
+	if errors.Is(queryErr, unix.ESRCH) {
+		return os.ErrProcessDone
+	}
+	if queryErr != nil {
+		return err
+	}
+	const darwinPWexit = 0x00002000
+	for _, p := range procs {
+		if p.Proc.P_stat != 5 && (p.Proc.P_flag&darwinPWexit) == 0 {
+			return err
 		}
 	}
-	return err
+	return os.ErrProcessDone
 }
 
-func stopAdoptedProcessGroupAfterExit(id ProcessIdentityInfo) error {
+func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
+	id := proof.Leader
 	if !id.Valid() {
+		return ErrProcessIdentityMismatch
+	}
+	leaderSec, leaderUsec, hasLeaderStart := parseDarwinStartTime(id.StartToken)
+	if !hasLeaderStart {
 		return ErrProcessIdentityMismatch
 	}
 	info := inspectProcess(id.PID)
@@ -89,44 +123,50 @@ func stopAdoptedProcessGroupAfterExit(id ProcessIdentityInfo) error {
 	if errors.Is(queryErr, unix.ESRCH) {
 		return os.ErrProcessDone
 	}
-	if queryErr == nil {
-		hasLive := false
-		for _, p := range procs {
-			if p.Proc.P_stat == 5 {
-				continue
-			}
-			if int(p.Proc.P_pid) == id.PID {
-				tok := fmt.Sprintf("%d:%d", p.Proc.P_starttime.Sec, p.Proc.P_starttime.Usec)
-				if tok != id.StartToken {
-					return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
-				}
-			}
-			hasLive = true
-		}
-		if !hasLive {
-			return os.ErrProcessDone
-		}
+	if queryErr != nil {
+		return queryErr
 	}
-	err := syscall.Kill(-id.PGID, syscall.SIGKILL)
-	if errors.Is(err, syscall.ESRCH) {
+
+	verifiedMembers := 0
+	directTied := false
+	for _, p := range procs {
+		if p.Proc.P_stat == 5 {
+			continue
+		}
+		if int(p.Proc.P_pid) == id.PID {
+			tok := fmt.Sprintf("%d:%d", p.Proc.P_starttime.Sec, p.Proc.P_starttime.Usec)
+			if tok != id.StartToken {
+				return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+			}
+			directTied = true
+		}
+		if proof.HasUID && p.Eproc.Ucred.Uid != proof.UID {
+			return fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, p.Proc.P_pid, ErrProcessIdentityMismatch)
+		}
+		if proof.Sess != 0 && p.Eproc.Sess != proof.Sess {
+			return fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, p.Proc.P_pid, ErrProcessIdentityMismatch)
+		}
+		pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
+		if darwinStartTimeBefore(pSec, pUsec, leaderSec, leaderUsec) {
+			return fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, p.Proc.P_pid, ErrProcessIdentityMismatch)
+		}
+		if !proof.ExitObservedAt.IsZero() {
+			memberStart := time.Unix(pSec, int64(pUsec)*1000)
+			if memberStart.After(proof.ExitObservedAt.Add(10 * time.Millisecond)) {
+				return fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, p.Proc.P_pid, ErrProcessIdentityMismatch)
+			}
+		} else if int(p.Eproc.Ppid) == id.PID {
+			directTied = true
+		}
+		verifiedMembers++
+	}
+	if verifiedMembers == 0 {
 		return os.ErrProcessDone
 	}
-	if errors.Is(err, unix.EPERM) {
-		procs, queryErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", id.PGID)
-		if queryErr == nil {
-			allZombie := true
-			for _, p := range procs {
-				if p.Proc.P_stat != 5 {
-					allZombie = false
-					break
-				}
-			}
-			if allZombie {
-				return os.ErrProcessDone
-			}
-		}
+	if proof.ExitObservedAt.IsZero() && !directTied {
+		return fmt.Errorf("refusing to signal unverified pgid %d after leader disappeared: %w", id.PGID, ErrProcessIdentityMismatch)
 	}
-	return err
+	return darwinResolveGroupKillError(id.PGID, syscall.Kill(-id.PGID, syscall.SIGKILL))
 }
 
 func verifyBeforeWait(id ProcessIdentityInfo) error {

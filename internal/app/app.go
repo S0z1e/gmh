@@ -83,6 +83,18 @@ type Params struct {
 	Files []string
 }
 
+// BackgroundMaxLifetimeSecondsFromFlag converts the CLI -bg-max-lifetime flag
+// (-1 = unset, 0 = unlimited, >0 = seconds) into Params.BackgroundMaxLifetimeSeconds.
+func BackgroundMaxLifetimeSecondsFromFlag(flagVal int) int {
+	if flagVal == 0 {
+		return -1
+	}
+	if flagVal > 0 {
+		return flagVal
+	}
+	return 0
+}
+
 type App struct {
 	WorkspaceTrusted bool
 	Cfg              *agent.Config

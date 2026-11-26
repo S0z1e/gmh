@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"minimalharness/internal/checkpoint"
@@ -719,6 +718,13 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 		id := ProcessIdentityInfo{PID: rec.PID, PGID: rec.PGID, StartToken: rec.ProcessStarted}
 		info := inspectProcess(rec.PID)
 		if id.Matches(info) {
+			proof := processGroupProof{
+				Leader: id,
+				UID:    info.UID,
+				HasUID: info.HasUID,
+				SID:    info.SID,
+				Sess:   info.Sess,
+			}
 			extraNote := ""
 			if !rec.Unlimited && !rec.Deadline.IsZero() && !time.Now().Before(rec.Deadline) {
 				stopErr := stopVerifiedProcessGroup(id)
@@ -742,7 +748,31 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 					return job, nil
 				case stopErr == nil || errors.Is(stopErr, os.ErrProcessDone):
 					waitForAdoptedProcessGone(id, 2*time.Second)
-					_ = stopAdoptedProcessGroupAfterExit(id)
+					groupProof := proof
+					if stopErr == nil {
+						groupProof.ExitObservedAt = time.Now()
+					}
+					if gerr := stopAdoptedProcessGroupAfterExit(groupProof); errors.Is(gerr, ErrProcessIdentityMismatch) {
+						reason := fmt.Sprintf("refused to attach to PID %d: %v", id.PID, gerr)
+						if rec.FinishedAt.IsZero() {
+							rec.FinishedAt = time.Now()
+						}
+						summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
+						job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
+							Output:          summary,
+							Err:             errors.New(reason),
+							ExitCode:        -1,
+							ExitCodeUnknown: true,
+							Preview:         preview,
+						})
+						if jobsDir != "" {
+							_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+						}
+						return job, nil
+					} else if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
+						extraNote = fmt.Sprintf("deadline (%s) passed while harness was down, group stop failed (%v); ", rec.Deadline.UTC().Format(time.RFC3339), gerr)
+						break
+					}
 					timeoutDur := max(0, rec.Deadline.Sub(rec.Started))
 					timeoutErr := &timeoutError{timeout: timeoutDur}
 					note := fmt.Sprintf("adopted job PID %d (pgid %d) exceeded deadline (%s) while harness was down; stopped verified process group; %s",
@@ -793,11 +823,22 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 			waitCtx, cancelCause := context.WithCancelCause(context.Background())
 			note := fmt.Sprintf("adopted live OS process PID %d (pgid %d); %s%s", id.PID, id.PGID, extraNote, pipeCaptureEndedNote(rec.OutputFile))
 			job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
+			job.groupProof = proof
+			job.monitorDone = make(chan struct{})
 			job.cancel = func() { cancelCause(context.Canceled) }
-			job.closeCancel = func() {
-				_ = job.stopAdoptedProcess(ErrExecutorClosed, false)
+			job.closeStop = func() error {
+				stopErr := job.stopAdoptedProcess(ErrExecutorClosed, false)
+				if errors.Is(stopErr, ErrProcessIdentityMismatch) {
+					cancelCause(ErrProcessIdentityMismatch)
+					return stopErr
+				}
+				if stopErr != nil {
+					return stopErr
+				}
 				cancelCause(ErrExecutorClosed)
+				return nil
 			}
+			job.closeCancel = func() { _ = job.closeStop() }
 			if job.OutputFile != "" && e.OutputDir != "" {
 				e.markActiveOutput(e.OutputDir, job.OutputFile)
 			}
@@ -1036,10 +1077,19 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		if job.Status() != JobRunning && job.OutputFile != "" && job.outputDir != "" {
 			e.unmarkActiveOutput(job.outputDir, job.OutputFile)
 		}
+		if job.monitorDone != nil {
+			close(job.monitorDone)
+		}
 	}()
 	snap := job.Snapshot()
+	job.mu.Lock()
+	snapProof := job.groupProof
+	if snapProof.Leader == (ProcessIdentityInfo{}) {
+		snapProof.Leader = snap.Identity
+	}
+	job.mu.Unlock()
 
-	var timedOut atomic.Bool
+	var timedOut bool
 	var deadlineStopMu sync.Mutex
 	var deadlineStopErr error
 	if !snap.Unlimited && !snap.Deadline.IsZero() {
@@ -1050,17 +1100,20 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 			if job.Status() != JobRunning {
 				return
 			}
-			timedOut.Store(true)
+			deadlineStopMu.Lock()
+			if job.Status() != JobRunning {
+				deadlineStopMu.Unlock()
+				return
+			}
 			stopErr := job.stopAdoptedProcess(nil, true)
 			if errors.Is(stopErr, ErrProcessIdentityMismatch) {
+				deadlineStopMu.Unlock()
 				if cancelCause != nil {
 					cancelCause(ErrProcessIdentityMismatch)
 				}
 				return
 			}
 			if stopErr != nil {
-				timedOut.Store(false)
-				deadlineStopMu.Lock()
 				deadlineStopErr = stopErr
 				deadlineStopMu.Unlock()
 				if cancelCause != nil {
@@ -1068,6 +1121,7 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 				}
 				return
 			}
+			timedOut = true
 			if cancelCause != nil {
 				fallbackMu.Lock()
 				fallbackTimer = time.AfterFunc(2*time.Second, func() {
@@ -1075,6 +1129,7 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 				})
 				fallbackMu.Unlock()
 			}
+			deadlineStopMu.Unlock()
 		})
 		stopFn := func() {
 			timer.Stop()
@@ -1104,11 +1159,21 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
 		return
 	}
+
+	deadlineStopMu.Lock()
+	isTimedOut := timedOut
+	stopErr := deadlineStopErr
+	deadlineStopMu.Unlock()
+
 	if errors.Is(context.Cause(ctx), ErrExecutorClosed) {
-		_ = stopAdoptedProcessGroupAfterExit(snap.Identity)
+		if job.cleanupAdoptedGroupAfterExit(snapProof) {
+			return
+		}
 		err = ErrExecutorClosed
-	} else if timedOut.Load() {
-		_ = stopAdoptedProcessGroupAfterExit(snap.Identity)
+	} else if isTimedOut {
+		if job.cleanupAdoptedGroupAfterExit(snapProof) {
+			return
+		}
 		err = &timeoutError{timeout: max(0, snap.Deadline.Sub(snap.Started))}
 		exitCode = -1
 		exitKnown = false
@@ -1116,13 +1181,10 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		if !exitKnown && err == nil {
 			err = errAdoptedProcessExited
 		}
-		if gerr := stopAdoptedProcessGroupAfterExit(snap.Identity); gerr != nil && !errors.Is(gerr, os.ErrProcessDone) && !errors.Is(gerr, ErrProcessIdentityMismatch) {
-			err = errors.Join(err, fmt.Errorf("stop remaining bash processes: %w", gerr))
+		if job.cleanupAdoptedGroupAfterExit(snapProof) {
+			return
 		}
 	} else {
-		deadlineStopMu.Lock()
-		stopErr := deadlineStopErr
-		deadlineStopMu.Unlock()
 		waitErr := err
 		if stopErr != nil {
 			waitErr = stopErr
@@ -1181,9 +1243,24 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		Output:          summary,
 		Err:             err,
 		ExitCode:        exitCode,
-		ExitCodeUnknown: !exitKnown && !timedOut.Load(),
+		ExitCodeUnknown: !exitKnown && !isTimedOut,
 		Preview:         preview,
 	})
+}
+
+func (j *Job) cleanupAdoptedGroupAfterExit(proof processGroupProof) bool {
+	proof.ExitObservedAt = time.Now()
+	gerr := stopAdoptedProcessGroupAfterExit(proof)
+	if errors.Is(gerr, ErrProcessIdentityMismatch) {
+		summary, preview, _, _ := summarizeOutputFile(j.OutputFile, j.Cwd)
+		j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", proof.Leader.PID, gerr), summary, preview)
+		return true
+	}
+	if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
+		j.recordStopError(fmt.Errorf("stop remaining bash processes: %w", gerr))
+		return true
+	}
+	return false
 }
 
 // FormatRecoveredJobsSummary formats recovered jobs concisely for terminal and

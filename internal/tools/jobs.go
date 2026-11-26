@@ -58,6 +58,7 @@ type Job struct {
 	PID            int
 	PGID           int
 	ProcessStarted string
+	groupProof     processGroupProof
 	Adopted        bool
 	RecoveryNote   string
 	// OutputFile is the per-call file holding the full stdout+stderr
@@ -69,8 +70,10 @@ type Job struct {
 	WaitError    string
 	cancel       context.CancelFunc
 	closeCancel  context.CancelFunc
+	closeStop    func() error
 	stopParent   func() bool
 	stopDeadline func()
+	monitorDone  chan struct{}
 
 	jobsDir   string
 	outputDir string
@@ -423,9 +426,27 @@ func (j *Job) MarkReported() {
 // JobRegistry tracks every background job started by one Executor
 // (one process). Completed jobs stay listed so /jobs can show them.
 type JobRegistry struct {
-	mu   sync.Mutex
-	jobs []*Job
-	next int
+	mu       sync.Mutex
+	jobs     []*Job
+	next     int
+	abortGen uint64
+}
+
+func (r *JobRegistry) abortGeneration() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.abortGen
+}
+
+func (r *JobRegistry) cancelAll() {
+	r.mu.Lock()
+	r.abortGen++
+	jobs := make([]*Job, len(r.jobs))
+	copy(jobs, r.jobs)
+	r.mu.Unlock()
+	for _, job := range jobs {
+		job.Cancel()
+	}
 }
 
 func (r *JobRegistry) add(j *Job) {
@@ -451,7 +472,7 @@ func (r *JobRegistry) addWithSeq(j *Job, seq int) {
 	r.evictDelivered()
 }
 
-func (r *JobRegistry) addPreserved(j *Job) {
+func (r *JobRegistry) addPreserved(j *Job) uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if seq := jobSequenceNumber(j.ID); seq > r.next {
@@ -462,6 +483,7 @@ func (r *JobRegistry) addPreserved(j *Job) {
 	j.mu.Unlock()
 	r.jobs = append(r.jobs, j)
 	r.evictDelivered()
+	return r.abortGen
 }
 
 func (r *JobRegistry) listLocked() []*Job {
@@ -1017,6 +1039,11 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		output.Close()
 		return nil, ErrExecutorClosed
 	}
+	if e.jobs == nil {
+		e.jobs = &JobRegistry{}
+	}
+	reg := e.jobs
+	startAbortGen := reg.abortGeneration()
 	e.nextJobSeq++
 	seq := e.nextJobSeq
 	e.jobsMu.Unlock()
@@ -1039,6 +1066,9 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		job.ProcessStarted = proc.startToken
 		job.mu.Unlock()
 	}
+	if e.beforeJobPublish != nil {
+		e.beforeJobPublish()
+	}
 
 	e.jobsMu.Lock()
 	if e.jobsClosed {
@@ -1060,11 +1090,19 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		transferred = true
 		return nil, ErrExecutorClosed
 	}
-	if e.jobs == nil {
-		e.jobs = &JobRegistry{}
+	// Publish into the same registry captured before fork and check whether an
+	// abort cancelled that registry after startAbortGen was sampled. If so,
+	// cancel commandCtx here so in-progress launches cannot escape abort.
+	abortObserved := reg.addPreserved(job) != startAbortGen || ctx.Err() != nil
+	if abortObserved {
+		job.mu.Lock()
+		job.stopRequested = true
+		job.mu.Unlock()
 	}
-	e.jobs.addPreserved(job)
 	e.jobsMu.Unlock()
+	if abortObserved {
+		cancel()
+	}
 	job.persist()
 	transferred = true
 	go func() {
@@ -1139,6 +1177,20 @@ func (j *Job) CancelErr() error {
 	return nil
 }
 
+func (j *Job) recordStopError(err error) {
+	if err == nil {
+		return
+	}
+	j.mu.Lock()
+	if !j.finished && !j.unknown {
+		j.WaitError = err.Error()
+		j.RecoveryNote = fmt.Sprintf("adopted live OS process PID %d (pgid %d); stop error (%v) — job remains stoppable; %s",
+			j.PID, j.PGID, err, pipeCaptureEndedNote(j.OutputFile))
+	}
+	j.mu.Unlock()
+	j.persist()
+}
+
 func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	j.mu.Lock()
 	if j.finished || j.unknown {
@@ -1146,6 +1198,10 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 		return nil
 	}
 	id := ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
+	proof := j.groupProof
+	if proof.Leader == (ProcessIdentityInfo{}) {
+		proof.Leader = id
+	}
 	outFile, cwd, monitorFailed := j.OutputFile, j.Cwd, j.monitorFailed
 	execRef, outputDir, auditFn := j.exec, j.outputDir, j.audit
 	started, deadline := j.Started, j.Deadline
@@ -1158,22 +1214,33 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 		return err
 	}
 	if errors.Is(err, os.ErrProcessDone) {
-		gerr := stopAdoptedProcessGroupAfterExit(id)
+		proof.ExitObservedAt = time.Time{}
+		gerr := stopAdoptedProcessGroupAfterExit(proof)
 		if errors.Is(gerr, ErrProcessIdentityMismatch) {
 			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
 			j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr), summary, preview)
 			return gerr
 		}
 		if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
-			j.persist()
+			j.recordStopError(gerr)
 			return gerr
 		}
 	} else if err != nil {
-		j.persist()
+		j.recordStopError(err)
 		return err
 	} else if monitorFailed {
 		waitForAdoptedProcessGone(id, 2*time.Second)
-		_ = stopAdoptedProcessGroupAfterExit(id)
+		proof.ExitObservedAt = time.Now()
+		gerr := stopAdoptedProcessGroupAfterExit(proof)
+		if errors.Is(gerr, ErrProcessIdentityMismatch) {
+			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
+			j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr), summary, preview)
+			return gerr
+		}
+		if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
+			j.recordStopError(gerr)
+			return gerr
+		}
 	}
 	if monitorFailed {
 		summary, preview, _, hasFile := summarizeOutputFile(outFile, cwd)
@@ -1247,12 +1314,7 @@ func (e *Executor) CancelJobs() {
 // SessionCanceller captures the owning registry, so a delayed abort can never
 // cancel commands from a subsequently selected session.
 func (e *Executor) SessionCanceller() func() {
-	r := e.registry()
-	return func() {
-		for _, job := range r.List() {
-			job.Cancel()
-		}
-	}
+	return e.registry().cancelAll
 }
 
 // Jobs returns a snapshot of all background jobs for this Executor.

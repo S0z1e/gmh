@@ -33,63 +33,105 @@ func linuxBootID() string {
 }
 
 func inspectProcess(pid int) processInfo {
+	info, _ := inspectProcessErr(pid)
+	return info
+}
+
+type linuxProcMeta struct {
+	info       processInfo
+	ppid       int
+	startTicks uint64
+}
+
+func inspectLinuxProcMeta(pid int) (linuxProcMeta, error) {
 	if pid <= 0 {
-		return processInfo{}
+		return linuxProcMeta{}, nil
 	}
-	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	procDir := fmt.Sprintf("/proc/%d", pid)
+	stat, err := os.ReadFile(procDir + "/stat")
 	if err != nil {
-		return processInfo{}
+		if os.IsNotExist(err) || errors.Is(err, syscall.ESRCH) {
+			return linuxProcMeta{}, nil
+		}
+		return linuxProcMeta{}, err
 	}
 	end := strings.LastIndexByte(string(stat), ')')
 	if end < 0 {
-		return processInfo{}
+		return linuxProcMeta{}, nil
 	}
 	fields := strings.Fields(string(stat[end+1:]))
-	// fields[0] is state (field 3), fields[2] is pgrp (field 5),
+	// fields[0] is state (field 3), fields[1] is ppid (field 4),
+	// fields[2] is pgrp (field 5), fields[3] is session (field 6),
 	// fields[19] is starttime (field 22).
 	if len(fields) <= 19 {
-		return processInfo{}
+		return linuxProcMeta{}, nil
 	}
 	if fields[0] == "Z" || fields[0] == "X" || fields[0] == "x" {
-		return processInfo{Zombie: true}
+		return linuxProcMeta{info: processInfo{Zombie: true}}, nil
 	}
+	ppid, _ := strconv.Atoi(fields[1])
 	pgid, err := strconv.Atoi(fields[2])
 	if err != nil || pgid <= 0 {
 		pgid = 0
 	}
+	sid, _ := strconv.Atoi(fields[3])
+	startTicks, _ := strconv.ParseUint(fields[19], 10, 64)
 	token := fields[19]
 	if boot := linuxBootID(); boot != "" {
 		token = boot + ":" + fields[19]
 	}
-	return processInfo{
-		Alive:      true,
-		PGID:       pgid,
-		StartToken: token,
+	var uid uint32
+	var hasUID bool
+	if dirInfo, serr := os.Stat(procDir); serr == nil {
+		if st, ok := dirInfo.Sys().(*syscall.Stat_t); ok {
+			uid = st.Uid
+			hasUID = true
+		}
 	}
+	return linuxProcMeta{
+		info: processInfo{
+			Alive:      true,
+			PGID:       pgid,
+			StartToken: token,
+			UID:        uid,
+			HasUID:     hasUID,
+			SID:        sid,
+		},
+		ppid:       ppid,
+		startTicks: startTicks,
+	}, nil
+}
+
+func inspectProcessErr(pid int) (processInfo, error) {
+	meta, err := inspectLinuxProcMeta(pid)
+	return meta.info, err
+}
+
+func parseLinuxStartToken(token string) (bootID string, ticks uint64, ok bool) {
+	if b, t, found := strings.Cut(token, ":"); found {
+		v, err := strconv.ParseUint(t, 10, 64)
+		if err != nil {
+			return "", 0, false
+		}
+		return b, v, true
+	}
+	v, err := strconv.ParseUint(token, 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return "", v, true
 }
 
 func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	if !id.Valid() {
 		return ErrProcessIdentityMismatch
 	}
-	fd, err := unix.PidfdOpen(id.PID, 0)
-	if err == nil {
-		defer unix.Close(fd)
-	} else if errors.Is(err, unix.ESRCH) {
-		return os.ErrProcessDone
-	} else if !errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.EPERM) {
-		// Check identity even on restricted pidfd errors before giving up.
-		info := inspectProcess(id.PID)
-		if !info.Alive {
-			return os.ErrProcessDone
-		}
-		if !id.Matches(info) {
-			return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
-		}
+	// Verify via /proc and signal the process group without allocating a pidfd
+	// upfront, so descriptor exhaustion (EMFILE) does not block stopping.
+	info, err := inspectProcessErr(id.PID)
+	if err != nil {
 		return err
 	}
-
-	info := inspectProcess(id.PID)
 	if !info.Alive {
 		return os.ErrProcessDone
 	}
@@ -101,23 +143,98 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	} else if !errors.Is(kerr, syscall.ESRCH) {
 		return kerr
 	}
-	if fd >= 0 {
-		if kerr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); errors.Is(kerr, unix.ESRCH) {
-			return os.ErrProcessDone
-		} else {
-			return kerr
-		}
+	info2, err2 := inspectProcessErr(id.PID)
+	if err2 != nil {
+		return err2
 	}
-	return os.ErrProcessDone
+	if !info2.Alive {
+		return os.ErrProcessDone
+	}
+	if !id.Matches(info2) {
+		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+	}
+	fd, fdErr := unix.PidfdOpen(id.PID, 0)
+	if fdErr != nil {
+		if errors.Is(fdErr, unix.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return fdErr
+	}
+	defer unix.Close(fd)
+	if kerr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); errors.Is(kerr, unix.ESRCH) {
+		return os.ErrProcessDone
+	} else {
+		return kerr
+	}
 }
 
-func stopAdoptedProcessGroupAfterExit(id ProcessIdentityInfo) error {
+func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
+	id := proof.Leader
 	if !id.Valid() {
 		return ErrProcessIdentityMismatch
 	}
-	info := inspectProcess(id.PID)
+	leaderBoot, leaderTicks, hasLeaderStart := parseLinuxStartToken(id.StartToken)
+	if !hasLeaderStart {
+		return ErrProcessIdentityMismatch
+	}
+	info, err := inspectProcessErr(id.PID)
+	if err != nil {
+		return err
+	}
 	if info.Alive && !id.Matches(info) {
 		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return err
+	}
+	verifiedMembers := 0
+	directTied := false
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() || len(name) == 0 || name[0] < '0' || name[0] > '9' {
+			continue
+		}
+		pid, perr := strconv.Atoi(name)
+		if perr != nil || pid <= 0 {
+			continue
+		}
+		meta, merr := inspectLinuxProcMeta(pid)
+		if merr != nil {
+			return merr
+		}
+		if !meta.info.Alive || meta.info.PGID != id.PGID {
+			continue
+		}
+		if pid == id.PID {
+			if meta.info.StartToken != id.StartToken {
+				return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+			}
+			directTied = true
+		}
+		if proof.HasUID && meta.info.HasUID && meta.info.UID != proof.UID {
+			return fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+		}
+		if proof.SID > 0 && meta.info.SID != proof.SID {
+			return fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+		}
+		mBoot, _, _ := parseLinuxStartToken(meta.info.StartToken)
+		if leaderBoot != "" && mBoot != "" && mBoot != leaderBoot {
+			return fmt.Errorf("refusing to signal pgid %d: boot mismatch: %w", id.PGID, ErrProcessIdentityMismatch)
+		}
+		if meta.startTicks < leaderTicks {
+			return fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+		}
+		if proof.ExitObservedAt.IsZero() && meta.ppid == id.PID {
+			directTied = true
+		}
+		verifiedMembers++
+	}
+	if verifiedMembers == 0 {
+		return os.ErrProcessDone
+	}
+	if proof.ExitObservedAt.IsZero() && !directTied {
+		return fmt.Errorf("refusing to signal unverified pgid %d after leader disappeared: %w", id.PGID, ErrProcessIdentityMismatch)
 	}
 	if kerr := syscall.Kill(-id.PGID, syscall.SIGKILL); kerr == nil {
 		return nil
@@ -135,7 +252,10 @@ func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool,
 	fd, err := unix.PidfdOpen(id.PID, 0)
 	if err == nil {
 		defer unix.Close(fd)
-		info := inspectProcess(id.PID)
+		info, ierr := inspectProcessErr(id.PID)
+		if ierr != nil {
+			return -1, false, ierr
+		}
 		if !info.Alive {
 			return -1, false, errAdoptedProcessExited
 		}
@@ -173,7 +293,10 @@ func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool,
 		}
 	}
 	if errors.Is(err, unix.ESRCH) {
-		info := inspectProcess(id.PID)
+		info, ierr := inspectProcessErr(id.PID)
+		if ierr != nil {
+			return -1, false, ierr
+		}
 		if info.Alive && !id.Matches(info) {
 			return -1, false, ErrProcessIdentityMismatch
 		}
@@ -185,7 +308,10 @@ func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool,
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		info := inspectProcess(id.PID)
+		info, ierr := inspectProcessErr(id.PID)
+		if ierr != nil {
+			return -1, false, ierr
+		}
 		if !info.Alive {
 			return -1, false, errAdoptedProcessExited
 		}

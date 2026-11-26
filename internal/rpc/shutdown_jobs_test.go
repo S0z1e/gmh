@@ -3,6 +3,7 @@ package rpc
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -142,5 +143,46 @@ func TestRPCAbortCancelsRunningBackgroundJobs(t *testing.T) {
 	case <-job2.Done():
 	case <-time.After(3 * time.Second):
 		t.Fatal("idle RPC abort did not cancel the active session's background job")
+	}
+}
+
+func TestRPCAbortCancelsInProgressBackgroundLaunch(t *testing.T) {
+	for i := range 8 {
+		t.Run(fmt.Sprintf("iter-%d", i), func(t *testing.T) {
+			a, runner, _ := setupTestApp(t, "auto", []fakeStep{
+				{kind: "tool", tool: "bash", args: map[string]any{
+					"command":    "exec sleep 30",
+					"background": true,
+				}},
+				{kind: "text", text: "done", delay: 2 * time.Second},
+			})
+			d := startDriver(t, a, runner)
+			defer d.quit(t)
+			d.waitFor("ready", 2*time.Second)
+
+			d.send(map[string]any{"id": fmt.Sprintf("p-%d", i), "type": "prompt", "message": "run bg"})
+			d.waitFor("response", 2*time.Second)
+			d.waitFor("tool_start", 2*time.Second)
+
+			// Stagger abort across the fork/publish window of the background bash tool.
+			time.Sleep(time.Duration(i%4) * time.Millisecond)
+			d.send(map[string]any{"id": fmt.Sprintf("ab-%d", i), "type": "abort"})
+			_ = d.waitFor("response", 5*time.Second)
+			d.waitFor("agent_settled", 5*time.Second)
+
+			for _, job := range a.Cfg.Exec.Jobs() {
+				defer job.Cancel()
+				select {
+				case <-job.Done():
+				case <-time.After(3 * time.Second):
+					t.Fatalf("background job %s (PID %d) escaped abort", job.ID, job.PID)
+				}
+				if job.PID > 0 {
+					if _, _, alive := tools.ProcessIdentity(job.PID); alive {
+						t.Fatalf("aborted job %s PID %d still alive", job.ID, job.PID)
+					}
+				}
+			}
+		})
 	}
 }

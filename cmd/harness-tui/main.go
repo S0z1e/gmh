@@ -76,7 +76,7 @@ func main() {
 		Sandbox:                    *sandbox,
 		BashTimeoutSeconds:           *bashTO,
 		BackgroundThresholdSeconds:   *bgThresh,
-		BackgroundMaxLifetimeSeconds: bgMaxLifetimeParam(*bgMaxLifetime),
+		BackgroundMaxLifetimeSeconds: app.BackgroundMaxLifetimeSecondsFromFlag(*bgMaxLifetime),
 		Images:                       images,
 		Files:                      files,
 	})
@@ -218,16 +218,6 @@ func confirmStartupSteal(id string) bool {
 	default:
 		return false
 	}
-}
-
-func bgMaxLifetimeParam(flagVal int) int {
-	if flagVal == 0 {
-		return -1
-	}
-	if flagVal > 0 {
-		return flagVal
-	}
-	return 0
 }
 
 func fatal(err error) {

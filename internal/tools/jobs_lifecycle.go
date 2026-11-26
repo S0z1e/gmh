@@ -75,19 +75,30 @@ func (e *Executor) CloseJobs(ctx context.Context) error {
 	}
 	e.jobsMu.Unlock()
 	var cancelled []*Job
+	var closeStops []func() error
 	var stops []func()
+	var awaited []*Job
 	for _, job := range jobs {
 		job.mu.Lock()
 		if !job.finished && !job.unknown {
 			job.stopRequested = true
-			if job.closeCancel != nil {
+			if job.closeStop != nil {
+				closeStops = append(closeStops, job.closeStop)
+			} else if job.closeCancel != nil {
 				stops = append(stops, job.closeCancel)
 			} else if job.cancel != nil {
 				stops = append(stops, job.cancel)
 			}
 			cancelled = append(cancelled, job)
+			awaited = append(awaited, job)
 		}
 		job.mu.Unlock()
+	}
+	var closeErrs []error
+	for _, stop := range closeStops {
+		if err := stop(); err != nil {
+			closeErrs = append(closeErrs, err)
+		}
 	}
 	for _, stop := range stops {
 		stop()
@@ -102,15 +113,44 @@ func (e *Executor) CloseJobs(ctx context.Context) error {
 		select {
 		case <-run.done:
 		case <-ctx.Done():
-			return ctx.Err()
+			closeErrs = append(closeErrs, ctx.Err())
+			return errors.Join(closeErrs...)
 		}
 	}
-	for _, job := range jobs {
+	for _, job := range awaited {
+		if len(closeErrs) > 0 && job.Status() == JobRunning && job.monitorDone != nil {
+			// If stop already failed synchronously (WaitError recorded), don't
+			// block until ctx.Done() waiting for a job we couldn't stop.
+			job.mu.Lock()
+			hasWaitErr := job.WaitError != ""
+			job.mu.Unlock()
+			if hasWaitErr {
+				continue
+			}
+		}
+		if job.monitorDone != nil {
+			select {
+			case <-job.Done():
+			case <-job.monitorDone:
+				job.mu.Lock()
+				failed := !job.finished && !job.unknown && job.WaitError != ""
+				waitErr := job.WaitError
+				job.mu.Unlock()
+				if failed {
+					closeErrs = append(closeErrs, errors.New(waitErr))
+				}
+			case <-ctx.Done():
+				closeErrs = append(closeErrs, ctx.Err())
+				return errors.Join(closeErrs...)
+			}
+			continue
+		}
 		select {
 		case <-job.Done():
 		case <-ctx.Done():
-			return ctx.Err()
+			closeErrs = append(closeErrs, ctx.Err())
+			return errors.Join(closeErrs...)
 		}
 	}
-	return nil
+	return errors.Join(closeErrs...)
 }

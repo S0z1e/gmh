@@ -12,7 +12,7 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	return ErrProcessIdentityMismatch
 }
 
-func stopAdoptedProcessGroupAfterExit(id ProcessIdentityInfo) error {
+func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	return ErrProcessIdentityMismatch
 }
 

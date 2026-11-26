@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,10 @@ import (
 
 	"golang.org/x/sys/windows"
 )
+
+func isWindowsProcessMissing(err error) bool {
+	return errors.Is(err, windows.ERROR_INVALID_PARAMETER)
+}
 
 func processGroupID(pid int) int {
 	if pid <= 0 {
@@ -48,11 +53,17 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	}
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE, false, uint32(id.PID))
 	if err != nil {
-		return os.ErrProcessDone
+		if isWindowsProcessMissing(err) {
+			return os.ErrProcessDone
+		}
+		return err
 	}
 	defer windows.CloseHandle(h)
 	var code uint32
-	if err := windows.GetExitCodeProcess(h, &code); err != nil || code != 259 {
+	if err := windows.GetExitCodeProcess(h, &code); err != nil {
+		return err
+	}
+	if code != 259 {
 		return os.ErrProcessDone
 	}
 	var creation, exit, kernel, user windows.Filetime
@@ -75,8 +86,8 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	return nil
 }
 
-func stopAdoptedProcessGroupAfterExit(id ProcessIdentityInfo) error {
-	return stopVerifiedProcessGroup(id)
+func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
+	return stopVerifiedProcessGroup(proof.Leader)
 }
 
 func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {
@@ -85,7 +96,10 @@ func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool,
 	}
 	h, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(id.PID))
 	if err != nil {
-		return -1, false, errAdoptedProcessExited
+		if isWindowsProcessMissing(err) {
+			return -1, false, errAdoptedProcessExited
+		}
+		return -1, false, err
 	}
 	defer windows.CloseHandle(h)
 
