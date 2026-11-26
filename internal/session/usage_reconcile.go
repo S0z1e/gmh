@@ -235,6 +235,26 @@ func (s *Store) readUsageJournalLocked() (usageJournalView, error) {
 			view.damageReason = "journal line is not valid JSON"
 			break
 		}
+		if a.Version != 1 || (first && a.ID != "") || (!first && (a.ID == "" || a.Request.ID != a.ID)) {
+			view.damaged = true
+			view.damageReason = "invalid usage journal record"
+			break
+		}
+		if a.Request.Usage != nil && (!a.Request.Usage.Valid()) {
+			view.damaged = true
+			view.damageReason = "invalid or overflowing usage counters"
+			break
+		}
+		if a.InvalidUsage && (a.Request.Usage != nil || a.EstimateUSD != nil || a.ExactEstimateUSD != "") {
+			view.damaged = true
+			view.damageReason = "invalid usage marker"
+			break
+		}
+		if _, err := a.exactCost(); err != nil {
+			view.damaged = true
+			view.damageReason = err.Error()
+			break
+		}
 		if chain != nil {
 			chainStarted = true
 			previous = hashUsageRecord(append(append([]byte(nil), line...), '\n'))
@@ -420,5 +440,5 @@ func BlockingUsageError(artifacts []UsageArtifact) error {
 	if len(artifacts) == 0 {
 		return nil
 	}
-	return fmt.Errorf("strict metering blocked by %s; repair: harness usage-repair --session <id> --quarantine <artifact>", formatUsageArtifacts(artifacts))
+	return fmt.Errorf("strict metering blocked by %s; repair: harness usage-repair --root <project> --session <id> --quarantine <artifact>", formatUsageArtifacts(artifacts))
 }

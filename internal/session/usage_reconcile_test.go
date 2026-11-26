@@ -313,6 +313,9 @@ func TestNotDispatchedMarkerClearsOnReopen(t *testing.T) {
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("not-dispatched marker survived reopen: %v", err)
 	}
+	if totals.LegacyHistory || !totals.TokenCountsComplete() {
+		t.Fatalf("empty journal looked like legacy history: %+v", totals)
+	}
 	report, err := s.ReconcileUsage()
 	if err != nil || report.States[id] != usageStateNotDispatched || report.RecoveryGap {
 		t.Fatalf("%+v %v", report, err)
@@ -357,5 +360,43 @@ func TestDamagedJournalNamesArtifactAndQuarantinesIdempotently(t *testing.T) {
 	again, err := s.RepairUsage(UsageRepairQuarantine, path)
 	if err != nil || again.RecoveryGap {
 		t.Fatalf("second quarantine was not idempotent: %+v %v", again, err)
+	}
+}
+
+func TestQuarantineKeepsATornBackupBlocking(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("both", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 1)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	backup := path + "-torn-BACKUPID.bak"
+	if err := os.WriteFile(backup, []byte("torn"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	s.Close()
+	s, err = Open("both", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	report, err := s.RepairUsage(UsageRepairQuarantine, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.RecoveryGap || len(report.Artifacts) != 1 || report.Artifacts[0].Path != backup {
+		t.Fatalf("torn backup disappeared: %+v", report)
 	}
 }

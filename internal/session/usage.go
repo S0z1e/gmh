@@ -154,7 +154,11 @@ func (s *Store) loadUsageLocked() error {
 		if err != nil {
 			return err
 		}
-		artifacts := usageArtifactsLocked(s.usagePathLocked(), pending, nil)
+		backups, err := recoveryBackups(s.usagePathLocked())
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		artifacts := usageArtifactsLocked(s.usagePathLocked(), pending, backups)
 		s.usageTotals.RecoveryGap = len(artifacts) > 0
 		s.usageRecovery = UsageReconciliation{SessionID: s.ID, Artifacts: artifacts, RecoveryGap: s.usageTotals.RecoveryGap}
 		s.usageLoaded = true
@@ -249,7 +253,11 @@ func (s *Store) loadUsageLocked() error {
 		delete(pending, id)
 	}
 	if first {
-		totals.LegacyHistory = true
+		// An empty file is not history. It is created before the first request
+		// and must not look like a session that predates metering.
+		if info, statErr := f.Stat(); statErr == nil && info.Size() > 0 {
+			totals.LegacyHistory = true
+		}
 	}
 	s.usageChainOn = chainStarted
 	s.usageChainDigest = previous
