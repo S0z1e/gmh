@@ -23,11 +23,6 @@ func (r *Runner) RefreshUsage() error {
 		r.runBaseline = totals
 		r.runAccountingIncomplete = false
 	}
-	if r.App.Store.UsageWriteFailed() {
-		r.MeteringAvailable = false
-		r.runAccountingIncomplete = true
-		return fmt.Errorf("provider usage persistence failed; accounting incomplete for this writer")
-	}
 	r.MeteringAvailable = !r.runAccountingIncomplete
 	r.SessionMetering = totals
 	r.SessionUsage, r.SessionCost = totals.Usage, totals.EstimateUSD

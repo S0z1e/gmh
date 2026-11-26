@@ -250,6 +250,10 @@ func TestAppendFailureRecoversWriterWithoutDroppingEvidence(t *testing.T) {
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("committed marker survived recovery: %v", err)
 	}
+	totals, err = s.UsageTotals()
+	if err != nil || totals.Attempts != 2 {
+		t.Fatalf("next read did not recover the writer: %+v %v", totals, err)
+	}
 }
 
 func TestReconcileReportsCommittedState(t *testing.T) {
@@ -398,5 +402,8 @@ func TestQuarantineKeepsATornBackupBlocking(t *testing.T) {
 	}
 	if !report.RecoveryGap || len(report.Artifacts) != 1 || report.Artifacts[0].Path != backup {
 		t.Fatalf("torn backup disappeared: %+v", report)
+	}
+	if len(report.Quarantined) != 1 || report.Quarantined[0] != path {
+		t.Fatalf("quarantine was not audited: %+v", report.Quarantined)
 	}
 }

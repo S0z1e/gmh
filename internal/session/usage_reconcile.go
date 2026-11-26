@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"minimalharness/internal/llm"
 )
 
 const (
@@ -85,7 +87,9 @@ func (s *Store) ReconcileUsage() (UsageReconciliation, error) {
 		return UsageReconciliation{}, os.ErrClosed
 	}
 	if s.usageWriteFailed {
-		return UsageReconciliation{}, fmt.Errorf("usage persistence already failed; reopen before reconciliation")
+		if err := s.reopenUsageAfterWriteFailureLocked(); err != nil {
+			return UsageReconciliation{}, err
+		}
 	}
 	if err := s.loadUsageLocked(); err != nil {
 		return UsageReconciliation{}, err
@@ -196,6 +200,7 @@ func (s *Store) reconcileUsageLocked(action string) (UsageReconciliation, error)
 type usageJournalView struct {
 	ids          map[string]bool
 	sequences    int64
+	usage        llm.Usage
 	damaged      bool
 	damageReason string
 }
@@ -240,10 +245,18 @@ func (s *Store) readUsageJournalLocked() (usageJournalView, error) {
 			view.damageReason = "invalid usage journal record"
 			break
 		}
-		if a.Request.Usage != nil && (!a.Request.Usage.Valid()) {
+		if a.Request.Usage != nil && !a.Request.Usage.Valid() {
 			view.damaged = true
 			view.damageReason = "invalid or overflowing usage counters"
 			break
+		}
+		if !first && a.Request.Usage != nil && !view.usage.CanAdd(*a.Request.Usage) {
+			view.damaged = true
+			view.damageReason = "invalid or overflowing usage counters"
+			break
+		}
+		if !first && a.Request.Usage != nil {
+			view.usage.Add(*a.Request.Usage)
 		}
 		if a.InvalidUsage && (a.Request.Usage != nil || a.EstimateUSD != nil || a.ExactEstimateUSD != "") {
 			view.damaged = true
@@ -330,10 +343,19 @@ func (s *Store) RepairUsage(action, artifact string) (UsageReconciliation, error
 		}
 		s.usageLoaded = false
 		s.usageInfo = nil
+		s.usageTotals = UsageTotals{}
 		if err := s.loadUsageLocked(); err != nil && !errors.Is(err, errUsageDamaged) {
 			return UsageReconciliation{}, err
 		}
-		return s.reconcileUsageLocked(action)
+		report, err := s.reconcileUsageLocked(action)
+		if err != nil {
+			return UsageReconciliation{}, err
+		}
+		report.Quarantined = append(report.Quarantined, artifact)
+		if err := s.auditUsageActionLocked(action, report); err != nil {
+			return UsageReconciliation{}, err
+		}
+		return report, nil
 	default:
 		return UsageReconciliation{}, fmt.Errorf("unknown usage repair %q; use %s", action, usageRepairQuarantine)
 	}

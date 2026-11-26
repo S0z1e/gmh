@@ -32,6 +32,7 @@ type Store struct {
 	mu               sync.Mutex
 	closed           bool
 	usageWriteFailed bool
+	usageFailedTurn  bool
 	usageLoaded      bool
 	usageTotals      UsageTotals
 	usageInfo        os.FileInfo

@@ -137,6 +137,7 @@ func (s *Store) loadUsageLocked() error {
 	f, err := s.openUsageLocked(false)
 	if os.IsNotExist(err) {
 		// Existing histories predate metering. Keep that coverage gap visible.
+		s.usageTotals = UsageTotals{}
 		r, err := os.Open(s.Path)
 		if err != nil {
 			return err
@@ -289,7 +290,12 @@ func (s *Store) UsageTotals() (UsageTotals, error) {
 	// Keep this writer's accounting unavailable, even if reconciliation can read
 	// its previous valid prefix. Loading a different writer starts a new run.
 	if s.usageWriteFailed {
-		return UsageTotals{}, fmt.Errorf("provider usage persistence failed; accounting incomplete for this writer")
+		if !s.usageFailedTurn {
+			return UsageTotals{}, fmt.Errorf("provider usage persistence failed; accounting incomplete for this writer")
+		}
+		if err := s.reopenUsageAfterWriteFailureLocked(); err != nil {
+			return UsageTotals{}, err
+		}
 	}
 	if s.closed {
 		return UsageTotals{}, os.ErrClosed
@@ -310,6 +316,7 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 		if writeErr != nil && !recorded {
 			s.usageLoaded = false
 			s.usageWriteFailed = true
+			s.usageFailedTurn = false
 		}
 	}()
 	if s.usageWriteFailed {
@@ -568,6 +575,7 @@ func (s *Store) reopenUsageAfterWriteFailureLocked() error {
 	s.usageLoaded = false
 	s.usageInfo = nil
 	s.usageWriteFailed = false
+	s.usageFailedTurn = true
 	if err := s.loadUsageLocked(); err != nil {
 		s.usageWriteFailed = true
 		return fmt.Errorf("provider usage persistence failed; accounting incomplete for this writer: %w", err)
@@ -575,12 +583,4 @@ func (s *Store) reopenUsageAfterWriteFailureLocked() error {
 	// The failed call may have cleared the loaded flag without refreshing the
 	// totals. A successful reopen replaces both.
 	return nil
-}
-
-// UsageWriteFailed reports that this process lost an append. A later call
-// reopens the writer; until then the published totals are not complete.
-func (s *Store) UsageWriteFailed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.usageWriteFailed
 }
