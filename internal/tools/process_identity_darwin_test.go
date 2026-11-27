@@ -1240,3 +1240,157 @@ func TestDarwinInitialRecoveryPreservesLegacyJobOnInspectError(t *testing.T) {
 		t.Fatalf("target pid %d still alive after StopJob", targetPID)
 	}
 }
+
+func TestDarwinMismatchRetryTracksNewlyVerifiedChildAndKeepsPending(t *testing.T) {
+	tmpDir := t.TempDir()
+	childAPIDFile := filepath.Join(tmpDir, "childA.pid")
+	childCPIDFile := filepath.Join(tmpDir, "childC.pid")
+	// Spawn one bash parent childA (pid written to childAPIDFile) that spawns
+	// childC (pid written to childCPIDFile) while childA waits, keeping
+	// childA alive as childC's verified parent after groupCmd exits.
+	groupCmd := exec.Command("bash", "-c", fmt.Sprintf(
+		"bash -c 'sleep 30 & echo $! > %q; wait' & echo $! > %q",
+		childCPIDFile, childAPIDFile,
+	))
+	configureProcess(groupCmd)
+	if err := groupCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := groupCmd.Process.Pid
+	leaderInfo := inspectProcess(leaderPID)
+	readPID := func(path string) int {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if b, err := os.ReadFile(path); err == nil {
+				if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+					return p
+				}
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for pid file %s", path)
+		return 0
+	}
+	childAPID := readPID(childAPIDFile)
+	childCPID := readPID(childCPIDFile)
+	_ = groupCmd.Wait()
+	t.Cleanup(func() {
+		for _, pid := range []int{childAPID, childCPID} {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+
+	infoA := inspectProcess(childAPID)
+	infoC := inspectProcess(childCPID)
+	if !infoA.Alive || !infoC.Alive {
+		t.Fatalf("children not alive: A=%+v C=%+v", infoA, infoC)
+	}
+	if infoA.PGID != infoC.PGID {
+		t.Fatalf("expected shared PGID: A=%+v C=%+v", infoA, infoC)
+	}
+
+	intruderCmd := exec.Command("sleep", "30")
+	configureProcess(intruderCmd)
+	if err := intruderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	intruderPID := intruderCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(intruderPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = intruderCmd.Wait()
+	})
+	intruderSlice, err := unix.SysctlKinfoProcSlice("kern.proc.pid", intruderPID)
+	if err != nil || len(intruderSlice) == 0 {
+		t.Fatalf("sysctl intruder pid %d failed: %v", intruderPID, err)
+	}
+	intruderProc := intruderSlice[0]
+	intruderProc.Eproc.Ucred.Uid = infoA.UID + 1
+	intruderProc.Eproc.Pgid = int32(infoA.PGID)
+
+	origSlice := darwinSysctlKinfoProcSliceFn
+	origInspect := inspectProcessErrFn
+	t.Cleanup(func() {
+		darwinSysctlKinfoProcSliceFn = origSlice
+		inspectProcessErrFn = origInspect
+	})
+
+	var blockC atomic.Bool
+	blockC.Store(true)
+	darwinSysctlKinfoProcSliceFn = func(name string, args ...int) ([]unix.KinfoProc, error) {
+		procs, err := origSlice(name, args...)
+		if err != nil {
+			return nil, err
+		}
+		if name == "kern.proc.pgrp" && len(args) == 1 && args[0] == infoA.PGID {
+			// Put mismatched intruder BEFORE real members so the scan hits a
+			// mismatch before reaching newly forked childC.
+			if inspectProcess(intruderPID).Alive {
+				return append([]unix.KinfoProc{intruderProc}, procs...), nil
+			}
+		}
+		return procs, nil
+	}
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, nil
+		}
+		if pid == childCPID && blockC.Load() {
+			return processInfo{}, syscall.EACCES
+		}
+		return origInspect(pid)
+	}
+
+	leaderTok := leaderInfo.StartToken
+	if leaderTok == "" {
+		leaderTok = infoA.StartToken
+	}
+	proof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: infoA.PGID, StartToken: leaderTok},
+		UID:            infoA.UID,
+		HasUID:         true,
+		SID:            infoA.SID,
+		Sess:           infoA.Sess,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers: map[int]string{
+			leaderPID: leaderTok,
+			childAPID: infoA.StartToken,
+		},
+	}
+
+	if err := stopAdoptedProcessGroupAfterExitTrack(&proof); !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want EACCES while newly verified childC cannot be inspected", err)
+	}
+	if proof.KnownMembers[childCPID] != infoC.StartToken {
+		t.Fatalf("expected newly verified childC (%d) retained in proof.KnownMembers: %+v", childCPID, proof.KnownMembers)
+	}
+	for wait := 0; wait < 20 && inspectProcess(childAPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childAPID).Alive {
+		t.Fatalf("childA pid %d survived cleanup", childAPID)
+	}
+	if !inspectProcess(childCPID).Alive {
+		t.Fatalf("childC pid %d should remain alive under EACCES", childCPID)
+	}
+	if !inspectProcess(intruderPID).Alive {
+		t.Fatalf("intruder pid %d was killed unexpectedly", intruderPID)
+	}
+
+	// Clearing EACCES and retrying finishes stopping newly verified childC cleanly.
+	blockC.Store(false)
+	if rerr := stopAdoptedProcessGroupAfterExitTrack(&proof); rerr != nil {
+		t.Fatalf("retry stopAdoptedProcessGroupAfterExitTrack err = %v, want nil", rerr)
+	}
+	for wait := 0; wait < 20 && inspectProcess(childCPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childCPID).Alive {
+		t.Fatalf("newly verified childC pid %d survived mismatch retry", childCPID)
+	}
+	if !inspectProcess(intruderPID).Alive {
+		t.Fatalf("intruder pid %d was killed unexpectedly on retry", intruderPID)
+	}
+}

@@ -155,6 +155,12 @@ func isFDLimitErr(err error) bool {
 	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
 }
 
+func recordFirstMismatch(dst *error, err error) {
+	if dst != nil && *dst == nil && err != nil {
+		*dst = err
+	}
+}
+
 func waitForKnownMembersExit(id ProcessIdentityInfo, signalErr error, checkLive func() (bool, error)) error {
 	var lastLiveErr error
 	for i := 0; i < 20; i++ {

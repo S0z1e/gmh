@@ -1486,8 +1486,8 @@ func TestLinuxMismatchRetryTracksNewlyVerifiedChildAndKeepsPending(t *testing.T)
 	childCPIDFile := filepath.Join(tmpDir, "childC.pid")
 	jobTok := "linux-mismatch-scanproof-tok"
 	groupCmd := exec.Command("bash", "-c", fmt.Sprintf(
-		"sleep 30 & echo $! > %q; sleep 30 & echo $! > %q; sleep 30 & echo $! > %q",
-		childAPIDFile, childBPIDFile, childCPIDFile,
+		"sleep 30 & echo $! > %q; env -u %s sleep 30 & echo $! > %q; sleep 30 & echo $! > %q",
+		childAPIDFile, jobTokenEnvVar, childBPIDFile, childCPIDFile,
 	))
 	groupCmd.Env = append(os.Environ(), jobTokenEnvVar+"="+jobTok)
 	configureProcess(groupCmd)
@@ -1543,6 +1543,7 @@ func TestLinuxMismatchRetryTracksNewlyVerifiedChildAndKeepsPending(t *testing.T)
 	pidfdOpenFn = func(int, int) (int, error) {
 		return -1, syscall.ENOSYS
 	}
+	var reusedB atomic.Bool
 	inspectProcessErrFn = func(pid int) (processInfo, error) {
 		if pid == leaderPID {
 			return processInfo{}, nil
@@ -1553,7 +1554,11 @@ func TestLinuxMismatchRetryTracksNewlyVerifiedChildAndKeepsPending(t *testing.T)
 		if pid == leaderPID {
 			return linuxProcMeta{}, nil
 		}
-		return origInspectMeta(pid)
+		m, err := origInspectMeta(pid)
+		if err == nil && pid == childBPID && m.info.Alive && reusedB.Load() {
+			m.info.StartToken = m.info.StartToken + "-reused"
+		}
+		return m, err
 	}
 
 	var blockC atomic.Bool
@@ -1564,8 +1569,10 @@ func TestLinuxMismatchRetryTracksNewlyVerifiedChildAndKeepsPending(t *testing.T)
 		}
 		fd, m, err := origOpenHandle(pid)
 		if err == nil && pid == childBPID && m.info.Alive {
-			// Simulate childB PID reuse during revalidation while childC (newly
-			// discovered via JobToken) must stay in scope across mismatch retry.
+			// Model childB exiting and its PID being replaced by an unrelated
+			// process from handle revalidation onward across both proc handle and
+			// subsequent /proc lookups.
+			reusedB.Store(true)
 			m.info.StartToken = m.info.StartToken + "-reused"
 		}
 		return fd, m, err

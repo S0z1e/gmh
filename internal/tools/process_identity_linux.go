@@ -681,28 +681,20 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 			verified = true
 		}
 		if proof.HasUID && meta.info.HasUID && meta.info.UID != proof.UID {
-			if mismatchErr == nil {
-				mismatchErr = fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
-			}
+			recordFirstMismatch(&mismatchErr, fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch))
 			continue
 		}
 		if proof.SID > 0 && meta.info.SID != proof.SID {
-			if mismatchErr == nil {
-				mismatchErr = fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
-			}
+			recordFirstMismatch(&mismatchErr, fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch))
 			continue
 		}
 		mBoot, _, _ := parseLinuxStartToken(meta.info.StartToken)
 		if leaderBoot != "" && mBoot != "" && mBoot != leaderBoot {
-			if mismatchErr == nil {
-				mismatchErr = fmt.Errorf("refusing to signal pgid %d: boot mismatch: %w", id.PGID, ErrProcessIdentityMismatch)
-			}
+			recordFirstMismatch(&mismatchErr, fmt.Errorf("refusing to signal pgid %d: boot mismatch: %w", id.PGID, ErrProcessIdentityMismatch))
 			continue
 		}
 		if meta.startTicks < leaderTicks {
-			if mismatchErr == nil {
-				mismatchErr = fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
-			}
+			recordFirstMismatch(&mismatchErr, fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch))
 			continue
 		}
 		if proof.KnownMembers[pid] == meta.info.StartToken {
@@ -767,7 +759,7 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 			break
 		}
 	}
-	return candidates, handleErr, nil
+	return candidates, handleErr, mismatchErr
 }
 
 func classifyCachedMemberFD(proof processGroupProof, pid int, tok string) (hasFD, alive bool, err error) {
@@ -936,9 +928,15 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 		return false, ErrProcessIdentityMismatch
 	}
 	cloned := cloneGroupProof(proof)
+	cloned.verifiedFDs = proof.verifiedFDs
 	candidates, handleErr, mismatchErr := collectAndVerifyLinuxCandidates(&cloned, id, leaderBoot, leaderTicks)
 	if mismatchErr != nil {
-		if ok, lerr := hasVerifiedLiveKnownMemberLinux(proof); ok {
+		for _, c := range candidates {
+			if c.verified {
+				return true, nil
+			}
+		}
+		if ok, lerr := hasVerifiedLiveKnownMemberLinux(cloned); ok {
 			return true, nil
 		} else if lerr != nil {
 			return false, lerr
@@ -950,7 +948,7 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 			return true, nil
 		}
 	}
-	if ok, lerr := hasVerifiedLiveKnownMemberLinux(proof); ok {
+	if ok, lerr := hasVerifiedLiveKnownMemberLinux(cloned); ok {
 		return true, nil
 	} else if lerr != nil {
 		return false, lerr
@@ -1122,9 +1120,7 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 		if !cand.verified && !proof.ExitObservedAt.IsZero() && hasBoot {
 			memberStart := time.Unix(bootSec+int64(meta.startTicks/100), int64((meta.startTicks%100)*10_000_000))
 			if memberStart.After(proof.ExitObservedAt.Add(2 * time.Second)) {
-				if revalMismatchErr == nil {
-					revalMismatchErr = fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, pid, ErrProcessIdentityMismatch)
-				}
+				recordFirstMismatch(&revalMismatchErr, fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, pid, ErrProcessIdentityMismatch))
 				liveMembers++
 				unverifiedMembers++
 				continue
@@ -1182,9 +1178,7 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 		}
 		if meta2.info.StartToken != meta.info.StartToken {
 			_ = unix.Close(fd)
-			if revalMismatchErr == nil {
-				revalMismatchErr = fmt.Errorf("refusing to signal pid %d: %w", pid, ErrProcessIdentityMismatch)
-			}
+			recordFirstMismatch(&revalMismatchErr, fmt.Errorf("refusing to signal pid %d: %w", pid, ErrProcessIdentityMismatch))
 			continue
 		}
 		openedFDs = append(openedFDs, fd)
@@ -1210,9 +1204,7 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 			break
 		}
 		if errors.Is(serr, ErrProcessIdentityMismatch) {
-			if revalMismatchErr == nil {
-				revalMismatchErr = serr
-			}
+			recordFirstMismatch(&revalMismatchErr, serr)
 			continue
 		}
 		if serr != nil {

@@ -204,12 +204,16 @@ func darwinResolveGroupKillError(pgid int, err error) error {
 
 func darwinResolveGroupCandidates(proof processGroupProof, id ProcessIdentityInfo, leaderSec int64, leaderUsec int32, procs []unix.KinfoProc) (known map[int]string, liveCount int, err error) {
 	known = mergeGroupMembers(nil, proof.KnownMembers)
+	eligible := make(map[int]bool, len(procs))
+	inProcs := make(map[int]bool, len(procs))
+	var mismatchErr error
 	for _, p := range procs {
 		if p.Proc.P_stat == 5 {
 			continue
 		}
 		liveCount++
 		pid := int(p.Proc.P_pid)
+		inProcs[pid] = true
 		pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
 		tok := fmt.Sprintf("%d:%d", pSec, pUsec)
 		if pid == id.PID {
@@ -219,19 +223,24 @@ func darwinResolveGroupCandidates(proof processGroupProof, id ProcessIdentityInf
 			known[pid] = tok
 		}
 		if proof.HasUID && p.Eproc.Ucred.Uid != proof.UID {
-			return nil, liveCount, fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+			recordFirstMismatch(&mismatchErr, fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch))
+			continue
 		}
 		if proof.Sess != 0 && p.Eproc.Sess != proof.Sess {
-			return nil, liveCount, fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+			recordFirstMismatch(&mismatchErr, fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch))
+			continue
 		}
 		if proof.SID > 0 {
 			if msid, serr := unix.Getsid(pid); serr == nil && msid != proof.SID {
-				return nil, liveCount, fmt.Errorf("refusing to signal pgid %d: member pid %d sid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+				recordFirstMismatch(&mismatchErr, fmt.Errorf("refusing to signal pgid %d: member pid %d sid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch))
+				continue
 			}
 		}
 		if darwinStartTimeBefore(pSec, pUsec, leaderSec, leaderUsec) {
-			return nil, liveCount, fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+			recordFirstMismatch(&mismatchErr, fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch))
+			continue
 		}
+		eligible[pid] = true
 	}
 	// Resolve descendant ancestry transitively so multi-hop children forked after
 	// leader exit (c1 -> c2 -> c3) inherit verification across hops.
@@ -242,6 +251,9 @@ func darwinResolveGroupCandidates(proof processGroupProof, id ProcessIdentityInf
 				continue
 			}
 			pid := int(p.Proc.P_pid)
+			if !eligible[pid] {
+				continue
+			}
 			pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
 			tok := fmt.Sprintf("%d:%d", pSec, pUsec)
 			if existing, ok := known[pid]; ok && existing == tok {
@@ -251,7 +263,7 @@ func darwinResolveGroupCandidates(proof processGroupProof, id ProcessIdentityInf
 			if ppid == id.PID {
 				known[pid] = tok
 				added = true
-			} else if parentTok, ok := known[ppid]; ok {
+			} else if parentTok, ok := known[ppid]; ok && (!inProcs[ppid] || eligible[ppid]) {
 				parentSec, parentUsec, parsed := parseDarwinStartTime(parentTok)
 				if parsed && !darwinStartTimeBefore(pSec, pUsec, parentSec, parentUsec) {
 					known[pid] = tok
@@ -263,7 +275,7 @@ func darwinResolveGroupCandidates(proof processGroupProof, id ProcessIdentityInf
 			break
 		}
 	}
-	return known, liveCount, nil
+	return known, liveCount, mismatchErr
 }
 
 func darwinMatchesKnownMember(proof processGroupProof, id ProcessIdentityInfo, info processInfo, tok string) bool {
@@ -323,7 +335,9 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 	}
 	known, liveCount, err := darwinResolveGroupCandidates(proof, id, leaderSec, leaderUsec, procs)
 	if err != nil {
-		if live, lerr := hasVerifiedLiveKnownMemberDarwin(proof); live {
+		scanProof := cloneGroupProof(proof)
+		scanProof.KnownMembers = mergeGroupMembers(scanProof.KnownMembers, known)
+		if live, lerr := hasVerifiedLiveKnownMemberDarwin(scanProof); live {
 			return true, nil
 		} else if lerr != nil {
 			return false, lerr
@@ -418,6 +432,7 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	}
 
 	known, liveCount, cerr := darwinResolveGroupCandidates(*proof, id, leaderSec, leaderUsec, procs)
+	proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, known)
 	if cerr != nil {
 		sig, serr := darwinSignalVerifiedKnownMembers(*proof, id)
 		if leaderErr != nil && isProcessAccessError(leaderErr) {
@@ -440,7 +455,6 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 		}
 		return os.ErrProcessDone
 	}
-	proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, known)
 
 	groupVerified := false
 	hasSetsidProof := !proof.VerifiedAt.IsZero() && proof.SID > 0 && proof.SID == id.PID && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken
