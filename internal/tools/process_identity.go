@@ -8,6 +8,12 @@ import (
 
 const jobTokenEnvVar = "GMH_JOB_TOKEN"
 
+var (
+	inspectProcessErrFn          = inspectProcessErr
+	stopVerifiedProcessGroupFn   = stopVerifiedProcessGroupWithProof
+	hasVerifiedLiveGroupMemberFn = hasVerifiedLiveGroupMember
+)
+
 // ErrProcessIdentityMismatch reports that an OS process ID no longer matches the
 // recorded process group or OS start token (such as after PID reuse).
 var ErrProcessIdentityMismatch = errors.New("process identity mismatch")

@@ -121,7 +121,7 @@ func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
 	if !id.Matches(info) {
 		return nil
 	}
-	procs, err := unix.SysctlKinfoProcSlice("kern.proc.pgrp", id.PGID)
+	procs, err := darwinSysctlKinfoProcSliceFn("kern.proc.pgrp", id.PGID)
 	if err != nil {
 		return map[int]string{id.PID: id.StartToken}
 	}
@@ -182,7 +182,7 @@ func darwinResolveGroupKillError(pgid int, err error) error {
 	}
 	// On XNU, signalling a process group whose remaining members just entered
 	// teardown or were reaped can fail with EPERM instead of ESRCH.
-	procs, queryErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", pgid)
+	procs, queryErr := darwinSysctlKinfoProcSliceFn("kern.proc.pgrp", pgid)
 	if errors.Is(queryErr, unix.ESRCH) {
 		return os.ErrProcessDone
 	}
@@ -271,7 +271,7 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 	if !hasLeaderStart {
 		return false, ErrProcessIdentityMismatch
 	}
-	procs, queryErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", id.PGID)
+	procs, queryErr := darwinSysctlKinfoProcSliceFn("kern.proc.pgrp", id.PGID)
 	if errors.Is(queryErr, unix.ESRCH) {
 		return false, nil
 	}
@@ -329,7 +329,7 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	if info.Alive && !id.Matches(info) {
 		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 	}
-	procs, queryErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", id.PGID)
+	procs, queryErr := darwinSysctlKinfoProcSliceFn("kern.proc.pgrp", id.PGID)
 	if errors.Is(queryErr, unix.ESRCH) {
 		return os.ErrProcessDone
 	}

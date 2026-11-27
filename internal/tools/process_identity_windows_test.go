@@ -3,8 +3,11 @@
 package tools
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -341,4 +344,217 @@ func TestStopAdoptedWindowsGroupContinuesAfterLeaderPIDRecycled(t *testing.T) {
 	if replacementSignalled {
 		t.Fatal("replacement process at leader PID or its child must never be signalled")
 	}
+}
+
+func TestWindowsRecoveryAndStopAdoptedContinueAfterLeaderPIDReused(t *testing.T) {
+	base := time.Unix(1700000500, 0)
+	leaderTok, _ := windowsTokenAt(base)
+	childTok, childNs := windowsTokenAt(base.Add(1 * time.Second))
+	replacementTok, replacementNs := windowsTokenAt(base.Add(10 * time.Second))
+
+	t.Run("resolveRecoveredJob_routes_reused_leader_pid_to_cleanup", func(t *testing.T) {
+		root := t.TempDir()
+		sessionBase := t.TempDir()
+		outID := "sess-win-reused-recover"
+		outDir := filepath.Join(sessionBase, outID, "bash-output")
+		jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+		if err := os.MkdirAll(outDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(jobsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		outFile := filepath.Join(outDir, "bash-1.log")
+		if err := os.WriteFile(outFile, []byte("out\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		rec := PersistedJob{
+			ID:             "bg-1",
+			OutputID:       outID,
+			Command:        "sleep 30",
+			Cwd:            root,
+			OutputFile:     outFile,
+			Started:        base,
+			Deadline:       base.Add(10 * time.Minute),
+			PID:            100,
+			PGID:           100,
+			ProcessStarted: leaderTok,
+			Status:         JobRunning,
+			GroupProof: &PersistedGroupProof{
+				VerifiedAt:     base.Add(2 * time.Second),
+				CleanupPending: true,
+				KnownMembers: map[int]string{
+					100: leaderTok,
+					201: childTok,
+				},
+			},
+		}
+		if err := savePersistedJob(jobsDir, rec); err != nil {
+			t.Fatal(err)
+		}
+
+		origInspectErr := inspectProcessErrFn
+		origSnap := snapshotWindowsProcessesFn
+		origTerm := terminateWindowsProcessFn
+		defer func() {
+			inspectProcessErrFn = origInspectErr
+			snapshotWindowsProcessesFn = origSnap
+			terminateWindowsProcessFn = origTerm
+		}()
+
+		// Recovery sees an unrelated live replacement occupying leader PID 100.
+		inspectProcessErrFn = func(pid int) (processInfo, error) {
+			if pid == 100 {
+				return processInfo{Alive: true, PGID: 100, StartToken: replacementTok}, nil
+			}
+			return processInfo{}, nil
+		}
+
+		var childSignalled, replacementSignalled bool
+		pass := 0
+		snapshotWindowsProcessesFn = func(ln int64, jobTok string, jobHandle uintptr) ([]windowsProcEntry, error) {
+			pass++
+			if pass == 1 {
+				return []windowsProcEntry{
+					{pid: 100, ppid: 50, startToken: replacementTok, startNs: replacementNs},
+					{pid: 201, ppid: 100, startToken: childTok, startNs: childNs},
+				}, nil
+			}
+			return []windowsProcEntry{
+				{pid: 100, ppid: 50, startToken: replacementTok, startNs: replacementNs},
+			}, nil
+		}
+		terminateWindowsProcessFn = func(cand windowsProcEntry, expectedToken string, jobHandle uintptr) (bool, error) {
+			if cand.pid == 100 {
+				replacementSignalled = true
+				return false, fmt.Errorf("unexpectedly signalled replacement pid 100")
+			}
+			if cand.pid == 201 {
+				childSignalled = true
+				return true, nil
+			}
+			return false, nil
+		}
+
+		exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+		exec2.SwitchSession(outID)
+		defer exec2.CloseJobs(context.Background())
+
+		recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+		if err != nil || len(recovered) != 1 {
+			t.Fatalf("RecoverSessionJobs = %+v, err=%v", recovered, err)
+		}
+		if recovered[0].Status != JobDone {
+			t.Fatalf("status = %q, want done after cleaning surviving child past leader PID reuse", recovered[0].Status)
+		}
+		if !childSignalled {
+			t.Fatal("surviving child 201 was not signalled during recovery")
+		}
+		if replacementSignalled {
+			t.Fatal("replacement process 100 was wrongly signalled")
+		}
+	})
+
+	t.Run("stopAdoptedProcess_routes_leader_mismatch_to_member_cleanup", func(t *testing.T) {
+		root := t.TempDir()
+		outDir := filepath.Join(root, "out")
+		jobsDir := filepath.Join(root, "jobs")
+		if err := os.MkdirAll(outDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(jobsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		outFile := filepath.Join(outDir, "bash-1.log")
+		if err := os.WriteFile(outFile, []byte("out\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: "sess-win-stop", JobsDir: jobsDir}
+		exec2.SwitchSession("sess-win-stop")
+		defer exec2.CloseJobs(context.Background())
+
+		rec := PersistedJob{
+			ID:             "bg-1",
+			OutputID:       "sess-win-stop",
+			Command:        "sleep 30",
+			Cwd:            root,
+			OutputFile:     outFile,
+			Started:        base,
+			Deadline:       base.Add(10 * time.Minute),
+			PID:            100,
+			PGID:           100,
+			ProcessStarted: leaderTok,
+			Status:         JobRunning,
+		}
+		job := exec2.newRecoveredJobObject(rec, jobsDir, JobRunning, false, true, "adopted", JobResult{})
+		job.monitorFailed = true
+		job.groupProof = processGroupProof{
+			Leader:     ProcessIdentityInfo{PID: 100, PGID: 100, StartToken: leaderTok},
+			VerifiedAt: base.Add(2 * time.Second),
+			KnownMembers: map[int]string{
+				100: leaderTok,
+				201: childTok,
+			},
+		}
+
+		origStopGroup := stopVerifiedProcessGroupFn
+		origInspect := inspectWindowsProcessFn
+		origSnap := snapshotWindowsProcessesFn
+		origTerm := terminateWindowsProcessFn
+		defer func() {
+			stopVerifiedProcessGroupFn = origStopGroup
+			inspectWindowsProcessFn = origInspect
+			snapshotWindowsProcessesFn = origSnap
+			terminateWindowsProcessFn = origTerm
+		}()
+
+		stopVerifiedProcessGroupFn = func(proof processGroupProof) error {
+			return fmt.Errorf("refusing to signal pid %d: %w", proof.Leader.PID, ErrProcessIdentityMismatch)
+		}
+		inspectWindowsProcessFn = func(pid int) (processInfo, error) {
+			if pid == 100 {
+				return processInfo{Alive: true, PGID: 100, StartToken: replacementTok}, nil
+			}
+			return processInfo{}, nil
+		}
+		var childSignalled, replacementSignalled bool
+		pass := 0
+		snapshotWindowsProcessesFn = func(ln int64, jobTok string, jobHandle uintptr) ([]windowsProcEntry, error) {
+			pass++
+			if pass == 1 {
+				return []windowsProcEntry{
+					{pid: 100, ppid: 50, startToken: replacementTok, startNs: replacementNs},
+					{pid: 201, ppid: 100, startToken: childTok, startNs: childNs},
+				}, nil
+			}
+			return []windowsProcEntry{
+				{pid: 100, ppid: 50, startToken: replacementTok, startNs: replacementNs},
+			}, nil
+		}
+		terminateWindowsProcessFn = func(cand windowsProcEntry, expectedToken string, jobHandle uintptr) (bool, error) {
+			if cand.pid == 100 {
+				replacementSignalled = true
+				return false, fmt.Errorf("unexpectedly signalled replacement pid 100")
+			}
+			if cand.pid == 201 {
+				childSignalled = true
+				return true, nil
+			}
+			return false, nil
+		}
+
+		if err := job.stopAdoptedProcess(nil, false); err != nil {
+			t.Fatalf("stopAdoptedProcess err = %v, want nil", err)
+		}
+		if job.Status() != JobDone {
+			t.Fatalf("job status = %q, want done", job.Status())
+		}
+		if !childSignalled {
+			t.Fatal("surviving child 201 was not signalled after leader mismatch")
+		}
+		if replacementSignalled {
+			t.Fatal("replacement process 100 was wrongly signalled")
+		}
+	})
 }

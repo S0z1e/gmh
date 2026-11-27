@@ -777,7 +777,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 		rec.OutputReceipt = ""
 		id := ProcessIdentityInfo{PID: rec.PID, PGID: rec.PGID, StartToken: rec.ProcessStarted}
 		expiredDuringDowntime := !rec.Unlimited && !rec.Deadline.IsZero() && !time.Now().Before(rec.Deadline)
-		info, inspectErr := inspectProcessErr(rec.PID)
+		info, inspectErr := inspectProcessErrFn(rec.PID)
 		if inspectErr != nil && id.Valid() {
 			proof := groupProofFromPersisted(rec, id, rec.OutputFile)
 			var note string
@@ -894,12 +894,12 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 			return e.attachAdoptedStopControls(job, jobsDir)
 		}
 
-		if (!info.Alive || info.Zombie) && id.Valid() && rec.GroupProof != nil && !rec.GroupProof.VerifiedAt.IsZero() {
+		if (!info.Alive || info.Zombie || !id.Matches(info)) && id.Valid() && rec.GroupProof != nil && !rec.GroupProof.VerifiedAt.IsZero() {
 			proof := groupProofFromPersisted(rec, id, rec.OutputFile)
 			liveMember := rec.GroupProof.CleanupPending
 			var scanErr error
 			if !liveMember {
-				liveMember, scanErr = hasVerifiedLiveGroupMember(proof)
+				liveMember, scanErr = hasVerifiedLiveGroupMemberFn(proof)
 			}
 			if errors.Is(scanErr, ErrProcessIdentityMismatch) {
 				liveMember = false
@@ -941,7 +941,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 				}
 				if gerr == nil || errors.Is(gerr, os.ErrProcessDone) {
 					resErr := error(errAdoptedProcessExited)
-					isTimedOut := !rec.Unlimited && !rec.Deadline.IsZero() && !time.Now().Before(rec.Deadline)
+					isTimedOut := expiredDuringDowntime
 					if isTimedOut {
 						resErr = &timeoutError{timeout: max(0, rec.Deadline.Sub(rec.Started))}
 					}
@@ -950,6 +950,10 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 					summary, preview := formatAdoptedSummaryPreview(rec.OutputFile, rec.Cwd, fmt.Sprintf("(adopted background job exited; %s)", note), note)
 					job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
 					job.Adopted = true
+					job.expiredOnAdoption = expiredDuringDowntime
+					if isTimedOut {
+						summary, preview = job.prepareAdoptedDowntimeTimeoutSummary(id.PID, id.PGID, rec.Deadline, rec.OutputFile, rec.Cwd)
+					}
 					job.finishAdoptedWithAudit(JobResult{
 						Output:          summary,
 						Err:             resErr,
@@ -959,12 +963,19 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 					}, e.Audit, -1, resErr)
 					return job, nil
 				}
-				note := fmt.Sprintf("adopted pending group cleanup for exited PID %d (pgid %d); stop error (%v) — job remains stoppable; %s",
-					id.PID, id.PGID, gerr, pipeCaptureEndedNote(rec.OutputFile))
+				var note string
+				if expiredDuringDowntime {
+					note = fmt.Sprintf("adopted pending group cleanup for exited PID %d (pgid %d); deadline (%s) passed while harness was down, stop error (%v) — job remains stoppable; %s",
+						id.PID, id.PGID, rec.Deadline.UTC().Format(time.RFC3339), gerr, pipeCaptureEndedNote(rec.OutputFile))
+				} else {
+					note = fmt.Sprintf("adopted pending group cleanup for exited PID %d (pgid %d); stop error (%v) — job remains stoppable; %s",
+						id.PID, id.PGID, gerr, pipeCaptureEndedNote(rec.OutputFile))
+				}
 				job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
 				job.WaitError = gerr.Error()
 				job.monitorFailed = true
 				job.cleanupPending = true
+				job.expiredOnAdoption = expiredDuringDowntime
 				job.groupProof = cloneGroupProof(proof)
 				return e.attachAdoptedStopControls(job, jobsDir)
 			}
@@ -1511,23 +1522,16 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 	}
 
 	note := pipeCaptureEndedNote(job.OutputFile)
-	completionSummary := fmt.Sprintf("(adopted background job exited; %s)", note)
-	summaryNote := note
 	job.mu.Lock()
 	expiredOnAdoption := job.expiredOnAdoption
 	job.mu.Unlock()
+	var summary string
+	var preview *BashOutputPreview
 	if isTimedOut && expiredOnAdoption {
-		timeoutNote := fmt.Sprintf("adopted job PID %d (pgid %d) exceeded deadline (%s) while harness was down; stopped verified process group; %s",
-			snap.Identity.PID, snap.Identity.PGID, snap.Deadline.UTC().Format(time.RFC3339), note)
-		job.mu.Lock()
-		if !job.finished && !job.unknown {
-			job.RecoveryNote = timeoutNote
-		}
-		job.mu.Unlock()
-		summaryNote = timeoutNote
-		completionSummary = fmt.Sprintf("(adopted background job stopped on adoption; %s)", timeoutNote)
+		summary, preview = job.prepareAdoptedDowntimeTimeoutSummary(snap.Identity.PID, snap.Identity.PGID, snap.Deadline, job.OutputFile, job.Cwd)
+	} else {
+		summary, preview = formatAdoptedSummaryPreview(job.OutputFile, job.Cwd, fmt.Sprintf("(adopted background job exited; %s)", note), note)
 	}
-	summary, preview := formatAdoptedSummaryPreview(job.OutputFile, job.Cwd, completionSummary, summaryNote)
 	job.finishAdoptedWithAudit(JobResult{
 		Output:          summary,
 		Err:             err,

@@ -287,9 +287,11 @@ func TestDarwinLiveAdoptionPreservesPersistedMembersWhenRecaptureFails(t *testin
 
 	origSlice := darwinSysctlKinfoProcSliceFn
 	var failPgrpOnce atomic.Bool
+	var pgrpFaultFired atomic.Bool
 	failPgrpOnce.Store(true)
 	darwinSysctlKinfoProcSliceFn = func(name string, args ...int) ([]unix.KinfoProc, error) {
 		if name == "kern.proc.pgrp" && failPgrpOnce.Swap(false) {
+			pgrpFaultFired.Store(true)
 			return nil, unix.EPERM
 		}
 		return origSlice(name, args...)
@@ -310,6 +312,9 @@ func TestDarwinLiveAdoptionPreservesPersistedMembersWhenRecaptureFails(t *testin
 	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
 	if err != nil || len(recovered) != 1 {
 		t.Fatalf("RecoverSessionJobs = %+v, err=%v", recovered, err)
+	}
+	if !pgrpFaultFired.Load() {
+		t.Fatal("expected kern.proc.pgrp EPERM fault to fire during recapture")
 	}
 	job := exec2.registry().Get(recovered[0].ID)
 	recoveredJob = job
@@ -410,6 +415,116 @@ func TestDarwinExpiredDeadlineDuringDowntimeReportsExpiryAfterInspectRecovery(t 
 	}
 	if strings.Contains(snap.RecoveryNote, "job remains stoppable") {
 		t.Fatalf("RecoveryNote still says stale 'job remains stoppable': %q", snap.RecoveryNote)
+	}
+}
+
+func TestDarwinPendingPostExitCleanupReportsDowntimeDeadlineExpiry(t *testing.T) {
+	for _, failFirst := range []bool{false, true} {
+		name := "immediate_cleanup"
+		if failFirst {
+			name = "retry_after_transient_cleanup_error"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			sessionBase := t.TempDir()
+			outID := "sess-darwin-pending-expired-" + name
+			outDir := filepath.Join(sessionBase, outID, "bash-output")
+			jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+			childPIDFile := filepath.Join(root, "child.pid")
+
+			cmd, _ := spawnCrashHelper(t, map[string]string{
+				"GMH_HELPER_ROOT":      root,
+				"GMH_HELPER_OUTDIR":    outDir,
+				"GMH_HELPER_JOBSDIR":   jobsDir,
+				"GMH_HELPER_OUTID":     outID,
+				"GMH_HELPER_WAIT_TEXT": "READY",
+				"GMH_HELPER_CMD":       fmt.Sprintf("sleep 30 & echo $! > %q; printf 'READY\\n'; exit 0", childPIDFile),
+			})
+			if err := cmd.Process.Kill(); err != nil {
+				t.Fatal(err)
+			}
+			_ = cmd.Wait()
+
+			pidData, err := os.ReadFile(childPIDFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			childPID, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+			if err != nil || childPID <= 0 {
+				t.Fatalf("invalid child pid %q: %v", string(pidData), err)
+			}
+			t.Cleanup(func() {
+				if p, err := os.FindProcess(childPID); err == nil {
+					_ = p.Kill()
+				}
+			})
+
+			recs, err := loadPersistedJobs(jobsDir)
+			if err != nil || len(recs) != 1 {
+				t.Fatalf("loadPersistedJobs = %+v, err=%v", recs, err)
+			}
+			rec := recs[0]
+			childInfo := inspectProcess(childPID)
+			if !childInfo.Alive {
+				t.Fatalf("child pid %d not alive", childPID)
+			}
+			rec.Unlimited = false
+			rec.Deadline = time.Now().Add(-10 * time.Second)
+			rec.GroupProof = &PersistedGroupProof{
+				UID:            childInfo.UID,
+				HasUID:         childInfo.HasUID,
+				SID:            childInfo.SID,
+				Sess:           uint64(childInfo.Sess),
+				VerifiedAt:     time.Now().Add(-20 * time.Second),
+				CleanupPending: true,
+				KnownMembers:   map[int]string{rec.PID: rec.ProcessStarted, childPID: childInfo.StartToken},
+			}
+			if err := savePersistedJob(jobsDir, rec); err != nil {
+				t.Fatal(err)
+			}
+
+			// Wait until the leader exits while the verified child remains alive.
+			for wait := 0; wait < 40 && inspectProcess(rec.PID).Alive; wait++ {
+				time.Sleep(15 * time.Millisecond)
+			}
+
+			var cleanupCalls atomic.Int32
+			exec2 := &Executor{
+				Root:      root,
+				OutputDir: outDir,
+				OutputID:  outID,
+				JobsDir:   jobsDir,
+				stopAdoptedGroupAfterExit: func(proof processGroupProof) error {
+					if failFirst && cleanupCalls.Add(1) == 1 {
+						return errors.New("transient cleanup failure")
+					}
+					return stopAdoptedProcessGroupAfterExit(proof)
+				},
+			}
+			t.Cleanup(func() { _ = exec2.CloseJobs(context.Background()) })
+			exec2.SwitchSession(outID)
+
+			recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+			if err != nil || len(recovered) != 1 {
+				t.Fatalf("RecoverSessionJobs = %+v, err=%v", recovered, err)
+			}
+			job := exec2.registry().Get(recovered[0].ID)
+			select {
+			case <-job.Done():
+			case <-time.After(4 * time.Second):
+				t.Fatal("pending post-exit expired job did not settle")
+			}
+			snap := job.Snapshot()
+			if snap.Status != JobDone {
+				t.Fatalf("status = %q, want done", snap.Status)
+			}
+			if !strings.Contains(snap.RecoveryNote, "exceeded deadline") || !strings.Contains(snap.RecoveryNote, "while harness was down") {
+				t.Fatalf("RecoveryNote = %q, want downtime deadline expiry note", snap.RecoveryNote)
+			}
+			if strings.Contains(snap.RecoveryNote, "job remains stoppable") {
+				t.Fatalf("RecoveryNote retained stale 'job remains stoppable': %q", snap.RecoveryNote)
+			}
+		})
 	}
 }
 

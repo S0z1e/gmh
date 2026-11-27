@@ -1411,6 +1411,30 @@ func (j *Job) mergeLearnedGroupMembers(proof processGroupProof) {
 	j.mu.Unlock()
 }
 
+func hasIndependentGroupProof(proof processGroupProof) bool {
+	if proof.JobToken != "" || proof.jobHandle != 0 || !proof.VerifiedAt.IsZero() {
+		return true
+	}
+	for pid := range proof.KnownMembers {
+		if pid != proof.Leader.PID {
+			return true
+		}
+	}
+	return false
+}
+
+func (j *Job) prepareAdoptedDowntimeTimeoutSummary(pid, pgid int, deadline time.Time, outFile, cwd string) (string, *BashOutputPreview) {
+	timeoutNote := fmt.Sprintf("adopted job PID %d (pgid %d) exceeded deadline (%s) while harness was down; stopped verified process group; %s",
+		pid, pgid, deadline.UTC().Format(time.RFC3339), pipeCaptureEndedNote(outFile))
+	j.mu.Lock()
+	if !j.finished && !j.unknown {
+		j.RecoveryNote = timeoutNote
+	}
+	j.mu.Unlock()
+	summary, preview := formatAdoptedSummaryPreview(outFile, cwd, fmt.Sprintf("(adopted background job stopped on adoption; %s)", timeoutNote), timeoutNote)
+	return summary, preview
+}
+
 func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	j.proofFDMu.Lock()
 	j.mu.Lock()
@@ -1438,7 +1462,10 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	// reparented children remain verifiable if the leader exits or wait fails.
 	proof := j.refreshVerifiedGroupMembersLocked()
 
-	err := stopVerifiedProcessGroupWithProof(proof)
+	err := stopVerifiedProcessGroupFn(proof)
+	if errors.Is(err, ErrProcessIdentityMismatch) && hasIndependentGroupProof(proof) {
+		err = os.ErrProcessDone
+	}
 	if errors.Is(err, ErrProcessIdentityMismatch) {
 		j.proofFDMu.Unlock()
 		summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
@@ -1510,14 +1537,7 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 			pid, pgid := j.PID, j.PGID
 			j.mu.Unlock()
 			if expiredOnAdoption {
-				timeoutNote := fmt.Sprintf("adopted job PID %d (pgid %d) exceeded deadline (%s) while harness was down; stopped verified process group; %s",
-					pid, pgid, deadline.UTC().Format(time.RFC3339), note)
-				j.mu.Lock()
-				if !j.finished && !j.unknown {
-					j.RecoveryNote = timeoutNote
-				}
-				j.mu.Unlock()
-				summary, preview = formatAdoptedSummaryPreview(outFile, cwd, fmt.Sprintf("(adopted background job stopped; %s)", timeoutNote), timeoutNote)
+				summary, preview = j.prepareAdoptedDowntimeTimeoutSummary(pid, pgid, deadline, outFile, cwd)
 			}
 		} else {
 			exitCode = -1
