@@ -45,33 +45,49 @@ type DeliveryStatus struct {
 	AdoptionNoticed bool
 }
 
+// PersistedGroupProof stores serializable process-group verification metadata
+// across restarts so pending post-exit cleanup remains safely revalidatable.
+type PersistedGroupProof struct {
+	UID               uint32         `json:"uid,omitempty"`
+	HasUID            bool           `json:"has_uid,omitempty"`
+	SID               int            `json:"sid,omitempty"`
+	Sess              uint64         `json:"sess,omitempty"`
+	OutputFile        string         `json:"output_file,omitempty"`
+	LeaderPipeTargets []string       `json:"leader_pipe_targets,omitempty"`
+	KnownMembers      map[int]string `json:"known_members,omitempty"`
+	VerifiedAt        time.Time      `json:"verified_at,omitempty"`
+	ExitObservedAt    time.Time      `json:"exit_observed_at,omitempty"`
+	CleanupPending    bool           `json:"cleanup_pending,omitempty"`
+}
+
 // PersistedJob stores durable background-job metadata across harness crashes.
 type PersistedJob struct {
-	ID              string    `json:"id"`
-	Started         time.Time `json:"started"`
-	Deadline        time.Time `json:"deadline,omitempty"`
-	Unlimited       bool      `json:"unlimited,omitempty"`
-	InvocationID    string    `json:"invocation_id,omitempty"`
-	ToolCallID      string    `json:"tool_call_id,omitempty"`
-	Command         string    `json:"command"`
-	Cwd             string    `json:"cwd,omitempty"`
-	OutputFile      string    `json:"output_file,omitempty"`
-	OutputID        string    `json:"output_id,omitempty"`
-	OutputReceipt   string    `json:"output_receipt,omitempty"`
-	PID             int       `json:"pid,omitempty"`
-	PGID            int       `json:"pgid,omitempty"`
-	ProcessStarted  string    `json:"process_started,omitempty"`
-	JobToken        string    `json:"job_token,omitempty"`
-	Status          JobStatus `json:"status"`
-	ExitCode        *int      `json:"exit_code,omitempty"`
-	ExitCodeUnknown bool      `json:"exit_code_unknown,omitempty"`
-	Error           string    `json:"error,omitempty"`
-	FinishedAt      time.Time `json:"finished_at,omitempty"`
-	Delivered       bool      `json:"delivered,omitempty"`
-	StopRequested   bool      `json:"stop_requested,omitempty"`
-	AdoptionNoticed bool      `json:"adoption_noticed,omitempty"`
-	UnknownNoticed  bool      `json:"unknown_noticed,omitempty"`
-	RecoveryNote    string    `json:"recovery_note,omitempty"`
+	ID              string               `json:"id"`
+	Started         time.Time            `json:"started"`
+	Deadline        time.Time            `json:"deadline,omitempty"`
+	Unlimited       bool                 `json:"unlimited,omitempty"`
+	InvocationID    string               `json:"invocation_id,omitempty"`
+	ToolCallID      string               `json:"tool_call_id,omitempty"`
+	Command         string               `json:"command"`
+	Cwd             string               `json:"cwd,omitempty"`
+	OutputFile      string               `json:"output_file,omitempty"`
+	OutputID        string               `json:"output_id,omitempty"`
+	OutputReceipt   string               `json:"output_receipt,omitempty"`
+	PID             int                  `json:"pid,omitempty"`
+	PGID            int                  `json:"pgid,omitempty"`
+	ProcessStarted  string               `json:"process_started,omitempty"`
+	JobToken        string               `json:"job_token,omitempty"`
+	GroupProof      *PersistedGroupProof `json:"group_proof,omitempty"`
+	Status          JobStatus            `json:"status"`
+	ExitCode        *int                 `json:"exit_code,omitempty"`
+	ExitCodeUnknown bool                 `json:"exit_code_unknown,omitempty"`
+	Error           string               `json:"error,omitempty"`
+	FinishedAt      time.Time            `json:"finished_at,omitempty"`
+	Delivered       bool                 `json:"delivered,omitempty"`
+	StopRequested   bool                 `json:"stop_requested,omitempty"`
+	AdoptionNoticed bool                 `json:"adoption_noticed,omitempty"`
+	UnknownNoticed  bool                 `json:"unknown_noticed,omitempty"`
+	RecoveryNote    string               `json:"recovery_note,omitempty"`
 }
 
 // RecoveredJob describes one retained job inspected while reopening a session.
@@ -828,33 +844,104 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 					extraNote = fmt.Sprintf("deadline (%s) passed while harness was down, stop failed (%v); ", rec.Deadline.UTC().Format(time.RFC3339), stopErr)
 				}
 			}
-			waitCtx, cancelCause := context.WithCancelCause(context.Background())
 			note := fmt.Sprintf("adopted live OS process PID %d (pgid %d); %s%s", id.PID, id.PGID, extraNote, pipeCaptureEndedNote(rec.OutputFile))
 			job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
 			job.groupProof = cloneGroupProof(proof)
 			job.groupProof.verifiedFDs = proof.verifiedFDs
-			job.monitorDone = make(chan struct{})
-			job.cancel = func() { cancelCause(context.Canceled) }
-			job.closeStop = func() error {
-				stopErr := job.stopAdoptedProcess(ErrExecutorClosed, false)
-				if errors.Is(stopErr, ErrProcessIdentityMismatch) {
-					cancelCause(ErrProcessIdentityMismatch)
-					return stopErr
+			return e.attachAdoptedStopControls(job, jobsDir)
+		}
+
+		if (!info.Alive || info.Zombie) && id.Valid() && rec.GroupProof != nil && rec.GroupProof.CleanupPending && !rec.GroupProof.VerifiedAt.IsZero() {
+			proof := processGroupProof{
+				Leader:            id,
+				UID:               rec.GroupProof.UID,
+				HasUID:            rec.GroupProof.HasUID,
+				SID:               rec.GroupProof.SID,
+				Sess:              uintptr(rec.GroupProof.Sess),
+				JobToken:          rec.JobToken,
+				OutputFile:        rec.OutputFile,
+				LeaderPipeTargets: append([]string(nil), rec.GroupProof.LeaderPipeTargets...),
+				KnownMembers:      mergeGroupMembers(nil, rec.GroupProof.KnownMembers),
+				VerifiedAt:        rec.GroupProof.VerifiedAt,
+				ExitObservedAt:    rec.GroupProof.ExitObservedAt,
+			}
+			if proof.ExitObservedAt.IsZero() {
+				proof.ExitObservedAt = time.Now()
+			}
+			stopGroupAfterExitFn := stopAdoptedProcessGroupAfterExit
+			if e.stopAdoptedGroupAfterExit != nil {
+				stopGroupAfterExitFn = e.stopAdoptedGroupAfterExit
+			}
+			gerr := stopGroupAfterExitFn(proof)
+			if errors.Is(gerr, ErrProcessIdentityMismatch) {
+				reason := fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr)
+				if rec.FinishedAt.IsZero() {
+					rec.FinishedAt = time.Now()
 				}
-				if stopErr != nil {
-					return stopErr
+				summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
+				job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
+					Output:          summary,
+					Err:             errors.New(reason),
+					ExitCode:        -1,
+					ExitCodeUnknown: true,
+					Preview:         preview,
+				})
+				if jobsDir != "" {
+					_ = savePersistedJob(jobsDir, job.persistedSnapshot())
 				}
-				cancelCause(ErrExecutorClosed)
-				return nil
+				return job, nil
 			}
-			job.closeCancel = func() { _ = job.closeStop() }
-			if job.OutputFile != "" && e.OutputDir != "" {
-				e.markActiveOutput(e.OutputDir, job.OutputFile)
+			if gerr == nil || errors.Is(gerr, os.ErrProcessDone) {
+				resErr := error(errAdoptedProcessExited)
+				isTimedOut := !rec.Unlimited && !rec.Deadline.IsZero() && !time.Now().Before(rec.Deadline)
+				if isTimedOut {
+					resErr = &timeoutError{timeout: max(0, rec.Deadline.Sub(rec.Started))}
+				}
+				note := fmt.Sprintf("completed pending post-exit group cleanup for PID %d (pgid %d) after harness restart; %s",
+					id.PID, id.PGID, pipeCaptureEndedNote(rec.OutputFile))
+				summary, preview, _, hasFile := summarizeOutputFile(rec.OutputFile, rec.Cwd)
+				if !hasFile {
+					summary = fmt.Sprintf("(adopted background job exited; %s)", note)
+				} else {
+					summary += "\n[" + note + "]"
+				}
+				rec.FinishedAt = time.Now()
+				rec.Error = resErr.Error()
+				rec.RecoveryNote = note
+				rec.ExitCodeUnknown = !isTimedOut
+				job := e.newRecoveredJobObject(rec, jobsDir, JobDone, false, adoptionNoticed, note, JobResult{
+					Output:          summary,
+					Err:             resErr,
+					ExitCode:        -1,
+					ExitCodeUnknown: !isTimedOut,
+					Preview:         preview,
+				})
+				job.Adopted = true
+				if e.Audit != nil {
+					e.Audit(AuditEntry{
+						InvocationID: job.InvocationID,
+						ToolCallID:   job.ToolCallID,
+						TS:           time.Now(),
+						Kind:         "bash",
+						Tool:         "bash",
+						Args:         truncate(job.Command, 500),
+						ExitCode:     -1,
+						Error:        resErr.Error(),
+					})
+				}
+				if jobsDir != "" {
+					_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+				}
+				return job, nil
 			}
-			if jobsDir != "" {
-				_ = savePersistedJob(jobsDir, job.persistedSnapshot())
-			}
-			return job, &adoptionMonitor{job: job, ctx: waitCtx, cancelCause: cancelCause}
+			note := fmt.Sprintf("adopted pending group cleanup for exited PID %d (pgid %d); stop error (%v) — job remains stoppable; %s",
+				id.PID, id.PGID, gerr, pipeCaptureEndedNote(rec.OutputFile))
+			job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
+			job.WaitError = gerr.Error()
+			job.monitorFailed = true
+			job.cleanupPending = true
+			job.groupProof = cloneGroupProof(proof)
+			return e.attachAdoptedStopControls(job, jobsDir)
 		}
 
 		var reason string
@@ -882,6 +969,32 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 		}
 		return job, nil
 	}
+}
+
+func (e *Executor) attachAdoptedStopControls(job *Job, jobsDir string) (*Job, *adoptionMonitor) {
+	waitCtx, cancelCause := context.WithCancelCause(context.Background())
+	job.monitorDone = make(chan struct{})
+	job.cancel = func() { cancelCause(context.Canceled) }
+	job.closeStop = func() error {
+		stopErr := job.stopAdoptedProcess(ErrExecutorClosed, false)
+		if errors.Is(stopErr, ErrProcessIdentityMismatch) {
+			cancelCause(ErrProcessIdentityMismatch)
+			return stopErr
+		}
+		if stopErr != nil {
+			return stopErr
+		}
+		cancelCause(ErrExecutorClosed)
+		return nil
+	}
+	job.closeCancel = func() { _ = job.closeStop() }
+	if job.OutputFile != "" && e.OutputDir != "" {
+		e.markActiveOutput(e.OutputDir, job.OutputFile)
+	}
+	if jobsDir != "" {
+		_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+	}
+	return job, &adoptionMonitor{job: job, ctx: waitCtx, cancelCause: cancelCause}
 }
 
 // JobsDirPath returns the directory storing durable background-job metadata.
@@ -1097,46 +1210,62 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 	var deadlineStopErr error
 	if !snap.Unlimited && !snap.Deadline.IsZero() {
 		var fallbackMu sync.Mutex
+		var activeTimer *time.Timer
 		var fallbackTimer *time.Timer
-		remaining := max(0, time.Until(snap.Deadline))
-		timer := time.AfterFunc(remaining, func() {
-			if job.Status() != JobRunning {
-				return
-			}
-			deadlineStopMu.Lock()
-			if job.Status() != JobRunning {
-				deadlineStopMu.Unlock()
-				return
-			}
-			stopErr := job.stopAdoptedProcess(nil, true)
-			if errors.Is(stopErr, ErrProcessIdentityMismatch) {
-				deadlineStopMu.Unlock()
-				if cancelCause != nil {
-					cancelCause(ErrProcessIdentityMismatch)
-				}
-				return
-			}
-			if stopErr != nil {
-				deadlineStopErr = stopErr
-				deadlineStopMu.Unlock()
-				if cancelCause != nil {
-					cancelCause(stopErr)
-				}
-				return
-			}
-			timedOut = true
-			if cancelCause != nil {
-				fallbackMu.Lock()
-				fallbackTimer = time.AfterFunc(2*time.Second, func() {
-					cancelCause(&timeoutError{timeout: max(0, snap.Deadline.Sub(snap.Started))})
-				})
-				fallbackMu.Unlock()
-			}
-			deadlineStopMu.Unlock()
-		})
-		stopFn := func() {
-			timer.Stop()
+		var stopped bool
+		var scheduleAttempt func(delay time.Duration, backoff time.Duration)
+		scheduleAttempt = func(delay time.Duration, backoff time.Duration) {
 			fallbackMu.Lock()
+			if stopped {
+				fallbackMu.Unlock()
+				return
+			}
+			activeTimer = time.AfterFunc(delay, func() {
+				if job.Status() != JobRunning || ctx.Err() != nil {
+					return
+				}
+				deadlineStopMu.Lock()
+				if job.Status() != JobRunning || ctx.Err() != nil {
+					deadlineStopMu.Unlock()
+					return
+				}
+				stopErr := job.stopAdoptedProcess(nil, true)
+				if errors.Is(stopErr, ErrProcessIdentityMismatch) {
+					deadlineStopMu.Unlock()
+					if cancelCause != nil {
+						cancelCause(ErrProcessIdentityMismatch)
+					}
+					return
+				}
+				if stopErr != nil {
+					deadlineStopErr = stopErr
+					deadlineStopMu.Unlock()
+					next := min(backoff*2, 2*time.Second)
+					scheduleAttempt(backoff, next)
+					return
+				}
+				timedOut = true
+				if cancelCause != nil {
+					fallbackMu.Lock()
+					if !stopped {
+						fallbackTimer = time.AfterFunc(2*time.Second, func() {
+							cancelCause(&timeoutError{timeout: max(0, snap.Deadline.Sub(snap.Started))})
+						})
+					}
+					fallbackMu.Unlock()
+				}
+				deadlineStopMu.Unlock()
+			})
+			fallbackMu.Unlock()
+		}
+		remaining := max(0, time.Until(snap.Deadline))
+		scheduleAttempt(remaining, 100*time.Millisecond)
+		stopFn := func() {
+			fallbackMu.Lock()
+			stopped = true
+			if activeTimer != nil {
+				activeTimer.Stop()
+			}
 			if fallbackTimer != nil {
 				fallbackTimer.Stop()
 			}
@@ -1274,7 +1403,41 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		}
 	}
 
-	if job.cleanupAdoptedGroupAfterExit() {
+	job.mu.Lock()
+	pendingCleanup := job.cleanupPending
+	stopDeadlineFn := job.stopDeadline
+	job.mu.Unlock()
+	if !isTimedOut && (pendingCleanup || stopErr != nil) && !snap.Unlimited && !snap.Deadline.IsZero() && !time.Now().Before(snap.Deadline) {
+		isTimedOut = true
+		err = &timeoutError{timeout: max(0, snap.Deadline.Sub(snap.Started))}
+		exitCode = -1
+		exitKnown = false
+	}
+	if isTimedOut && stopDeadlineFn != nil {
+		// Post-exit deadline retry loop owns group cleanup now.
+		stopDeadlineFn()
+	}
+
+	cleanupBackoff := 100 * time.Millisecond
+	for job.cleanupAdoptedGroupAfterExit() {
+		if job.Status() != JobRunning || !isTimedOut || errors.Is(context.Cause(ctx), ErrExecutorClosed) {
+			return
+		}
+		timer := time.NewTimer(cleanupBackoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			if errors.Is(context.Cause(ctx), ErrExecutorClosed) {
+				return
+			}
+		case <-job.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		cleanupBackoff = min(cleanupBackoff*2, 2*time.Second)
+	}
+	if job.Status() != JobRunning {
 		return
 	}
 

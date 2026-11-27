@@ -339,15 +339,18 @@ func TestStopAdoptedProcessGroupAfterExitEMFILEBoundsAndPartialCleanupLinux(t *t
 func TestCaptureVerifiedGroupProofPrunesExitedFDsLinux(t *testing.T) {
 	root := t.TempDir()
 	c1File := filepath.Join(root, "c1.pid")
-	c1Rel := filepath.Join(root, "c1.rel")
 	c1Gone := filepath.Join(root, "c1.gone")
-	c2Rel := filepath.Join(root, "c2.rel")
 	c2File := filepath.Join(root, "c2.pid")
 	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf(
-		"sleep 30 & c1=$!; echo $c1 > %q; while [ ! -f %q ]; do sleep 0.02; done; kill -9 $c1 2>/dev/null; wait $c1 2>/dev/null; touch %q; while [ ! -f %q ]; do sleep 0.02; done; sleep 30 & echo $! > %q; sleep 30",
-		c1File, c1Rel, c1Gone, c2Rel, c2File,
+		"sleep 30 & c1=$!; echo $c1 > %q; read _; kill -9 $c1 2>/dev/null; wait $c1 2>/dev/null; touch %q; read _; sleep 30 & echo $! > %q; sleep 30",
+		c1File, c1Gone, c2File,
 	))
 	configureProcess(cmd)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +389,20 @@ func TestCaptureVerifiedGroupProofPrunesExitedFDsLinux(t *testing.T) {
 		t.Fatalf("expected c1 %d in verifiedFDs: %+v", c1PID, proof.verifiedFDs)
 	}
 
-	if err := os.WriteFile(c1Rel, []byte("go\n"), 0644); err != nil {
+	// Partial / incomplete scan (failing ReadDir AFTER leader inspection) must preserve
+	// live omitted child c1's pidfd in verifiedFDs.
+	origReadProcDir := readProcDirFn
+	readProcDirFn = func() ([]os.DirEntry, error) {
+		return nil, syscall.EMFILE
+	}
+	captureVerifiedGroupProof(&proof)
+	readProcDirFn = origReadProcDir
+	if keptC1, stillHasC1 := proof.verifiedFDs[c1PID]; !stillHasC1 || keptC1.fd != c1Entry.fd {
+		t.Fatalf("incomplete scan discarded live omitted child c1 %d pidfd: %+v", c1PID, proof.verifiedFDs)
+	}
+
+	// Release c1 via stdin builtin read gate (zero child forks while waiting).
+	if _, err := stdin.Write([]byte("go1\n")); err != nil {
 		t.Fatal(err)
 	}
 	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
@@ -399,8 +415,7 @@ func TestCaptureVerifiedGroupProofPrunesExitedFDsLinux(t *testing.T) {
 		time.Sleep(15 * time.Millisecond)
 	}
 
-	// Refresh BEFORE c2 spawns so c1Entry.fd cannot be reused by a replacement pidfd
-	// before checking EBADF.
+	// Refresh BEFORE c2 spawns while shell blocks on builtin `read` (no sleep children).
 	captureVerifiedGroupProof(&proof)
 	if _, stillCached := proof.verifiedFDs[c1PID]; stillCached {
 		t.Fatalf("exited child c1 %d pidfd was not pruned from verifiedFDs", c1PID)
@@ -412,16 +427,8 @@ func TestCaptureVerifiedGroupProofPrunesExitedFDsLinux(t *testing.T) {
 		t.Fatalf("pruned fd %d still open (fcntl err=%v)", c1Entry.fd, err)
 	}
 
-	// Partial / EMFILE refresh must preserve live cached pidfds (leader handle stays open).
-	cleanupFDs := exhaustFDsUntilEMFILE(t)
-	captureVerifiedGroupProof(&proof)
-	cleanupFDs()
-	if lEntry, hasLeader := proof.verifiedFDs[leaderPID]; !hasLeader || lEntry.fd <= 0 {
-		t.Fatalf("partial EMFILE refresh discarded live leader pidfd: %+v", proof.verifiedFDs)
-	}
-
 	// Now spawn c2 and confirm refresh picks it up while keeping c1 pruned.
-	if err := os.WriteFile(c2Rel, []byte("go\n"), 0644); err != nil {
+	if _, err := stdin.Write([]byte("go2\n")); err != nil {
 		t.Fatal(err)
 	}
 	var c2PID int

@@ -274,6 +274,10 @@ func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
 	}
 }
 
+var readProcDirFn = func() ([]os.DirEntry, error) {
+	return os.ReadDir("/proc")
+}
+
 func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
 	members, _ := captureVerifiedGroupMembersWithStatus(proof)
 	return members
@@ -293,7 +297,7 @@ func captureVerifiedGroupMembersWithStatus(proof processGroupProof) (map[int]str
 		return nil, false
 	}
 	members := map[int]string{id.PID: id.StartToken}
-	entries, err := os.ReadDir("/proc")
+	entries, err := readProcDirFn()
 	if err != nil {
 		return members, false
 	}
@@ -632,12 +636,6 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 		if meta.startTicks < leaderTicks {
 			return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 		}
-		if !proof.ExitObservedAt.IsZero() && hasBoot {
-			memberStart := time.Unix(bootSec+int64(meta.startTicks/100), int64((meta.startTicks%100)*10_000_000))
-			if memberStart.After(proof.ExitObservedAt.Add(2 * time.Second)) {
-				return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, pid, ErrProcessIdentityMismatch)
-			}
-		}
 		if proof.KnownMembers[pid] == meta.info.StartToken {
 			memberVerified = true
 		} else if meta.ppid == id.PID {
@@ -665,6 +663,12 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 			}
 			if hasFD {
 				memberVerified = true
+			}
+		}
+		if !memberVerified && !proof.ExitObservedAt.IsZero() && hasBoot {
+			memberStart := time.Unix(bootSec+int64(meta.startTicks/100), int64((meta.startTicks%100)*10_000_000))
+			if memberStart.After(proof.ExitObservedAt.Add(2 * time.Second)) {
+				return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 			}
 		}
 		liveMembers++

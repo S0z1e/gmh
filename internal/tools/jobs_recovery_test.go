@@ -2185,4 +2185,343 @@ func TestCrashRecoveryIncompleteProofKeepsJobStoppable(t *testing.T) {
 	}
 }
 
+func TestCrashRecoveryVerifiedChildForkedAfterCleanupErrorStillStops(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-grandchild-after-exit"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	c1Ready := filepath.Join(root, "c1.ready")
+	c1Trigger := filepath.Join(root, "c1.fork")
+	c1File := filepath.Join(root, "c1.pid")
+	c2File := filepath.Join(root, "c2.pid")
+	leaderRel := filepath.Join(root, "leader.rel")
+
+	helperCmd, meta := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "C1-READY",
+		"GMH_HELPER_CMD": fmt.Sprintf(
+			"(touch %q; while [ ! -f %q ]; do sleep 0.02; done; sleep 30 & echo $! > %q; wait) & c1=$!; echo $c1 > %q; printf 'C1-READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0",
+			c1Ready, c1Trigger, c2File, c1File, leaderRel,
+		),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if _, err := os.Stat(c1Ready); err == nil {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	b1, err := os.ReadFile(c1File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1PID, _ := strconv.Atoi(strings.TrimSpace(string(b1)))
+	if c1PID <= 0 {
+		t.Fatalf("invalid c1 pid %q", string(b1))
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(c1PID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	var hookMu sync.Mutex
+	failFirstCleanup := true
+	cleanupSawFailure := make(chan struct{}, 1)
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		stopAdoptedGroupAfterExit: func(proof processGroupProof) error {
+			hookMu.Lock()
+			fail := failFirstCleanup
+			if fail {
+				failFirstCleanup = false
+			}
+			hookMu.Unlock()
+			if fail {
+				select {
+				case cleanupSawFailure <- struct{}{}:
+				default:
+				}
+				return errors.New("injected transient cleanup EMFILE")
+			}
+			return stopAdoptedProcessGroupAfterExit(proof)
+		},
+	}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 || recovered[0].Status != JobRunning {
+		t.Fatalf("recovered = %+v, err=%v", recovered, err)
+	}
+	job := exec2.registry().Get(meta.JobID)
+
+	// Let leader exit while c1 is verified and recorded in KnownMembers.
+	if err := os.WriteFile(leaderRel, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cleanupSawFailure:
+	case <-time.After(4 * time.Second):
+		t.Fatal("cleanup did not run after leader exit")
+	}
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline) && job.Snapshot().WaitError == ""; {
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	// Wait past Darwin's 10ms ExitObservedAt tolerance, then have verified c1 fork c2.
+	time.Sleep(30 * time.Millisecond)
+	if err := os.WriteFile(c1Trigger, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var c2PID int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(c2File); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 && p != c1PID {
+				c2PID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if c2PID <= 0 {
+		t.Fatal("grandchild c2 did not fork")
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(c2PID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	// Retry via StopJob must verify c2 via c1 ancestry (NOT reject on ExitObservedAt cutoff),
+	// stop both c1 and c2, and finish JobDone.
+	res, stopErr := exec2.StopJob(meta.JobID)
+	if stopErr != nil {
+		t.Fatalf("StopJob failed after verified descendant forked post-exit child: %v (%s)", stopErr, res.Text)
+	}
+	if job.Status() != JobDone {
+		t.Fatalf("job status = %q, want done", job.Status())
+	}
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if !inspectProcess(c1PID).Alive && !inspectProcess(c2PID).Alive {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("c1 (%v) or c2 (%v) survived StopJob cleanup", inspectProcess(c1PID).Alive, inspectProcess(c2PID).Alive)
+}
+
+func TestCrashRecoveryDeadlineRetriesTransientCleanupFailure(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-deadline-retry"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childPIDFile := filepath.Join(root, "child.pid")
+
+	helperCmd, meta := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "CHILD-READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("sleep 30 & echo $! > %q; printf 'CHILD-READY\\n'; sleep 30", childPIDFile),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	b, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	// Shorten deadline so it expires quickly after adoption.
+	recs, err := loadPersistedJobs(jobsDir)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("loadPersistedJobs = %+v, err=%v", recs, err)
+	}
+	recs[0].Deadline = time.Now().Add(80 * time.Millisecond)
+	recs[0].Unlimited = false
+	if err := savePersistedJob(jobsDir, recs[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	attempts := 0
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		stopAdoptedGroupAfterExit: func(proof processGroupProof) error {
+			mu.Lock()
+			attempts++
+			n := attempts
+			mu.Unlock()
+			if n <= 2 {
+				return errors.New("injected transient cleanup EMFILE")
+			}
+			return stopAdoptedProcessGroupAfterExit(proof)
+		},
+	}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	if _, err := exec2.RecoverSessionJobs(outID, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	job := exec2.registry().Get(meta.JobID)
+	select {
+	case <-job.Done():
+	case <-time.After(6 * time.Second):
+		t.Fatalf("deadline job did not settle after transient cleanup retries (status=%q waitErr=%q)", job.Status(), job.Snapshot().WaitError)
+	}
+	res, ok := job.Result()
+	if !ok || !IsTimeout(res.Err) {
+		t.Fatalf("deadline Result = %+v, ok=%v, want timeoutError", res, ok)
+	}
+	mu.Lock()
+	gotAttempts := attempts
+	mu.Unlock()
+	if gotAttempts < 3 {
+		t.Fatalf("expected >= 3 cleanup attempts via backoff retry, got %d", gotAttempts)
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d survived deadline cleanup retry", childPID)
+	}
+}
+
+func TestCrashRecoveryPendingCleanupSurvivesSecondRestart(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-two-restarts"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childPIDFile := filepath.Join(root, "child.pid")
+	relFile := filepath.Join(root, "leader.rel")
+
+	helperCmd, meta := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "CHILD-READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("sleep 30 & echo $! > %q; printf 'CHILD-READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0", childPIDFile, relFile),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	b, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	// Harness 2 adopts, observes leader exit, fails post-exit cleanup, and persists GroupProof.
+	cleanupFailed := make(chan struct{}, 1)
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		stopAdoptedGroupAfterExit: func(proof processGroupProof) error {
+			select {
+			case cleanupFailed <- struct{}{}:
+			default:
+			}
+			return errors.New("injected persistent EMFILE during harness 2")
+		},
+	}
+	exec2.SwitchSession(outID)
+	if _, err := exec2.RecoverSessionJobs(outID, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	job2 := exec2.registry().Get(meta.JobID)
+	if err := os.WriteFile(relFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cleanupFailed:
+	case <-time.After(4 * time.Second):
+		t.Fatal("harness 2 did not reach cleanup")
+	}
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline) && job2.Snapshot().WaitError == ""; {
+		time.Sleep(15 * time.Millisecond)
+	}
+	// Simulate harness 2 crash via CloseJobs (which also fails cleanup and leaves persisted record running with GroupProof).
+	_ = exec2.CloseJobs(context.Background())
+
+	// Harness 3 starts while cleanup still fails once on recovery: must stay JobRunning
+	// (NOT JobUnknown!), and subsequent StopJob must kill childPID and finish JobDone.
+	var mu3 sync.Mutex
+	failRecover := true
+	exec3 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		stopAdoptedGroupAfterExit: func(proof processGroupProof) error {
+			mu3.Lock()
+			fail := failRecover
+			mu3.Unlock()
+			if fail {
+				return errors.New("transient EMFILE on harness 3 startup")
+			}
+			return stopAdoptedProcessGroupAfterExit(proof)
+		},
+	}
+	exec3.SwitchSession(outID)
+	defer exec3.CloseJobs(context.Background())
+
+	rec3, err := exec3.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(rec3) != 1 || rec3[0].Status != JobRunning {
+		t.Fatalf("harness 3 recovered = %+v, err=%v; want JobRunning", rec3, err)
+	}
+	job3 := exec3.registry().Get(meta.JobID)
+
+	mu3.Lock()
+	failRecover = false
+	mu3.Unlock()
+
+	res, stopErr := exec3.StopJob(meta.JobID)
+	if stopErr != nil {
+		t.Fatalf("harness 3 StopJob failed: %v (%s)", stopErr, res.Text)
+	}
+	if job3.Status() != JobDone {
+		t.Fatalf("harness 3 job status = %q, want done", job3.Status())
+	}
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline) && inspectProcess(childPID).Alive; {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d survived cleanup after second restart", childPID)
+	}
+}
+
 var _ = errors.New

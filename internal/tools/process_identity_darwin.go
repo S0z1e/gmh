@@ -212,11 +212,12 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 		pid := int(p.Proc.P_pid)
 		pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
 		tok := fmt.Sprintf("%d:%d", pSec, pUsec)
+		directVerified := false
 		if pid == id.PID {
 			if tok != id.StartToken {
 				return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 			}
-			groupVerified = true
+			directVerified = true
 		}
 		if proof.HasUID && p.Eproc.Ucred.Uid != proof.UID {
 			return fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
@@ -232,21 +233,24 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 		if darwinStartTimeBefore(pSec, pUsec, leaderSec, leaderUsec) {
 			return fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 		}
-		if !proof.ExitObservedAt.IsZero() {
+		if proof.KnownMembers[pid] == tok {
+			directVerified = true
+		} else if int(p.Eproc.Ppid) == id.PID {
+			directVerified = true
+		} else if parentTok, ok := proof.KnownMembers[int(p.Eproc.Ppid)]; ok {
+			parentSec, parentUsec, parsed := parseDarwinStartTime(parentTok)
+			if parsed && !darwinStartTimeBefore(pSec, pUsec, parentSec, parentUsec) {
+				directVerified = true
+			}
+		}
+		if !directVerified && !proof.ExitObservedAt.IsZero() {
 			memberStart := time.Unix(pSec, int64(pUsec)*1000)
 			if memberStart.After(proof.ExitObservedAt.Add(10 * time.Millisecond)) {
 				return fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 			}
 		}
-		if proof.KnownMembers[pid] == tok {
+		if directVerified {
 			groupVerified = true
-		} else if int(p.Eproc.Ppid) == id.PID {
-			groupVerified = true
-		} else if parentTok, ok := proof.KnownMembers[int(p.Eproc.Ppid)]; ok {
-			parentSec, parentUsec, parsed := parseDarwinStartTime(parentTok)
-			if parsed && !darwinStartTimeBefore(pSec, pUsec, parentSec, parentUsec) {
-				groupVerified = true
-			}
 		} else if !proof.VerifiedAt.IsZero() && proof.SID > 0 && proof.SID == id.PID && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken {
 			groupVerified = true
 		}

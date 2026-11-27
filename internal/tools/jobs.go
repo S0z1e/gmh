@@ -83,16 +83,17 @@ type Job struct {
 	audit     func(AuditEntry)
 	persistMu sync.Mutex
 
-	mu            sync.Mutex
-	done          chan struct{}
-	result        JobResult
-	finished      bool
-	unknown       bool
-	monitorFailed bool
-	retained      bool
-	forgotten     bool
-	finishedAt    time.Time
-	registry      *JobRegistry
+	mu             sync.Mutex
+	done           chan struct{}
+	result         JobResult
+	finished       bool
+	unknown        bool
+	monitorFailed  bool
+	cleanupPending bool
+	retained       bool
+	forgotten      bool
+	finishedAt     time.Time
+	registry       *JobRegistry
 	// A later turn must not deliver a recorded result twice.
 	delivered bool
 	// adoptionNoticed ensures an adopted running job sends at most one
@@ -248,6 +249,28 @@ func (j *Job) snapshotForPersist() (PersistedJob, string, bool) {
 	if j.result.Err != nil {
 		errMsg = j.result.Err.Error()
 	}
+	var persistedProof *PersistedGroupProof
+	if status == JobRunning && (j.Adopted || j.cleanupPending || !j.groupProof.VerifiedAt.IsZero()) {
+		var knownCopy map[int]string
+		if len(j.groupProof.KnownMembers) > 0 {
+			knownCopy = make(map[int]string, len(j.groupProof.KnownMembers))
+			for k, v := range j.groupProof.KnownMembers {
+				knownCopy[k] = v
+			}
+		}
+		persistedProof = &PersistedGroupProof{
+			UID:               j.groupProof.UID,
+			HasUID:            j.groupProof.HasUID,
+			SID:               j.groupProof.SID,
+			Sess:              uint64(j.groupProof.Sess),
+			OutputFile:        j.groupProof.OutputFile,
+			LeaderPipeTargets: append([]string(nil), j.groupProof.LeaderPipeTargets...),
+			KnownMembers:      knownCopy,
+			VerifiedAt:        j.groupProof.VerifiedAt,
+			ExitObservedAt:    j.groupProof.ExitObservedAt,
+			CleanupPending:    j.cleanupPending || !j.groupProof.ExitObservedAt.IsZero(),
+		}
+	}
 	return PersistedJob{
 		ID:              j.ID,
 		Started:         j.Started,
@@ -264,6 +287,7 @@ func (j *Job) snapshotForPersist() (PersistedJob, string, bool) {
 		PGID:            j.PGID,
 		ProcessStarted:  j.ProcessStarted,
 		JobToken:        j.JobToken,
+		GroupProof:      persistedProof,
 		Status:          status,
 		ExitCode:        exitCode,
 		ExitCodeUnknown: j.result.ExitCodeUnknown,
@@ -1201,6 +1225,9 @@ func (j *Job) recordStopError(err error) {
 	j.mu.Lock()
 	if !j.finished && !j.unknown {
 		j.monitorFailed = true
+		if !j.groupProof.ExitObservedAt.IsZero() {
+			j.cleanupPending = true
+		}
 		j.WaitError = err.Error()
 		j.RecoveryNote = fmt.Sprintf("adopted live OS process PID %d (pgid %d); stop error (%v) — job remains stoppable; %s",
 			j.PID, j.PGID, err, pipeCaptureEndedNote(j.OutputFile))
@@ -1243,14 +1270,20 @@ func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
 	captureVerifiedGroupProof(&proof)
 
 	j.mu.Lock()
+	prevMembers := len(j.groupProof.KnownMembers)
+	prevPipes := len(j.groupProof.LeaderPipeTargets)
 	j.groupProof.KnownMembers = mergeGroupMembers(j.groupProof.KnownMembers, proof.KnownMembers)
 	j.groupProof.LeaderPipeTargets = mergePipeTargets(j.groupProof.LeaderPipeTargets, proof.LeaderPipeTargets)
 	if !proof.VerifiedAt.IsZero() {
 		j.groupProof.VerifiedAt = proof.VerifiedAt
 	}
 	j.groupProof.verifiedFDs = proof.verifiedFDs
+	changed := len(j.groupProof.KnownMembers) > prevMembers || len(j.groupProof.LeaderPipeTargets) > prevPipes
 	out := j.snapshotGroupProofLocked()
 	j.mu.Unlock()
+	if changed {
+		j.persist()
+	}
 	return out
 }
 
