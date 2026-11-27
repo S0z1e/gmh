@@ -530,6 +530,12 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 		}
 		meta, merr := inspectLinuxProcMeta(pid)
 		if merr != nil {
+			if isProcessAccessError(merr) {
+				if pid == id.PID || proof.KnownMembers[pid] != "" {
+					handleErr = merr
+				}
+				continue
+			}
 			handleErr = merr
 			break
 		}
@@ -667,14 +673,14 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	if !hasLeaderStart {
 		return ErrProcessIdentityMismatch
 	}
-	info, err := inspectProcessErr(id.PID)
-	if isFDLimitErr(err) {
-		return stopKnownMembersFDFree(*proof, err)
+	info, leaderErr := inspectProcessErrFn(id.PID)
+	if isFDLimitErr(leaderErr) {
+		return stopKnownMembersFDFree(*proof, leaderErr)
 	}
-	if err != nil {
-		return err
+	if leaderErr != nil && !isProcessAccessError(leaderErr) {
+		return leaderErr
 	}
-	if info.Alive && !id.Matches(info) {
+	if leaderErr == nil && info.Alive && !id.Matches(info) {
 		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 	}
 	var bootSec int64
@@ -714,6 +720,10 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 			// /proc that forked and exited before its metadata was read cannot
 			// leave a descendant undetected.
 			if consecutiveEmpty >= 2 {
+				if leaderErr != nil {
+					_ = stopKnownMembersFDFree(*proof, leaderErr)
+					return leaderErr
+				}
 				if anySignalled {
 					return nil
 				}
@@ -742,7 +752,7 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 		return false, false, 0, mismatchErr
 	}
 	if handleErr != nil && len(candidates) == 0 {
-		if isFDLimitErr(handleErr) {
+		if isFDLimitErr(handleErr) || isProcessAccessError(handleErr) {
 			return false, false, 0, stopKnownMembersFDFree(*proof, handleErr)
 		}
 		return false, false, 0, handleErr
@@ -778,7 +788,7 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 			verifiedFDs = append(verifiedFDs, existing.fd)
 			continue
 		}
-		if handleErr != nil {
+		if isFDLimitErr(handleErr) {
 			continue
 		}
 		fd, ferr := unix.PidfdOpen(pid, 0)

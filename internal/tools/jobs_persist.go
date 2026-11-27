@@ -702,6 +702,24 @@ func summaryFromRecoveredJob(job *Job) RecoveredJob {
 	}
 }
 
+func (e *Executor) finishRecoveredJobUnknown(rec PersistedJob, jobsDir string, unknownNoticed, adoptionNoticed bool, reason string) *Job {
+	if rec.FinishedAt.IsZero() {
+		rec.FinishedAt = time.Now()
+	}
+	summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
+	job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
+		Output:          summary,
+		Err:             errors.New(reason),
+		ExitCode:        -1,
+		ExitCodeUnknown: true,
+		Preview:         preview,
+	})
+	if jobsDir != "" {
+		_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+	}
+	return job
+}
+
 func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsDir string) (*Job, *adoptionMonitor) {
 	if !validRecoveredOutputPath(rec.OutputFile, rec.OutputID, e.OutputID, e.OutputDir) {
 		rec.OutputFile = ""
@@ -810,21 +828,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 				case errors.Is(stopErr, ErrProcessIdentityMismatch) && !stopMismatchRecovered:
 					closeVerifiedGroupProof(&proof)
 					reason := fmt.Sprintf("refused to attach to PID %d: process identity, group, or start token mismatch (PID reused)", id.PID)
-					if rec.FinishedAt.IsZero() {
-						rec.FinishedAt = time.Now()
-					}
-					summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
-					job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
-						Output:          summary,
-						Err:             errors.New(reason),
-						ExitCode:        -1,
-						ExitCodeUnknown: true,
-						Preview:         preview,
-					})
-					if jobsDir != "" {
-						_ = savePersistedJob(jobsDir, job.persistedSnapshot())
-					}
-					return job, nil
+					return e.finishRecoveredJobUnknown(rec, jobsDir, unknownNoticed, adoptionNoticed, reason), nil
 				case stopErr == nil || errors.Is(stopErr, os.ErrProcessDone) || stopMismatchRecovered:
 					if !stopMismatchRecovered {
 						waitForAdoptedProcessGone(id, 2*time.Second)
@@ -848,21 +852,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 					if gerr := stopGroupAfterExitTrackFn(&groupProof); errors.Is(gerr, ErrProcessIdentityMismatch) {
 						closeVerifiedGroupProof(&proof)
 						reason := fmt.Sprintf("refused to attach to PID %d: %v", id.PID, gerr)
-						if rec.FinishedAt.IsZero() {
-							rec.FinishedAt = time.Now()
-						}
-						summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
-						job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
-							Output:          summary,
-							Err:             errors.New(reason),
-							ExitCode:        -1,
-							ExitCodeUnknown: true,
-							Preview:         preview,
-						})
-						if jobsDir != "" {
-							_ = savePersistedJob(jobsDir, job.persistedSnapshot())
-						}
-						return job, nil
+						return e.finishRecoveredJobUnknown(rec, jobsDir, unknownNoticed, adoptionNoticed, reason), nil
 					} else if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
 						proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, groupProof.KnownMembers)
 						extraNote = fmt.Sprintf("deadline (%s) passed while harness was down, group stop failed (%v); ", rec.Deadline.UTC().Format(time.RFC3339), gerr)
@@ -897,21 +887,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 						if errors.Is(gerr, ErrProcessIdentityMismatch) {
 							closeVerifiedGroupProof(&proof)
 							reason := fmt.Sprintf("refused to attach to PID %d: %v", id.PID, gerr)
-							if rec.FinishedAt.IsZero() {
-								rec.FinishedAt = time.Now()
-							}
-							summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
-							job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
-								Output:          summary,
-								Err:             errors.New(reason),
-								ExitCode:        -1,
-								ExitCodeUnknown: true,
-								Preview:         preview,
-							})
-							if jobsDir != "" {
-								_ = savePersistedJob(jobsDir, job.persistedSnapshot())
-							}
-							return job, nil
+							return e.finishRecoveredJobUnknown(rec, jobsDir, unknownNoticed, adoptionNoticed, reason), nil
 						}
 						if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
 							reportErr = gerr

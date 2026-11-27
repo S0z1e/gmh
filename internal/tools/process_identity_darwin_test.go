@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -117,6 +118,146 @@ func TestDarwinInspectProcessErrPreservesSysctlErrorDuringWaitRecovery(t *testin
 	}
 	if inspectProcess(targetPID).Alive {
 		t.Fatalf("target pid %d still alive after StopJob", targetPID)
+	}
+}
+
+func TestDarwinAccessDeniedCleanupSignalsVerifiedChildrenAndKeepsLeaderPending(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-darwin-eacces-descendants"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childPIDFile := filepath.Join(root, "child.pid")
+	relFile := filepath.Join(root, "release")
+
+	cmd, _ := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("sleep 30 & echo $! > %q; printf 'READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0", childPIDFile, relFile),
+	})
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	pidData, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+	if err != nil || childPID <= 0 {
+		t.Fatalf("invalid child pid %q: %v", string(pidData), err)
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	recs, err := loadPersistedJobs(jobsDir)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("loadPersistedJobs = %+v, err=%v", recs, err)
+	}
+	rec := recs[0]
+	childInfo := inspectProcess(childPID)
+	if !childInfo.Alive {
+		t.Fatalf("child pid %d not alive", childPID)
+	}
+	rec.GroupProof = &PersistedGroupProof{
+		UID:          childInfo.UID,
+		HasUID:       childInfo.HasUID,
+		SID:          childInfo.SID,
+		Sess:         uint64(childInfo.Sess),
+		VerifiedAt:   time.Now(),
+		KnownMembers: map[int]string{rec.PID: rec.ProcessStarted, childPID: childInfo.StartToken},
+	}
+	// Trigger expired deadline during downtime so initial recovery hits leader EACCES.
+	rec.Unlimited = false
+	rec.Deadline = time.Now().Add(-10 * time.Second)
+	if err := savePersistedJob(jobsDir, rec); err != nil {
+		t.Fatal(err)
+	}
+	targetPID := rec.PID
+
+	// Release leader so only the verified child remains in the PGID while leader inspect denies access.
+	if err := os.WriteFile(relFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for wait := 0; wait < 40 && inspectProcess(targetPID).Alive; wait++ {
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	origInspect := inspectProcessErrFn
+	var forceLeaderEACCES atomic.Bool
+	forceLeaderEACCES.Store(true)
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if forceLeaderEACCES.Load() && pid == targetPID {
+			return processInfo{Alive: true, PGID: targetPID, StartToken: rec.ProcessStarted, UID: childInfo.UID, HasUID: true, SID: childInfo.SID, Sess: childInfo.Sess}, nil
+		}
+		return origInspect(pid)
+	}
+
+	origStopGroup := stopVerifiedProcessGroupFn
+	stopVerifiedProcessGroupFn = func(proof processGroupProof) error {
+		if forceLeaderEACCES.Load() && proof.Leader.PID == targetPID {
+			return syscall.EACCES
+		}
+		return origStopGroup(proof)
+	}
+
+	// Switch inspectProcessErrFn to return EACCES right as stopAdoptedProcessGroupAfterExitTrack inspects targetPID.
+	var callCount atomic.Int32
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if forceLeaderEACCES.Load() && pid == targetPID {
+			if callCount.Add(1) == 1 {
+				return processInfo{Alive: true, PGID: targetPID, StartToken: rec.ProcessStarted, UID: childInfo.UID, HasUID: true, SID: childInfo.SID, Sess: childInfo.Sess}, nil
+			}
+			return processInfo{}, syscall.EACCES
+		}
+		return origInspect(pid)
+	}
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	var recoveredJob *Job
+	t.Cleanup(func() {
+		forceLeaderEACCES.Store(false)
+		inspectProcessErrFn = origInspect
+		stopVerifiedProcessGroupFn = origStopGroup
+		_ = exec2.CloseJobs(context.Background())
+		if recoveredJob != nil && recoveredJob.monitorDone != nil {
+			<-recoveredJob.monitorDone
+		}
+	})
+	exec2.SwitchSession(outID)
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 {
+		t.Fatalf("RecoverSessionJobs = %+v, err=%v", recovered, err)
+	}
+	recoveredJob = exec2.registry().Get(recovered[0].ID)
+
+	// Verified child must be cleaned even while leader EACCES keeps job unresolved/running.
+	for wait := 0; wait < 40 && inspectProcess(childPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("verified child pid %d survived cleanup when leader inspect returned EACCES", childPID)
+	}
+	if recoveredJob.Status() != JobRunning {
+		t.Fatalf("job status = %q while leader state unresolved under EACCES, want JobRunning", recoveredJob.Status())
+	}
+
+	forceLeaderEACCES.Store(false)
+	select {
+	case <-recoveredJob.Done():
+	case <-time.After(4 * time.Second):
+		t.Fatal("job did not settle after leader EACCES cleared")
+	}
+	if recoveredJob.Status() != JobDone {
+		t.Fatalf("status after leader inspect recovered = %q, want done", recoveredJob.Status())
 	}
 }
 

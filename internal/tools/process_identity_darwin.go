@@ -99,7 +99,7 @@ func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
 	if !id.Valid() {
 		return ErrProcessIdentityMismatch
 	}
-	info, err := inspectProcessErr(id.PID)
+	info, err := inspectProcessErrFn(id.PID)
 	if err != nil {
 		return err
 	}
@@ -314,6 +314,35 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	return stopAdoptedProcessGroupAfterExitTrack(&cloned)
 }
 
+func darwinSignalVerifiedKnownMembers(proof processGroupProof, id ProcessIdentityInfo) error {
+	var firstErr error
+	for pid, tok := range proof.KnownMembers {
+		if pid <= 0 || pid == id.PID || tok == "" {
+			continue
+		}
+		info, ierr := inspectProcessErrFn(pid)
+		if ierr != nil {
+			if firstErr == nil && !errors.Is(ierr, os.ErrProcessDone) {
+				firstErr = ierr
+			}
+			continue
+		}
+		if !info.Alive || info.Zombie || info.StartToken != tok {
+			continue
+		}
+		if proof.HasUID && info.HasUID && info.UID != proof.UID {
+			continue
+		}
+		if proof.Sess != 0 && info.Sess != proof.Sess {
+			continue
+		}
+		if kerr := syscall.Kill(pid, syscall.SIGKILL); kerr != nil && !errors.Is(kerr, syscall.ESRCH) && firstErr == nil {
+			firstErr = kerr
+		}
+	}
+	return firstErr
+}
+
 func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	if proof == nil {
 		return ErrProcessIdentityMismatch
@@ -326,18 +355,25 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	if !hasLeaderStart {
 		return ErrProcessIdentityMismatch
 	}
-	info, err := inspectProcessErr(id.PID)
-	if err != nil {
-		return err
+	info, leaderErr := inspectProcessErrFn(id.PID)
+	if leaderErr != nil && !isProcessAccessError(leaderErr) {
+		return leaderErr
 	}
-	if info.Alive && !id.Matches(info) {
+	if leaderErr == nil && info.Alive && !id.Matches(info) {
 		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 	}
 	procs, queryErr := darwinSysctlKinfoProcSliceFn("kern.proc.pgrp", id.PGID)
 	if errors.Is(queryErr, unix.ESRCH) {
+		if leaderErr != nil {
+			_ = darwinSignalVerifiedKnownMembers(*proof, id)
+			return leaderErr
+		}
 		return os.ErrProcessDone
 	}
 	if queryErr != nil {
+		if isProcessAccessError(queryErr) {
+			_ = darwinSignalVerifiedKnownMembers(*proof, id)
+		}
 		return queryErr
 	}
 
@@ -346,6 +382,10 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 		return cerr
 	}
 	if liveCount == 0 {
+		if leaderErr != nil {
+			_ = darwinSignalVerifiedKnownMembers(*proof, id)
+			return leaderErr
+		}
 		return os.ErrProcessDone
 	}
 	proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, known)
@@ -376,14 +416,24 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 		}
 		return fmt.Errorf("refusing to signal unverified pgid %d after leader disappeared: %w", id.PGID, ErrProcessIdentityMismatch)
 	}
-	return darwinResolveGroupKillError(id.PGID, syscall.Kill(-id.PGID, syscall.SIGKILL))
+	kerr := darwinResolveGroupKillError(id.PGID, syscall.Kill(-id.PGID, syscall.SIGKILL))
+	if kerr != nil && !errors.Is(kerr, os.ErrProcessDone) {
+		if isProcessAccessError(kerr) {
+			_ = darwinSignalVerifiedKnownMembers(*proof, id)
+		}
+		return kerr
+	}
+	if leaderErr != nil {
+		return leaderErr
+	}
+	return kerr
 }
 
 func verifyBeforeWait(id ProcessIdentityInfo) error {
 	if !id.Valid() {
 		return ErrProcessIdentityMismatch
 	}
-	info, err := inspectProcessErr(id.PID)
+	info, err := inspectProcessErrFn(id.PID)
 	if err != nil {
 		return err
 	}

@@ -755,3 +755,57 @@ func TestCrashRecoveryInconclusiveLinuxGroupScanKeepsJobStoppable(t *testing.T) 
 		t.Fatalf("child pid %d survived StopJob", childPID)
 	}
 }
+
+func TestLinuxAccessDeniedCleanupSignalsVerifiedChildrenAndKeepsLeaderPending(t *testing.T) {
+	childCmd := exec.Command("sleep", "30")
+	configureProcess(childCmd)
+	if err := childCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	childPID := childCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = childCmd.Wait()
+	})
+	childInfo := inspectProcess(childPID)
+	if !childInfo.Alive {
+		t.Fatalf("child pid %d not alive", childPID)
+	}
+
+	origInspect := inspectProcessErrFn
+	t.Cleanup(func() { inspectProcessErrFn = origInspect })
+	leaderPID := childPID + 99999
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, syscall.EACCES
+		}
+		return origInspect(pid)
+	}
+
+	proof := processGroupProof{
+		Leader: ProcessIdentityInfo{
+			PID:        leaderPID,
+			PGID:       childInfo.PGID,
+			StartToken: childInfo.StartToken,
+		},
+		UID:            childInfo.UID,
+		HasUID:         childInfo.HasUID,
+		SID:            childInfo.SID,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers:   map[int]string{childPID: childInfo.StartToken},
+	}
+
+	err := stopAdoptedProcessGroupAfterExitTrack(&proof)
+	if !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want EACCES keeping leader unresolved", err)
+	}
+	for wait := 0; wait < 20 && inspectProcess(childPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("verified child pid %d survived Linux cleanup under leader EACCES", childPID)
+	}
+}
