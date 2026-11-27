@@ -900,17 +900,48 @@ func TestLinuxUnreadableRootRefusesNumericPPIDAndCleansVerifiedPastGroupMismatch
 		}
 	}
 
-	// Subcase 2: even when another member causes a UID mismatch under leader
-	// EACCES, individually verified KnownMembers child is still cleaned up while
-	// leader EACCES stays unresolved.
+	// Subcase 2: even when an intruder member causes a UID mismatch under leader
+	// EACCES (with no cached verifiedFDs), a freshly validated pidfd signals the
+	// verified KnownMembers child cleanly while keeping leader EACCES retryable.
+	intruderCmd := exec.Command("sleep", "30")
+	configureProcess(intruderCmd)
+	if err := intruderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	intruderPID := intruderCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(intruderPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = intruderCmd.Wait()
+	})
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == leaderPID {
+			return linuxProcMeta{}, syscall.EACCES
+		}
+		if pid == intruderPID {
+			m, err := origInspectMeta(pid)
+			if err == nil {
+				m.info.PGID = verifiedInfo.PGID
+				m.info.UID = verifiedInfo.UID + 1
+				m.info.HasUID = true
+			}
+			return m, err
+		}
+		return origInspectMeta(pid)
+	}
 	mixedProof := processGroupProof{
 		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: verifiedInfo.PGID, StartToken: verifiedInfo.StartToken},
-		UID:            verifiedInfo.UID + 1, // forces UID mismatch during whole-group scan
+		UID:            verifiedInfo.UID,
 		HasUID:         true,
 		SID:            verifiedInfo.SID,
 		VerifiedAt:     time.Now().Add(-5 * time.Second),
 		ExitObservedAt: time.Now().Add(-2 * time.Second),
 		KnownMembers:   map[int]string{leaderPID: verifiedInfo.StartToken, verifiedPID: verifiedInfo.StartToken},
+	}
+	live, liveErr := hasVerifiedLiveGroupMember(mixedProof)
+	if liveErr != nil || !live {
+		t.Fatalf("hasVerifiedLiveGroupMember past intruder UID mismatch = (%v, %v), want (true, nil)", live, liveErr)
 	}
 	if err := stopAdoptedProcessGroupAfterExitTrack(&mixedProof); !errors.Is(err, syscall.EACCES) {
 		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want EACCES keeping leader pending", err)

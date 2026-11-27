@@ -632,6 +632,92 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 	return candidates, handleErr, nil
 }
 
+func hasVerifiedLiveKnownMemberLinux(proof processGroupProof) (bool, error) {
+	id := proof.Leader
+	var inspectErr error
+	for pid, tok := range proof.KnownMembers {
+		if pid <= 0 || pid == id.PID || tok == "" {
+			continue
+		}
+		hasFD, alive, verr := verifyPreCapturedMemberFD(proof, pid, tok)
+		if hasFD {
+			if verr == nil && alive {
+				return true, nil
+			}
+			continue
+		}
+		meta, merr := inspectLinuxProcMetaFn(pid)
+		if merr != nil {
+			if inspectErr == nil {
+				inspectErr = merr
+			}
+			continue
+		}
+		if !meta.info.Alive || meta.info.PGID != id.PGID || meta.info.StartToken != tok {
+			continue
+		}
+		if proof.HasUID && meta.info.HasUID && meta.info.UID != proof.UID {
+			continue
+		}
+		if proof.SID > 0 && meta.info.SID != proof.SID {
+			continue
+		}
+		return true, nil
+	}
+	return false, inspectErr
+}
+
+func signalVerifiedKnownMembersLinux(proof processGroupProof, id ProcessIdentityInfo) (anySignalled bool, fdLimited bool, err error) {
+	var firstErr error
+	for pid, tok := range proof.KnownMembers {
+		if pid <= 0 || pid == id.PID || tok == "" {
+			continue
+		}
+		hasFD, alive, verr := verifyPreCapturedMemberFD(proof, pid, tok)
+		if hasFD {
+			if verr == nil && alive {
+				entry := proof.verifiedFDs[pid]
+				if kerr := unix.PidfdSendSignal(entry.fd, unix.SIGKILL, nil, 0); kerr == nil {
+					anySignalled = true
+				} else if !errors.Is(kerr, unix.ESRCH) && firstErr == nil {
+					firstErr = kerr
+				}
+			}
+			continue
+		}
+		fd, ferr := unix.PidfdOpen(pid, 0)
+		if isFDLimitErr(ferr) {
+			return anySignalled, true, ferr
+		}
+		if errors.Is(ferr, unix.ESRCH) {
+			continue
+		}
+		if ferr != nil {
+			if firstErr == nil {
+				firstErr = ferr
+			}
+			continue
+		}
+		meta, merr := inspectLinuxProcMetaFn(pid)
+		if merr == nil && meta.info.Alive && meta.info.PGID == id.PGID && meta.info.StartToken == tok &&
+			(!proof.HasUID || !meta.info.HasUID || meta.info.UID == proof.UID) &&
+			(proof.SID <= 0 || meta.info.SID == proof.SID) {
+			if kerr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); kerr == nil {
+				anySignalled = true
+			} else if !errors.Is(kerr, unix.ESRCH) && firstErr == nil {
+				firstErr = kerr
+			}
+		} else if isFDLimitErr(merr) {
+			_ = unix.Close(fd)
+			return anySignalled, true, merr
+		} else if merr != nil && !errors.Is(merr, unix.ESRCH) && firstErr == nil {
+			firstErr = merr
+		}
+		_ = unix.Close(fd)
+	}
+	return anySignalled, false, firstErr
+}
+
 func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 	id := proof.Leader
 	if !id.Valid() {
@@ -644,12 +730,18 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 	cloned := cloneGroupProof(proof)
 	candidates, handleErr, mismatchErr := collectAndVerifyLinuxCandidates(&cloned, id, leaderBoot, leaderTicks)
 	if mismatchErr != nil {
+		if ok, _ := hasVerifiedLiveKnownMemberLinux(proof); ok {
+			return true, nil
+		}
 		return false, mismatchErr
 	}
 	for _, c := range candidates {
 		if c.verified {
 			return true, nil
 		}
+	}
+	if ok, _ := hasVerifiedLiveKnownMemberLinux(proof); ok {
+		return true, nil
 	}
 	if handleErr != nil {
 		return false, handleErr
@@ -717,9 +809,43 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 			anySignalled = true
 		}
 		if perr != nil {
-			if errors.Is(perr, ErrProcessIdentityMismatch) && leaderErr != nil && isProcessAccessError(leaderErr) {
-				_ = stopKnownMembersFDFree(*proof, leaderErr)
-				return leaderErr
+			if errors.Is(perr, ErrProcessIdentityMismatch) {
+				sig, fdLimited, serr := signalVerifiedKnownMembersLinux(*proof, id)
+				if fdLimited {
+					return stopKnownMembersFDFree(*proof, serr)
+				}
+				if leaderErr != nil && isProcessAccessError(leaderErr) {
+					return leaderErr
+				}
+				if sig {
+					// Brief grace wait so signalled persisted children exit cleanly.
+					for i := 0; i < 20; i++ {
+						live, _ := hasVerifiedLiveKnownMemberLinux(*proof)
+						if !live {
+							return nil
+						}
+						time.Sleep(5 * time.Millisecond)
+					}
+					if serr != nil {
+						return serr
+					}
+					return fmt.Errorf("verified process group members for pid %d still alive after signalling: %w", id.PID, errGroupMembersStillAlive)
+				}
+				if serr != nil {
+					return serr
+				}
+				return perr
+			}
+			if isProcessAccessError(perr) {
+				sig, fdLimited, serr := signalVerifiedKnownMembersLinux(*proof, id)
+				if fdLimited {
+					return stopKnownMembersFDFree(*proof, serr)
+				}
+				_ = sig
+				_ = serr
+				if leaderErr != nil && isProcessAccessError(leaderErr) {
+					return leaderErr
+				}
 			}
 			return perr
 		}
@@ -761,8 +887,15 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 		return false, false, 0, mismatchErr
 	}
 	if handleErr != nil && len(candidates) == 0 {
-		if isFDLimitErr(handleErr) || isProcessAccessError(handleErr) {
+		if isFDLimitErr(handleErr) {
 			return false, false, 0, stopKnownMembersFDFree(*proof, handleErr)
+		}
+		if isProcessAccessError(handleErr) {
+			sig, _, serr := signalVerifiedKnownMembersLinux(*proof, id)
+			if serr != nil {
+				return sig, false, 0, serr
+			}
+			return sig, false, 0, handleErr
 		}
 		return false, false, 0, handleErr
 	}

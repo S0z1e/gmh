@@ -389,6 +389,107 @@ func TestDarwinAccessDeniedGroupUIDMismatchStillKillsVerifiedKnownMember(t *test
 	}
 }
 
+func TestDarwinExitedLeaderUIDMismatchRecoversAndSurfacesOrphan(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-darwin-exited-uid-mismatch"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childPIDFile := filepath.Join(root, "child.pid")
+	relFile := filepath.Join(root, "release")
+
+	cmd, _ := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("sleep 30 & echo $! > %q; printf 'READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0", childPIDFile, relFile),
+	})
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	pidData, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+	if err != nil || childPID <= 0 {
+		t.Fatalf("invalid child pid %q: %v", string(pidData), err)
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+	childInfo := inspectProcess(childPID)
+	if !childInfo.Alive {
+		t.Fatalf("child pid %d not alive", childPID)
+	}
+	recs, err := loadPersistedJobs(jobsDir)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("loadPersistedJobs = %+v, err=%v", recs, err)
+	}
+	rec := recs[0]
+	rec.GroupProof = &PersistedGroupProof{
+		UID:            childInfo.UID,
+		HasUID:         true,
+		SID:            childInfo.SID,
+		Sess:           uint64(childInfo.Sess),
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		CleanupPending: false,
+		KnownMembers:   map[int]string{rec.PID: rec.ProcessStarted, childPID: childInfo.StartToken},
+	}
+	if err := savePersistedJob(jobsDir, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	// Leader exits while child remains alive (no CleanupPending flag set on disk).
+	if err := os.WriteFile(relFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for wait := 0; wait < 40 && inspectProcess(rec.PID).Alive; wait++ {
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	origSlice := darwinSysctlKinfoProcSliceFn
+	t.Cleanup(func() { darwinSysctlKinfoProcSliceFn = origSlice })
+	darwinSysctlKinfoProcSliceFn = func(name string, args ...int) ([]unix.KinfoProc, error) {
+		procs, err := origSlice(name, args...)
+		if name == "kern.proc.pgrp" && len(procs) > 0 {
+			// Force UID mismatch in pgrp scan while kern.proc.pid remains intact.
+			for i := range procs {
+				procs[i].Eproc.Ucred.Uid = childInfo.UID + 1
+			}
+		}
+		return procs, err
+	}
+
+	// 1. Orphan scan must still surface this job because verified child is live.
+	orphans, err := FindOrphanedRunningJobs(jobsDir, "other-sess", "")
+	if err != nil || len(orphans) != 1 {
+		t.Fatalf("FindOrphanedRunningJobs = %+v, err=%v; want 1 orphan", orphans, err)
+	}
+
+	// 2. Recovery without CleanupPending must find & clean up the verified child and finish JobDone.
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 || recovered[0].Status != JobDone {
+		t.Fatalf("RecoverSessionJobs = %+v, err=%v; want JobDone after cleaning verified child", recovered, err)
+	}
+	for wait := 0; wait < 20 && inspectProcess(childPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("verified child pid %d survived recovery", childPID)
+	}
+}
+
 func TestDarwinNativeWaitCapturesGroupProofAfterInitialInspectError(t *testing.T) {
 	root := t.TempDir()
 	sessionBase := t.TempDir()

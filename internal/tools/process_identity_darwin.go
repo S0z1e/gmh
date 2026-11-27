@@ -266,6 +266,27 @@ func darwinResolveGroupCandidates(proof processGroupProof, id ProcessIdentityInf
 	return known, liveCount, nil
 }
 
+func hasVerifiedLiveKnownMemberDarwin(proof processGroupProof) bool {
+	id := proof.Leader
+	for pid, tok := range proof.KnownMembers {
+		if pid <= 0 || pid == id.PID || tok == "" {
+			continue
+		}
+		info, err := inspectProcessErrFn(pid)
+		if err != nil || !info.Alive || info.Zombie || info.StartToken != tok {
+			continue
+		}
+		if proof.HasUID && info.HasUID && info.UID != proof.UID {
+			continue
+		}
+		if proof.Sess != 0 && info.Sess != proof.Sess {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 	id := proof.Leader
 	if !id.Valid() {
@@ -280,10 +301,16 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 		return false, nil
 	}
 	if queryErr != nil {
+		if hasVerifiedLiveKnownMemberDarwin(proof) {
+			return true, nil
+		}
 		return false, queryErr
 	}
 	known, liveCount, err := darwinResolveGroupCandidates(proof, id, leaderSec, leaderUsec, procs)
 	if err != nil {
+		if hasVerifiedLiveKnownMemberDarwin(proof) {
+			return true, nil
+		}
 		return false, err
 	}
 	if liveCount == 0 {
@@ -314,7 +341,7 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	return stopAdoptedProcessGroupAfterExitTrack(&cloned)
 }
 
-func darwinSignalVerifiedKnownMembers(proof processGroupProof, id ProcessIdentityInfo) error {
+func darwinSignalVerifiedKnownMembers(proof processGroupProof, id ProcessIdentityInfo) (anySignalled bool, err error) {
 	var firstErr error
 	for pid, tok := range proof.KnownMembers {
 		if pid <= 0 || pid == id.PID || tok == "" {
@@ -336,11 +363,13 @@ func darwinSignalVerifiedKnownMembers(proof processGroupProof, id ProcessIdentit
 		if proof.Sess != 0 && info.Sess != proof.Sess {
 			continue
 		}
-		if kerr := syscall.Kill(pid, syscall.SIGKILL); kerr != nil && !errors.Is(kerr, syscall.ESRCH) && firstErr == nil {
+		if kerr := syscall.Kill(pid, syscall.SIGKILL); kerr == nil {
+			anySignalled = true
+		} else if !errors.Is(kerr, syscall.ESRCH) && firstErr == nil {
 			firstErr = kerr
 		}
 	}
-	return firstErr
+	return anySignalled, firstErr
 }
 
 func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
@@ -365,29 +394,44 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	procs, queryErr := darwinSysctlKinfoProcSliceFn("kern.proc.pgrp", id.PGID)
 	if errors.Is(queryErr, unix.ESRCH) {
 		if leaderErr != nil {
-			_ = darwinSignalVerifiedKnownMembers(*proof, id)
+			_, _ = darwinSignalVerifiedKnownMembers(*proof, id)
 			return leaderErr
 		}
 		return os.ErrProcessDone
 	}
 	if queryErr != nil {
 		if isProcessAccessError(queryErr) {
-			_ = darwinSignalVerifiedKnownMembers(*proof, id)
+			_, _ = darwinSignalVerifiedKnownMembers(*proof, id)
 		}
 		return queryErr
 	}
 
 	known, liveCount, cerr := darwinResolveGroupCandidates(*proof, id, leaderSec, leaderUsec, procs)
 	if cerr != nil {
+		sig, serr := darwinSignalVerifiedKnownMembers(*proof, id)
 		if leaderErr != nil && isProcessAccessError(leaderErr) {
-			_ = darwinSignalVerifiedKnownMembers(*proof, id)
 			return leaderErr
+		}
+		if sig {
+			for i := 0; i < 20; i++ {
+				if !hasVerifiedLiveKnownMemberDarwin(*proof) {
+					return nil
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if serr != nil {
+				return serr
+			}
+			return fmt.Errorf("verified process group members for pid %d still alive after signalling: %w", id.PID, errGroupMembersStillAlive)
+		}
+		if serr != nil {
+			return serr
 		}
 		return cerr
 	}
 	if liveCount == 0 {
 		if leaderErr != nil {
-			_ = darwinSignalVerifiedKnownMembers(*proof, id)
+			_, _ = darwinSignalVerifiedKnownMembers(*proof, id)
 			return leaderErr
 		}
 		return os.ErrProcessDone
@@ -423,7 +467,7 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	kerr := darwinResolveGroupKillError(id.PGID, syscall.Kill(-id.PGID, syscall.SIGKILL))
 	if kerr != nil && !errors.Is(kerr, os.ErrProcessDone) {
 		if isProcessAccessError(kerr) {
-			_ = darwinSignalVerifiedKnownMembers(*proof, id)
+			_, _ = darwinSignalVerifiedKnownMembers(*proof, id)
 		}
 		return kerr
 	}
