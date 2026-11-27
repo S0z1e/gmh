@@ -146,6 +146,16 @@ func (e *Executor) CloseJobs(ctx context.Context) error {
 				job.mu.Unlock()
 				if failed {
 					closeErrs = append(closeErrs, errors.New(waitErr))
+					continue
+				}
+				// Even if monitorDone closed after a transient error or race with
+				// StopJob, wait for any concurrent/subsequent completion audit and
+				// job.Done() before returning.
+				select {
+				case <-job.Done():
+				case <-ctx.Done():
+					closeErrs = append(closeErrs, ctx.Err())
+					return errors.Join(closeErrs...)
 				}
 			case <-ctx.Done():
 				closeErrs = append(closeErrs, ctx.Err())

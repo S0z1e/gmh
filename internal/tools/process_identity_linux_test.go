@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -715,21 +716,34 @@ func TestCrashRecoveryInconclusiveLinuxGroupScanKeepsJobStoppable(t *testing.T) 
 	}
 
 	origReadProcDir := readProcDirFn
+	var forceEMFILE atomic.Bool
+	forceEMFILE.Store(true)
 	readProcDirFn = func() ([]os.DirEntry, error) {
-		return nil, syscall.EMFILE
+		if forceEMFILE.Load() {
+			return nil, syscall.EMFILE
+		}
+		return origReadProcDir()
 	}
-	defer func() { readProcDirFn = origReadProcDir }()
 
 	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
 	exec2.SwitchSession(outID)
-	defer exec2.CloseJobs(context.Background())
+	var recoveredJob *Job
+	t.Cleanup(func() {
+		forceEMFILE.Store(false)
+		_ = exec2.CloseJobs(context.Background())
+		if recoveredJob != nil && recoveredJob.monitorDone != nil {
+			<-recoveredJob.monitorDone
+		}
+		readProcDirFn = origReadProcDir
+	})
 
 	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
 	if err != nil || len(recovered) != 1 || recovered[0].Status != JobRunning {
 		t.Fatalf("inconclusive EMFILE scan recovery = %+v, err=%v; want JobRunning", recovered, err)
 	}
+	recoveredJob = exec2.registry().Get("bg-inconclusive")
 
-	readProcDirFn = origReadProcDir
+	forceEMFILE.Store(false)
 	res, stopErr := exec2.StopJob("bg-inconclusive")
 	if stopErr != nil {
 		t.Fatalf("StopJob after inconclusive scan failed: %v (%s)", stopErr, res.Text)

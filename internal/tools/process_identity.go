@@ -66,6 +66,7 @@ type processGroupProof struct {
 	KnownMembers      map[int]string
 	VerifiedAt        time.Time
 	verifiedFDs       map[int]verifiedProcFD
+	jobHandle         uintptr
 	ExitObservedAt    time.Time
 }
 
