@@ -1062,7 +1062,146 @@ func TestLinuxRecoveryKeepsJobPendingWhenOneKnownMemberRaisesEACCES(t *testing.T
 	if inspectProcess(childAPID).Alive {
 		t.Fatalf("childA pid %d survived cleanup", childAPID)
 	}
-	if !inspectProcess(childBPID).Alive {
-		t.Fatalf("expected childB pid %d to still be alive under EACCES", childBPID)
+	metaB, errB := origInspectMeta(childBPID)
+	if errB != nil || !metaB.info.Alive {
+		t.Fatalf("expected childB pid %d to still be alive under EACCES (meta=%+v, err=%v)", childBPID, metaB, errB)
+	}
+
+	// Retry after clearing EACCES finishes cleaning childB cleanly.
+	forceBEACCES.Store(false)
+	if rerr := stopAdoptedProcessGroupAfterExitTrack(&proof); rerr != nil {
+		t.Fatalf("retry stopAdoptedProcessGroupAfterExitTrack err = %v", rerr)
+	}
+	for wait := 0; wait < 20; wait++ {
+		if m, merr := origInspectMeta(childBPID); merr != nil || !m.info.Alive {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if m, merr := origInspectMeta(childBPID); merr == nil && m.info.Alive {
+		t.Fatalf("childB pid %d survived cleanup retry", childBPID)
+	}
+}
+
+func TestLinuxCachedPidfdVerificationErrorPreserved(t *testing.T) {
+	childACmd := exec.Command("sleep", "30")
+	configureProcess(childACmd)
+	if err := childACmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	childAPID := childACmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childAPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = childACmd.Wait()
+	})
+	infoA := inspectProcess(childAPID)
+
+	childBCmd := exec.Command("sleep", "30")
+	configureProcess(childBCmd)
+	if err := childBCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	childBPID := childBCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childBPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = childBCmd.Wait()
+	})
+	infoB := inspectProcess(childBPID)
+
+	intruderCmd := exec.Command("sleep", "30")
+	configureProcess(intruderCmd)
+	if err := intruderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	intruderPID := intruderCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(intruderPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = intruderCmd.Wait()
+	})
+
+	// Open a non-pidfd file descriptor for childB so verifyPreCapturedMemberFD
+	// fails with a non-mismatch kernel error (EINVAL/EBADF) rather than ESRCH.
+	nullFile, err := os.Open("/dev/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nullFile.Close()
+
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	t.Cleanup(func() {
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+	})
+
+	leaderPID := infoA.PGID
+	if leaderPID == childAPID || leaderPID == childBPID {
+		leaderPID = childBPID + 99998
+	}
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == intruderPID {
+			m, err := origInspectMeta(pid)
+			if err == nil {
+				m.info.PGID = infoA.PGID
+				m.info.UID = infoA.UID + 1
+				m.info.HasUID = true
+			}
+			return m, err
+		}
+		return origInspectMeta(pid)
+	}
+
+	proof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: infoA.PGID, StartToken: infoA.StartToken},
+		UID:            infoA.UID,
+		HasUID:         true,
+		SID:            infoA.SID,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers: map[int]string{
+			leaderPID: infoA.StartToken,
+			childAPID: infoA.StartToken,
+			childBPID: infoB.StartToken,
+		},
+		verifiedFDs: map[int]verifiedProcFD{
+			childBPID: {fd: int(nullFile.Fd()), startToken: infoB.StartToken},
+		},
+	}
+
+	// Presence check for childB alone (when childA has exited) must propagate
+	// cached verification error instead of returning (false, nil).
+	onlyB := proof
+	onlyB.KnownMembers = map[int]string{leaderPID: infoA.StartToken, childBPID: infoB.StartToken}
+	if live, lerr := hasVerifiedLiveKnownMemberLinux(onlyB); live || lerr == nil {
+		t.Fatalf("hasVerifiedLiveKnownMemberLinux = (%v, %v), want (false, non-nil cached FD error)", live, lerr)
+	}
+
+	// Cleanup with cached FD error on childB after killing childA must NOT return nil.
+	if err := stopAdoptedProcessGroupAfterExitTrack(&proof); err == nil {
+		t.Fatal("stopAdoptedProcessGroupAfterExitTrack = nil despite cached pidfd verification error on childB")
+	}
+	for wait := 0; wait < 20; wait++ {
+		if m, merr := origInspectMeta(childAPID); merr != nil || !m.info.Alive {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if m, merr := origInspectMeta(childAPID); merr == nil && m.info.Alive {
+		t.Fatalf("childA pid %d survived cleanup", childAPID)
+	}
+	if m, merr := origInspectMeta(childBPID); merr != nil || !m.info.Alive {
+		t.Fatalf("expected childB pid %d to still be alive under cached FD error (meta=%+v, err=%v)", childBPID, m, merr)
 	}
 }

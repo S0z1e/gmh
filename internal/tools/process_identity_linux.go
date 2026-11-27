@@ -641,6 +641,12 @@ func hasVerifiedLiveKnownMemberLinux(proof processGroupProof) (bool, error) {
 		}
 		hasFD, alive, verr := verifyPreCapturedMemberFD(proof, pid, tok)
 		if hasFD {
+			if verr != nil && !errors.Is(verr, ErrProcessIdentityMismatch) {
+				if inspectErr == nil {
+					inspectErr = verr
+				}
+				continue
+			}
 			if verr == nil && alive {
 				return true, nil
 			}
@@ -675,6 +681,12 @@ func signalVerifiedKnownMembersLinux(proof processGroupProof, id ProcessIdentity
 		}
 		hasFD, alive, verr := verifyPreCapturedMemberFD(proof, pid, tok)
 		if hasFD {
+			if verr != nil && !errors.Is(verr, ErrProcessIdentityMismatch) {
+				if firstErr == nil {
+					firstErr = verr
+				}
+				continue
+			}
 			if verr == nil && alive {
 				entry := proof.verifiedFDs[pid]
 				if kerr := unix.PidfdSendSignal(entry.fd, unix.SIGKILL, nil, 0); kerr == nil {
@@ -822,29 +834,9 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 					return leaderErr
 				}
 				if sig {
-					// Brief grace wait so signalled persisted children exit cleanly; never
-					// treat unresolvable member inspection or signal errors as completion.
-					var lastLiveErr error
-					for i := 0; i < 20; i++ {
-						live, lerr := hasVerifiedLiveKnownMemberLinux(*proof)
-						if lerr != nil {
-							lastLiveErr = lerr
-						}
-						if !live && lerr == nil {
-							if serr != nil {
-								return serr
-							}
-							return nil
-						}
-						time.Sleep(5 * time.Millisecond)
-					}
-					if serr != nil {
-						return serr
-					}
-					if lastLiveErr != nil {
-						return lastLiveErr
-					}
-					return fmt.Errorf("verified process group members for pid %d still alive after signalling: %w", id.PID, errGroupMembersStillAlive)
+					return waitForKnownMembersExit(id, serr, func() (bool, error) {
+						return hasVerifiedLiveKnownMemberLinux(*proof)
+					})
 				}
 				if serr != nil {
 					return serr

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"errors"
+	"fmt"
 	"syscall"
 	"time"
 )
@@ -152,4 +153,25 @@ func isFDLimitErr(err error) bool {
 		return false
 	}
 	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
+}
+
+func waitForKnownMembersExit(id ProcessIdentityInfo, signalErr error, checkLive func() (bool, error)) error {
+	var lastLiveErr error
+	for i := 0; i < 20; i++ {
+		live, lerr := checkLive()
+		if lerr != nil {
+			lastLiveErr = lerr
+		}
+		if !live && lerr == nil {
+			return signalErr
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if signalErr != nil {
+		return signalErr
+	}
+	if lastLiveErr != nil {
+		return lastLiveErr
+	}
+	return fmt.Errorf("verified process group members for pid %d still alive after signalling: %w", id.PID, errGroupMembersStillAlive)
 }

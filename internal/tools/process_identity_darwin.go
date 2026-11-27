@@ -424,27 +424,9 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 			return leaderErr
 		}
 		if sig {
-			var lastLiveErr error
-			for i := 0; i < 20; i++ {
-				live, lerr := hasVerifiedLiveKnownMemberDarwin(*proof)
-				if lerr != nil {
-					lastLiveErr = lerr
-				}
-				if !live && lerr == nil {
-					if serr != nil {
-						return serr
-					}
-					return nil
-				}
-				time.Sleep(5 * time.Millisecond)
-			}
-			if serr != nil {
-				return serr
-			}
-			if lastLiveErr != nil {
-				return lastLiveErr
-			}
-			return fmt.Errorf("verified process group members for pid %d still alive after signalling: %w", id.PID, errGroupMembersStillAlive)
+			return waitForKnownMembersExit(id, serr, func() (bool, error) {
+				return hasVerifiedLiveKnownMemberDarwin(*proof)
+			})
 		}
 		if serr != nil {
 			return serr
