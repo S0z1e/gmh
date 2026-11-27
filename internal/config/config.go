@@ -198,17 +198,18 @@ type File struct {
 	API     string `json:"api"`
 	Model   string `json:"model"`
 
-	Mode                   string               `json:"mode"`
-	BashTimeoutSeconds     *int                 `json:"bashTimeoutSeconds"`
-	ApprovalTimeoutSeconds *int                 `json:"approvalTimeoutSeconds"`
-	BashEnv                []string             `json:"bashEnv"`
-	Verification           *verification.Policy `json:"verification"`
-	BgThresholdSeconds     *int                 `json:"bgThresholdSeconds"`
-	DenyInsteadOfPrompt    *bool                `json:"denyInsteadOfPrompt"`
-	Sandbox                *bool                `json:"sandbox"`
-	ContextLimit           *int                 `json:"contextLimit"`
-	AnthropicMaxTokens     *int                 `json:"anthropicMaxTokens"`
-	TUITheme               string               `json:"tuiTheme"`
+	Mode                         string               `json:"mode"`
+	BashTimeoutSeconds           *int                 `json:"bashTimeoutSeconds"`
+	ApprovalTimeoutSeconds       *int                 `json:"approvalTimeoutSeconds"`
+	BashEnv                      []string             `json:"bashEnv"`
+	Verification                 *verification.Policy `json:"verification"`
+	BgThresholdSeconds           *int                 `json:"bgThresholdSeconds"`
+	BackgroundMaxLifetimeSeconds *int                 `json:"backgroundMaxLifetimeSeconds"`
+	DenyInsteadOfPrompt          *bool                `json:"denyInsteadOfPrompt"`
+	Sandbox                      *bool                `json:"sandbox"`
+	ContextLimit                 *int                 `json:"contextLimit"`
+	AnthropicMaxTokens           *int                 `json:"anthropicMaxTokens"`
+	TUITheme                     string               `json:"tuiTheme"`
 	// Plugins is the optional plugins section (nil = unset: nothing
 	// is disabled). A project file's section replaces the global
 	// one, like a provider's models list.
@@ -361,6 +362,9 @@ func Merge(dst, src *File) {
 	}
 	if src.BgThresholdSeconds != nil {
 		dst.BgThresholdSeconds = src.BgThresholdSeconds
+	}
+	if src.BackgroundMaxLifetimeSeconds != nil {
+		dst.BackgroundMaxLifetimeSeconds = src.BackgroundMaxLifetimeSeconds
 	}
 	if src.DenyInsteadOfPrompt != nil {
 		dst.DenyInsteadOfPrompt = src.DenyInsteadOfPrompt
@@ -645,6 +649,9 @@ func Validate(f *File) error {
 	}
 	if f.BgThresholdSeconds != nil && *f.BgThresholdSeconds < 0 {
 		return fmt.Errorf("bgThresholdSeconds must be >= 0 (0 disables backgrounding)")
+	}
+	if f.BackgroundMaxLifetimeSeconds != nil && *f.BackgroundMaxLifetimeSeconds < 0 {
+		return fmt.Errorf("backgroundMaxLifetimeSeconds must be >= 0 (0 disables the lifetime cap)")
 	}
 	if f.ContextLimit != nil && *f.ContextLimit <= 0 {
 		return fmt.Errorf("contextLimit must be > 0")

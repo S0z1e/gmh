@@ -58,29 +58,43 @@ type Job struct {
 	PID            int
 	PGID           int
 	ProcessStarted string
+	JobToken       string
+	groupProof     processGroupProof
+	proofFDMu      sync.Mutex
 	Adopted        bool
 	RecoveryNote   string
 	// OutputFile is the per-call file holding the full stdout+stderr
 	// ("" when OutputDir was unset); it grows while the job runs.
-	OutputFile  string
-	Started     time.Time
-	cancel      context.CancelFunc
-	closeCancel context.CancelFunc
-	stopParent  func() bool
+	OutputFile   string
+	Started      time.Time
+	Deadline     time.Time
+	Unlimited    bool
+	WaitError    string
+	cancel       context.CancelFunc
+	closeCancel  context.CancelFunc
+	closeStop    func() error
+	stopParent   func() bool
+	stopDeadline func()
+	monitorDone  chan struct{}
 
 	jobsDir   string
 	outputDir string
+	exec      *Executor
+	audit     func(AuditEntry)
 	persistMu sync.Mutex
 
-	mu         sync.Mutex
-	done       chan struct{}
-	result     JobResult
-	finished   bool
-	unknown    bool
-	retained   bool
-	forgotten  bool
-	finishedAt time.Time
-	registry   *JobRegistry
+	mu                sync.Mutex
+	done              chan struct{}
+	result            JobResult
+	finished          bool
+	unknown           bool
+	monitorFailed     bool
+	cleanupPending    bool
+	expiredOnAdoption bool
+	retained          bool
+	forgotten         bool
+	finishedAt        time.Time
+	registry          *JobRegistry
 	// A later turn must not deliver a recorded result twice.
 	delivered bool
 	// adoptionNoticed ensures an adopted running job sends at most one
@@ -99,6 +113,8 @@ type Job struct {
 type JobSnapshot struct {
 	ID              string
 	Started         time.Time
+	Deadline        time.Time
+	Unlimited       bool
 	InvocationID    string
 	ToolCallID      string
 	Command         string
@@ -109,6 +125,7 @@ type JobSnapshot struct {
 	Identity        ProcessIdentityInfo
 	Adopted         bool
 	RecoveryNote    string
+	WaitError       string
 	Status          JobStatus
 	FinishedAt      time.Time
 	Delivered       bool
@@ -132,6 +149,8 @@ func (j *Job) Snapshot() JobSnapshot {
 	return JobSnapshot{
 		ID:              j.ID,
 		Started:         j.Started,
+		Deadline:        j.Deadline,
+		Unlimited:       j.Unlimited,
 		InvocationID:    j.InvocationID,
 		ToolCallID:      j.ToolCallID,
 		Command:         j.Command,
@@ -142,6 +161,7 @@ func (j *Job) Snapshot() JobSnapshot {
 		Identity:        ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted},
 		Adopted:         j.Adopted,
 		RecoveryNote:    j.RecoveryNote,
+		WaitError:       j.WaitError,
 		Status:          status,
 		FinishedAt:      j.finishedAt,
 		Delivered:       j.delivered,
@@ -230,9 +250,15 @@ func (j *Job) snapshotForPersist() (PersistedJob, string, bool) {
 	if j.result.Err != nil {
 		errMsg = j.result.Err.Error()
 	}
+	var persistedProof *PersistedGroupProof
+	if status == JobRunning && (j.Adopted || j.cleanupPending || !j.groupProof.VerifiedAt.IsZero()) {
+		persistedProof = persistedGroupProofFromProof(j.groupProof, j.cleanupPending || !j.groupProof.ExitObservedAt.IsZero())
+	}
 	return PersistedJob{
 		ID:              j.ID,
 		Started:         j.Started,
+		Deadline:        j.Deadline,
+		Unlimited:       j.Unlimited,
 		InvocationID:    j.InvocationID,
 		ToolCallID:      j.ToolCallID,
 		Command:         j.Command,
@@ -243,6 +269,8 @@ func (j *Job) snapshotForPersist() (PersistedJob, string, bool) {
 		PID:             j.PID,
 		PGID:            j.PGID,
 		ProcessStarted:  j.ProcessStarted,
+		JobToken:        j.JobToken,
+		GroupProof:      persistedProof,
 		Status:          status,
 		ExitCode:        exitCode,
 		ExitCodeUnknown: j.result.ExitCodeUnknown,
@@ -294,6 +322,10 @@ func (j *Job) markUnknown(reason, outputSummary string, preview *BashOutputPrevi
 		j.stopParent()
 		j.stopParent = nil
 	}
+	if j.stopDeadline != nil {
+		j.stopDeadline()
+		j.stopDeadline = nil
+	}
 	j.unknown = true
 	j.RecoveryNote = reason
 	j.finishedAt = time.Now()
@@ -305,30 +337,54 @@ func (j *Job) markUnknown(reason, outputSummary string, preview *BashOutputPrevi
 		Preview:         preview,
 	}
 	j.mu.Unlock()
+	j.closeProofFDs()
 	j.persist()
 	close(j.done)
 }
 
 func (j *Job) finish(r JobResult) {
+	j.finishCore(r, nil, nil)
+}
+
+func (j *Job) finishCore(r JobResult, prePersist func(), postPersist func()) bool {
 	j.mu.Lock()
 	if j.finished || j.unknown {
 		j.mu.Unlock()
-		return
+		return false
 	}
 	if j.stopParent != nil {
 		j.stopParent()
 		j.stopParent = nil
 	}
+	if j.stopDeadline != nil {
+		j.stopDeadline()
+		j.stopDeadline = nil
+	}
 	j.result = r
 	j.finished = true
+	j.cleanupPending = false
 	j.finishedAt = time.Now()
 	registry, delivered := j.registry, j.delivered
 	j.mu.Unlock()
+	j.closeProofFDs()
+	if prePersist != nil {
+		prePersist()
+	}
 	if delivered && registry != nil {
 		registry.trimDelivered()
 	}
 	j.persist()
+	if postPersist != nil {
+		postPersist()
+	}
 	close(j.done)
+	return true
+}
+
+func (j *Job) closeProofFDs() {
+	j.proofFDMu.Lock()
+	defer j.proofFDMu.Unlock()
+	closeVerifiedGroupProof(&j.groupProof)
 }
 
 // Delivered reports whether the job's terminal outcome (or unknown notice) was
@@ -400,9 +456,33 @@ func (j *Job) MarkReported() {
 // JobRegistry tracks every background job started by one Executor
 // (one process). Completed jobs stay listed so /jobs can show them.
 type JobRegistry struct {
-	mu   sync.Mutex
-	jobs []*Job
-	next int
+	mu       sync.Mutex
+	jobs     []*Job
+	next     int
+	abortGen uint64
+}
+
+func (r *JobRegistry) abortGeneration() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.abortGen
+}
+
+func (r *JobRegistry) prepareCancelAll() func() {
+	r.mu.Lock()
+	r.abortGen++
+	jobs := make([]*Job, len(r.jobs))
+	copy(jobs, r.jobs)
+	r.mu.Unlock()
+	return func() {
+		for _, job := range jobs {
+			job.Cancel()
+		}
+	}
+}
+
+func (r *JobRegistry) cancelAll() {
+	r.prepareCancelAll()()
 }
 
 func (r *JobRegistry) add(j *Job) {
@@ -428,7 +508,7 @@ func (r *JobRegistry) addWithSeq(j *Job, seq int) {
 	r.evictDelivered()
 }
 
-func (r *JobRegistry) addPreserved(j *Job) {
+func (r *JobRegistry) addPreserved(j *Job) uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if seq := jobSequenceNumber(j.ID); seq > r.next {
@@ -439,6 +519,7 @@ func (r *JobRegistry) addPreserved(j *Job) {
 	j.mu.Unlock()
 	r.jobs = append(r.jobs, j)
 	r.evictDelivered()
+	return r.abortGen
 }
 
 func (r *JobRegistry) listLocked() []*Job {
@@ -609,9 +690,10 @@ type startedBashProcess struct {
 	pid               int
 	pgid              int
 	startToken        string
+	info              processInfo
 }
 
-func (e *Executor) startBashProcess(ctx context.Context, command string, timeout time.Duration, output *bashOutputFile, dir string) (*startedBashProcess, error) {
+func (e *Executor) startBashProcess(ctx context.Context, command string, timeout time.Duration, output *bashOutputFile, dir string, extraEnv ...string) (*startedBashProcess, error) {
 	var runCtx context.Context
 	var cancel context.CancelFunc
 	if timeout > 0 {
@@ -631,7 +713,11 @@ func (e *Executor) startBashProcess(ctx context.Context, command string, timeout
 		cmd = exec.CommandContext(runCtx, "bash", "-c", command)
 		cmd.Dir = dir
 	}
-	cmd.Env = bashEnvironment(e.BashEnv)
+	env := bashEnvironment(e.BashEnv)
+	if len(extraEnv) > 0 {
+		env = append(append([]string(nil), env...), extraEnv...)
+	}
+	cmd.Env = env
 	// Own process group, killed as a whole on timeout/abort (see
 	// Cancel below). Without this, only the direct bash child died
 	// and grandchildren lingered as orphans.
@@ -689,10 +775,11 @@ func (e *Executor) startBashProcess(ctx context.Context, command string, timeout
 	pid := 0
 	pgid := 0
 	var startToken string
+	var info processInfo
 	if cmd.Process != nil {
 		pid = cmd.Process.Pid
 		pgid = processGroupID(pid)
-		info := inspectProcess(pid)
+		info = inspectProcess(pid)
 		if info.PGID > 0 {
 			pgid = info.PGID
 		}
@@ -717,6 +804,7 @@ func (e *Executor) startBashProcess(ctx context.Context, command string, timeout
 		pid:               pid,
 		pgid:              pgid,
 		startToken:        startToken,
+		info:              info,
 	}, nil
 }
 
@@ -952,6 +1040,15 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 	identity := invocationFromContext(ctx)
 	key, _ := ctx.Value(failureKeyContext{}).(string)
 	jobsDir := e.JobsDirPath()
+	started := time.Now()
+	var deadline time.Time
+	unlimited := false
+	if timeout > 0 {
+		deadline = started.Add(timeout)
+	} else {
+		unlimited = true
+	}
+	jobToken := randomHexToken(16)
 	job := &Job{
 		InvocationID: identity.id,
 		ToolCallID:   identity.callID,
@@ -960,10 +1057,13 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		Cwd:          dir,
 		OutputID:     e.OutputID,
 		OutputFile:   output.publicPath(),
+		JobToken:     jobToken,
 		jobsDir:      jobsDir,
 		outputDir:    e.OutputDir,
 		retained:     !foreground || jobsDir != "",
-		Started:      time.Now(),
+		Started:      started,
+		Deadline:     deadline,
+		Unlimited:    unlimited,
 		done:         make(chan struct{}),
 		cancel:       cancel,
 		closeCancel:  func() { cancelCause(ErrExecutorClosed) },
@@ -984,6 +1084,11 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		output.Close()
 		return nil, ErrExecutorClosed
 	}
+	if e.jobs == nil {
+		e.jobs = &JobRegistry{}
+	}
+	reg := e.jobs
+	startAbortGen := reg.abortGeneration()
 	e.nextJobSeq++
 	seq := e.nextJobSeq
 	e.jobsMu.Unlock()
@@ -998,13 +1103,30 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		job.mu.Unlock()
 		cancel()
 	}
-	proc, startErr := e.startBashProcess(commandCtx, a.Command, timeout, output, dir)
+	proc, startErr := e.startBashProcess(commandCtx, a.Command, timeout, output, dir, jobTokenEnvVar+"="+jobToken)
 	if startErr == nil {
 		job.mu.Lock()
 		job.PID = proc.pid
 		job.PGID = proc.pgid
 		job.ProcessStarted = proc.startToken
+		id := ProcessIdentityInfo{PID: proc.pid, PGID: proc.pgid, StartToken: proc.startToken}
+		if id.Valid() {
+			job.groupProof = processGroupProof{
+				Leader:       id,
+				UID:          proc.info.UID,
+				HasUID:       proc.info.HasUID,
+				SID:          proc.info.SID,
+				Sess:         proc.info.Sess,
+				JobToken:     jobToken,
+				OutputFile:   job.OutputFile,
+				KnownMembers: map[int]string{id.PID: id.StartToken},
+				VerifiedAt:   time.Now(),
+			}
+		}
 		job.mu.Unlock()
+	}
+	if e.beforeJobPublish != nil {
+		e.beforeJobPublish()
 	}
 
 	e.jobsMu.Lock()
@@ -1027,11 +1149,19 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		transferred = true
 		return nil, ErrExecutorClosed
 	}
-	if e.jobs == nil {
-		e.jobs = &JobRegistry{}
+	// Publish into the same registry captured before fork and check whether an
+	// abort cancelled that registry after startAbortGen was sampled. If so,
+	// cancel commandCtx here so in-progress launches cannot escape abort.
+	abortObserved := reg.addPreserved(job) != startAbortGen || ctx.Err() != nil
+	if abortObserved {
+		job.mu.Lock()
+		job.stopRequested = true
+		job.mu.Unlock()
 	}
-	e.jobs.addPreserved(job)
 	e.jobsMu.Unlock()
+	if abortObserved {
+		cancel()
+	}
 	job.persist()
 	transferred = true
 	go func() {
@@ -1090,29 +1220,379 @@ func (j *Job) CancelErr() error {
 	}
 	j.stopRequested = true
 	adopted := j.Adopted
-	id := ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
 	cancel := j.cancel
-	outFile, cwd := j.OutputFile, j.Cwd
 	j.mu.Unlock()
 	if adopted {
-		err := stopVerifiedProcessGroup(id)
-		if errors.Is(err, ErrProcessIdentityMismatch) {
-			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
-			j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, err), summary, preview)
-			if cancel != nil {
-				cancel()
-			}
-			return err
+		err := j.stopAdoptedProcess(context.Canceled, false)
+		if errors.Is(err, ErrProcessIdentityMismatch) && cancel != nil {
+			cancel()
 		}
-		if err != nil && !errors.Is(err, os.ErrProcessDone) {
-			j.persist()
-			return err
-		}
-		j.persist()
-		return nil
+		return err
 	}
 	if cancel != nil {
 		cancel()
+	}
+	j.persist()
+	return nil
+}
+
+func (j *Job) recordStopError(err error) {
+	if err == nil {
+		return
+	}
+	j.mu.Lock()
+	if !j.finished && !j.unknown {
+		j.monitorFailed = true
+		if !j.groupProof.ExitObservedAt.IsZero() {
+			j.cleanupPending = true
+		}
+		j.WaitError = err.Error()
+		j.RecoveryNote = fmt.Sprintf("adopted live OS process PID %d (pgid %d); stop error (%v) — job remains stoppable; %s",
+			j.PID, j.PGID, err, pipeCaptureEndedNote(j.OutputFile))
+	}
+	j.mu.Unlock()
+	j.persist()
+}
+
+func (j *Job) snapshotGroupProofLocked() processGroupProof {
+	proof := cloneGroupProof(j.groupProof)
+	proof.verifiedFDs = j.groupProof.verifiedFDs
+	if proof.Leader == (ProcessIdentityInfo{}) {
+		proof.Leader = ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
+	}
+	if proof.JobToken == "" {
+		proof.JobToken = j.JobToken
+	}
+	if proof.OutputFile == "" {
+		proof.OutputFile = j.OutputFile
+	}
+	return proof
+}
+
+func (j *Job) handleAdoptedLeaderIdentityMismatch(outFile, cwd string) bool {
+	j.proofFDMu.Lock()
+	j.mu.Lock()
+	proof := j.snapshotGroupProofLocked()
+	j.mu.Unlock()
+	hasProof := hasIndependentGroupProof(proof)
+	j.proofFDMu.Unlock()
+	if hasProof {
+		return true
+	}
+	summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
+	j.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
+	return false
+}
+
+func populateGroupProofIdentity(proof *processGroupProof, info processInfo) {
+	if proof == nil || !info.Alive {
+		return
+	}
+	if !proof.HasUID && info.HasUID {
+		proof.UID = info.UID
+		proof.HasUID = true
+	}
+	if proof.SID <= 0 && info.SID > 0 {
+		proof.SID = info.SID
+	}
+	if proof.Sess == 0 && info.Sess != 0 {
+		proof.Sess = info.Sess
+	}
+}
+
+func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
+	j.mu.Lock()
+	if j.finished || j.unknown {
+		proof := j.snapshotGroupProofLocked()
+		j.mu.Unlock()
+		return proof
+	}
+	proof := j.snapshotGroupProofLocked()
+	j.mu.Unlock()
+
+	if proof.Leader.Valid() && (!proof.HasUID || proof.Sess == 0 || proof.SID <= 0) {
+		if linfo, lerr := inspectProcessErr(proof.Leader.PID); lerr == nil && proof.Leader.Matches(linfo) {
+			populateGroupProofIdentity(&proof, linfo)
+		}
+	}
+	captureVerifiedGroupProof(&proof)
+
+	j.mu.Lock()
+	prevMembers := len(j.groupProof.KnownMembers)
+	prevPipes := len(j.groupProof.LeaderPipeTargets)
+	prevVerified := !j.groupProof.VerifiedAt.IsZero()
+	j.groupProof.KnownMembers = mergeGroupMembers(j.groupProof.KnownMembers, proof.KnownMembers)
+	j.groupProof.LeaderPipeTargets = mergePipeTargets(j.groupProof.LeaderPipeTargets, proof.LeaderPipeTargets)
+	if !j.groupProof.HasUID && proof.HasUID {
+		j.groupProof.UID = proof.UID
+		j.groupProof.HasUID = true
+	}
+	if j.groupProof.SID <= 0 && proof.SID > 0 {
+		j.groupProof.SID = proof.SID
+	}
+	if j.groupProof.Sess == 0 && proof.Sess != 0 {
+		j.groupProof.Sess = proof.Sess
+	}
+	if !proof.VerifiedAt.IsZero() {
+		j.groupProof.VerifiedAt = proof.VerifiedAt
+	}
+	j.groupProof.verifiedFDs = proof.verifiedFDs
+	var staleProof processGroupProof
+	if j.groupProof.jobHandle == 0 && proof.jobHandle != 0 {
+		j.groupProof.jobHandle = proof.jobHandle
+	} else if proof.jobHandle != 0 && proof.jobHandle != j.groupProof.jobHandle {
+		staleProof.jobHandle = proof.jobHandle
+	}
+	changed := (!prevVerified && !j.groupProof.VerifiedAt.IsZero()) || len(j.groupProof.KnownMembers) > prevMembers || len(j.groupProof.LeaderPipeTargets) > prevPipes
+	out := j.snapshotGroupProofLocked()
+	j.mu.Unlock()
+	if staleProof.jobHandle != 0 {
+		closeVerifiedGroupProof(&staleProof)
+	}
+	if changed {
+		j.persist()
+	}
+	return out
+}
+
+func (j *Job) runStopGroupAfterExit(proof *processGroupProof) error {
+	if j.exec != nil && j.exec.stopAdoptedGroupAfterExit != nil {
+		return j.exec.stopAdoptedGroupAfterExit(*proof)
+	}
+	return stopAdoptedProcessGroupAfterExitTrack(proof)
+}
+
+func formatAdoptedSummaryPreview(outFile, cwd, emptyMsg, fileNote string) (string, *BashOutputPreview) {
+	summary, preview, _, hasFile := summarizeOutputFile(outFile, cwd)
+	if !hasFile {
+		summary = emptyMsg
+	} else {
+		summary += "\n[" + fileNote + "]"
+	}
+	if preview != nil {
+		note := "[" + fileNote + "]"
+		if preview.Notice != "" {
+			preview.Notice += "\n" + note
+		} else {
+			preview.Notice = note
+		}
+	}
+	return summary, preview
+}
+
+func (j *Job) finishAdoptedWithAudit(r JobResult, auditFn func(AuditEntry), auditCode int, auditErr error) bool {
+	j.mu.Lock()
+	invID, callID, cmd := j.InvocationID, j.ToolCallID, j.Command
+	execRef, outFile, outputDir := j.exec, j.OutputFile, j.outputDir
+	j.mu.Unlock()
+
+	return j.finishCore(r, func() {
+		if execRef != nil && outFile != "" && outputDir != "" {
+			execRef.unmarkActiveOutput(outputDir, outFile)
+		}
+	}, func() {
+		if auditFn != nil {
+			entry := AuditEntry{
+				InvocationID: invID,
+				ToolCallID:   callID,
+				TS:           time.Now(),
+				Kind:         "bash",
+				Tool:         "bash",
+				Args:         truncate(cmd, 500),
+				ExitCode:     auditCode,
+			}
+			if auditErr != nil {
+				entry.Error = auditErr.Error()
+			}
+			auditFn(entry)
+		}
+	})
+}
+
+func (j *Job) preparePendingPostExitCleanupLocked() processGroupProof {
+	j.cleanupPending = true
+	if !j.groupProof.VerifiedAt.IsZero() && j.groupProof.ExitObservedAt.IsZero() {
+		j.groupProof.ExitObservedAt = time.Now()
+	}
+	return j.snapshotGroupProofLocked()
+}
+
+func (j *Job) mergeLearnedGroupMembers(proof processGroupProof) {
+	if len(proof.KnownMembers) == 0 {
+		return
+	}
+	j.mu.Lock()
+	j.groupProof.KnownMembers = mergeGroupMembers(j.groupProof.KnownMembers, proof.KnownMembers)
+	stale := detachStaleVerifiedFDs(&j.groupProof)
+	j.mu.Unlock()
+	closeVerifiedGroupProof(&stale)
+}
+
+func hasIndependentGroupProof(proof processGroupProof) bool {
+	if proof.JobToken != "" || proof.jobHandle != 0 || !proof.VerifiedAt.IsZero() {
+		return true
+	}
+	for pid := range proof.KnownMembers {
+		if pid != proof.Leader.PID {
+			return true
+		}
+	}
+	return false
+}
+
+func (j *Job) prepareAdoptedDowntimeTimeoutSummary(pid, pgid int, deadline time.Time, outFile, cwd string) (string, *BashOutputPreview) {
+	timeoutNote := fmt.Sprintf("adopted job PID %d (pgid %d) exceeded deadline (%s) while harness was down; stopped verified process group; %s",
+		pid, pgid, deadline.UTC().Format(time.RFC3339), pipeCaptureEndedNote(outFile))
+	j.mu.Lock()
+	if !j.finished && !j.unknown {
+		j.RecoveryNote = timeoutNote
+	}
+	j.mu.Unlock()
+	summary, preview := formatAdoptedSummaryPreview(outFile, cwd, fmt.Sprintf("(adopted background job stopped on adoption; %s)", timeoutNote), timeoutNote)
+	return summary, preview
+}
+
+func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
+	j.proofFDMu.Lock()
+	j.mu.Lock()
+	if j.finished || j.unknown {
+		j.mu.Unlock()
+		j.proofFDMu.Unlock()
+		return nil
+	}
+	id := ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
+	outFile, cwd, monitorFailed := j.OutputFile, j.Cwd, j.monitorFailed
+	auditFn := j.audit
+	started, deadline := j.Started, j.Deadline
+	monitorDone := false
+	if j.monitorDone != nil {
+		select {
+		case <-j.monitorDone:
+			monitorDone = true
+		default:
+		}
+	}
+	mustFinalize := monitorFailed || monitorDone
+	pendingCleanup := j.cleanupPending || !j.groupProof.ExitObservedAt.IsZero()
+	var proof processGroupProof
+	if pendingCleanup {
+		proof = j.preparePendingPostExitCleanupLocked()
+	}
+	j.mu.Unlock()
+
+	var err error
+	if pendingCleanup {
+		err = os.ErrProcessDone
+	} else {
+		// Refresh verified PGID members while the leader may still be alive so any
+		// reparented children remain verifiable if the leader exits or wait fails.
+		proof = j.refreshVerifiedGroupMembersLocked()
+		err = stopVerifiedProcessGroupFn(proof)
+		if errors.Is(err, ErrProcessIdentityMismatch) && hasIndependentGroupProof(proof) {
+			err = os.ErrProcessDone
+		}
+	}
+	if errors.Is(err, ErrProcessIdentityMismatch) {
+		j.proofFDMu.Unlock()
+		summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
+		j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, err), summary, preview)
+		return err
+	}
+	if errors.Is(err, os.ErrProcessDone) {
+		j.mu.Lock()
+		proof = j.preparePendingPostExitCleanupLocked()
+		j.mu.Unlock()
+		j.persist()
+		gerr := j.runStopGroupAfterExit(&proof)
+		j.mergeLearnedGroupMembers(proof)
+		j.proofFDMu.Unlock()
+		if errors.Is(gerr, ErrProcessIdentityMismatch) {
+			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
+			j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr), summary, preview)
+			return gerr
+		}
+		if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
+			j.recordStopError(gerr)
+			return gerr
+		}
+	} else if err != nil {
+		if isProcessAccessError(err) && hasIndependentGroupProof(proof) {
+			// Leader PID denied access (for instance, a protected process reused
+			// the PID or leader query is restricted); attempt cleanup of
+			// independently verified descendants while keeping leader state
+			// unresolved until it can be verified.
+			descProof := cloneGroupProof(proof)
+			gerr := j.runStopGroupAfterExit(&descProof)
+			j.mergeLearnedGroupMembers(descProof)
+			j.proofFDMu.Unlock()
+			if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) && !errors.Is(gerr, ErrProcessIdentityMismatch) {
+				j.recordStopError(gerr)
+				return gerr
+			}
+			j.recordStopError(err)
+			return err
+		}
+		j.proofFDMu.Unlock()
+		j.recordStopError(err)
+		return err
+	} else if mustFinalize {
+		j.proofFDMu.Unlock()
+		waitForAdoptedProcessGone(id, 2*time.Second)
+		j.proofFDMu.Lock()
+		j.mu.Lock()
+		stillActive := !j.finished && !j.unknown
+		if stillActive {
+			proof = j.preparePendingPostExitCleanupLocked()
+		}
+		j.mu.Unlock()
+		if !stillActive {
+			j.proofFDMu.Unlock()
+			return nil
+		}
+		j.persist()
+		gerr := j.runStopGroupAfterExit(&proof)
+		j.mergeLearnedGroupMembers(proof)
+		j.proofFDMu.Unlock()
+		if errors.Is(gerr, ErrProcessIdentityMismatch) {
+			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
+			j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr), summary, preview)
+			return gerr
+		}
+		if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
+			j.recordStopError(gerr)
+			return gerr
+		}
+	} else {
+		j.proofFDMu.Unlock()
+	}
+	if mustFinalize {
+		note := pipeCaptureEndedNote(outFile)
+		summary, preview := formatAdoptedSummaryPreview(outFile, cwd, fmt.Sprintf("(adopted background job stopped; %s)", note), note)
+		resErr := cause
+		var exitCode int
+		var exitUnknown bool
+		if isTimeout {
+			resErr = &timeoutError{timeout: max(0, deadline.Sub(started))}
+			exitCode = -1
+			j.mu.Lock()
+			expiredOnAdoption := j.expiredOnAdoption
+			pid, pgid := j.PID, j.PGID
+			j.mu.Unlock()
+			if expiredOnAdoption {
+				summary, preview = j.prepareAdoptedDowntimeTimeoutSummary(pid, pgid, deadline, outFile, cwd)
+			}
+		} else {
+			exitCode = -1
+			exitUnknown = true
+		}
+		j.finishAdoptedWithAudit(JobResult{
+			Output:          summary,
+			Err:             resErr,
+			ExitCode:        exitCode,
+			ExitCodeUnknown: exitUnknown,
+			Preview:         preview,
+		}, auditFn, -1, resErr)
+		return nil
 	}
 	j.persist()
 	return nil
@@ -1134,12 +1614,14 @@ func (e *Executor) CancelJobs() {
 // SessionCanceller captures the owning registry, so a delayed abort can never
 // cancel commands from a subsequently selected session.
 func (e *Executor) SessionCanceller() func() {
-	r := e.registry()
-	return func() {
-		for _, job := range r.List() {
-			job.Cancel()
-		}
-	}
+	return e.registry().cancelAll
+}
+
+// PrepareSessionCancel advances the registry's abort generation and snapshots
+// currently running jobs so callers holding a turn lock can release the lock
+// before signalling jobs, without racing against jobs started by a queued turn.
+func (e *Executor) PrepareSessionCancel() func() {
+	return e.registry().prepareCancelAll()
 }
 
 // Jobs returns a snapshot of all background jobs for this Executor.

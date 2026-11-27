@@ -38,6 +38,7 @@ func main() {
 		sandbox        = flag.Bool("sandbox", false, "run bash calls under bwrap (bubblewrap): the workspace is the only writable directory (also env HARNESS_SANDBOX=1 or config sandbox)")
 		bashTO         = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
 		bgThresh       = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
+		bgMaxLifetime  = flag.Int("bg-max-lifetime", -1, "max lifetime in seconds for background:true jobs without a per-call timeout (-1 = env OPENAI_BACKGROUND_MAX_LIFETIME_SECONDS, config, or 7200s default, 0 = unlimited)")
 		images         stringList
 		files          stringList
 	)
@@ -58,25 +59,26 @@ func main() {
 	}
 
 	a, err := app.Setup(app.Params{
-		Root:                       *root,
-		WorkspaceTrust:             *workspaceTrust,
-		Mode:                       *mode,
-		Model:                      *model,
-		API:                        *api,
-		Provider:                   *provider,
-		ConfigPath:                 *config,
-		MaxSteps:                   *maxSteps,
-		ContextLimit:               *ctxLimit,
-		Resume:                     *resume,
-		Steal:                      *steal,
-		RebindSession:              *rebindSession,
-		SessionID:                  *sessionID,
-		DenyInsteadOfPrompt:        *deny,
-		Sandbox:                    *sandbox,
-		BashTimeoutSeconds:         *bashTO,
-		BackgroundThresholdSeconds: *bgThresh,
-		Images:                     images,
-		Files:                      files,
+		Root:                         *root,
+		WorkspaceTrust:               *workspaceTrust,
+		Mode:                         *mode,
+		Model:                        *model,
+		API:                          *api,
+		Provider:                     *provider,
+		ConfigPath:                   *config,
+		MaxSteps:                     *maxSteps,
+		ContextLimit:                 *ctxLimit,
+		Resume:                       *resume,
+		Steal:                        *steal,
+		RebindSession:                *rebindSession,
+		SessionID:                    *sessionID,
+		DenyInsteadOfPrompt:          *deny,
+		Sandbox:                      *sandbox,
+		BashTimeoutSeconds:           *bashTO,
+		BackgroundThresholdSeconds:   *bgThresh,
+		BackgroundMaxLifetimeSeconds: app.BackgroundMaxLifetimeSecondsFromFlag(*bgMaxLifetime),
+		Images:                       images,
+		Files:                        files,
 	})
 	if err != nil {
 		fatal(err)
@@ -101,6 +103,9 @@ func main() {
 	}
 	if a.ResumedMessage != "" {
 		info += "\n" + a.ResumedMessage
+	}
+	if notice := a.OrphanedNotice(); notice != "" {
+		info += "\n" + notice
 	}
 	lines := make(chan string, 16)
 	// Theme: HARNESS_TUI_THEME picks default, terminal (no painted

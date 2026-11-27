@@ -138,16 +138,18 @@ type Event struct {
 	Attempt         int               `json:"attempt,omitempty"`
 	Type            string            `json:"type"`
 	// ready: protocol version and session identity.
-	Protocol       int                  `json:"protocol,omitempty"`
-	Session        string               `json:"session,omitempty"`
-	Model          string               `json:"model,omitempty"`
-	API            string               `json:"api,omitempty"`
-	Mode           string               `json:"mode,omitempty"`
-	Root           string               `json:"root,omitempty"`
-	Resumed        bool                 `json:"resumed,omitempty"`
-	Messages       int                  `json:"messages,omitempty"`
-	ResumedMessage string               `json:"resumed_message,omitempty"`
-	RecoveredJobs  []tools.RecoveredJob `json:"recovered_jobs,omitempty"`
+	Protocol           int                         `json:"protocol,omitempty"`
+	Session            string                      `json:"session,omitempty"`
+	Model              string                      `json:"model,omitempty"`
+	API                string                      `json:"api,omitempty"`
+	Mode               string                      `json:"mode,omitempty"`
+	Root               string                      `json:"root,omitempty"`
+	Resumed            bool                        `json:"resumed,omitempty"`
+	Messages           int                         `json:"messages,omitempty"`
+	ResumedMessage     string                      `json:"resumed_message,omitempty"`
+	RecoveredJobs      []tools.RecoveredJob        `json:"recovered_jobs,omitempty"`
+	OrphanedJobs       []tools.OrphanedSessionJobs `json:"orphaned_jobs,omitempty"`
+	OrphanedJobsNotice string                      `json:"orphaned_jobs_notice,omitempty"`
 	// text_delta, background_wait, turn_started: the text.
 	Text string `json:"text,omitempty"`
 	// step_usage, agent_settled.

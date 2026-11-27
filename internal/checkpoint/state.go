@@ -93,6 +93,8 @@ const (
 type Job struct {
 	ID              string    `json:"id"`
 	Started         time.Time `json:"started"`
+	Deadline        time.Time `json:"deadline,omitempty"`
+	Unlimited       bool      `json:"unlimited,omitempty"`
 	InvocationID    string    `json:"invocation_id,omitempty"`
 	Command         string    `json:"command"`
 	Cwd             string    `json:"cwd,omitempty"`
@@ -746,6 +748,9 @@ func (s State) validate() error {
 		}
 		if j.PID < 0 || j.PGID < 0 {
 			return fmt.Errorf("checkpoint job process identity must be non-negative")
+		}
+		if !j.Deadline.IsZero() && j.Unlimited {
+			return fmt.Errorf("checkpoint job cannot set both deadline and unlimited")
 		}
 		switch j.Status {
 		case Running, Unknown:

@@ -314,9 +314,10 @@
   — never only when the turn ends. Pass `background:true` for a
   command that will not exit on its own (dev server, watcher): it
   returns at once with a job id, and its output is delivered the
-  same way. An explicit `background:true` job has NO timeout unless
-  a per-call `timeout` is given — a dev server must outlive any
-  cap. The bash timeout is 120s by default, 600s max
+  same way. An explicit `background:true` job runs up to the configured max
+  lifetime (default 2 hours / 7200s via `backgroundMaxLifetimeSeconds`,
+  `OPENAI_BACKGROUND_MAX_LIFETIME_SECONDS`, or `-bg-max-lifetime`; `0`
+  disables the cap) unless a per-call `timeout` is given. The bash timeout is 120s by default, 600s max
   (per-call `timeout`, `bashTimeoutSeconds`, or
   `OPENAI_BASH_TIMEOUT_SECONDS`); a timeout kills the whole
   process group, so a command's grandchildren die with it. Every
@@ -336,12 +337,11 @@
   message gives the output file path so you can read its partial
   output, and the result is delivered at the next turn when the
   job finishes. A background job outlives its turn: it keeps
-  running after the turn settles (and after quit, orphaned) until it exits on its
-  own or is stopped, so a dev server started in one turn is still serving in the
-  next. On resume after a harness crash, verifiable live background jobs are safely
-  adopted while exited
-  processes or reused PIDs are reported as `unknown` without replaying commands;
-  use `/jobs stop <id>` to explicitly terminate an active/adopted job. Output files
+  running after the turn settles until it exits on its
+  own, times out, or is stopped, so a dev server started in one turn is still serving in the
+  next. Quitting (`/quit`, `/exit`, RPC `quit`) stops running and adopted jobs and saves their results; an explicit RPC `abort` cancels the active session's background jobs. On resume after a harness crash, verifiable live background jobs are safely
+  adopted with their remaining deadline enforced (and remaining verified descendants cleaned up when the leader exits across macOS, Linux, and Windows; on Linux, adopted job exit codes are unavailable and reported as `exit status unavailable`). Exited leaders with pending cleanup or surviving verified descendants have their group proof revalidated, clean up remaining descendants to finish `done` (or stay `running` and stoppable on transient failure), while reused PIDs or exited leaders without surviving verified groups are reported as `unknown` without replaying commands;
+  startup and `/jobs` also surface orphaned running jobs (including pending-cleanup groups whose leader exited) from other sessions in the same workspace, and `/jobs stop <id>` explicitly terminates an active/adopted job. Output files
   cap at 64 MiB: past that the run is killed and the call fails, so
   a spewing command cannot fill the disk.
 - Events: the agent loop emits an event stream (`text_delta`,

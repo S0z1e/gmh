@@ -227,3 +227,155 @@ func TestRPCReadyResumeAndStopRecoveredJobs(t *testing.T) {
 		t.Fatalf("resume_session missing recovered summary: %v", rData)
 	}
 }
+
+func TestRPCSurfacesOrphanedJobsOnFreshSession(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	root := t.TempDir()
+	config := `{"providers":{"mock":{"apiKey":"test","baseUrl":"https://example.invalid","api":"chat","model":"mock"}}}`
+	if err := os.WriteFile(filepath.Join(root, ".harness.json"), []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	releaseFile := filepath.Join(root, "release-rpc-orphan")
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), exe, "-test.run=^TestRPCCrashRecoveryHelperProcess$")
+	cmd.Env = append(os.Environ(),
+		"GMH_RPC_CRASH_HELPER=1",
+		"GMH_HELPER_ROOT="+root,
+		"GMH_HELPER_RELEASE="+releaseFile,
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	sc := bufio.NewScanner(stdout)
+	if !sc.Scan() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("rpc crash helper exited early: %v", sc.Err())
+	}
+	var meta rpcCrashMeta
+	if err := json.Unmarshal([]byte(sc.Text()), &meta); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("decode helper meta: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.WriteFile(releaseFile, []byte("go\n"), 0644)
+		if meta.LivePID > 0 {
+			if p, err := os.FindProcess(meta.LivePID); err == nil {
+				_ = p.Kill()
+			}
+		}
+		if cmd.Process != nil && cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, alive := tools.ProcessIdentity(meta.DeadPID); !alive {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// Open a fresh RPC session without --resume.
+	a, err := app.Setup(app.Params{WorkspaceTrust: "trust", Root: root, Mode: "auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	d := startDriver(t, a, &app.Runner{App: a, Print: func(string, ...any) {}})
+	defer d.quit(t)
+
+	ready := d.waitFor("ready", 2*time.Second)
+	if ready["resumed"] == true {
+		t.Fatalf("fresh session ready.resumed = true, want false: %v", ready)
+	}
+	if notice, _ := ready["orphaned_jobs_notice"].(string); !strings.Contains(notice, meta.SessionID) {
+		t.Fatalf("ready.orphaned_jobs_notice = %q, want session %s", notice, meta.SessionID)
+	}
+
+	d.send(map[string]any{"id": "jobs-orphan", "type": "jobs"})
+	jobsResp := d.waitFor("response", 2*time.Second)
+	dataMap := jobsResp["data"].(map[string]any)
+	if notice, _ := dataMap["orphaned_jobs_notice"].(string); !strings.Contains(notice, meta.SessionID) {
+		t.Fatalf("jobs response missing orphaned_jobs_notice naming %s: %v", meta.SessionID, dataMap)
+	}
+}
+
+func TestRPCJobsQueryConcurrentWithSessionSwitches(t *testing.T) {
+	a, runner, _ := setupTestApp(t, "auto", []fakeStep{{kind: "text", text: "unused"}})
+	d := startDriver(t, a, runner)
+	d.waitFor("ready", 2*time.Second)
+
+	job, err := a.Cfg.Exec.BashBackground(context.Background(), tools.BashArgs{
+		Command:    "exec sleep 30",
+		Background: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer job.Cancel()
+
+	// Hammer jobs queries on the reader goroutine while the agent goroutine
+	// creates, renames, and resumes sessions (touching Store and retainedStores).
+	firstID := a.Store.ID
+	stopPoll := make(chan struct{})
+	pollDone := make(chan struct{})
+	var lastJobID string
+	go func() {
+		defer close(pollDone)
+		for i := 0; ; i++ {
+			select {
+			case <-stopPoll:
+				return
+			default:
+			}
+			id := fmt.Sprintf("j-%d", i)
+			lastJobID = id
+			d.send(map[string]any{"id": id, "type": "jobs"})
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	for i := 0; i < 6; i++ {
+		d.send(map[string]any{"id": fmt.Sprintf("new-%d", i), "type": "new_session"})
+		time.Sleep(5 * time.Millisecond)
+	}
+	d.send(map[string]any{"id": "ren-1", "type": "rename_session", "name": firstID, "new": "concurrent-renamed"})
+	d.send(map[string]any{"id": "res-1", "type": "resume_session", "session": "concurrent-renamed"})
+	sawResume := false
+	for !sawResume {
+		msg := d.waitFor("response", 5*time.Second)
+		if msg["id"] == "res-1" {
+			sawResume = true
+		}
+	}
+	close(stopPoll)
+	<-pollDone
+	if lastJobID != "" {
+		// Send a final sentinel jobs query and wait until it arrives so no
+		// in-flight j-* responses remain queued ahead of quit.
+		d.send(map[string]any{"id": "j-sentinel", "type": "jobs"})
+		for {
+			msg := d.waitFor("response", 5*time.Second)
+			if msg["id"] == "j-sentinel" {
+				break
+			}
+		}
+	}
+	d.quit(t)
+}

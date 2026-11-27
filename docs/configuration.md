@@ -137,7 +137,9 @@ the `providers` map. The `mode` field accepts `ask-for-approval`,
 approval, continuation, and question requests; default 300;
 `0` waits with no deadline; `HARNESS_APPROVAL_TIMEOUT_SECONDS`
 overrides the file), `bgThresholdSeconds` (`0`
-disables backgrounding), `denyInsteadOfPrompt`, `contextLimit`,
+disables backgrounding), `backgroundMaxLifetimeSeconds` (default 7200 / 2 hours;
+`0` disables the lifetime cap; `OPENAI_BACKGROUND_MAX_LIFETIME_SECONDS` and
+`-bg-max-lifetime` override), `denyInsteadOfPrompt`, `contextLimit`,
 `anthropicMaxTokens`, `tuiTheme`
 (`default|terminal|catppuccin-mocha`). Precedence is flag >
 environment variable > model value > project file > global file > the

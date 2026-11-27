@@ -294,3 +294,36 @@ func TestCapturedCancelOnlyStopsOwnerSession(t *testing.T) {
 	default:
 	}
 }
+
+func TestSessionCancellerCancelsInProgressLaunch(t *testing.T) {
+	cancelFired := make(chan struct{})
+	var e *Executor
+	e = &Executor{
+		Root: t.TempDir(),
+		beforeJobPublish: func() {
+			e.SessionCanceller()()
+			close(cancelFired)
+		},
+	}
+	job, err := e.BashBackground(context.Background(), BashArgs{
+		Command:    "exec sleep 30",
+		Background: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer job.Cancel()
+	<-cancelFired
+
+	select {
+	case <-job.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatalf("in-progress launch PID %d escaped SessionCanceller", job.PID)
+	}
+	if !job.StopRequested() {
+		t.Fatal("StopRequested() = false after SessionCanceller aborted in-progress launch")
+	}
+	if _, _, alive := ProcessIdentity(job.PID); alive {
+		t.Fatalf("aborted in-progress job PID %d still alive", job.PID)
+	}
+}

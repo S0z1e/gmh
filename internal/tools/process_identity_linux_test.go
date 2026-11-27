@@ -1,0 +1,1976 @@
+//go:build linux
+
+package tools
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+func exhaustFDsUntilEMFILE(t *testing.T) func() {
+	return exhaustFDsLeaving(t, 0)
+}
+
+func exhaustFDsLeaving(t *testing.T, leave int) func() {
+	t.Helper()
+	var openFDs []*os.File
+	for range 4096 {
+		f, err := os.Open("/dev/null")
+		if err != nil {
+			if errors.Is(err, syscall.EMFILE) {
+				for i := 0; i < leave && len(openFDs) > 0; i++ {
+					_ = openFDs[len(openFDs)-1].Close()
+					openFDs = openFDs[:len(openFDs)-1]
+				}
+				return func() {
+					for _, of := range openFDs {
+						_ = of.Close()
+					}
+				}
+			}
+			for _, of := range openFDs {
+				_ = of.Close()
+			}
+			t.Fatalf("unexpected open error before EMFILE: %v", err)
+		}
+		openFDs = append(openFDs, f)
+	}
+	for _, of := range openFDs {
+		_ = of.Close()
+	}
+	t.Skip("RLIMIT_NOFILE too large to hit EMFILE within test cap")
+	return func() {}
+}
+
+func TestStopVerifiedProcessGroupUnderEMFILELinux(t *testing.T) {
+	var oldLim unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &oldLim); err != nil {
+		t.Fatal(err)
+	}
+	curMax := oldLim.Cur
+	if curMax > 256 {
+		newLim := oldLim
+		newLim.Cur = 256
+		if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &newLim); err == nil {
+			defer func() { _ = unix.Setrlimit(unix.RLIMIT_NOFILE, &oldLim) }()
+		}
+	}
+
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", "exec sleep 30")
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	t.Cleanup(func() { _ = killProcessTree(cmd) })
+
+	pid := cmd.Process.Pid
+	info, err := inspectProcessErr(pid)
+	if err != nil || !info.Alive {
+		t.Fatalf("inspectProcessErr(%d) = %+v, err=%v", pid, info, err)
+	}
+	proof := processGroupProof{
+		Leader: ProcessIdentityInfo{PID: pid, PGID: info.PGID, StartToken: info.StartToken},
+		UID:    info.UID,
+		HasUID: info.HasUID,
+		SID:    info.SID,
+	}
+	captureVerifiedGroupProof(&proof)
+	defer closeVerifiedGroupProof(&proof)
+
+	cleanupFDs := exhaustFDsUntilEMFILE(t)
+	_, _, waitErr := waitAdoptedProcess(context.Background(), proof.Leader)
+	if !errors.Is(waitErr, syscall.EMFILE) {
+		cleanupFDs()
+		t.Fatalf("waitAdoptedProcess under EMFILE err = %v, want EMFILE", waitErr)
+	}
+
+	// Same PID, PGID, SID, and UID, but stale leader StartToken must be rejected.
+	staleLeader := proof
+	staleLeader.Leader.StartToken = "stale-boot:1"
+	if mismatchErr := stopVerifiedProcessGroupWithProof(staleLeader); !errors.Is(mismatchErr, ErrProcessIdentityMismatch) {
+		cleanupFDs()
+		t.Fatalf("stale leader token under EMFILE err = %v, want ErrProcessIdentityMismatch", mismatchErr)
+	}
+
+	// Same PID, PGID, SID, and UID, but stale KnownMembers token in post-exit fallback must be rejected.
+	staleMember := proof
+	staleMember.KnownMembers = map[int]string{pid: "stale-boot:1"}
+	if mismatchErr := stopAdoptedProcessGroupAfterExit(staleMember); !errors.Is(mismatchErr, ErrProcessIdentityMismatch) {
+		cleanupFDs()
+		t.Fatalf("stale KnownMembers token under EMFILE err = %v, want ErrProcessIdentityMismatch", mismatchErr)
+	}
+
+	// Unbacked proof with no verified FD must fail with EMFILE rather than signalling blindly.
+	unbacked := processGroupProof{Leader: proof.Leader, UID: proof.UID, HasUID: proof.HasUID, SID: proof.SID}
+	if unbackedErr := stopVerifiedProcessGroupWithProof(unbacked); !isFDLimitErr(unbackedErr) {
+		cleanupFDs()
+		t.Fatalf("unbacked stop under EMFILE err = %v, want EMFILE/ENFILE", unbackedErr)
+	}
+
+	wrongProof := proof
+	wrongProof.Leader.PGID = info.PGID + 1
+	if mismatchErr := stopVerifiedProcessGroupWithProof(wrongProof); !errors.Is(mismatchErr, ErrProcessIdentityMismatch) {
+		cleanupFDs()
+		t.Fatalf("stopVerifiedProcessGroupWithProof mismatched PGID under EMFILE err = %v, want ErrProcessIdentityMismatch", mismatchErr)
+	}
+
+	stopErr := stopVerifiedProcessGroupWithProof(proof)
+	cleanupFDs()
+	if stopErr != nil {
+		t.Fatalf("stopVerifiedProcessGroupWithProof under EMFILE failed: %v", stopErr)
+	}
+	select {
+	case <-waitDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("process survived stopVerifiedProcessGroupWithProof under EMFILE")
+	}
+
+	// Post-exit EMFILE fallback must preserve EMFILE rather than returning
+	// os.ErrProcessDone when captured members have exited and /proc cannot be read
+	// to rule out later-forked descendants occupying the PGID.
+	cleanupFDsAfterExit := exhaustFDsUntilEMFILE(t)
+	postExitErr := stopAdoptedProcessGroupAfterExit(proof)
+	cleanupFDsAfterExit()
+	if !isFDLimitErr(postExitErr) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExit after leader exit under EMFILE err = %v, want EMFILE/ENFILE", postExitErr)
+	}
+}
+
+func TestStopAdoptedProcessGroupAfterExitRefusesEqualIDReusedSessionLinux(t *testing.T) {
+	root := t.TempDir()
+	childPIDFile := filepath.Join(root, "child.pid")
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q", childPIDFile))
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	_ = cmd.Wait()
+
+	pidBytes, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil || childPID <= 0 {
+		t.Fatalf("invalid child pid %q: %v", string(pidBytes), err)
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	childInfo := inspectProcess(childPID)
+	if !childInfo.Alive || childInfo.PGID <= 0 {
+		t.Fatalf("child pid %d not inspectable: %+v", childPID, childInfo)
+	}
+
+	// Simulates Linux ID recycling where a replacement session has equal PID, PGID,
+	// and SID (due to Setsid: true), the replacement leader exited, and an old
+	// once-verified proof from an earlier job whose numeric IDs match is checked.
+	// Because the surviving child has no matching token/ancestry and lacks JobToken,
+	// Linux stopAdoptedProcessGroupAfterExit MUST refuse to signal the child.
+	childBoot, _, _ := parseLinuxStartToken(childInfo.StartToken)
+	olderTok := "1"
+	if childBoot != "" {
+		olderTok = childBoot + ":1"
+	}
+	staleEqualProof := processGroupProof{
+		Leader: ProcessIdentityInfo{
+			PID:        leaderPID,
+			PGID:       leaderPID,
+			StartToken: olderTok,
+		},
+		UID:            childInfo.UID,
+		HasUID:         childInfo.HasUID,
+		SID:            leaderPID,
+		KnownMembers:   map[int]string{leaderPID: olderTok},
+		VerifiedAt:     time.Now().Add(-time.Minute),
+		JobToken:       "stale-secret-token-not-matching-child",
+		ExitObservedAt: time.Now(),
+	}
+	if err := stopAdoptedProcessGroupAfterExit(staleEqualProof); !errors.Is(err, ErrProcessIdentityMismatch) {
+		t.Fatalf("equal-ID recycled session proof err = %v, want ErrProcessIdentityMismatch", err)
+	}
+	if !inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d was killed by stale equal-ID proof", childPID)
+	}
+}
+
+func TestStopAdoptedProcessGroupAfterExitEMFILEBoundsAndPartialCleanupLinux(t *testing.T) {
+	var oldLim unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &oldLim); err != nil {
+		t.Fatal(err)
+	}
+	if oldLim.Cur > 256 {
+		newLim := oldLim
+		newLim.Cur = 256
+		if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &newLim); err == nil {
+			defer func() { _ = unix.Setrlimit(unix.RLIMIT_NOFILE, &oldLim) }()
+		}
+	}
+
+	root := t.TempDir()
+	c1File := filepath.Join(root, "c1.pid")
+	c2File := filepath.Join(root, "c2.pid")
+	releaseFile := filepath.Join(root, "release")
+	jobTok := "test-emfile-job-token"
+	cmd := exec.CommandContext(t.Context(), "bash", "-c",
+		fmt.Sprintf("sleep 30 & echo $! > %q; while [ ! -f %q ]; do sleep 0.02; done; sleep 30 & echo $! > %q", c1File, releaseFile, c2File),
+	)
+	cmd.Env = append(os.Environ(), jobTokenEnvVar+"="+jobTok)
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	leaderInfo := inspectProcess(leaderPID)
+	if !leaderInfo.Alive {
+		t.Fatalf("leader pid %d not inspectable", leaderPID)
+	}
+
+	var c1PID int
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(c1File); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				c1PID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if c1PID <= 0 {
+		t.Fatal("c1 did not start")
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(c1PID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	// Capture proof while only leader and c1 exist (c1 has a cached pidfd).
+	proof := processGroupProof{
+		Leader:   ProcessIdentityInfo{PID: leaderPID, PGID: leaderInfo.PGID, StartToken: leaderInfo.StartToken},
+		UID:      leaderInfo.UID,
+		HasUID:   leaderInfo.HasUID,
+		SID:      leaderInfo.SID,
+		JobToken: jobTok,
+	}
+	captureVerifiedGroupProof(&proof)
+	defer closeVerifiedGroupProof(&proof)
+	if _, ok := proof.verifiedFDs[c1PID]; !ok {
+		t.Fatalf("expected cached pidfd for c1 %d in %+v", c1PID, proof.verifiedFDs)
+	}
+
+	// Fork uncaptured c2 and let leader exit.
+	if err := os.WriteFile(releaseFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	var c2PID int
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(c2File); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				c2PID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if c2PID <= 0 {
+		t.Fatal("c2 did not start")
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(c2PID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	// With 0 FDs free: post-exit cleanup MUST kill cached c1 via PidfdSendSignal,
+	// MUST NOT use numeric kill(-PGID) (so uncaptured c2 remains alive), and MUST
+	// return EMFILE rather than nil.
+	cleanupZero := exhaustFDsUntilEMFILE(t)
+	errZero := stopAdoptedProcessGroupAfterExit(proof)
+	cleanupZero()
+	if !isFDLimitErr(errZero) {
+		t.Fatalf("0-FD post-exit cleanup err = %v, want EMFILE/ENFILE", errZero)
+	}
+	c1DeadBy := time.Now().Add(2 * time.Second)
+	for time.Now().Before(c1DeadBy) && inspectProcess(c1PID).Alive {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if inspectProcess(c1PID).Alive {
+		t.Fatalf("cached c1 pid %d survived post-exit EMFILE cleanup", c1PID)
+	}
+	if !inspectProcess(c2PID).Alive {
+		t.Fatalf("uncaptured c2 pid %d was killed by numeric kill(-PGID) during 0-FD EMFILE cleanup", c2PID)
+	}
+
+	// With exactly 1 FD free: PidfdOpen on c2 consumes the last FD and /proc
+	// revalidation hits EMFILE. Cleanup MUST preserve EMFILE rather than returning nil.
+	cleanupOne := exhaustFDsLeaving(t, 1)
+	errOne := stopAdoptedProcessGroupAfterExit(proof)
+	cleanupOne()
+	if !isFDLimitErr(errOne) {
+		t.Fatalf("1-FD partial cleanup err = %v, want EMFILE/ENFILE", errOne)
+	}
+	if !inspectProcess(c2PID).Alive {
+		t.Fatalf("c2 pid %d should still be alive after 1-FD revalidation EMFILE", c2PID)
+	}
+}
+
+func TestCaptureVerifiedGroupProofPrunesExitedFDsLinux(t *testing.T) {
+	root := t.TempDir()
+	c1File := filepath.Join(root, "c1.pid")
+	c1Gone := filepath.Join(root, "c1.gone")
+	c2File := filepath.Join(root, "c2.pid")
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf(
+		"sleep 30 & c1=$!; echo $c1 > %q; read _; kill -9 $c1 2>/dev/null; wait $c1 2>/dev/null; printf 'gone\\n' > %q; read _; sleep 30 & echo $! > %q; sleep 30",
+		c1File, c1Gone, c2File,
+	))
+	configureProcess(cmd)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = killProcessTree(cmd) })
+
+	leaderPID := cmd.Process.Pid
+	leaderInfo := inspectProcess(leaderPID)
+	if !leaderInfo.Alive {
+		t.Fatal("leader not inspectable")
+	}
+	var c1PID int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(c1File); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				c1PID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if c1PID <= 0 {
+		t.Fatal("c1 did not start")
+	}
+
+	proof := processGroupProof{
+		Leader: ProcessIdentityInfo{PID: leaderPID, PGID: leaderInfo.PGID, StartToken: leaderInfo.StartToken},
+		UID:    leaderInfo.UID,
+		HasUID: leaderInfo.HasUID,
+		SID:    leaderInfo.SID,
+	}
+	captureVerifiedGroupProof(&proof)
+	defer closeVerifiedGroupProof(&proof)
+
+	c1Entry, ok := proof.verifiedFDs[c1PID]
+	if !ok || c1Entry.fd <= 0 {
+		t.Fatalf("expected c1 %d in verifiedFDs: %+v", c1PID, proof.verifiedFDs)
+	}
+
+	// Partial / incomplete scan (failing ReadDir AFTER leader inspection) must preserve
+	// live omitted child c1's pidfd in verifiedFDs.
+	origReadProcDir := readProcDirFn
+	readProcDirFn = func() ([]os.DirEntry, error) {
+		return nil, syscall.EMFILE
+	}
+	captureVerifiedGroupProof(&proof)
+	readProcDirFn = origReadProcDir
+	if keptC1, stillHasC1 := proof.verifiedFDs[c1PID]; !stillHasC1 || keptC1.fd != c1Entry.fd {
+		t.Fatalf("incomplete scan discarded live omitted child c1 %d pidfd: %+v", c1PID, proof.verifiedFDs)
+	}
+
+	// Release c1 via stdin builtin read gate (zero child forks while waiting).
+	if _, err := stdin.Write([]byte("go1\n")); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(c1Gone); err == nil && strings.TrimSpace(string(b)) == "gone" {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline) && inspectProcess(c1PID).Alive; {
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	// Refresh BEFORE c2 spawns while shell blocks on builtin `read` (no sleep children).
+	captureVerifiedGroupProof(&proof)
+	if _, stillCached := proof.verifiedFDs[c1PID]; stillCached {
+		t.Fatalf("exited child c1 %d pidfd was not pruned from verifiedFDs", c1PID)
+	}
+	if _, historyKept := proof.KnownMembers[c1PID]; !historyKept {
+		t.Fatalf("c1 %d historical KnownMembers entry should be preserved", c1PID)
+	}
+	if _, err := unix.FcntlInt(uintptr(c1Entry.fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("pruned fd %d still open (fcntl err=%v)", c1Entry.fd, err)
+	}
+
+	// Now spawn c2 and confirm refresh picks it up while keeping c1 pruned.
+	if _, err := stdin.Write([]byte("go2\n")); err != nil {
+		t.Fatal(err)
+	}
+	var c2PID int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(c2File); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				c2PID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if c2PID <= 0 {
+		t.Fatal("c2 did not start")
+	}
+	captureVerifiedGroupProof(&proof)
+	if c2Entry, hasC2 := proof.verifiedFDs[c2PID]; !hasC2 || c2Entry.fd <= 0 {
+		t.Fatalf("expected live child c2 %d in verifiedFDs", c2PID)
+	}
+}
+
+func TestStopAdoptedProcessGroupAfterExitTokenlessLegacyAndRetryLinux(t *testing.T) {
+	root := t.TempDir()
+
+	// Part A: Tokenless child inheriting legacy os.Pipe() stdout/stderr (while closing
+	// FD 3) is positively verified via captured LeaderPipeTargets and stopped.
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyA := filepath.Join(root, "readyA")
+	relA := filepath.Join(root, "relA")
+	c1File := filepath.Join(root, "c1.pid")
+	cmdA := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf(
+		"touch %q; while [ ! -f %q ]; do sleep 0.02; done; (exec 3>&-; sleep 30) & echo $! > %q",
+		readyA, relA, c1File,
+	))
+	configureProcess(cmdA)
+	cmdA.Stdout = writer
+	cmdA.Stderr = writer
+	if err := cmdA.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		t.Fatal(err)
+	}
+	_ = writer.Close()
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if _, err := os.Stat(readyA); err == nil {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	leaderAPID := cmdA.Process.Pid
+	leaderAInfo := inspectProcess(leaderAPID)
+	proofA := processGroupProof{
+		Leader: ProcessIdentityInfo{PID: leaderAPID, PGID: leaderAInfo.PGID, StartToken: leaderAInfo.StartToken},
+		UID:    leaderAInfo.UID,
+		HasUID: leaderAInfo.HasUID,
+		SID:    leaderAInfo.SID,
+	}
+	captureVerifiedGroupProof(&proofA)
+	defer closeVerifiedGroupProof(&proofA)
+	if len(proofA.LeaderPipeTargets) == 0 {
+		t.Fatal("expected LeaderPipeTargets to capture legacy pipe inode")
+	}
+
+	// Simulate crash before child forks and leader exits.
+	_ = reader.Close()
+	if err := os.WriteFile(relA, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmdA.Wait()
+	b, err := os.ReadFile(c1File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1PID, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(c1PID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	proofA.ExitObservedAt = time.Now()
+	if err := stopAdoptedProcessGroupAfterExit(proofA); err != nil {
+		t.Fatalf("tokenless pipe-backed cleanup err = %v, want nil", err)
+	}
+	if inspectProcess(c1PID).Alive {
+		t.Fatalf("child pid %d survived tokenless pipe cleanup", c1PID)
+	}
+
+	// Part B: Tokenless child closing stdout/stderr (> /dev/null) with no KnownMembers/ppid
+	// returns retryable errIncompleteGroupProof (NOT ErrProcessIdentityMismatch) when leader
+	// was live-verified and exit observed, preserving /jobs stop retryability without killing blindly.
+	c2File := filepath.Join(root, "c2.pid")
+	cmdB := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf("(exec >/dev/null 2>&1; sleep 30) & echo $! > %q", c2File))
+	configureProcess(cmdB)
+	if err := cmdB.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderBPID := cmdB.Process.Pid
+	leaderBInfo := inspectProcess(leaderBPID)
+	_ = cmdB.Wait()
+	b2, err := os.ReadFile(c2File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2PID, _ := strconv.Atoi(strings.TrimSpace(string(b2)))
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(c2PID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	proofB := processGroupProof{
+		Leader:            ProcessIdentityInfo{PID: leaderBPID, PGID: leaderBInfo.PGID, StartToken: leaderBInfo.StartToken},
+		UID:               leaderBInfo.UID,
+		HasUID:            leaderBInfo.HasUID,
+		SID:               leaderBInfo.SID,
+		LeaderPipeTargets: proofA.LeaderPipeTargets,
+		KnownMembers:      map[int]string{leaderBPID: leaderBInfo.StartToken},
+		VerifiedAt:        time.Now(),
+		ExitObservedAt:    time.Now(),
+	}
+	errB := stopAdoptedProcessGroupAfterExit(proofB)
+	if !errors.Is(errB, errIncompleteGroupProof) || errors.Is(errB, ErrProcessIdentityMismatch) {
+		t.Fatalf("tokenless child without FD/ancestry err = %v, want errIncompleteGroupProof (not ErrProcessIdentityMismatch)", errB)
+	}
+	if !inspectProcess(c2PID).Alive {
+		t.Fatalf("unverified child pid %d should not be killed blindly when proof is incomplete", c2PID)
+	}
+}
+
+func TestStopAdoptedProcessGroupAfterExitMultiHopPastCutoffAndRetainLinux(t *testing.T) {
+	root := t.TempDir()
+	c1File := filepath.Join(root, "c1.pid")
+	c2File := filepath.Join(root, "c2.pid")
+	c3File := filepath.Join(root, "c3.pid")
+	leaderRel := filepath.Join(root, "leader.rel")
+	// Leader spawns c1, waits until proof captures ONLY c1, then c1 spawns c2 -> c3
+	// before leader exits.
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf(
+		"( (sleep 30 & echo $! > %q; wait) & echo $! > %q; wait ) & c1=$!; echo $c1 > %q; while [ ! -f %q ]; do sleep 0.02; done; exit 0",
+		c3File, c2File, c1File, leaderRel,
+	))
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	leaderInfo := inspectProcess(leaderPID)
+
+	var c1PID, c2PID, c3PID int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b1, err := os.ReadFile(c1File); err == nil {
+			c1PID, _ = strconv.Atoi(strings.TrimSpace(string(b1)))
+		}
+		if b2, err := os.ReadFile(c2File); err == nil {
+			c2PID, _ = strconv.Atoi(strings.TrimSpace(string(b2)))
+		}
+		if b3, err := os.ReadFile(c3File); err == nil {
+			c3PID, _ = strconv.Atoi(strings.TrimSpace(string(b3)))
+		}
+		if c1PID > 0 && c2PID > 0 && c3PID > 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if c1PID <= 0 || c2PID <= 0 || c3PID <= 0 {
+		t.Fatalf("expected c1/c2/c3 pids, got %d/%d/%d", c1PID, c2PID, c3PID)
+	}
+	for _, p := range []int{c1PID, c2PID, c3PID} {
+		pidCopy := p
+		t.Cleanup(func() {
+			if proc, err := os.FindProcess(pidCopy); err == nil {
+				_ = proc.Kill()
+			}
+		})
+	}
+
+	c1Info := inspectProcess(c1PID)
+	if !c1Info.Alive {
+		t.Fatalf("c1 %d not alive", c1PID)
+	}
+	if err := os.WriteFile(leaderRel, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	// Seed proof ONLY with leader and c1, and set ExitObservedAt 10s in the past
+	// (well past Linux's 2s cutoff). Transitive resolution must verify c2 and c3
+	// via c1, retain them on EMFILE, and clean up all three when FDs are available.
+	c1Token := c1Info.StartToken
+	proof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: leaderInfo.PGID, StartToken: leaderInfo.StartToken},
+		UID:            leaderInfo.UID,
+		HasUID:         leaderInfo.HasUID,
+		SID:            leaderInfo.SID,
+		KnownMembers:   map[int]string{leaderPID: leaderInfo.StartToken, c1PID: c1Token},
+		VerifiedAt:     time.Now().Add(-15 * time.Second),
+		ExitObservedAt: time.Now().Add(-10 * time.Second),
+	}
+
+	// Simulate EMFILE on PidfdOpen during partial cleanup (0 FDs free after ReadDir):
+	// exhaust to 0 FDs except ReadDir? Use 1 FD free so ReadDir/meta succeed and PidfdOpen fails or revalidation hits EMFILE.
+	cleanupOne := exhaustFDsLeaving(t, 1)
+	emfileErr := stopAdoptedProcessGroupAfterExitTrack(&proof)
+	cleanupOne()
+	if !isFDLimitErr(emfileErr) {
+		t.Fatalf("expected EMFILE preserving learned members, got %v", emfileErr)
+	}
+	if proof.KnownMembers[c2PID] == "" || proof.KnownMembers[c3PID] == "" {
+		t.Fatalf("expected newly verified descendants c2 (%d) and c3 (%d) retained in KnownMembers on EMFILE: %+v", c2PID, c3PID, proof.KnownMembers)
+	}
+
+	if err := stopAdoptedProcessGroupAfterExitTrack(&proof); err != nil {
+		t.Fatalf("multi-hop cleanup past 2s Linux cutoff failed: %v", err)
+	}
+	for _, p := range []int{c1PID, c2PID, c3PID} {
+		if inspectProcess(p).Alive {
+			t.Fatalf("descendant pid %d survived transitive cleanup", p)
+		}
+	}
+}
+
+func TestCrashRecoveryInconclusiveLinuxGroupScanKeepsJobStoppable(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-inconclusive-scan"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(jobsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	c1File := filepath.Join(root, "c1.pid")
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q; exit 0", c1File))
+	jobTok := "inconclusive-scan-tok"
+	cmd.Env = append(os.Environ(), jobTokenEnvVar+"="+jobTok)
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	leaderInfo := inspectProcess(leaderPID)
+	_ = cmd.Wait()
+
+	b, err := os.ReadFile(c1File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	rec := PersistedJob{
+		ID:             "bg-inconclusive",
+		Started:        time.Now().Add(-time.Second),
+		Unlimited:      true,
+		Command:        "inconclusive scan job",
+		Cwd:            root,
+		OutputID:       outID,
+		PID:            leaderPID,
+		PGID:           leaderInfo.PGID,
+		ProcessStarted: leaderInfo.StartToken,
+		JobToken:       jobTok,
+		GroupProof: &PersistedGroupProof{
+			UID:          leaderInfo.UID,
+			HasUID:       leaderInfo.HasUID,
+			SID:          leaderInfo.SID,
+			KnownMembers: map[int]string{leaderPID: leaderInfo.StartToken},
+			VerifiedAt:   time.Now().Add(-time.Second),
+		},
+		Status: JobRunning,
+	}
+	if err := savePersistedJob(jobsDir, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	origReadProcDir := readProcDirFn
+	var forceEMFILE atomic.Bool
+	forceEMFILE.Store(true)
+	readProcDirFn = func() ([]os.DirEntry, error) {
+		if forceEMFILE.Load() {
+			return nil, syscall.EMFILE
+		}
+		return origReadProcDir()
+	}
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	var recoveredJob *Job
+	t.Cleanup(func() {
+		forceEMFILE.Store(false)
+		_ = exec2.CloseJobs(context.Background())
+		if recoveredJob != nil && recoveredJob.monitorDone != nil {
+			<-recoveredJob.monitorDone
+		}
+		readProcDirFn = origReadProcDir
+	})
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 || recovered[0].Status != JobRunning {
+		t.Fatalf("inconclusive EMFILE scan recovery = %+v, err=%v; want JobRunning", recovered, err)
+	}
+	recoveredJob = exec2.registry().Get("bg-inconclusive")
+
+	forceEMFILE.Store(false)
+	res, stopErr := exec2.StopJob("bg-inconclusive")
+	if stopErr != nil {
+		t.Fatalf("StopJob after inconclusive scan failed: %v (%s)", stopErr, res.Text)
+	}
+	if exec2.registry().Get("bg-inconclusive").Status() != JobDone {
+		t.Fatalf("status after StopJob = %q, want done", exec2.registry().Get("bg-inconclusive").Status())
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d survived StopJob", childPID)
+	}
+}
+
+func TestLinuxAccessDeniedCleanupSignalsVerifiedChildrenAndKeepsLeaderPending(t *testing.T) {
+	childCmd := exec.Command("sleep", "30")
+	configureProcess(childCmd)
+	if err := childCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	childPID := childCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = childCmd.Wait()
+	})
+	childInfo := inspectProcess(childPID)
+	if !childInfo.Alive {
+		t.Fatalf("child pid %d not alive", childPID)
+	}
+
+	origInspect := inspectProcessErrFn
+	t.Cleanup(func() { inspectProcessErrFn = origInspect })
+	leaderPID := childPID + 99999
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, syscall.EACCES
+		}
+		return origInspect(pid)
+	}
+
+	proof := processGroupProof{
+		Leader: ProcessIdentityInfo{
+			PID:        leaderPID,
+			PGID:       childInfo.PGID,
+			StartToken: childInfo.StartToken,
+		},
+		UID:            childInfo.UID,
+		HasUID:         childInfo.HasUID,
+		SID:            childInfo.SID,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers:   map[int]string{childPID: childInfo.StartToken},
+	}
+
+	err := stopAdoptedProcessGroupAfterExitTrack(&proof)
+	if !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want EACCES keeping leader unresolved", err)
+	}
+	for wait := 0; wait < 20 && inspectProcess(childPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("verified child pid %d survived Linux cleanup under leader EACCES", childPID)
+	}
+}
+
+func TestLinuxUnreadableRootRefusesNumericPPIDAndCleansVerifiedPastGroupMismatch(t *testing.T) {
+	unrelatedCmd := exec.Command("sleep", "30")
+	configureProcess(unrelatedCmd)
+	if err := unrelatedCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedPID := unrelatedCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(unrelatedPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = unrelatedCmd.Wait()
+	})
+	unrelatedInfo := inspectProcess(unrelatedPID)
+	if !unrelatedInfo.Alive {
+		t.Fatalf("unrelated pid %d not alive", unrelatedPID)
+	}
+
+	verifiedCmd := exec.Command("sleep", "30")
+	configureProcess(verifiedCmd)
+	if err := verifiedCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	verifiedPID := verifiedCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(verifiedPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = verifiedCmd.Wait()
+	})
+	verifiedInfo := inspectProcess(verifiedPID)
+	if !verifiedInfo.Alive {
+		t.Fatalf("verified pid %d not alive", verifiedPID)
+	}
+
+	// Simulate an unreadable leader PID inside /proc alongside an intruder with a
+	// mismatched UID in the same PGID and an unverified process whose numeric PPID
+	// happens to equal leaderPID.
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	t.Cleanup(func() {
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+	})
+
+	leaderPID := verifiedInfo.PGID
+	if leaderPID == verifiedPID || leaderPID == unrelatedPID {
+		leaderPID = verifiedPID + 99998
+	}
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, syscall.EACCES
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == leaderPID {
+			return linuxProcMeta{}, syscall.EACCES
+		}
+		if pid == unrelatedPID {
+			m, err := origInspectMeta(pid)
+			if err == nil {
+				m.ppid = leaderPID
+				m.info.PGID = leaderPID
+			}
+			return m, err
+		}
+		return origInspectMeta(pid)
+	}
+
+	// Subcase 1: unverified unrelatedPID sharing numeric PPID/PGID with unreadable
+	// leaderPID must NEVER be verified or signalled.
+	unverifiedProof := processGroupProof{
+		Leader:       ProcessIdentityInfo{PID: leaderPID, PGID: leaderPID, StartToken: unrelatedInfo.StartToken},
+		UID:          unrelatedInfo.UID,
+		HasUID:       unrelatedInfo.HasUID,
+		SID:          unrelatedInfo.SID,
+		VerifiedAt:   time.Now().Add(-5 * time.Second),
+		KnownMembers: map[int]string{leaderPID: unrelatedInfo.StartToken},
+	}
+	candidates, _, merr := collectAndVerifyLinuxCandidates(&unverifiedProof, unverifiedProof.Leader, "", 0)
+	if merr != nil {
+		t.Fatalf("unexpected mismatch err: %v", merr)
+	}
+	for _, c := range candidates {
+		if c.pid == unrelatedPID && c.verified {
+			t.Fatalf("unrelated pid %d verified via unreadable root numeric ppid", unrelatedPID)
+		}
+	}
+
+	// Subcase 2: even when an intruder member causes a UID mismatch under leader
+	// EACCES (with no cached verifiedFDs), a freshly validated pidfd signals the
+	// verified KnownMembers child cleanly while keeping leader EACCES retryable.
+	intruderCmd := exec.Command("sleep", "30")
+	configureProcess(intruderCmd)
+	if err := intruderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	intruderPID := intruderCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(intruderPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = intruderCmd.Wait()
+	})
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == leaderPID {
+			return linuxProcMeta{}, syscall.EACCES
+		}
+		if pid == intruderPID {
+			m, err := origInspectMeta(pid)
+			if err == nil {
+				m.info.PGID = verifiedInfo.PGID
+				m.info.UID = verifiedInfo.UID + 1
+				m.info.HasUID = true
+			}
+			return m, err
+		}
+		return origInspectMeta(pid)
+	}
+	mixedProof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: verifiedInfo.PGID, StartToken: verifiedInfo.StartToken},
+		UID:            verifiedInfo.UID,
+		HasUID:         true,
+		SID:            verifiedInfo.SID,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers:   map[int]string{leaderPID: verifiedInfo.StartToken, verifiedPID: verifiedInfo.StartToken},
+	}
+	live, liveErr := hasVerifiedLiveGroupMember(mixedProof)
+	if liveErr != nil || !live {
+		t.Fatalf("hasVerifiedLiveGroupMember past intruder UID mismatch = (%v, %v), want (true, nil)", live, liveErr)
+	}
+	if err := stopAdoptedProcessGroupAfterExitTrack(&mixedProof); !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want EACCES keeping leader pending", err)
+	}
+	for wait := 0; wait < 20 && inspectProcess(verifiedPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(verifiedPID).Alive {
+		t.Fatalf("verified child pid %d survived cleanup after group UID mismatch under leader EACCES", verifiedPID)
+	}
+	if !inspectProcess(unrelatedPID).Alive {
+		t.Fatalf("unrelated pid %d was killed despite unverified numeric ppid", unrelatedPID)
+	}
+}
+
+func TestLinuxRecoveryKeepsJobPendingWhenOneKnownMemberRaisesEACCES(t *testing.T) {
+	tmpDir := t.TempDir()
+	childAPIDFile := filepath.Join(tmpDir, "childA.pid")
+	childBPIDFile := filepath.Join(tmpDir, "childB.pid")
+	groupCmd := exec.Command("bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q; sleep 30 & echo $! > %q", childAPIDFile, childBPIDFile))
+	configureProcess(groupCmd)
+	if err := groupCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := groupCmd.Process.Pid
+	leaderTok := inspectProcess(leaderPID).StartToken
+	readSpawnedPID := func(p string) int {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if b, err := os.ReadFile(p); err == nil {
+				if v, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && v > 0 {
+					return v
+				}
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for pid file %s", p)
+		return 0
+	}
+	childAPID := readSpawnedPID(childAPIDFile)
+	childBPID := readSpawnedPID(childBPIDFile)
+	// Wait for the bash leader to exit so childA and childB remain alone in the shared PGID/SID.
+	_ = groupCmd.Wait()
+	if leaderTok == "" {
+		leaderTok = inspectProcess(childAPID).StartToken
+	}
+	t.Cleanup(func() {
+		for _, pid := range []int{childAPID, childBPID} {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+
+	infoA := inspectProcess(childAPID)
+	infoB := inspectProcess(childBPID)
+	if !infoA.Alive || !infoB.Alive {
+		t.Fatalf("children not alive: A=%+v B=%+v", infoA, infoB)
+	}
+	if infoA.PGID != infoB.PGID || infoA.SID != infoB.SID {
+		t.Fatalf("expected shared process group/session: A=%+v B=%+v", infoA, infoB)
+	}
+
+	intruderCmd := exec.Command("sleep", "30")
+	configureProcess(intruderCmd)
+	if err := intruderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	intruderPID := intruderCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(intruderPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = intruderCmd.Wait()
+	})
+
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	t.Cleanup(func() {
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+	})
+
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	var forceBEACCES atomic.Bool
+	forceBEACCES.Store(true)
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == childBPID && forceBEACCES.Load() {
+			return linuxProcMeta{}, syscall.EACCES
+		}
+		if pid == intruderPID {
+			m, err := origInspectMeta(pid)
+			if err == nil {
+				m.info.PGID = infoA.PGID
+				m.info.UID = infoA.UID + 1
+				m.info.HasUID = true
+			}
+			return m, err
+		}
+		return origInspectMeta(pid)
+	}
+
+	proof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: infoA.PGID, StartToken: leaderTok},
+		UID:            infoA.UID,
+		HasUID:         true,
+		SID:            infoA.SID,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers: map[int]string{
+			leaderPID: infoA.StartToken,
+			childAPID: infoA.StartToken,
+			childBPID: infoB.StartToken,
+		},
+	}
+
+	err := stopAdoptedProcessGroupAfterExitTrack(&proof)
+	if !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want EACCES while childB is inaccessible", err)
+	}
+	for wait := 0; wait < 20; wait++ {
+		if m, merr := origInspectMeta(childAPID); merr != nil || !m.info.Alive {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if m, merr := origInspectMeta(childAPID); merr == nil && m.info.Alive {
+		t.Fatalf("childA pid %d survived cleanup", childAPID)
+	}
+	metaB, errB := origInspectMeta(childBPID)
+	if errB != nil || !metaB.info.Alive {
+		t.Fatalf("expected childB pid %d to still be alive under EACCES (meta=%+v, err=%v)", childBPID, metaB, errB)
+	}
+
+	// Retry after clearing EACCES finishes cleaning childB cleanly.
+	forceBEACCES.Store(false)
+	if rerr := stopAdoptedProcessGroupAfterExitTrack(&proof); rerr != nil {
+		t.Fatalf("retry stopAdoptedProcessGroupAfterExitTrack err = %v", rerr)
+	}
+	for wait := 0; wait < 20; wait++ {
+		if m, merr := origInspectMeta(childBPID); merr != nil || !m.info.Alive {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if m, merr := origInspectMeta(childBPID); merr == nil && m.info.Alive {
+		t.Fatalf("childB pid %d survived cleanup retry", childBPID)
+	}
+}
+
+func TestLinuxCachedPidfdVerificationErrorPreserved(t *testing.T) {
+	childACmd := exec.Command("sleep", "30")
+	configureProcess(childACmd)
+	if err := childACmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	childAPID := childACmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childAPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = childACmd.Wait()
+	})
+	infoA := inspectProcess(childAPID)
+
+	childBCmd := exec.Command("sleep", "30")
+	configureProcess(childBCmd)
+	if err := childBCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	childBPID := childBCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childBPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = childBCmd.Wait()
+	})
+	infoB := inspectProcess(childBPID)
+
+	intruderCmd := exec.Command("sleep", "30")
+	configureProcess(intruderCmd)
+	if err := intruderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	intruderPID := intruderCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(intruderPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = intruderCmd.Wait()
+	})
+
+	// Open a non-pidfd file descriptor for childB so verifyPreCapturedMemberFD
+	// fails with a non-mismatch kernel error (EINVAL/EBADF) rather than ESRCH.
+	nullFile, err := os.Open("/dev/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nullFile.Close()
+
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	t.Cleanup(func() {
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+	})
+
+	leaderPID := infoA.PGID
+	if leaderPID == childAPID || leaderPID == childBPID {
+		leaderPID = childBPID + 99998
+	}
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == intruderPID {
+			m, err := origInspectMeta(pid)
+			if err == nil {
+				m.info.PGID = infoA.PGID
+				m.info.UID = infoA.UID + 1
+				m.info.HasUID = true
+			}
+			return m, err
+		}
+		return origInspectMeta(pid)
+	}
+
+	proof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: infoA.PGID, StartToken: infoA.StartToken},
+		UID:            infoA.UID,
+		HasUID:         true,
+		SID:            infoA.SID,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers: map[int]string{
+			leaderPID: infoA.StartToken,
+			childAPID: infoA.StartToken,
+			childBPID: infoB.StartToken,
+		},
+		verifiedFDs: map[int]verifiedProcFD{
+			childBPID: {fd: int(nullFile.Fd()), startToken: infoB.StartToken},
+		},
+	}
+
+	// Presence check for childB alone (when childA has exited) must propagate
+	// cached verification error instead of returning (false, nil).
+	onlyB := proof
+	onlyB.KnownMembers = map[int]string{leaderPID: infoA.StartToken, childBPID: infoB.StartToken}
+	if live, lerr := hasVerifiedLiveKnownMemberLinux(onlyB); live || lerr == nil {
+		t.Fatalf("hasVerifiedLiveKnownMemberLinux = (%v, %v), want (false, non-nil cached FD error)", live, lerr)
+	}
+
+	// Cleanup with cached FD error on childB after killing childA must NOT return nil.
+	if err := stopAdoptedProcessGroupAfterExitTrack(&proof); err == nil {
+		t.Fatal("stopAdoptedProcessGroupAfterExitTrack = nil despite cached pidfd verification error on childB")
+	}
+	for wait := 0; wait < 20; wait++ {
+		if m, merr := origInspectMeta(childAPID); merr != nil || !m.info.Alive {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if m, merr := origInspectMeta(childAPID); merr == nil && m.info.Alive {
+		t.Fatalf("childA pid %d survived cleanup", childAPID)
+	}
+	if m, merr := origInspectMeta(childBPID); merr != nil || !m.info.Alive {
+		t.Fatalf("expected childB pid %d to still be alive under cached FD error (meta=%+v, err=%v)", childBPID, m, merr)
+	}
+}
+
+func TestLinuxCachedPidfdTreatsUnreapedZombieAsExited(t *testing.T) {
+	zombieCmd := exec.Command("sh", "-c", "exit 0")
+	configureProcess(zombieCmd)
+	if err := zombieCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	zpid := zombieCmd.Process.Pid
+	zinfo := inspectProcess(zpid)
+	fd, err := unix.PidfdOpen(zpid, 0)
+	if err != nil {
+		_ = zombieCmd.Process.Kill()
+		_ = zombieCmd.Wait()
+		t.Skipf("pidfd_open unsupported: %v", err)
+	}
+	defer unix.Close(fd)
+	defer func() { _ = zombieCmd.Wait() }()
+
+	// Poll until sh exits and becomes an unreaped zombie (do NOT call Wait yet).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		if n, perr := unix.Poll(pfd, 0); perr == nil && n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	proof := processGroupProof{
+		Leader: ProcessIdentityInfo{PID: zpid, PGID: zinfo.PGID, StartToken: zinfo.StartToken},
+		verifiedFDs: map[int]verifiedProcFD{
+			zpid: {fd: fd, startToken: zinfo.StartToken},
+		},
+	}
+	hasFD, alive, verr := verifyPreCapturedMemberFD(proof, zpid, zinfo.StartToken)
+	if verr != nil || !hasFD || alive {
+		t.Fatalf("verifyPreCapturedMemberFD(zombie) = (hasFD=%v, alive=%v, err=%v), want (true, false, nil)", hasFD, alive, verr)
+	}
+	if live, lerr := hasVerifiedLiveKnownMemberLinux(processGroupProof{
+		Leader:       ProcessIdentityInfo{PID: zpid + 1, PGID: zinfo.PGID, StartToken: zinfo.StartToken},
+		KnownMembers: map[int]string{zpid: zinfo.StartToken},
+		verifiedFDs:  proof.verifiedFDs,
+	}); live || lerr != nil {
+		t.Fatalf("hasVerifiedLiveKnownMemberLinux(zombie) = (%v, %v), want (false, nil)", live, lerr)
+	}
+}
+
+func TestCrashRecoveryAdoptedLeaderExitStopsBackgroundChildWithoutPidfdLinux(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "ENOSYS", err: syscall.ENOSYS},
+		{name: "EPERM", err: syscall.EPERM},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			origPidfdOpen := pidfdOpenFn
+			t.Cleanup(func() { pidfdOpenFn = origPidfdOpen })
+			pidfdOpenFn = func(int, int) (int, error) {
+				return -1, tc.err
+			}
+			runCrashRecoveryAdoptedLeaderExitStopsBackgroundChild(t)
+		})
+	}
+}
+
+func TestLinuxCleanupWithoutPidfdVerifiesIdentityAndRefusesReuse(t *testing.T) {
+	origPidfdOpen := pidfdOpenFn
+	origPidfdSendSignal := pidfdSendSignalFn
+	origOpenHandle := openLinuxProcHandleFn
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	t.Cleanup(func() {
+		pidfdOpenFn = origPidfdOpen
+		pidfdSendSignalFn = origPidfdSendSignal
+		openLinuxProcHandleFn = origOpenHandle
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+	})
+	pidfdOpenFn = func(int, int) (int, error) {
+		return -1, syscall.ENOSYS
+	}
+
+	// Subcase 1: when a verified child PID is reused (StartToken changes when
+	// inspected through its opened /proc/<pid> handle) under ENOSYS, cleanup
+	// refuses to kill the replacement process and returns ErrProcessIdentityMismatch.
+	reusedCmd := exec.Command("sleep", "30")
+	configureProcess(reusedCmd)
+	if err := reusedCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	reusedPID := reusedCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(reusedPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = reusedCmd.Wait()
+	})
+	reusedInfo := inspectProcess(reusedPID)
+	if !reusedInfo.Alive {
+		t.Fatalf("reused pid %d not alive", reusedPID)
+	}
+	fakeLeaderPID := reusedInfo.PGID + 99997
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == fakeLeaderPID {
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == fakeLeaderPID {
+			return linuxProcMeta{}, nil
+		}
+		return origInspectMeta(pid)
+	}
+	openLinuxProcHandleFn = func(pid int) (int, linuxProcMeta, error) {
+		fd, m, err := origOpenHandle(pid)
+		if err == nil && pid == reusedPID && m.info.Alive {
+			m.info.StartToken = m.info.StartToken + "-reused"
+		}
+		return fd, m, err
+	}
+	reusedProof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: fakeLeaderPID, PGID: reusedInfo.PGID, StartToken: reusedInfo.StartToken},
+		UID:            reusedInfo.UID,
+		HasUID:         reusedInfo.HasUID,
+		SID:            reusedInfo.SID,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers: map[int]string{
+			fakeLeaderPID: reusedInfo.StartToken,
+			reusedPID:     reusedInfo.StartToken,
+		},
+	}
+	if err := stopAdoptedProcessGroupAfterExit(reusedProof); !errors.Is(err, ErrProcessIdentityMismatch) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExit on reused PID without pidfd = %v, want ErrProcessIdentityMismatch", err)
+	}
+	if m, merr := origInspectMeta(reusedPID); merr != nil || !m.info.Alive {
+		t.Fatalf("reused pid %d was killed despite StartToken change (meta=%+v, err=%v)", reusedPID, m, merr)
+	}
+
+	// Subcase 2: signalVerifiedKnownMembersLinux still stops verified children
+	// past an intruder mismatch when pidfd_open returns EPERM using the pinned
+	// /proc/<pid> handle + pidfd_send_signal.
+	pidfdOpenFn = func(int, int) (int, error) {
+		return -1, syscall.EPERM
+	}
+	openLinuxProcHandleFn = origOpenHandle
+	inspectLinuxProcMetaFn = origInspectMeta
+
+	verifiedCmd := exec.Command("sleep", "30")
+	configureProcess(verifiedCmd)
+	if err := verifiedCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	verifiedPID := verifiedCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(verifiedPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = verifiedCmd.Wait()
+	})
+	verifiedInfo := inspectProcess(verifiedPID)
+
+	intruderCmd := exec.Command("sleep", "30")
+	configureProcess(intruderCmd)
+	if err := intruderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	intruderPID := intruderCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(intruderPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = intruderCmd.Wait()
+	})
+
+	leaderPID := verifiedInfo.PGID + 99996
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, syscall.EACCES
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == leaderPID {
+			return linuxProcMeta{}, syscall.EACCES
+		}
+		if pid == intruderPID {
+			m, err := origInspectMeta(pid)
+			if err == nil {
+				m.info.PGID = verifiedInfo.PGID
+				m.info.UID = verifiedInfo.UID + 1
+				m.info.HasUID = true
+			}
+			return m, err
+		}
+		return origInspectMeta(pid)
+	}
+	mixedProof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: verifiedInfo.PGID, StartToken: verifiedInfo.StartToken},
+		UID:            verifiedInfo.UID,
+		HasUID:         true,
+		SID:            verifiedInfo.SID,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers:   map[int]string{leaderPID: verifiedInfo.StartToken, verifiedPID: verifiedInfo.StartToken},
+	}
+	if err := stopAdoptedProcessGroupAfterExitTrack(&mixedProof); !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack without pidfd err = %v, want EACCES keeping leader pending", err)
+	}
+	for wait := 0; wait < 20; wait++ {
+		if m, merr := origInspectMeta(verifiedPID); merr != nil || !m.info.Alive {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if m, merr := origInspectMeta(verifiedPID); merr == nil && m.info.Alive {
+		t.Fatalf("verified child pid %d survived known-member cleanup without pidfd", verifiedPID)
+	}
+	if m, merr := origInspectMeta(intruderPID); merr != nil || !m.info.Alive {
+		t.Fatalf("intruder pid %d was killed unexpectedly (meta=%+v, err=%v)", intruderPID, m, merr)
+	}
+
+	// Subcase 3: when handle-based signalling itself is unavailable
+	// (pidfd_send_signal returns ENOSYS/EPERM), both cleanup and leader handle
+	// signalling preserve a retryable error rather than falling back to kill(pid).
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == fakeLeaderPID {
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == fakeLeaderPID {
+			return linuxProcMeta{}, nil
+		}
+		return origInspectMeta(pid)
+	}
+	for _, sigErr := range []error{syscall.ENOSYS, syscall.EPERM} {
+		pidfdOpenFn = func(int, int) (int, error) {
+			return -1, syscall.ENOSYS
+		}
+		pidfdSendSignalFn = func(int, unix.Signal, *unix.Siginfo, int) error {
+			return sigErr
+		}
+		if err := stopAdoptedProcessGroupAfterExit(reusedProof); !errors.Is(err, sigErr) {
+			t.Fatalf("stopAdoptedProcessGroupAfterExit without pidfd_send_signal err = %v, want retryable %v", err, sigErr)
+		}
+		if err := stopVerifiedLeaderByProcHandle(ProcessIdentityInfo{
+			PID:        reusedPID,
+			PGID:       reusedInfo.PGID,
+			StartToken: reusedInfo.StartToken,
+		}); !errors.Is(err, sigErr) {
+			t.Fatalf("stopVerifiedLeaderByProcHandle without pidfd_send_signal err = %v, want retryable %v", err, sigErr)
+		}
+		if m, merr := origInspectMeta(reusedPID); merr != nil || !m.info.Alive {
+			t.Fatalf("pid %d was killed despite unavailable pidfd_send_signal (%v)", reusedPID, sigErr)
+		}
+	}
+}
+
+func TestLinuxMismatchRetryTracksNewlyVerifiedChildAndKeepsPending(t *testing.T) {
+	tmpDir := t.TempDir()
+	childAPIDFile := filepath.Join(tmpDir, "childA.pid")
+	childBPIDFile := filepath.Join(tmpDir, "childB.pid")
+	childCPIDFile := filepath.Join(tmpDir, "childC.pid")
+	jobTok := "linux-mismatch-scanproof-tok"
+	groupCmd := exec.Command("bash", "-c", fmt.Sprintf(
+		"sleep 30 & echo $! > %q; env -u %s sleep 30 & echo $! > %q; sleep 30 & echo $! > %q",
+		childAPIDFile, jobTokenEnvVar, childBPIDFile, childCPIDFile,
+	))
+	groupCmd.Env = append(os.Environ(), jobTokenEnvVar+"="+jobTok)
+	configureProcess(groupCmd)
+	if err := groupCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := groupCmd.Process.Pid
+	leaderTok := inspectProcess(leaderPID).StartToken
+	readSpawnedPID := func(p string) int {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if b, err := os.ReadFile(p); err == nil {
+				if v, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && v > 0 {
+					return v
+				}
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for pid file %s", p)
+		return 0
+	}
+	childAPID := readSpawnedPID(childAPIDFile)
+	childBPID := readSpawnedPID(childBPIDFile)
+	childCPID := readSpawnedPID(childCPIDFile)
+	_ = groupCmd.Wait()
+	t.Cleanup(func() {
+		for _, pid := range []int{childAPID, childBPID, childCPID} {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+
+	infoA := inspectProcess(childAPID)
+	infoB := inspectProcess(childBPID)
+	infoC := inspectProcess(childCPID)
+	if !infoA.Alive || !infoB.Alive || !infoC.Alive {
+		t.Fatalf("children not alive: A=%+v B=%+v C=%+v", infoA, infoB, infoC)
+	}
+	if leaderTok == "" {
+		leaderTok = infoA.StartToken
+	}
+
+	origPidfdOpen := pidfdOpenFn
+	origOpenHandle := openLinuxProcHandleFn
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	t.Cleanup(func() {
+		pidfdOpenFn = origPidfdOpen
+		openLinuxProcHandleFn = origOpenHandle
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+	})
+
+	pidfdOpenFn = func(int, int) (int, error) {
+		return -1, syscall.ENOSYS
+	}
+	var reusedB atomic.Bool
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == leaderPID {
+			return linuxProcMeta{}, nil
+		}
+		m, err := origInspectMeta(pid)
+		if err == nil && pid == childBPID && m.info.Alive && reusedB.Load() {
+			m.info.StartToken = m.info.StartToken + "-reused"
+		}
+		return m, err
+	}
+
+	var blockC atomic.Bool
+	blockC.Store(true)
+	openLinuxProcHandleFn = func(pid int) (int, linuxProcMeta, error) {
+		if pid == childCPID && blockC.Load() {
+			return -1, linuxProcMeta{}, syscall.EACCES
+		}
+		fd, m, err := origOpenHandle(pid)
+		if err == nil && pid == childBPID && m.info.Alive {
+			// Model childB exiting and its PID being replaced by an unrelated
+			// process from handle revalidation onward across both proc handle and
+			// subsequent /proc lookups.
+			reusedB.Store(true)
+			m.info.StartToken = m.info.StartToken + "-reused"
+		}
+		return fd, m, err
+	}
+
+	// Seed proof with childA and childB only (childC is NOT in initial KnownMembers).
+	proof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: infoA.PGID, StartToken: leaderTok},
+		UID:            infoA.UID,
+		HasUID:         true,
+		SID:            infoA.SID,
+		JobToken:       jobTok,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers: map[int]string{
+			leaderPID: leaderTok,
+			childAPID: infoA.StartToken,
+			childBPID: infoB.StartToken,
+		},
+	}
+
+	err := stopAdoptedProcessGroupAfterExitTrack(&proof)
+	if !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want EACCES while newly verified childC cannot be signalled", err)
+	}
+	if proof.KnownMembers[childCPID] != infoC.StartToken {
+		t.Fatalf("expected newly verified childC (%d) retained in proof.KnownMembers: %+v", childCPID, proof.KnownMembers)
+	}
+	for wait := 0; wait < 20; wait++ {
+		if m, merr := origInspectMeta(childAPID); merr != nil || !m.info.Alive {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if m, merr := origInspectMeta(childAPID); merr == nil && m.info.Alive {
+		t.Fatalf("childA pid %d survived cleanup", childAPID)
+	}
+	if m, merr := origInspectMeta(childCPID); merr != nil || !m.info.Alive {
+		t.Fatalf("childC pid %d should still be alive under EACCES (meta=%+v, err=%v)", childCPID, m, merr)
+	}
+	if m, merr := origInspectMeta(childBPID); merr != nil || !m.info.Alive {
+		t.Fatalf("reused childB pid %d should remain alive (meta=%+v, err=%v)", childBPID, m, merr)
+	}
+
+	// After clearing EACCES, retry stops newly verified childC even while childB
+	// still fails revalidation, keeping reused childB untouched.
+	blockC.Store(false)
+	if rerr := stopAdoptedProcessGroupAfterExitTrack(&proof); rerr != nil {
+		t.Fatalf("retry stopAdoptedProcessGroupAfterExitTrack err = %v, want nil after newly verified childC is stopped", rerr)
+	}
+	for wait := 0; wait < 20; wait++ {
+		if m, merr := origInspectMeta(childCPID); merr != nil || !m.info.Alive {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if m, merr := origInspectMeta(childCPID); merr == nil && m.info.Alive {
+		t.Fatalf("newly verified childC pid %d survived mismatch retry", childCPID)
+	}
+	if m, merr := origInspectMeta(childBPID); merr != nil || !m.info.Alive {
+		t.Fatalf("reused childB pid %d was killed on retry (meta=%+v, err=%v)", childBPID, m, merr)
+	}
+}
+
+func TestLinuxFreshlyVerifiedMemberOverwritesStalePIDTokenAcrossMismatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	childPIDFile := filepath.Join(tmpDir, "child.pid")
+	jobTok := "linux-stale-pid-token-tok"
+	cmd := exec.Command("bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q", childPIDFile))
+	cmd.Env = append(os.Environ(), jobTokenEnvVar+"="+jobTok)
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	leaderTok := inspectProcess(leaderPID).StartToken
+	var childPID int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(childPIDFile); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				childPID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		t.Fatal("child did not start")
+	}
+	_ = cmd.Wait()
+	t.Cleanup(func() {
+		_ = syscall.Kill(childPID, syscall.SIGKILL)
+	})
+	info := inspectProcess(childPID)
+	if !info.Alive {
+		t.Fatalf("child pid %d not alive", childPID)
+	}
+	if leaderTok == "" {
+		leaderTok = info.StartToken
+	}
+
+	intruderCmd := exec.Command("sleep", "30")
+	configureProcess(intruderCmd)
+	if err := intruderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	intruderPID := intruderCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(intruderPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = intruderCmd.Wait()
+	})
+
+	nullFile, err := os.Open("/dev/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nullFile.Close()
+
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	t.Cleanup(func() {
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+	})
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == leaderPID {
+			return linuxProcMeta{}, nil
+		}
+		if pid == intruderPID {
+			m, merr := origInspectMeta(pid)
+			if merr == nil {
+				m.info.PGID = info.PGID
+				m.info.UID = info.UID + 1
+				m.info.HasUID = true
+			}
+			return m, merr
+		}
+		return origInspectMeta(pid)
+	}
+
+	// Seed KnownMembers AND verifiedFDs at childPID with an older saved token
+	// (simulating an exited earlier child at the same PID). JobToken verification
+	// must overwrite KnownMembers[childPID], drop the stale verifiedFD entry,
+	// and stop childPID past the intruder mismatch.
+	proof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: info.PGID, StartToken: leaderTok},
+		UID:            info.UID,
+		HasUID:         true,
+		SID:            info.SID,
+		JobToken:       jobTok,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers: map[int]string{
+			leaderPID: leaderTok,
+			childPID:  "stale-boot:1",
+		},
+		verifiedFDs: map[int]verifiedProcFD{
+			childPID: {fd: int(nullFile.Fd()), startToken: "stale-boot:1"},
+		},
+	}
+
+	if rerr := stopAdoptedProcessGroupAfterExitTrack(&proof); rerr != nil {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want nil", rerr)
+	}
+	if proof.KnownMembers[childPID] != info.StartToken {
+		t.Fatalf("KnownMembers[%d] = %q, want updated %q", childPID, proof.KnownMembers[childPID], info.StartToken)
+	}
+	for wait := 0; wait < 20 && inspectProcess(childPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("freshly verified child pid %d survived mismatch cleanup despite JobToken", childPID)
+	}
+	if !inspectProcess(intruderPID).Alive {
+		t.Fatalf("intruder pid %d was killed unexpectedly", intruderPID)
+	}
+}
+
+func TestLinuxFreshChildRetrySurvivesEACCESThenEMFILE(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-stale-fd-eacces-emfile"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(jobsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	childPIDFile := filepath.Join(root, "child.pid")
+	jobTok := "linux-eacces-emfile-retry-tok"
+	cmd := exec.Command("bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q", childPIDFile))
+	cmd.Env = append(os.Environ(), jobTokenEnvVar+"="+jobTok)
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	leaderTok := inspectProcess(leaderPID).StartToken
+	var childPID int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(childPIDFile); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				childPID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		t.Fatal("child did not start")
+	}
+	_ = cmd.Wait()
+	t.Cleanup(func() {
+		_ = syscall.Kill(childPID, syscall.SIGKILL)
+	})
+	info := inspectProcess(childPID)
+	if !info.Alive {
+		t.Fatalf("child pid %d not alive", childPID)
+	}
+	if leaderTok == "" {
+		leaderTok = info.StartToken
+	}
+
+	// Obtain a dead pidfd representing an exited earlier process that once held
+	// childPID before childPID was reused by the current JobToken child.
+	exitedCmd := exec.Command("sh", "-c", "exit 0")
+	configureProcess(exitedCmd)
+	if err := exitedCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	staleFD, serr := unix.PidfdOpen(exitedCmd.Process.Pid, 0)
+	_ = exitedCmd.Wait()
+	if serr != nil {
+		t.Skipf("pidfd_open unsupported: %v", serr)
+	}
+	var staleFDOwnedByJob atomic.Bool
+	t.Cleanup(func() {
+		if !staleFDOwnedByJob.Load() {
+			_ = unix.Close(staleFD)
+		}
+	})
+
+	rec := PersistedJob{
+		ID:             "bg-stale-fd-retry",
+		Started:        time.Now().Add(-time.Second),
+		Unlimited:      true,
+		Command:        "eacces then emfile job",
+		Cwd:            root,
+		OutputID:       outID,
+		PID:            leaderPID,
+		PGID:           info.PGID,
+		ProcessStarted: leaderTok,
+		JobToken:       jobTok,
+		GroupProof: &PersistedGroupProof{
+			UID:            info.UID,
+			HasUID:         info.HasUID,
+			SID:            info.SID,
+			KnownMembers:   map[int]string{leaderPID: leaderTok, childPID: "stale-boot:1"},
+			VerifiedAt:     time.Now().Add(-time.Second),
+			CleanupPending: true,
+		},
+		Status: JobRunning,
+	}
+	if err := savePersistedJob(jobsDir, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	origPidfdOpen := pidfdOpenFn
+	origOpenHandle := openLinuxProcHandleFn
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	origReadProcDir := readProcDirFn
+	var forceChildEACCES atomic.Bool
+	var forceLeaderEMFILE atomic.Bool
+	var recoverEMFILE atomic.Bool
+	recoverEMFILE.Store(true)
+	t.Cleanup(func() {
+		pidfdOpenFn = origPidfdOpen
+		openLinuxProcHandleFn = origOpenHandle
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+		readProcDirFn = origReadProcDir
+	})
+
+	// Hold recovery open in JobRunning initially and install all function hooks
+	// before starting recovery so the monitor exits deterministically under EMFILE
+	// without racing on hook assignments or manual StopJob calls.
+	readProcDirFn = func() ([]os.DirEntry, error) {
+		if recoverEMFILE.Load() {
+			return nil, syscall.EMFILE
+		}
+		return origReadProcDir()
+	}
+	pidfdOpenFn = func(pid int, flags int) (int, error) {
+		if pid == childPID && forceChildEACCES.Load() {
+			return -1, syscall.EACCES
+		}
+		return origPidfdOpen(pid, flags)
+	}
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			if forceLeaderEMFILE.Load() {
+				return processInfo{}, syscall.EMFILE
+			}
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == leaderPID {
+			if forceLeaderEMFILE.Load() {
+				return linuxProcMeta{}, syscall.EMFILE
+			}
+			return linuxProcMeta{}, nil
+		}
+		return origInspectMeta(pid)
+	}
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	var recoveredJob *Job
+	t.Cleanup(func() {
+		recoverEMFILE.Store(false)
+		forceChildEACCES.Store(false)
+		forceLeaderEMFILE.Store(false)
+		_ = exec2.CloseJobs(context.Background())
+		if recoveredJob != nil && recoveredJob.monitorDone != nil {
+			<-recoveredJob.monitorDone
+		}
+	})
+	if _, err := exec2.RecoverSessionJobs(outID, nil, nil, nil); err != nil {
+		t.Fatalf("RecoverSessionJobs: %v", err)
+	}
+	recoveredJob = exec2.registry().Get("bg-stale-fd-retry")
+	if recoveredJob == nil || recoveredJob.Status() != JobRunning {
+		t.Fatalf("expected running adopted job, got %+v", recoveredJob)
+	}
+	if recoveredJob.monitorDone != nil {
+		select {
+		case <-recoveredJob.monitorDone:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for initial monitor to stop under EMFILE")
+		}
+	}
+	recoveredJob.proofFDMu.Lock()
+	recoveredJob.mu.Lock()
+	recoveredJob.groupProof.verifiedFDs = map[int]verifiedProcFD{
+		childPID: {fd: staleFD, startToken: "stale-boot:1"},
+	}
+	staleFDOwnedByJob.Store(true)
+	recoveredJob.mu.Unlock()
+	recoveredJob.proofFDMu.Unlock()
+
+	// Step 1: StopJob learns info.StartToken for childPID via JobToken and then
+	// encounters EACCES on signal handle open; job must stay running with staleFD evicted.
+	recoverEMFILE.Store(false)
+	forceChildEACCES.Store(true)
+	if _, stopErr := exec2.StopJob("bg-stale-fd-retry"); !errors.Is(stopErr, syscall.EACCES) {
+		t.Fatalf("first StopJob err = %v, want EACCES", stopErr)
+	}
+	if recoveredJob.Status() != JobRunning {
+		t.Fatalf("job status after first EACCES = %q, want running", recoveredJob.Status())
+	}
+
+	// Step 2: Next StopJob hits EMFILE on leader inspection; must preserve EMFILE
+	// and stay running/stoppable rather than returning ErrProcessIdentityMismatch.
+	forceLeaderEMFILE.Store(true)
+	if _, stopErr := exec2.StopJob("bg-stale-fd-retry"); !isFDLimitErr(stopErr) {
+		t.Fatalf("second StopJob under EMFILE err = %v, want EMFILE/ENFILE", stopErr)
+	}
+	if recoveredJob.Status() != JobRunning {
+		t.Fatalf("job status under EMFILE = %q, want running (not unknown)", recoveredJob.Status())
+	}
+	if !inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d unexpectedly dead before final retry", childPID)
+	}
+
+	// Step 3: Clear faults and verify final StopJob cleans childPID and finishes JobDone.
+	forceLeaderEMFILE.Store(false)
+	forceChildEACCES.Store(false)
+	if _, stopErr := exec2.StopJob("bg-stale-fd-retry"); stopErr != nil {
+		t.Fatalf("final StopJob err = %v, want nil", stopErr)
+	}
+	if recoveredJob.Status() != JobDone {
+		t.Fatalf("final status = %q, want done", recoveredJob.Status())
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d survived final StopJob", childPID)
+	}
+}

@@ -122,6 +122,14 @@ type Executor struct {
 
 	cacheOnce  sync.Once
 	fetchCache *webfetchCache
+
+	// waitAdopted overrides waitAdoptedProcess in tests.
+	waitAdopted func(context.Context, ProcessIdentityInfo) (int, bool, error)
+	// stopAdoptedGroupAfterExit overrides stopAdoptedProcessGroupAfterExit in tests.
+	stopAdoptedGroupAfterExit func(processGroupProof) error
+	// beforeJobPublish runs right before startBashJob publishes a newly started
+	// job into the registry, allowing deterministic race tests.
+	beforeJobPublish func()
 }
 
 // webfetchCache returns the executor's page cache, creating it on

@@ -44,6 +44,7 @@ func main() {
 		sandbox        = flag.Bool("sandbox", false, "run bash calls under bwrap (bubblewrap): the workspace is the only writable directory (also env HARNESS_SANDBOX=1 or config sandbox)")
 		bashTO         = flag.Int("bash-timeout", 0, "default bash timeout in seconds (default 120, or env OPENAI_BASH_TIMEOUT_SECONDS)")
 		bgThresh       = flag.Int("bg-threshold", -1, "seconds a bash call runs before it is backgrounded (-1 = env OPENAI_BG_THRESHOLD_SECONDS or 120s default, 0 = never)")
+		bgMaxLifetime  = flag.Int("bg-max-lifetime", -1, "max lifetime in seconds for background:true jobs without a per-call timeout (-1 = env OPENAI_BACKGROUND_MAX_LIFETIME_SECONDS, config, or 7200s default, 0 = unlimited)")
 		rpcMode        = flag.Bool("rpc", false, "RPC mode: JSONL over stdin/stdout for a GUI (see README); stdout carries protocol data only")
 		images         stringList
 		files          stringList
@@ -85,7 +86,7 @@ func main() {
 			fatal(err)
 		}
 		if uiMode == "tui" {
-			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *steal, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *sandbox, images, files, *workspaceTrust, *rebindSession); err != nil {
+			if err := execTUI(*root, *mode, *model, *api, *provider, *config, *maxSteps, *resume, *steal, *sessionID, *ctxLimit, *deny, *bashTO, *bgThresh, *bgMaxLifetime, *sandbox, images, files, *workspaceTrust, *rebindSession); err != nil {
 				fmt.Fprintf(os.Stderr, "harness: TUI unavailable (%v); continuing in plain mode.\n", err)
 			} else {
 				return // Windows waits for the child rather than replacing this process.
@@ -111,27 +112,28 @@ func main() {
 	}
 
 	a, err := app.Setup(app.Params{
-		Root:                       *root,
-		WorkspaceTrust:             *workspaceTrust,
-		Mode:                       *mode,
-		Model:                      *model,
-		API:                        *api,
-		Provider:                   *provider,
-		ConfigPath:                 *config,
-		MaxSteps:                   *maxSteps,
-		ContextLimit:               *ctxLimit,
-		Resume:                     *resume,
-		Steal:                      *steal,
-		RebindSession:              *rebindSession,
-		SessionID:                  *sessionID,
-		DenyInsteadOfPrompt:        *deny,
-		Headless:                   *printMode != "",
-		Sandbox:                    *sandbox,
-		BashTimeoutSeconds:         *bashTO,
-		BackgroundThresholdSeconds: *bgThresh,
-		DisableBackground:          *printMode != "",
-		Images:                     images,
-		Files:                      files,
+		Root:                         *root,
+		WorkspaceTrust:               *workspaceTrust,
+		Mode:                         *mode,
+		Model:                        *model,
+		API:                          *api,
+		Provider:                     *provider,
+		ConfigPath:                   *config,
+		MaxSteps:                     *maxSteps,
+		ContextLimit:                 *ctxLimit,
+		Resume:                       *resume,
+		Steal:                        *steal,
+		RebindSession:                *rebindSession,
+		SessionID:                    *sessionID,
+		DenyInsteadOfPrompt:          *deny,
+		Headless:                     *printMode != "",
+		Sandbox:                      *sandbox,
+		BashTimeoutSeconds:           *bashTO,
+		BackgroundThresholdSeconds:   *bgThresh,
+		BackgroundMaxLifetimeSeconds: app.BackgroundMaxLifetimeSecondsFromFlag(*bgMaxLifetime),
+		DisableBackground:            *printMode != "",
+		Images:                       images,
+		Files:                        files,
 	})
 	if err != nil {
 		fatal(err)
@@ -168,6 +170,13 @@ func main() {
 	}
 	if a.ResumedMessage != "" {
 		fmt.Println(a.ResumedMessage)
+	}
+	if notice := a.OrphanedNotice(); notice != "" {
+		if *printMode != "" {
+			fmt.Fprintln(os.Stderr, notice)
+		} else {
+			fmt.Println(notice)
+		}
 	}
 
 	// Plain renderer: the CLI is one consumer of the loop's event stream.
@@ -377,15 +386,15 @@ func askQuestionFromScanner(scanner *input.Lines) func(agent.QuestionRequest) (a
 
 // execTUI replaces this process with the sibling harness-tui binary,
 // passing the same flags through. Windows waits for that process to finish.
-func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume string, steal bool, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images, files []string, workspaceTrust string, rebindSession bool) error {
+func execTUI(root, mode, model, api, provider, config string, maxSteps int, resume string, steal bool, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh, bgMaxLifetime int, sandbox bool, images, files []string, workspaceTrust string, rebindSession bool) error {
 	sibling, err := tuiSibling()
 	if err != nil {
 		return err
 	}
-	return runTUIProcess(sibling, tuiArgs(sibling, root, mode, model, api, provider, config, maxSteps, resume, steal, sessionID, ctxLimit, deny, bashTO, bgThresh, sandbox, images, files, workspaceTrust, rebindSession))
+	return runTUIProcess(sibling, tuiArgs(sibling, root, mode, model, api, provider, config, maxSteps, resume, steal, sessionID, ctxLimit, deny, bashTO, bgThresh, bgMaxLifetime, sandbox, images, files, workspaceTrust, rebindSession))
 }
 
-func tuiArgs(sibling, root, mode, model, api, provider, config string, maxSteps int, resume string, steal bool, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh int, sandbox bool, images, files []string, workspaceTrust string, rebindSession bool) []string {
+func tuiArgs(sibling, root, mode, model, api, provider, config string, maxSteps int, resume string, steal bool, sessionID string, ctxLimit int, deny bool, bashTO, bgThresh, bgMaxLifetime int, sandbox bool, images, files []string, workspaceTrust string, rebindSession bool) []string {
 	args := []string{
 		sibling,
 		"-root", root,
@@ -404,6 +413,7 @@ func tuiArgs(sibling, root, mode, model, api, provider, config string, maxSteps 
 		"-deny-instead-of-prompt=" + strconv.FormatBool(deny),
 		"-bash-timeout", strconv.Itoa(bashTO),
 		"-bg-threshold", strconv.Itoa(bgThresh),
+		"-bg-max-lifetime", strconv.Itoa(bgMaxLifetime),
 		"-sandbox=" + strconv.FormatBool(sandbox),
 	}
 	for _, img := range images {

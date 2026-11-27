@@ -29,6 +29,8 @@ func snapshotJob(job *tools.Job, delivered bool) checkpoint.Job {
 	out := checkpoint.Job{
 		ID:              snap.ID,
 		Started:         snap.Started,
+		Deadline:        snap.Deadline,
+		Unlimited:       snap.Unlimited,
 		InvocationID:    snap.InvocationID,
 		Command:         snap.Command,
 		Cwd:             snap.Cwd,

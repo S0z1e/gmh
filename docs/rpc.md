@@ -12,7 +12,7 @@ harness --rpc -root /path/to/project -mode suggest
 ```
 
 The first line on stdout is a `ready` event:
-`{"type":"ready","protocol":1,"session":"<id>","model":"...","api":"chat","mode":"suggest","root":"...","resumed":false,"messages":0}` (when resumed with recovered background jobs, `ready`, `resume_session`, and `steal_session` may also include `resumed_message` and `recovered_jobs`).
+`{"type":"ready","protocol":1,"session":"<id>","model":"...","api":"chat","mode":"suggest","root":"...","resumed":false,"messages":0}` (when resumed with recovered background jobs, `ready`, `resume_session`, and `steal_session` may also include `resumed_message` and `recovered_jobs`; when other unsupervised sessions in the same workspace have live background jobs, `ready` and `jobs` also include `orphaned_jobs` and `orphaned_jobs_notice`).
 
 All responses and events carry a strictly increasing `sequence` for the
 connection. Events carry `connection_id` and, when applicable, `session`,
@@ -77,7 +77,8 @@ echoed in the response):
   conversation, not whether a tool may act, so no approval rule
   applies to it. In a headless run (`-p`, or no GUI) there is nobody
   to ask and the guard denies.
-- `abort` → `{"aborted":true|false}`. Cancels the running turn, and
+- `abort` → `{"aborted":true|false}`. Cancels the running turn, cancels
+  running background jobs belonging to the active session, and
   fails any approval, continuation, or question waiting on a dialog,
   so a turn blocked on approval can still be stopped.
 - `question_response` `{"question_id":"quest-1","answers":[{"question":0,"selected":["Postgres"],"custom":""}]}` →

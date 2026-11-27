@@ -75,42 +75,127 @@ func (e *Executor) CloseJobs(ctx context.Context) error {
 	}
 	e.jobsMu.Unlock()
 	var cancelled []*Job
+	var closeStops []func() error
 	var stops []func()
+	var awaited []*Job
 	for _, job := range jobs {
 		job.mu.Lock()
 		if !job.finished && !job.unknown {
 			job.stopRequested = true
-			if job.closeCancel != nil {
+			if job.closeStop != nil {
+				closeStops = append(closeStops, job.closeStop)
+			} else if job.closeCancel != nil {
 				stops = append(stops, job.closeCancel)
 			} else if job.cancel != nil {
 				stops = append(stops, job.cancel)
 			}
 			cancelled = append(cancelled, job)
+			awaited = append(awaited, job)
+		} else {
+			select {
+			case <-job.done:
+			default:
+				// Terminal transition was claimed (e.g. completion audit in flight)
+				// but j.done is still open: await completion before returning.
+				awaited = append(awaited, job)
+			}
 		}
 		job.mu.Unlock()
+	}
+	var closeErrs []error
+	var stopCh chan error
+	if len(closeStops) > 0 {
+		stopCh = make(chan error, len(closeStops))
+		for _, stop := range closeStops {
+			go func(fn func() error) {
+				stopCh <- fn()
+			}(stop)
+		}
 	}
 	for _, stop := range stops {
 		stop()
 	}
-	for _, job := range cancelled {
-		job.persist()
-	}
 	for _, run := range runs {
 		run.cancel()
+	}
+	for range closeStops {
+		select {
+		case err := <-stopCh:
+			if err != nil {
+				closeErrs = append(closeErrs, err)
+			}
+		case <-ctx.Done():
+			closeErrs = append(closeErrs, ctx.Err())
+			return errors.Join(closeErrs...)
+		}
+	}
+	if len(cancelled) > 0 {
+		persistDone := make(chan struct{})
+		go func() {
+			defer close(persistDone)
+			for _, job := range cancelled {
+				job.persist()
+			}
+		}()
+		select {
+		case <-persistDone:
+		case <-ctx.Done():
+			closeErrs = append(closeErrs, ctx.Err())
+			return errors.Join(closeErrs...)
+		}
 	}
 	for _, run := range runs {
 		select {
 		case <-run.done:
 		case <-ctx.Done():
-			return ctx.Err()
+			closeErrs = append(closeErrs, ctx.Err())
+			return errors.Join(closeErrs...)
 		}
 	}
-	for _, job := range jobs {
+	for _, job := range awaited {
+		if len(closeErrs) > 0 && job.Status() == JobRunning && job.monitorDone != nil {
+			// If stop already failed synchronously (WaitError recorded), don't
+			// block until ctx.Done() waiting for a job we couldn't stop.
+			job.mu.Lock()
+			hasWaitErr := job.WaitError != ""
+			job.mu.Unlock()
+			if hasWaitErr {
+				continue
+			}
+		}
+		if job.monitorDone != nil {
+			select {
+			case <-job.Done():
+			case <-job.monitorDone:
+				job.mu.Lock()
+				failed := !job.finished && !job.unknown && job.WaitError != ""
+				waitErr := job.WaitError
+				job.mu.Unlock()
+				if failed {
+					closeErrs = append(closeErrs, errors.New(waitErr))
+					continue
+				}
+				// Even if monitorDone closed after a transient error or race with
+				// StopJob, wait for any concurrent/subsequent completion audit and
+				// job.Done() before returning.
+				select {
+				case <-job.Done():
+				case <-ctx.Done():
+					closeErrs = append(closeErrs, ctx.Err())
+					return errors.Join(closeErrs...)
+				}
+			case <-ctx.Done():
+				closeErrs = append(closeErrs, ctx.Err())
+				return errors.Join(closeErrs...)
+			}
+			continue
+		}
 		select {
 		case <-job.Done():
 		case <-ctx.Done():
-			return ctx.Err()
+			closeErrs = append(closeErrs, ctx.Err())
+			return errors.Join(closeErrs...)
 		}
 	}
-	return nil
+	return errors.Join(closeErrs...)
 }

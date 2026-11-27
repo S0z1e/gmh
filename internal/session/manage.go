@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"minimalharness/internal/privatefile"
+	"minimalharness/internal/workspace"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,26 +26,7 @@ type Info struct {
 // runs, and the list is for picking a recent one, not an archive.
 const maxListSessions = 30
 
-// List returns the sessions in Dir(), newest first. Audit sidecars
-// and pre-compact archives are not sessions, so they never appear.
-func List() ([]Info, error) {
-	unlock, err := lockManagement()
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
-	if _, err := recoverOperations(); err != nil {
-		return nil, err
-	}
-
-	dir := Dir()
-	entries, err := artifactEntries()
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
+func activeSessionEntries(dir string, entries []os.DirEntry) ([]string, map[string]*Header, error) {
 	// Registries identify arbitrary archive names without relying on a suffix.
 	headers := map[string]*Header{}
 	for _, entry := range entries {
@@ -66,7 +48,7 @@ func List() ([]Info, error) {
 		seen[h.OutputID] = true
 		r, err := loadArtifactRegistry(h)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, name := range r.Promoted {
 			promoted[name] = true
@@ -78,7 +60,7 @@ func List() ([]Info, error) {
 			}
 		}
 	}
-	var out []Info
+	var ids []string
 	for _, en := range entries {
 		name := en.Name()
 		if en.IsDir() || !strings.HasSuffix(name, ".jsonl") || archives[name] {
@@ -88,7 +70,124 @@ func List() ([]Info, error) {
 		if headers[name] == nil && strings.HasSuffix(id, "-audit") || !promoted[name] && legacyArchiveName(id) {
 			continue
 		}
-		info, err := readInfo(filepath.Join(dir, name), id)
+		ids = append(ids, id)
+	}
+	return ids, headers, nil
+}
+
+// WorkspaceSession describes an active (non-archive) session bound to a workspace.
+type WorkspaceSession struct {
+	ID        string
+	OutputID  string
+	JobsDir   string
+	OutputDir string
+	Busy      bool
+}
+
+func isSessionWriterBusy(dir, id string) bool {
+	if err := ValidateSessionID(id); err != nil {
+		return true
+	}
+	lockPath := filepath.Join(dir, ".writers", id+".lock")
+	f, err := openWriterLease(lockPath, os.O_RDWR)
+	if os.IsNotExist(err) {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+	return errors.Is(tryLockWriter(f), ErrSessionBusy)
+}
+
+// ListWorkspaceSessions returns non-archive sessions bound to root that have a
+// durable jobs directory, along with whether another writer holds each lock.
+func ListWorkspaceSessions(root string) ([]WorkspaceSession, error) {
+	identity, err := workspace.Identify(root)
+	if err != nil {
+		return nil, err
+	}
+	repo := repositoryIdentity(identity.Path)
+	unlock, err := lockManagement()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if _, err := recoverOperations(); err != nil {
+		return nil, err
+	}
+
+	dir := Dir()
+	entries, err := artifactEntries()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	ids, headers, err := activeSessionEntries(dir, entries)
+	if err != nil {
+		return nil, err
+	}
+	var out []WorkspaceSession
+	seenOutput := map[string]bool{}
+	for _, id := range ids {
+		h := headers[id+".jsonl"]
+		if checkBinding(h, identity, repo) != nil {
+			continue
+		}
+		outputID := id
+		if h.OutputID != "" {
+			outputID = h.OutputID
+		}
+		if seenOutput[outputID] {
+			continue
+		}
+		jobsDir := filepath.Join(dir, outputID, "bash-output-jobs")
+		st, statErr := os.Stat(jobsDir)
+		if statErr != nil || !st.IsDir() {
+			continue
+		}
+		seenOutput[outputID] = true
+		out = append(out, WorkspaceSession{
+			ID:        id,
+			OutputID:  outputID,
+			JobsDir:   jobsDir,
+			OutputDir: filepath.Join(dir, outputID, "bash-output"),
+			Busy:      isSessionWriterBusy(dir, id),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// List returns the sessions in Dir(), newest first. Audit sidecars
+// and pre-compact archives are not sessions, so they never appear.
+func List() ([]Info, error) {
+	unlock, err := lockManagement()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if _, err := recoverOperations(); err != nil {
+		return nil, err
+	}
+
+	dir := Dir()
+	entries, err := artifactEntries()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	ids, _, err := activeSessionEntries(dir, entries)
+	if err != nil {
+		return nil, err
+	}
+	var out []Info
+	for _, id := range ids {
+		info, err := readInfo(filepath.Join(dir, id+".jsonl"), id)
 		if err != nil {
 			continue
 		}
