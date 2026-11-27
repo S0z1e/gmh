@@ -17,6 +17,12 @@ func isProcessAccessError(err error) bool {
 	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM)
 }
 
+func isPidfdUnavailableErr(err error) bool {
+	return errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM)
+}
+
+var pidfdOpenFn = unix.PidfdOpen
+
 func processGroupID(pid int) int {
 	if pid <= 0 {
 		return 0
@@ -278,7 +284,7 @@ func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
 	if !id.Matches(info2) {
 		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 	}
-	fd, fdErr := unix.PidfdOpen(id.PID, 0)
+	fd, fdErr := pidfdOpenFn(id.PID, 0)
 	if fdErr != nil {
 		if errors.Is(fdErr, unix.ESRCH) {
 			return os.ErrProcessDone
@@ -286,10 +292,31 @@ func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
 		if isFDLimitErr(fdErr) {
 			return signalVerifiedGroupByFD(proof, fdErr, map[int]string{id.PID: id.StartToken}, true)
 		}
+		if isPidfdUnavailableErr(fdErr) {
+			return stopVerifiedLeaderByProc(id)
+		}
 		return fdErr
 	}
 	defer unix.Close(fd)
 	if kerr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); errors.Is(kerr, unix.ESRCH) {
+		return os.ErrProcessDone
+	} else {
+		return kerr
+	}
+}
+
+func stopVerifiedLeaderByProc(id ProcessIdentityInfo) error {
+	info, err := inspectProcessErrFn(id.PID)
+	if err != nil {
+		return err
+	}
+	if !info.Alive {
+		return os.ErrProcessDone
+	}
+	if !id.Matches(info) {
+		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+	}
+	if kerr := syscall.Kill(id.PID, syscall.SIGKILL); errors.Is(kerr, syscall.ESRCH) {
 		return os.ErrProcessDone
 	} else {
 		return kerr
@@ -421,7 +448,7 @@ func captureVerifiedGroupProof(proof *processGroupProof) {
 		if existing, ok := proof.verifiedFDs[pid]; ok && existing.fd > 0 && existing.startToken == tok {
 			continue
 		}
-		fd, err := unix.PidfdOpen(pid, 0)
+		fd, err := pidfdOpenFn(pid, 0)
 		if err != nil || fd <= 0 {
 			continue
 		}
@@ -662,6 +689,56 @@ func classifyCachedMemberFD(proof processGroupProof, pid int, tok string) (hasFD
 	return true, alive, nil
 }
 
+type verifiedProcTarget struct {
+	pid        int
+	startToken string
+}
+
+func linuxProcMatchesMember(proof processGroupProof, id ProcessIdentityInfo, meta linuxProcMeta, tok string) bool {
+	return meta.info.Alive &&
+		meta.info.PGID == id.PGID &&
+		meta.info.StartToken == tok &&
+		(!proof.HasUID || !meta.info.HasUID || meta.info.UID == proof.UID) &&
+		(proof.SID <= 0 || meta.info.SID == proof.SID)
+}
+
+// revalidateAndSignalLinuxMember re-reads /proc/<pid> metadata to verify identity
+// immediately before signalling and sends SIGKILL via fd (if hasFD) or pid.
+func revalidateAndSignalLinuxMember(proof processGroupProof, id ProcessIdentityInfo, pid int, tok string, fd int, hasFD bool, failOnReuse bool) (signalled, gone, fdLimited bool, err error) {
+	meta, merr := inspectLinuxProcMetaFn(pid)
+	if merr != nil {
+		if isFDLimitErr(merr) {
+			return false, false, true, merr
+		}
+		if errors.Is(merr, unix.ESRCH) {
+			return false, true, false, nil
+		}
+		return false, false, false, merr
+	}
+	if !meta.info.Alive || meta.info.PGID != id.PGID {
+		return false, true, false, nil
+	}
+	if meta.info.StartToken != tok || !linuxProcMatchesMember(proof, id, meta, tok) {
+		if failOnReuse {
+			return false, false, false, fmt.Errorf("refusing to signal pid %d: %w", pid, ErrProcessIdentityMismatch)
+		}
+		return false, true, false, nil
+	}
+	var kerr error
+	if hasFD {
+		kerr = unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
+	} else {
+		kerr = syscall.Kill(pid, syscall.SIGKILL)
+	}
+	if kerr == nil {
+		return true, false, false, nil
+	}
+	if errors.Is(kerr, unix.ESRCH) || errors.Is(kerr, syscall.ESRCH) {
+		return false, true, false, nil
+	}
+	return false, false, false, kerr
+}
+
 func hasVerifiedLiveKnownMemberLinux(proof processGroupProof) (bool, error) {
 	id := proof.Leader
 	var inspectErr error
@@ -686,13 +763,7 @@ func hasVerifiedLiveKnownMemberLinux(proof processGroupProof) (bool, error) {
 			}
 			continue
 		}
-		if !meta.info.Alive || meta.info.PGID != id.PGID || meta.info.StartToken != tok {
-			continue
-		}
-		if proof.HasUID && meta.info.HasUID && meta.info.UID != proof.UID {
-			continue
-		}
-		if proof.SID > 0 && meta.info.SID != proof.SID {
+		if !linuxProcMatchesMember(proof, id, meta, tok) {
 			continue
 		}
 		return true, nil
@@ -721,35 +792,32 @@ func signalVerifiedKnownMembersLinux(proof processGroupProof, id ProcessIdentity
 			}
 			continue
 		}
-		fd, ferr := unix.PidfdOpen(pid, 0)
+		fd, ferr := pidfdOpenFn(pid, 0)
 		if isFDLimitErr(ferr) {
 			return anySignalled, true, ferr
 		}
 		if errors.Is(ferr, unix.ESRCH) {
 			continue
 		}
-		if ferr != nil {
+		if ferr != nil && !isPidfdUnavailableErr(ferr) {
 			if firstErr == nil {
 				firstErr = ferr
 			}
 			continue
 		}
-		meta, merr := inspectLinuxProcMetaFn(pid)
-		if merr == nil && meta.info.Alive && meta.info.PGID == id.PGID && meta.info.StartToken == tok &&
-			(!proof.HasUID || !meta.info.HasUID || meta.info.UID == proof.UID) &&
-			(proof.SID <= 0 || meta.info.SID == proof.SID) {
-			if kerr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); kerr == nil {
-				anySignalled = true
-			} else if !errors.Is(kerr, unix.ESRCH) && firstErr == nil {
-				firstErr = kerr
-			}
-		} else if isFDLimitErr(merr) {
+		hasOpenFD := ferr == nil
+		sig, _, fdLim, serr := revalidateAndSignalLinuxMember(proof, id, pid, tok, fd, hasOpenFD, false)
+		if hasOpenFD {
 			_ = unix.Close(fd)
-			return anySignalled, true, merr
-		} else if merr != nil && !errors.Is(merr, unix.ESRCH) && firstErr == nil {
-			firstErr = merr
 		}
-		_ = unix.Close(fd)
+		if fdLim {
+			return anySignalled, true, serr
+		}
+		if sig {
+			anySignalled = true
+		} else if serr != nil && firstErr == nil {
+			firstErr = serr
+		}
 	}
 	return anySignalled, false, firstErr
 }
@@ -936,6 +1004,7 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 	goneMembers := 0
 	groupVerified := false
 	var verifiedFDs []int
+	var verifiedPIDs []verifiedProcTarget
 	var openedFDs []int
 	defer func() {
 		for _, fd := range openedFDs {
@@ -964,13 +1033,17 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 		if isFDLimitErr(handleErr) {
 			continue
 		}
-		fd, ferr := unix.PidfdOpen(pid, 0)
+		fd, ferr := pidfdOpenFn(pid, 0)
 		if isFDLimitErr(ferr) {
 			handleErr = ferr
 			continue
 		}
 		if errors.Is(ferr, unix.ESRCH) {
 			goneMembers++
+			continue
+		}
+		if isPidfdUnavailableErr(ferr) {
+			verifiedPIDs = append(verifiedPIDs, verifiedProcTarget{pid: pid, startToken: meta.info.StartToken})
 			continue
 		}
 		if ferr != nil {
@@ -980,7 +1053,7 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 			continue
 		}
 		// Revalidate opened pidfd handle before accepting it.
-		meta2, merr := inspectLinuxProcMeta(pid)
+		meta2, merr := inspectLinuxProcMetaFn(pid)
 		if merr != nil {
 			_ = unix.Close(fd)
 			if isFDLimitErr(merr) {
@@ -1014,6 +1087,31 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 			sigErr = kerr
 		}
 	}
+	fallbackAccounted := 0
+	for _, target := range verifiedPIDs {
+		sig, gone, fdLim, serr := revalidateAndSignalLinuxMember(*proof, id, target.pid, target.startToken, 0, false, true)
+		if fdLim {
+			if handleErr == nil {
+				handleErr = serr
+			}
+			break
+		}
+		if errors.Is(serr, ErrProcessIdentityMismatch) {
+			return anySignalled, false, liveMembers, serr
+		}
+		if serr != nil {
+			if sigErr == nil {
+				sigErr = serr
+			}
+			continue
+		}
+		if sig {
+			anySignalled = true
+			fallbackAccounted++
+		} else if gone {
+			goneMembers++
+		}
+	}
 
 	if handleErr != nil {
 		if isFDLimitErr(handleErr) {
@@ -1035,8 +1133,8 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 	if sigErr != nil {
 		return anySignalled, false, liveMembers, sigErr
 	}
-	if len(verifiedFDs)+goneMembers != liveMembers {
-		return anySignalled, false, liveMembers, fmt.Errorf("incomplete cleanup for pgid %d (%d/%d members accounted): %w", id.PGID, len(verifiedFDs)+goneMembers, liveMembers, ErrProcessIdentityMismatch)
+	if len(verifiedFDs)+fallbackAccounted+goneMembers != liveMembers {
+		return anySignalled, false, liveMembers, fmt.Errorf("incomplete cleanup for pgid %d (%d/%d members accounted): %w", id.PGID, len(verifiedFDs)+fallbackAccounted+goneMembers, liveMembers, ErrProcessIdentityMismatch)
 	}
 	return anySignalled, false, liveMembers, nil
 }
@@ -1045,7 +1143,7 @@ func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool,
 	if !id.Valid() {
 		return -1, false, ErrProcessIdentityMismatch
 	}
-	fd, err := unix.PidfdOpen(id.PID, 0)
+	fd, err := pidfdOpenFn(id.PID, 0)
 	if err == nil {
 		defer unix.Close(fd)
 		info, ierr := inspectProcessErr(id.PID)
@@ -1098,7 +1196,7 @@ func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool,
 		}
 		return -1, false, errAdoptedProcessExited
 	}
-	if !errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.EPERM) {
+	if !isPidfdUnavailableErr(err) {
 		return -1, false, err
 	}
 	ticker := time.NewTicker(50 * time.Millisecond)

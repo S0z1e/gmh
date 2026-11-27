@@ -1074,6 +1074,11 @@ func TestCrashRecoveryWaitErrorKeepsJobRunningAndStoppable(t *testing.T) {
 }
 
 func TestCrashRecoveryAdoptedLeaderExitStopsBackgroundChild(t *testing.T) {
+	runCrashRecoveryAdoptedLeaderExitStopsBackgroundChild(t)
+}
+
+func runCrashRecoveryAdoptedLeaderExitStopsBackgroundChild(t *testing.T) {
+	t.Helper()
 	root := t.TempDir()
 	sessionBase := t.TempDir()
 	outID := "sess-child-cleanup"

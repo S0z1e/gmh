@@ -1263,3 +1263,174 @@ func TestLinuxCachedPidfdTreatsUnreapedZombieAsExited(t *testing.T) {
 		t.Fatalf("hasVerifiedLiveKnownMemberLinux(zombie) = (%v, %v), want (false, nil)", live, lerr)
 	}
 }
+
+func TestCrashRecoveryAdoptedLeaderExitStopsBackgroundChildWithoutPidfdLinux(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "ENOSYS", err: syscall.ENOSYS},
+		{name: "EPERM", err: syscall.EPERM},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			origPidfdOpen := pidfdOpenFn
+			t.Cleanup(func() { pidfdOpenFn = origPidfdOpen })
+			pidfdOpenFn = func(int, int) (int, error) {
+				return -1, tc.err
+			}
+			runCrashRecoveryAdoptedLeaderExitStopsBackgroundChild(t)
+		})
+	}
+}
+
+func TestLinuxCleanupWithoutPidfdVerifiesIdentityAndRefusesReuse(t *testing.T) {
+	origPidfdOpen := pidfdOpenFn
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	t.Cleanup(func() {
+		pidfdOpenFn = origPidfdOpen
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+	})
+	pidfdOpenFn = func(int, int) (int, error) {
+		return -1, syscall.ENOSYS
+	}
+
+	// Subcase 1: when a verified child PID is reused (StartToken changes) between
+	// candidate verification and signalling under ENOSYS, cleanup refuses to kill
+	// the replacement process and returns ErrProcessIdentityMismatch.
+	reusedCmd := exec.Command("sleep", "30")
+	configureProcess(reusedCmd)
+	if err := reusedCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	reusedPID := reusedCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(reusedPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = reusedCmd.Wait()
+	})
+	reusedInfo := inspectProcess(reusedPID)
+	if !reusedInfo.Alive {
+		t.Fatalf("reused pid %d not alive", reusedPID)
+	}
+	fakeLeaderPID := reusedInfo.PGID + 99997
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == fakeLeaderPID {
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	var calls atomic.Int32
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == fakeLeaderPID {
+			return linuxProcMeta{}, nil
+		}
+		m, err := origInspectMeta(pid)
+		if err == nil && pid == reusedPID && calls.Add(1) > 1 {
+			m.info.StartToken = m.info.StartToken + "-reused"
+		}
+		return m, err
+	}
+	reusedProof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: fakeLeaderPID, PGID: reusedInfo.PGID, StartToken: reusedInfo.StartToken},
+		UID:            reusedInfo.UID,
+		HasUID:         reusedInfo.HasUID,
+		SID:            reusedInfo.SID,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers: map[int]string{
+			fakeLeaderPID: reusedInfo.StartToken,
+			reusedPID:     reusedInfo.StartToken,
+		},
+	}
+	if err := stopAdoptedProcessGroupAfterExit(reusedProof); !errors.Is(err, ErrProcessIdentityMismatch) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExit on reused PID without pidfd = %v, want ErrProcessIdentityMismatch", err)
+	}
+	if m, merr := origInspectMeta(reusedPID); merr != nil || !m.info.Alive {
+		t.Fatalf("reused pid %d was killed despite StartToken change (meta=%+v, err=%v)", reusedPID, m, merr)
+	}
+
+	// Subcase 2: signalVerifiedKnownMembersLinux still stops verified children
+	// past an intruder mismatch when pidfd_open returns EPERM.
+	pidfdOpenFn = func(int, int) (int, error) {
+		return -1, syscall.EPERM
+	}
+	inspectLinuxProcMetaFn = origInspectMeta
+	calls.Store(0)
+
+	verifiedCmd := exec.Command("sleep", "30")
+	configureProcess(verifiedCmd)
+	if err := verifiedCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	verifiedPID := verifiedCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(verifiedPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = verifiedCmd.Wait()
+	})
+	verifiedInfo := inspectProcess(verifiedPID)
+
+	intruderCmd := exec.Command("sleep", "30")
+	configureProcess(intruderCmd)
+	if err := intruderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	intruderPID := intruderCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(intruderPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = intruderCmd.Wait()
+	})
+
+	leaderPID := verifiedInfo.PGID + 99996
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, syscall.EACCES
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == leaderPID {
+			return linuxProcMeta{}, syscall.EACCES
+		}
+		if pid == intruderPID {
+			m, err := origInspectMeta(pid)
+			if err == nil {
+				m.info.PGID = verifiedInfo.PGID
+				m.info.UID = verifiedInfo.UID + 1
+				m.info.HasUID = true
+			}
+			return m, err
+		}
+		return origInspectMeta(pid)
+	}
+	mixedProof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: verifiedInfo.PGID, StartToken: verifiedInfo.StartToken},
+		UID:            verifiedInfo.UID,
+		HasUID:         true,
+		SID:            verifiedInfo.SID,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers:   map[int]string{leaderPID: verifiedInfo.StartToken, verifiedPID: verifiedInfo.StartToken},
+	}
+	if err := stopAdoptedProcessGroupAfterExitTrack(&mixedProof); !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack without pidfd err = %v, want EACCES keeping leader pending", err)
+	}
+	for wait := 0; wait < 20; wait++ {
+		if m, merr := origInspectMeta(verifiedPID); merr != nil || !m.info.Alive {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if m, merr := origInspectMeta(verifiedPID); merr == nil && m.info.Alive {
+		t.Fatalf("verified child pid %d survived known-member cleanup without pidfd", verifiedPID)
+	}
+	if m, merr := origInspectMeta(intruderPID); merr != nil || !m.info.Alive {
+		t.Fatalf("intruder pid %d was killed unexpectedly (meta=%+v, err=%v)", intruderPID, m, merr)
+	}
+}
