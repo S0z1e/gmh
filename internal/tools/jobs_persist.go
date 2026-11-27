@@ -776,17 +776,26 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 	default: // JobRunning: validate live process identity and group before adopting.
 		rec.OutputReceipt = ""
 		id := ProcessIdentityInfo{PID: rec.PID, PGID: rec.PGID, StartToken: rec.ProcessStarted}
-		info := inspectProcess(rec.PID)
-		if id.Matches(info) {
+		info, inspectErr := inspectProcessErr(rec.PID)
+		if inspectErr != nil && id.Valid() {
+			proof := groupProofFromPersisted(rec, id, rec.OutputFile)
+			note := fmt.Sprintf("adopted process PID %d (pgid %d); process inspection error (%v) — job remains stoppable; %s",
+				id.PID, id.PGID, inspectErr, pipeCaptureEndedNote(rec.OutputFile))
+			job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
+			job.WaitError = inspectErr.Error()
+			job.groupProof = proof
+			if !proof.ExitObservedAt.IsZero() {
+				job.cleanupPending = true
+			}
+			return e.attachAdoptedStopControls(job, jobsDir)
+		}
+		if inspectErr == nil && id.Matches(info) {
 			proof := processGroupProof{
 				Leader:     id,
-				UID:        info.UID,
-				HasUID:     info.HasUID,
-				SID:        info.SID,
-				Sess:       info.Sess,
 				JobToken:   rec.JobToken,
 				OutputFile: rec.OutputFile,
 			}
+			populateGroupProofIdentity(&proof, info)
 			captureVerifiedGroupProof(&proof)
 			extraNote := ""
 			if !rec.Unlimited && !rec.Deadline.IsZero() && !time.Now().Before(rec.Deadline) {

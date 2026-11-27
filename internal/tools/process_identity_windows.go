@@ -24,6 +24,8 @@ var (
 )
 
 var inspectWindowsProcessFn = inspectProcessErr
+var snapshotWindowsProcessesFn = snapshotWindowsProcesses
+var terminateWindowsProcessFn = terminateVerifiedWindowsProcess
 
 func isWindowsProcessMissing(err error) bool {
 	return errors.Is(err, windows.ERROR_INVALID_PARAMETER)
@@ -135,13 +137,14 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 }
 
 type windowsProcEntry struct {
-	pid        int
-	ppid       int
-	startToken string
-	startNs    int64
-	hasJobTok  bool
-	inJobObj   bool
-	inspectErr error
+	pid           int
+	ppid          int
+	startToken    string
+	startNs       int64
+	hasJobTok     bool
+	inJobObj      bool
+	inspectErr    error
+	tokenProbeErr error
 }
 
 func parseWindowsStartToken(token string) (int64, bool) {
@@ -346,7 +349,7 @@ func inspectWindowsSnapshotEntry(pid, ppid int, leaderNs int64, jobToken string,
 	if jobToken != "" && leaderNs > 0 && ns >= leaderNs && !entry.inJobObj {
 		hasTok, tokErr := processHasJobTokenWindowsErr(pid, jobToken)
 		if tokErr != nil {
-			entry.inspectErr = tokErr
+			entry.tokenProbeErr = tokErr
 		} else {
 			entry.hasJobTok = hasTok
 		}
@@ -428,9 +431,8 @@ func resolveWindowsGroupDescendants(proof *processGroupProof, id ProcessIdentity
 		}
 	}
 
-	// Verify strong instance-independent evidence (JobToken or Job Object
-	// membership) and record any uncertain failures without aborting cleanup of
-	// already-verified group members.
+	// Live-parent ancestry propagation must also inspect e.inspectErr independently
+	// of e.tokenProbeErr, and only retain tokenProbeErr for unverified entries.
 	for _, e := range procs {
 		if e.inspectErr != nil {
 			_, knownParent := proof.KnownMembers[e.ppid]
@@ -471,6 +473,18 @@ func resolveWindowsGroupDescendants(proof *processGroupProof, id ProcessIdentity
 		}
 		if !added {
 			break
+		}
+	}
+
+	for _, e := range procs {
+		if e.tokenProbeErr == nil || e.startNs < leaderNs {
+			continue
+		}
+		if _, ok := verifiedMap[e.pid]; ok {
+			continue
+		}
+		if inconclusiveErr == nil {
+			inconclusiveErr = e.tokenProbeErr
 		}
 	}
 
@@ -622,7 +636,7 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	consecutiveEmpty := 0
 	var lastInconclusiveErr error
 	for pass := 0; pass < maxPasses; pass++ {
-		procs, err := snapshotWindowsProcesses(leaderNs, proof.JobToken, proof.jobHandle)
+		procs, err := snapshotWindowsProcessesFn(leaderNs, proof.JobToken, proof.jobHandle)
 		if err != nil {
 			return err
 		}
@@ -663,10 +677,16 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 		var termErr error
 		passSignalled := false
 		for _, cand := range verified {
-			sig, serr := terminateVerifiedWindowsProcess(cand, cand.startToken, proof.jobHandle)
+			sig, serr := terminateWindowsProcessFn(cand, cand.startToken, proof.jobHandle)
 			if serr != nil {
 				if errors.Is(serr, ErrProcessIdentityMismatch) {
-					return serr
+					if cand.pid == id.PID {
+						return serr
+					}
+					// Non-leader child exited and its PID was recycled between snapshot
+					// and signalling: treat that instance as gone and continue signalling
+					// remaining verified siblings.
+					continue
 				}
 				if termErr == nil {
 					termErr = serr

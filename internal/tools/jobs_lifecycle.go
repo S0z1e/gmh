@@ -125,15 +125,24 @@ func (e *Executor) CloseJobs(ctx context.Context) error {
 				closeErrs = append(closeErrs, err)
 			}
 		case <-ctx.Done():
-			for _, job := range cancelled {
-				job.persist()
-			}
 			closeErrs = append(closeErrs, ctx.Err())
 			return errors.Join(closeErrs...)
 		}
 	}
-	for _, job := range cancelled {
-		job.persist()
+	if len(cancelled) > 0 {
+		persistDone := make(chan struct{})
+		go func() {
+			defer close(persistDone)
+			for _, job := range cancelled {
+				job.persist()
+			}
+		}()
+		select {
+		case <-persistDone:
+		case <-ctx.Done():
+			closeErrs = append(closeErrs, ctx.Err())
+			return errors.Join(closeErrs...)
+		}
 	}
 	for _, run := range runs {
 		select {

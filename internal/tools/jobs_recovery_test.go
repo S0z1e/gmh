@@ -3096,4 +3096,52 @@ func TestCrashRecoveryCloseJobsHonorsDeadlineWhenCloseStopAuditBlocks(t *testing
 	}
 }
 
+func TestCrashRecoveryCloseJobsHonorsDeadlineWhenPersistBlocks(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-close-deadline-persist"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+
+	exec1 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec1.SwitchSession(outID)
+	_, err := exec1.BashBackground(context.Background(), BashArgs{Command: "sleep 30"})
+	if err != nil {
+		t.Fatalf("BashBackground: %v", err)
+	}
+	jobs := exec1.Jobs()
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 running job, got %d", len(jobs))
+	}
+	job := jobs[0]
+
+	// Simulate a concurrent writer holding persistMu during fsync.
+	job.persistMu.Lock()
+	unlocked := false
+	t.Cleanup(func() {
+		if !unlocked {
+			job.persistMu.Unlock()
+		}
+		_ = exec1.CloseJobs(context.Background())
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	cerr := exec1.CloseJobs(ctx)
+	elapsed := time.Since(start)
+	if !errors.Is(cerr, context.DeadlineExceeded) {
+		t.Fatalf("CloseJobs err = %v, want context.DeadlineExceeded", cerr)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("CloseJobs overran shutdown deadline while persistMu blocked: took %v (want ~100ms)", elapsed)
+	}
+
+	job.persistMu.Unlock()
+	unlocked = true
+	if ferr := exec1.CloseJobs(context.Background()); ferr != nil {
+		t.Fatalf("follow-up CloseJobs failed: %v", ferr)
+	}
+}
+
 var _ = errors.New

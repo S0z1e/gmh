@@ -116,3 +116,111 @@ func TestDarwinInspectProcessErrPreservesSysctlErrorDuringWaitRecovery(t *testin
 		t.Fatalf("target pid %d still alive after StopJob", targetPID)
 	}
 }
+
+func TestDarwinInitialRecoveryPreservesLegacyJobOnInspectError(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-darwin-initial-inspect-err"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+
+	cmd, _ := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "READY",
+		"GMH_HELPER_CMD":       "printf 'READY\\n'; sleep 30",
+	})
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	// Remove persisted GroupProof and JobToken to model a legacy record.
+	recs, err := loadPersistedJobs(jobsDir)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("loadPersistedJobs = %+v, err=%v", recs, err)
+	}
+	legacy := recs[0]
+	legacy.GroupProof = nil
+	legacy.JobToken = ""
+	if err := savePersistedJob(jobsDir, legacy); err != nil {
+		t.Fatalf("savePersistedJob: %v", err)
+	}
+	targetPID := legacy.PID
+
+	origSysctl := darwinSysctlKinfoProcSliceFn
+	var forceInspectErr atomic.Bool
+	forceInspectErr.Store(true)
+	darwinSysctlKinfoProcSliceFn = func(name string, args ...int) ([]unix.KinfoProc, error) {
+		if forceInspectErr.Load() && name == "kern.proc.pid" && len(args) == 1 && args[0] == targetPID {
+			return nil, unix.EPERM
+		}
+		return origSysctl(name, args...)
+	}
+
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+	}
+	var recoveredJob *Job
+	t.Cleanup(func() {
+		forceInspectErr.Store(false)
+		_ = exec2.CloseJobs(context.Background())
+		if recoveredJob != nil && recoveredJob.monitorDone != nil {
+			<-recoveredJob.monitorDone
+		}
+		darwinSysctlKinfoProcSliceFn = origSysctl
+	})
+	exec2.SwitchSession(outID)
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 {
+		t.Fatalf("RecoverSessionJobs = %+v, err=%v", recovered, err)
+	}
+	if recovered[0].Status != JobRunning {
+		t.Fatalf("recovered legacy job status = %q during transient EPERM, want JobRunning", recovered[0].Status)
+	}
+	job := exec2.registry().Get(recovered[0].ID)
+	recoveredJob = job
+	if job == nil || job.monitorDone == nil {
+		t.Fatalf("expected monitor to be attached on transient initial inspect error")
+	}
+
+	persistedAfter, err := loadPersistedJobs(jobsDir)
+	if err != nil || len(persistedAfter) != 1 || persistedAfter[0].Status != JobRunning {
+		t.Fatalf("persisted record overwritten during transient inspect error: %+v, err=%v", persistedAfter, err)
+	}
+
+	// Clear transient inspection error; fallback polling and StopJob must now work cleanly.
+	forceInspectErr.Store(false)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := job.Snapshot()
+		if snap.Status != JobRunning {
+			t.Fatalf("job status changed unexpectedly to %q", snap.Status)
+		}
+		job.mu.Lock()
+		verified := !job.groupProof.VerifiedAt.IsZero()
+		job.mu.Unlock()
+		if verified {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := exec2.StopJob(job.ID); err != nil {
+		t.Fatalf("StopJob failed after inspect error cleared: %v", err)
+	}
+	if job.Status() != JobDone {
+		t.Fatalf("job status after StopJob = %q, want done", job.Status())
+	}
+	for wait := 0; wait < 20 && inspectProcess(targetPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(targetPID).Alive {
+		t.Fatalf("target pid %d still alive after StopJob", targetPID)
+	}
+}

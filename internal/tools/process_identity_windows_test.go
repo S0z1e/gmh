@@ -135,18 +135,35 @@ func TestResolveWindowsGroupDescendantsPreservesInspectionErrors(t *testing.T) {
 			KnownMembers: map[int]string{100: leaderTok, 201: memberTok},
 		}
 		procs := []windowsProcEntry{
-			{pid: 999, ppid: 4, inspectErr: windows.ERROR_PARTIAL_COPY},
-			{pid: 201, ppid: 100, startToken: memberTok, startNs: memberNs},
+			{pid: 999, ppid: 4, tokenProbeErr: windows.ERROR_PARTIAL_COPY, startNs: memberNs},
+			{pid: 201, ppid: 100, startToken: memberTok, startNs: memberNs, tokenProbeErr: windows.ERROR_PARTIAL_COPY},
 		}
 		verified, inconclusiveErr, err := resolveWindowsGroupDescendants(&proof, id, leaderNs, false, procs)
 		if err != nil {
 			t.Fatalf("err = %v, want nil", err)
 		}
 		if len(verified) != 1 || verified[0].pid != 201 {
-			t.Fatalf("verified = %+v, want proven member [201] even with speculative probe failure", verified)
+			t.Fatalf("verified = %+v, want proven member [201] even with failing PEB probe on it", verified)
 		}
 		if !errors.Is(inconclusiveErr, windows.ERROR_PARTIAL_COPY) {
-			t.Fatalf("inconclusiveErr = %v, want ERROR_PARTIAL_COPY", inconclusiveErr)
+			t.Fatalf("inconclusiveErr = %v, want ERROR_PARTIAL_COPY for uncertain pid 999", inconclusiveErr)
+		}
+	})
+
+	t.Run("known_member_token_match_clears_optional_probe_error", func(t *testing.T) {
+		proof := processGroupProof{
+			Leader:       id,
+			KnownMembers: map[int]string{100: leaderTok, 201: memberTok},
+		}
+		procs := []windowsProcEntry{
+			{pid: 201, ppid: 100, startToken: memberTok, startNs: memberNs, tokenProbeErr: windows.ERROR_PARTIAL_COPY},
+		}
+		verified, inconclusiveErr, err := resolveWindowsGroupDescendants(&proof, id, leaderNs, false, procs)
+		if err != nil || inconclusiveErr != nil {
+			t.Fatalf("err=%v inconclusive=%v, want both nil", err, inconclusiveErr)
+		}
+		if len(verified) != 1 || verified[0].pid != 201 {
+			t.Fatalf("verified = %+v, want [201]", verified)
 		}
 	})
 
@@ -184,5 +201,71 @@ func TestParseWindowsEnvHasToken(t *testing.T) {
 	))
 	if parseWindowsEnvHasToken(wrongBlock, target) {
 		t.Fatal("expected false for wrong value and entry after double-NUL")
+	}
+}
+
+func TestStopAdoptedWindowsGroupTreatsRecycledChildExitAsGoneAndStopsSiblings(t *testing.T) {
+	base := time.Unix(1700000300, 0)
+	leaderTok, _ := windowsTokenAt(base)
+	child1Tok, child1Ns := windowsTokenAt(base.Add(1 * time.Second))
+	child2Tok, child2Ns := windowsTokenAt(base.Add(2 * time.Second))
+	replacementTok, replacementNs := windowsTokenAt(base.Add(10 * time.Second))
+
+	id := ProcessIdentityInfo{PID: 100, PGID: 100, StartToken: leaderTok}
+	proof := processGroupProof{
+		Leader:     id,
+		VerifiedAt: base.Add(3 * time.Second),
+		KnownMembers: map[int]string{
+			100: leaderTok,
+			201: child1Tok,
+			202: child2Tok,
+		},
+	}
+
+	origInspect := inspectWindowsProcessFn
+	origSnap := snapshotWindowsProcessesFn
+	origTerm := terminateWindowsProcessFn
+	defer func() {
+		inspectWindowsProcessFn = origInspect
+		snapshotWindowsProcessesFn = origSnap
+		terminateWindowsProcessFn = origTerm
+	}()
+
+	inspectWindowsProcessFn = func(pid int) (processInfo, error) {
+		return processInfo{}, nil
+	}
+
+	var child2Signalled bool
+	pass := 0
+	snapshotWindowsProcessesFn = func(ln int64, jobTok string, jobHandle uintptr) ([]windowsProcEntry, error) {
+		pass++
+		if pass == 1 {
+			return []windowsProcEntry{
+				{pid: 201, ppid: 100, startToken: child1Tok, startNs: child1Ns},
+				{pid: 202, ppid: 100, startToken: child2Tok, startNs: child2Ns},
+			}, nil
+		}
+		// After pass 1, child 201 was replaced at its recycled PID and child 202 exited.
+		return []windowsProcEntry{
+			{pid: 201, ppid: 50, startToken: replacementTok, startNs: replacementNs},
+		}, nil
+	}
+	terminateWindowsProcessFn = func(cand windowsProcEntry, expectedToken string, jobHandle uintptr) (bool, error) {
+		if cand.pid == 201 {
+			// Child 201 exited and its PID was recycled between snapshot and OpenProcess.
+			return false, fmt.Errorf("refusing to signal pid %d: %w", cand.pid, ErrProcessIdentityMismatch)
+		}
+		if cand.pid == 202 {
+			child2Signalled = true
+			return true, nil
+		}
+		return false, nil
+	}
+
+	if err := stopAdoptedProcessGroupAfterExitTrack(&proof); err != nil {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want nil (siblings still stopped)", err)
+	}
+	if !child2Signalled {
+		t.Fatal("expected sibling pid 202 to be signalled after pid 201 recycled")
 	}
 }

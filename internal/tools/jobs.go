@@ -1268,6 +1268,22 @@ func (j *Job) snapshotGroupProof() processGroupProof {
 	return j.snapshotGroupProofLocked()
 }
 
+func populateGroupProofIdentity(proof *processGroupProof, info processInfo) {
+	if proof == nil || !info.Alive {
+		return
+	}
+	if !proof.HasUID && info.HasUID {
+		proof.UID = info.UID
+		proof.HasUID = true
+	}
+	if proof.SID <= 0 && info.SID > 0 {
+		proof.SID = info.SID
+	}
+	if proof.Sess == 0 && info.Sess != 0 {
+		proof.Sess = info.Sess
+	}
+}
+
 func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
 	j.mu.Lock()
 	if j.finished || j.unknown {
@@ -1278,6 +1294,11 @@ func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
 	proof := j.snapshotGroupProofLocked()
 	j.mu.Unlock()
 
+	if proof.Leader.Valid() && (!proof.HasUID || proof.Sess == 0 || proof.SID <= 0) {
+		if linfo, lerr := inspectProcessErr(proof.Leader.PID); lerr == nil && proof.Leader.Matches(linfo) {
+			populateGroupProofIdentity(&proof, linfo)
+		}
+	}
 	captureVerifiedGroupProof(&proof)
 
 	j.mu.Lock()
@@ -1285,6 +1306,16 @@ func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
 	prevPipes := len(j.groupProof.LeaderPipeTargets)
 	j.groupProof.KnownMembers = mergeGroupMembers(j.groupProof.KnownMembers, proof.KnownMembers)
 	j.groupProof.LeaderPipeTargets = mergePipeTargets(j.groupProof.LeaderPipeTargets, proof.LeaderPipeTargets)
+	if !j.groupProof.HasUID && proof.HasUID {
+		j.groupProof.UID = proof.UID
+		j.groupProof.HasUID = true
+	}
+	if j.groupProof.SID <= 0 && proof.SID > 0 {
+		j.groupProof.SID = proof.SID
+	}
+	if j.groupProof.Sess == 0 && proof.Sess != 0 {
+		j.groupProof.Sess = proof.Sess
+	}
 	if !proof.VerifiedAt.IsZero() {
 		j.groupProof.VerifiedAt = proof.VerifiedAt
 	}
