@@ -31,6 +31,10 @@ func isWindowsProcessMissing(err error) bool {
 	return errors.Is(err, windows.ERROR_INVALID_PARAMETER)
 }
 
+func isProcessAccessError(err error) bool {
+	return errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, os.ErrPermission)
+}
+
 func isWindowsHandleInJob(procHandle, jobHandle windows.Handle) (bool, error) {
 	if procHandle == 0 || jobHandle == 0 {
 		return false, nil

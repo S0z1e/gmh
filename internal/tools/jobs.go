@@ -1508,6 +1508,27 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 			return gerr
 		}
 	} else if err != nil {
+		if isProcessAccessError(err) && hasIndependentGroupProof(proof) {
+			// Leader PID denied access (for instance, a protected process reused
+			// the PID or leader query is restricted); attempt cleanup of
+			// independently verified descendants while keeping leader state
+			// unresolved until it can be verified.
+			descProof := cloneGroupProof(proof)
+			gerr := j.runStopGroupAfterExit(&descProof)
+			j.mergeLearnedGroupMembers(descProof)
+			j.proofFDMu.Unlock()
+			if errors.Is(gerr, ErrProcessIdentityMismatch) {
+				summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
+				j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr), summary, preview)
+				return gerr
+			}
+			if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
+				j.recordStopError(gerr)
+				return gerr
+			}
+			j.recordStopError(err)
+			return err
+		}
 		j.proofFDMu.Unlock()
 		j.recordStopError(err)
 		return err

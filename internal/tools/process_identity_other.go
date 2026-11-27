@@ -2,7 +2,15 @@
 
 package tools
 
-import "context"
+import (
+	"context"
+	"errors"
+	"os"
+)
+
+func isProcessAccessError(err error) bool {
+	return errors.Is(err, os.ErrPermission)
+}
 
 func processGroupID(pid int) int { return pid }
 

@@ -15,6 +15,10 @@ import (
 
 const darwinNoteExitStatus = 0x04000000
 
+func isProcessAccessError(err error) bool {
+	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM)
+}
+
 func processGroupID(pid int) int {
 	if pid <= 0 {
 		return 0
