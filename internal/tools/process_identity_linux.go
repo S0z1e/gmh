@@ -275,23 +275,29 @@ func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
 }
 
 func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
+	members, _ := captureVerifiedGroupMembersWithStatus(proof)
+	return members
+}
+
+func captureVerifiedGroupMembersWithStatus(proof processGroupProof) (map[int]string, bool) {
 	id := proof.Leader
 	if !id.Valid() {
-		return nil
+		return nil, false
 	}
 	leaderBoot, leaderTicks, hasLeaderStart := parseLinuxStartToken(id.StartToken)
 	if !hasLeaderStart {
-		return nil
+		return nil, false
 	}
 	info, err := inspectProcessErr(id.PID)
 	if err != nil || !id.Matches(info) {
-		return nil
+		return nil, false
 	}
 	members := map[int]string{id.PID: id.StartToken}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return members
+		return members, false
 	}
+	complete := true
 	for _, entry := range entries {
 		name := entry.Name()
 		if !entry.IsDir() || len(name) == 0 || name[0] < '0' || name[0] > '9' {
@@ -302,7 +308,14 @@ func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
 			continue
 		}
 		meta, merr := inspectLinuxProcMeta(pid)
-		if merr != nil || !meta.info.Alive || meta.info.PGID != id.PGID {
+		if merr != nil {
+			complete = false
+			if isFDLimitErr(merr) {
+				break
+			}
+			continue
+		}
+		if !meta.info.Alive || meta.info.PGID != id.PGID {
 			continue
 		}
 		if pid == id.PID && meta.info.StartToken != id.StartToken {
@@ -323,7 +336,20 @@ func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
 		}
 		members[pid] = meta.info.StartToken
 	}
-	return members
+	return members, complete
+}
+
+func captureLeaderPipeTargets(pid int) []string {
+	if pid <= 0 {
+		return nil
+	}
+	var targets []string
+	for _, fd := range []string{"0", "1", "2"} {
+		if target, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, fd)); err == nil && strings.HasPrefix(target, "pipe:[") {
+			targets = mergePipeTargets(targets, []string{target})
+		}
+	}
+	return targets
 }
 
 func captureVerifiedGroupProof(proof *processGroupProof) {
@@ -342,16 +368,16 @@ func captureVerifiedGroupProof(proof *processGroupProof) {
 			delete(proof.verifiedFDs, pid)
 		}
 	}
-	members := captureVerifiedGroupMembers(*proof)
+	members, complete := captureVerifiedGroupMembersWithStatus(*proof)
 	if len(members) == 0 {
 		return
 	}
-	// Also prune any descriptor whose PID exited, left the PGID, became a zombie,
-	// or changed identity since the previous snapshot, while keeping KnownMembers
-	// historical ancestry intact.
+	// Only prune omitted PIDs when the /proc scan completed cleanly without read
+	// errors; under partial reads preserve live cached handles while still closing
+	// any handle whose observed StartToken changed.
 	for pid, entry := range proof.verifiedFDs {
 		liveTok, ok := members[pid]
-		if !ok || liveTok != entry.startToken {
+		if (ok && liveTok != entry.startToken) || (!ok && complete) {
 			if entry.fd > 0 {
 				_ = unix.Close(entry.fd)
 			}
@@ -361,6 +387,9 @@ func captureVerifiedGroupProof(proof *processGroupProof) {
 	proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, members)
 	if proof.KnownMembers[proof.Leader.PID] == proof.Leader.StartToken {
 		proof.VerifiedAt = time.Now()
+		if pipes := captureLeaderPipeTargets(proof.Leader.PID); len(pipes) > 0 {
+			proof.LeaderPipeTargets = mergePipeTargets(proof.LeaderPipeTargets, pipes)
+		}
 	}
 	for pid, tok := range members {
 		if existing, ok := proof.verifiedFDs[pid]; ok && existing.fd > 0 && existing.startToken == tok {
@@ -415,11 +444,24 @@ func processHasJobTokenErr(pid int, token string) (bool, error) {
 	return false, nil
 }
 
-func processHasOutputFileFDErr(pid int, outputFile string) (bool, error) {
-	if pid <= 0 || outputFile == "" {
+func processHasInheritedFDMatchErr(pid int, outputFile string, pipeTargets []string) (bool, error) {
+	if pid <= 0 || (outputFile == "" && len(pipeTargets) == 0) {
 		return false, nil
 	}
-	outStat, outErr := os.Stat(outputFile)
+	var pipeSet map[string]struct{}
+	if len(pipeTargets) > 0 {
+		pipeSet = make(map[string]struct{}, len(pipeTargets))
+		for _, t := range pipeTargets {
+			if strings.HasPrefix(t, "pipe:[") {
+				pipeSet[t] = struct{}{}
+			}
+		}
+	}
+	var outStat os.FileInfo
+	var outErr error
+	if outputFile != "" {
+		outStat, outErr = os.Stat(outputFile)
+	}
 	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
 	entries, err := os.ReadDir(fdDir)
 	if err != nil {
@@ -428,16 +470,22 @@ func processHasOutputFileFDErr(pid int, outputFile string) (bool, error) {
 		}
 		return false, err
 	}
-	deletedTarget := outputFile + " (deleted)"
+	deletedTarget := ""
+	if outputFile != "" {
+		deletedTarget = outputFile + " (deleted)"
+	}
 	for _, entry := range entries {
 		fdPath := fdDir + "/" + entry.Name()
-		if outErr == nil {
+		if outputFile != "" && outErr == nil {
 			if st, serr := os.Stat(fdPath); serr == nil && os.SameFile(outStat, st) {
 				return true, nil
 			}
 		}
 		if target, lerr := os.Readlink(fdPath); lerr == nil {
-			if target == outputFile || target == deletedTarget {
+			if outputFile != "" && (target == outputFile || target == deletedTarget) {
+				return true, nil
+			}
+			if _, ok := pipeSet[target]; ok {
 				return true, nil
 			}
 		}
@@ -488,6 +536,7 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	const maxPasses = 32
 	deadline := time.Now().Add(2 * time.Second)
 	anySignalled := false
+	consecutiveEmpty := 0
 	lastLiveMembers := 0
 	for pass := 0; pass < maxPasses; pass++ {
 		signalled, empty, liveMembers, perr := stopAdoptedProcessGroupAfterExitPass(&scanProof, id, leaderBoot, leaderTicks, bootSec, hasBoot)
@@ -499,16 +548,26 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 			return perr
 		}
 		if empty {
-			if anySignalled {
-				return nil
+			consecutiveEmpty++
+			// Require two consecutive clean empty scans so a member listed in
+			// /proc that forked and exited before its metadata was read cannot
+			// leave a descendant undetected.
+			if consecutiveEmpty >= 2 {
+				if anySignalled {
+					return nil
+				}
+				return os.ErrProcessDone
 			}
-			return os.ErrProcessDone
+		} else {
+			consecutiveEmpty = 0
 		}
 		if pass == maxPasses-1 || time.Now().After(deadline) {
 			break
 		}
 		if signalled {
 			time.Sleep(10 * time.Millisecond)
+		} else if empty {
+			time.Sleep(2 * time.Millisecond)
 		} else {
 			time.Sleep(5 * time.Millisecond)
 		}
@@ -598,13 +657,13 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 				memberVerified = true
 			}
 		}
-		if !memberVerified && proof.OutputFile != "" {
-			hasOutFD, outErr := processHasOutputFileFDErr(pid, proof.OutputFile)
-			if isFDLimitErr(outErr) {
-				handleErr = outErr
+		if !memberVerified && (proof.OutputFile != "" || len(proof.LeaderPipeTargets) > 0) {
+			hasFD, fdErr := processHasInheritedFDMatchErr(pid, proof.OutputFile, proof.LeaderPipeTargets)
+			if isFDLimitErr(fdErr) {
+				handleErr = fdErr
 				break
 			}
-			if hasOutFD {
+			if hasFD {
 				memberVerified = true
 			}
 		}

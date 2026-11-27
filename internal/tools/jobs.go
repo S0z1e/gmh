@@ -1244,6 +1244,7 @@ func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
 
 	j.mu.Lock()
 	j.groupProof.KnownMembers = mergeGroupMembers(j.groupProof.KnownMembers, proof.KnownMembers)
+	j.groupProof.LeaderPipeTargets = mergePipeTargets(j.groupProof.LeaderPipeTargets, proof.LeaderPipeTargets)
 	if !proof.VerifiedAt.IsZero() {
 		j.groupProof.VerifiedAt = proof.VerifiedAt
 	}
@@ -1297,6 +1298,12 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 		return err
 	}
 	if errors.Is(err, os.ErrProcessDone) {
+		j.mu.Lock()
+		if !j.groupProof.VerifiedAt.IsZero() && j.groupProof.ExitObservedAt.IsZero() {
+			j.groupProof.ExitObservedAt = time.Now()
+		}
+		proof = j.snapshotGroupProofLocked()
+		j.mu.Unlock()
 		gerr := stopGroupAfterExitFn(proof)
 		j.proofFDMu.Unlock()
 		if errors.Is(gerr, ErrProcessIdentityMismatch) {

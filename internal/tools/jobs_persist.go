@@ -754,10 +754,10 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 					return job, nil
 				case stopErr == nil || errors.Is(stopErr, os.ErrProcessDone):
 					waitForAdoptedProcessGone(id, 2*time.Second)
-					groupProof := proof
-					if stopErr == nil {
-						groupProof.ExitObservedAt = time.Now()
+					if !proof.VerifiedAt.IsZero() && proof.ExitObservedAt.IsZero() {
+						proof.ExitObservedAt = time.Now()
 					}
+					groupProof := proof
 					if gerr := stopAdoptedProcessGroupAfterExit(groupProof); errors.Is(gerr, ErrProcessIdentityMismatch) {
 						closeVerifiedGroupProof(&proof)
 						reason := fmt.Sprintf("refused to attach to PID %d: %v", id.PID, gerr)

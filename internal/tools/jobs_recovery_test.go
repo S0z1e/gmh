@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1960,12 +1961,16 @@ func TestCrashRecoveryTokenlessLegacyChildForkedAfterAdoptionStillStopsOnNormalE
 	if err := os.MkdirAll(jobsDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	outFile := filepath.Join(outDir, "bg-legacy.log")
+	outFile := filepath.Join(outDir, "bash-legacy.log")
 	logF, err := os.OpenFile(outFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer logF.Close()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		_ = logF.Close()
+		t.Fatal(err)
+	}
 
 	triggerFile := filepath.Join(root, "fork-and-exit")
 	readyFile := filepath.Join(root, "ready")
@@ -1975,8 +1980,8 @@ func TestCrashRecoveryTokenlessLegacyChildForkedAfterAdoptionStillStopsOnNormalE
 		readyFile, triggerFile, childPIDFile,
 	))
 	configureProcess(cmd)
-	cmd.Stdout = logF
-	cmd.Stderr = logF
+	cmd.Stdout = writer
+	cmd.Stderr = writer
 	// Ensure no GMH_JOB_TOKEN is present in the environment, matching a pre-upgrade job.
 	var cleanEnv []string
 	for _, kv := range os.Environ() {
@@ -1986,8 +1991,17 @@ func TestCrashRecoveryTokenlessLegacyChildForkedAfterAdoptionStillStopsOnNormalE
 	}
 	cmd.Env = cleanEnv
 	if err := cmd.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		_ = logF.Close()
 		t.Fatal(err)
 	}
+	_ = writer.Close()
+	pipeDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(logF, reader)
+		close(pipeDone)
+	}()
 	leaderPID := cmd.Process.Pid
 	waitLeaderDone := make(chan error, 1)
 	go func() { waitLeaderDone <- cmd.Wait() }()
@@ -2000,6 +2014,11 @@ func TestCrashRecoveryTokenlessLegacyChildForkedAfterAdoptionStillStopsOnNormalE
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
+	// Simulate harness crash before recovery: close reader end and log file while child keeps pipe write FD.
+	_ = reader.Close()
+	_ = logF.Close()
+	<-pipeDone
+
 	pgid, startTok, alive := ProcessIdentity(leaderPID)
 	if !alive {
 		t.Fatalf("legacy leader PID %d not alive", leaderPID)
@@ -2023,7 +2042,6 @@ func TestCrashRecoveryTokenlessLegacyChildForkedAfterAdoptionStillStopsOnNormalE
 	if err := savePersistedJob(jobsDir, rec); err != nil {
 		t.Fatal(err)
 	}
-	_ = logF.Close()
 
 	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
 	exec2.SwitchSession(outID)
@@ -2114,7 +2132,7 @@ func TestCrashRecoveryIncompleteProofKeepsJobStoppable(t *testing.T) {
 			attempts++
 			n := attempts
 			attemptsMu.Unlock()
-			if n == 1 {
+			if n <= 2 {
 				return fmt.Errorf("incomplete verification proof for tokenless pgid %d: %w", proof.Leader.PGID, errIncompleteGroupProof)
 			}
 			return os.ErrProcessDone
@@ -2149,7 +2167,15 @@ func TestCrashRecoveryIncompleteProofKeepsJobStoppable(t *testing.T) {
 		t.Fatalf("WaitError = %q, want incomplete-proof message", snap.WaitError)
 	}
 
-	// Retry via StopJob must remain allowed and finalize cleanly once group clears.
+	// First manual StopJob still receives incomplete proof: must stay running/retryable (not unknown).
+	if _, firstStopErr := exec2.StopJob(meta.JobID); !errors.Is(firstStopErr, errIncompleteGroupProof) {
+		t.Fatalf("first StopJob err = %v, want errIncompleteGroupProof", firstStopErr)
+	}
+	if job.Status() != JobRunning {
+		t.Fatalf("status after failed StopJob retry = %q, want running (must not mark unknown)", job.Status())
+	}
+
+	// Second StopJob once group clears must succeed and finalize cleanly.
 	res, stopErr := exec2.StopJob(meta.JobID)
 	if stopErr != nil {
 		t.Fatalf("retry StopJob after incomplete proof failed: %v (%s)", stopErr, res.Text)

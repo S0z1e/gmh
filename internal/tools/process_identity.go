@@ -55,17 +55,18 @@ type verifiedProcFD struct {
 }
 
 type processGroupProof struct {
-	Leader         ProcessIdentityInfo
-	UID            uint32
-	HasUID         bool
-	SID            int
-	Sess           uintptr
-	JobToken       string
-	OutputFile     string
-	KnownMembers   map[int]string
-	VerifiedAt     time.Time
-	verifiedFDs    map[int]verifiedProcFD
-	ExitObservedAt time.Time
+	Leader            ProcessIdentityInfo
+	UID               uint32
+	HasUID            bool
+	SID               int
+	Sess              uintptr
+	JobToken          string
+	OutputFile        string
+	LeaderPipeTargets []string
+	KnownMembers      map[int]string
+	VerifiedAt        time.Time
+	verifiedFDs       map[int]verifiedProcFD
+	ExitObservedAt    time.Time
 }
 
 func canRetryIncompleteGroupProof(proof processGroupProof) bool {
@@ -76,6 +77,11 @@ func canRetryIncompleteGroupProof(proof processGroupProof) bool {
 }
 
 func cloneGroupProof(p processGroupProof) processGroupProof {
+	if len(p.LeaderPipeTargets) > 0 {
+		p.LeaderPipeTargets = append([]string(nil), p.LeaderPipeTargets...)
+	} else {
+		p.LeaderPipeTargets = nil
+	}
 	if len(p.KnownMembers) == 0 {
 		p.KnownMembers = nil
 		return p
@@ -86,6 +92,33 @@ func cloneGroupProof(p processGroupProof) processGroupProof {
 	}
 	p.KnownMembers = cloned
 	return p
+}
+
+func mergePipeTargets(dst, src []string) []string {
+	if len(src) == 0 {
+		return dst
+	}
+	seen := make(map[string]struct{}, len(dst)+len(src))
+	out := make([]string, 0, len(dst)+len(src))
+	for _, s := range dst {
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	for _, s := range src {
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func mergeGroupMembers(dst, src map[int]string) map[int]string {
