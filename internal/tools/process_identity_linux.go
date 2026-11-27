@@ -730,8 +730,10 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 	cloned := cloneGroupProof(proof)
 	candidates, handleErr, mismatchErr := collectAndVerifyLinuxCandidates(&cloned, id, leaderBoot, leaderTicks)
 	if mismatchErr != nil {
-		if ok, _ := hasVerifiedLiveKnownMemberLinux(proof); ok {
+		if ok, lerr := hasVerifiedLiveKnownMemberLinux(proof); ok {
 			return true, nil
+		} else if lerr != nil {
+			return false, lerr
 		}
 		return false, mismatchErr
 	}
@@ -740,8 +742,10 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 			return true, nil
 		}
 	}
-	if ok, _ := hasVerifiedLiveKnownMemberLinux(proof); ok {
+	if ok, lerr := hasVerifiedLiveKnownMemberLinux(proof); ok {
 		return true, nil
+	} else if lerr != nil {
+		return false, lerr
 	}
 	if handleErr != nil {
 		return false, handleErr
@@ -818,16 +822,27 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 					return leaderErr
 				}
 				if sig {
-					// Brief grace wait so signalled persisted children exit cleanly.
+					// Brief grace wait so signalled persisted children exit cleanly; never
+					// treat unresolvable member inspection or signal errors as completion.
+					var lastLiveErr error
 					for i := 0; i < 20; i++ {
-						live, _ := hasVerifiedLiveKnownMemberLinux(*proof)
-						if !live {
+						live, lerr := hasVerifiedLiveKnownMemberLinux(*proof)
+						if lerr != nil {
+							lastLiveErr = lerr
+						}
+						if !live && lerr == nil {
+							if serr != nil {
+								return serr
+							}
 							return nil
 						}
 						time.Sleep(5 * time.Millisecond)
 					}
 					if serr != nil {
 						return serr
+					}
+					if lastLiveErr != nil {
+						return lastLiveErr
 					}
 					return fmt.Errorf("verified process group members for pid %d still alive after signalling: %w", id.PID, errGroupMembersStillAlive)
 				}

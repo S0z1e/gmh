@@ -266,25 +266,38 @@ func darwinResolveGroupCandidates(proof processGroupProof, id ProcessIdentityInf
 	return known, liveCount, nil
 }
 
-func hasVerifiedLiveKnownMemberDarwin(proof processGroupProof) bool {
+func darwinMatchesKnownMember(proof processGroupProof, id ProcessIdentityInfo, info processInfo, tok string) bool {
+	if !info.Alive || info.Zombie || info.PGID != id.PGID || info.StartToken != tok {
+		return false
+	}
+	if proof.HasUID && info.HasUID && info.UID != proof.UID {
+		return false
+	}
+	if proof.Sess != 0 && info.Sess != proof.Sess {
+		return false
+	}
+	return true
+}
+
+func hasVerifiedLiveKnownMemberDarwin(proof processGroupProof) (bool, error) {
 	id := proof.Leader
+	var inspectErr error
 	for pid, tok := range proof.KnownMembers {
 		if pid <= 0 || pid == id.PID || tok == "" {
 			continue
 		}
 		info, err := inspectProcessErrFn(pid)
-		if err != nil || !info.Alive || info.Zombie || info.StartToken != tok {
+		if err != nil {
+			if inspectErr == nil {
+				inspectErr = err
+			}
 			continue
 		}
-		if proof.HasUID && info.HasUID && info.UID != proof.UID {
-			continue
+		if darwinMatchesKnownMember(proof, id, info, tok) {
+			return true, nil
 		}
-		if proof.Sess != 0 && info.Sess != proof.Sess {
-			continue
-		}
-		return true
 	}
-	return false
+	return false, inspectErr
 }
 
 func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
@@ -301,15 +314,19 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 		return false, nil
 	}
 	if queryErr != nil {
-		if hasVerifiedLiveKnownMemberDarwin(proof) {
+		if live, lerr := hasVerifiedLiveKnownMemberDarwin(proof); live {
 			return true, nil
+		} else if lerr != nil {
+			return false, lerr
 		}
 		return false, queryErr
 	}
 	known, liveCount, err := darwinResolveGroupCandidates(proof, id, leaderSec, leaderUsec, procs)
 	if err != nil {
-		if hasVerifiedLiveKnownMemberDarwin(proof) {
+		if live, lerr := hasVerifiedLiveKnownMemberDarwin(proof); live {
 			return true, nil
+		} else if lerr != nil {
+			return false, lerr
 		}
 		return false, err
 	}
@@ -354,13 +371,7 @@ func darwinSignalVerifiedKnownMembers(proof processGroupProof, id ProcessIdentit
 			}
 			continue
 		}
-		if !info.Alive || info.Zombie || info.StartToken != tok {
-			continue
-		}
-		if proof.HasUID && info.HasUID && info.UID != proof.UID {
-			continue
-		}
-		if proof.Sess != 0 && info.Sess != proof.Sess {
+		if !darwinMatchesKnownMember(proof, id, info, tok) {
 			continue
 		}
 		if kerr := syscall.Kill(pid, syscall.SIGKILL); kerr == nil {
@@ -413,14 +424,25 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 			return leaderErr
 		}
 		if sig {
+			var lastLiveErr error
 			for i := 0; i < 20; i++ {
-				if !hasVerifiedLiveKnownMemberDarwin(*proof) {
+				live, lerr := hasVerifiedLiveKnownMemberDarwin(*proof)
+				if lerr != nil {
+					lastLiveErr = lerr
+				}
+				if !live && lerr == nil {
+					if serr != nil {
+						return serr
+					}
 					return nil
 				}
 				time.Sleep(5 * time.Millisecond)
 			}
 			if serr != nil {
 				return serr
+			}
+			if lastLiveErr != nil {
+				return lastLiveErr
 			}
 			return fmt.Errorf("verified process group members for pid %d still alive after signalling: %w", id.PID, errGroupMembersStillAlive)
 		}

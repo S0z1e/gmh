@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -487,6 +488,240 @@ func TestDarwinExitedLeaderUIDMismatchRecoversAndSurfacesOrphan(t *testing.T) {
 	}
 	if inspectProcess(childPID).Alive {
 		t.Fatalf("verified child pid %d survived recovery", childPID)
+	}
+}
+
+func TestDarwinRecoveryRejectsMovedPGIDKnownMember(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-darwin-moved-pgid"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childPIDFile := filepath.Join(root, "child.pid")
+	movedMarker := filepath.Join(root, "moved")
+	relFile := filepath.Join(root, "release")
+
+	// Start a helper leader whose child stays in the same PGID briefly, then moves
+	// itself to its own process group (`setpgid`) after we persist its initial identity.
+	cmd, _ := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("python3 -c 'import os,time; open(%q,\"w\").write(str(os.getpid())); time.sleep(0.05)' & printf 'READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0", childPIDFile, relFile),
+	})
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	// Spawn a separate process in its own process group (still same UID/session) to
+	// represent the child after changing PGID while matching recorded StartToken/UID/Sess.
+	movedCmd := exec.Command("sleep", "30")
+	configureProcess(movedCmd)
+	if err := movedCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	movedPID := movedCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(movedPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = movedCmd.Wait()
+	})
+	movedInfo := inspectProcess(movedPID)
+	if !movedInfo.Alive {
+		t.Fatalf("moved process %d not alive", movedPID)
+	}
+
+	recs, err := loadPersistedJobs(jobsDir)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("loadPersistedJobs = %+v, err=%v", recs, err)
+	}
+	rec := recs[0]
+	leaderPID := rec.PID
+	_ = movedMarker
+
+	if err := os.WriteFile(relFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for wait := 0; wait < 40 && inspectProcess(leaderPID).Alive; wait++ {
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	origSlice := darwinSysctlKinfoProcSliceFn
+	t.Cleanup(func() { darwinSysctlKinfoProcSliceFn = origSlice })
+	// Inject a foreign-UID entry in pgrp scan while movedPID sits outside rec.PGID
+	// in the same session and UID.
+	darwinSysctlKinfoProcSliceFn = func(name string, args ...int) ([]unix.KinfoProc, error) {
+		if name != "kern.proc.pgrp" {
+			return origSlice(name, args...)
+		}
+		var intruder unix.KinfoProc
+		intruder.Proc.P_pid = 999999
+		intruder.Proc.P_starttime = unix.Timeval{Sec: time.Now().Unix()}
+		intruder.Eproc.Pgid = int32(rec.PGID)
+		intruder.Eproc.Ucred.Uid = movedInfo.UID + 1
+		intruder.Eproc.Sess = movedInfo.Sess
+		return []unix.KinfoProc{intruder}, nil
+	}
+
+	proof := processGroupProof{
+		Leader:       ProcessIdentityInfo{PID: leaderPID, PGID: rec.PGID, StartToken: rec.ProcessStarted},
+		UID:          movedInfo.UID,
+		HasUID:       true,
+		SID:          movedInfo.SID,
+		Sess:         movedInfo.Sess,
+		VerifiedAt:   time.Now().Add(-5 * time.Second),
+		KnownMembers: map[int]string{leaderPID: rec.ProcessStarted, movedPID: movedInfo.StartToken},
+	}
+
+	live, lerr := hasVerifiedLiveGroupMember(proof)
+	if live || !errors.Is(lerr, ErrProcessIdentityMismatch) {
+		t.Fatalf("hasVerifiedLiveGroupMember = (%v, %v), want (false, ErrProcessIdentityMismatch) for moved-PGID member", live, lerr)
+	}
+	if err := stopAdoptedProcessGroupAfterExitTrack(&proof); !errors.Is(err, ErrProcessIdentityMismatch) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack = %v, want ErrProcessIdentityMismatch", err)
+	}
+	if !inspectProcess(movedPID).Alive {
+		t.Fatalf("process %d outside job PGID was killed by fallback", movedPID)
+	}
+}
+
+func TestDarwinRecoveryKeepsJobPendingWhenOneKnownMemberRaisesEACCES(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-darwin-partial-eacces"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childAPIDFile := filepath.Join(root, "childA.pid")
+	childBPIDFile := filepath.Join(root, "childB.pid")
+	relFile := filepath.Join(root, "release")
+
+	cmd, _ := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("sleep 30 & echo $! > %q; sleep 30 & echo $! > %q; printf 'READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0", childAPIDFile, childBPIDFile, relFile),
+	})
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	readPID := func(p string) int {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(string(b)))
+		if err != nil || v <= 0 {
+			t.Fatalf("bad pid %q: %v", string(b), err)
+		}
+		return v
+	}
+	childAPID := readPID(childAPIDFile)
+	childBPID := readPID(childBPIDFile)
+	t.Cleanup(func() {
+		for _, pid := range []int{childAPID, childBPID} {
+			if p, err := os.FindProcess(pid); err == nil {
+				_ = p.Kill()
+			}
+		}
+	})
+
+	infoA := inspectProcess(childAPID)
+	infoB := inspectProcess(childBPID)
+	if !infoA.Alive || !infoB.Alive {
+		t.Fatalf("children not alive: A=%+v B=%+v", infoA, infoB)
+	}
+	recs, err := loadPersistedJobs(jobsDir)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("loadPersistedJobs = %+v, err=%v", recs, err)
+	}
+	rec := recs[0]
+	rec.GroupProof = &PersistedGroupProof{
+		UID:            infoA.UID,
+		HasUID:         true,
+		SID:            infoA.SID,
+		Sess:           uint64(infoA.Sess),
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		CleanupPending: true,
+		KnownMembers: map[int]string{
+			rec.PID:   rec.ProcessStarted,
+			childAPID: infoA.StartToken,
+			childBPID: infoB.StartToken,
+		},
+	}
+	if err := savePersistedJob(jobsDir, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(relFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for wait := 0; wait < 40 && inspectProcess(rec.PID).Alive; wait++ {
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	origSlice := darwinSysctlKinfoProcSliceFn
+	origInspect := inspectProcessErrFn
+	var forceBEACCES atomic.Bool
+	forceBEACCES.Store(true)
+	t.Cleanup(func() {
+		forceBEACCES.Store(false)
+		darwinSysctlKinfoProcSliceFn = origSlice
+		inspectProcessErrFn = origInspect
+	})
+	darwinSysctlKinfoProcSliceFn = func(name string, args ...int) ([]unix.KinfoProc, error) {
+		procs, err := origSlice(name, args...)
+		if name == "kern.proc.pgrp" && len(procs) > 0 {
+			for i := range procs {
+				procs[i].Eproc.Ucred.Uid = infoA.UID + 1
+			}
+		}
+		return procs, err
+	}
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if forceBEACCES.Load() && pid == childBPID {
+			return processInfo{}, syscall.EACCES
+		}
+		return origInspect(pid)
+	}
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 {
+		t.Fatalf("RecoverSessionJobs = %+v, err=%v", recovered, err)
+	}
+	if recovered[0].Status != JobRunning {
+		t.Fatalf("recovered status = %q while childB returned EACCES, want JobRunning (must not mark JobDone)", recovered[0].Status)
+	}
+	for wait := 0; wait < 20 && inspectProcess(childAPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childAPID).Alive {
+		t.Fatalf("childA pid %d survived cleanup", childAPID)
+	}
+	if !inspectProcess(childBPID).Alive {
+		t.Fatalf("expected childB pid %d to still be alive under injected EACCES", childBPID)
+	}
+
+	forceBEACCES.Store(false)
+	if _, err := exec2.StopJob(recovered[0].ID); err != nil {
+		t.Fatalf("StopJob retry after childB EACCES cleared failed: %v", err)
+	}
+	for wait := 0; wait < 20 && inspectProcess(childBPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childBPID).Alive {
+		t.Fatalf("childB pid %d survived StopJob retry", childBPID)
 	}
 }
 

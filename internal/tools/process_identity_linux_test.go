@@ -956,3 +956,113 @@ func TestLinuxUnreadableRootRefusesNumericPPIDAndCleansVerifiedPastGroupMismatch
 		t.Fatalf("unrelated pid %d was killed despite unverified numeric ppid", unrelatedPID)
 	}
 }
+
+func TestLinuxRecoveryKeepsJobPendingWhenOneKnownMemberRaisesEACCES(t *testing.T) {
+	childACmd := exec.Command("sleep", "30")
+	configureProcess(childACmd)
+	if err := childACmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	childAPID := childACmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childAPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = childACmd.Wait()
+	})
+	infoA := inspectProcess(childAPID)
+
+	childBCmd := exec.Command("sleep", "30")
+	configureProcess(childBCmd)
+	if err := childBCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	childBPID := childBCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childBPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = childBCmd.Wait()
+	})
+	infoB := inspectProcess(childBPID)
+
+	intruderCmd := exec.Command("sleep", "30")
+	configureProcess(intruderCmd)
+	if err := intruderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	intruderPID := intruderCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(intruderPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = intruderCmd.Wait()
+	})
+
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	t.Cleanup(func() {
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+	})
+
+	leaderPID := infoA.PGID
+	if leaderPID == childAPID || leaderPID == childBPID {
+		leaderPID = childBPID + 99998
+	}
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	var forceBEACCES atomic.Bool
+	forceBEACCES.Store(true)
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == childBPID && forceBEACCES.Load() {
+			return linuxProcMeta{}, syscall.EACCES
+		}
+		if pid == intruderPID {
+			m, err := origInspectMeta(pid)
+			if err == nil {
+				m.info.PGID = infoA.PGID
+				m.info.UID = infoA.UID + 1
+				m.info.HasUID = true
+			}
+			return m, err
+		}
+		m, err := origInspectMeta(pid)
+		if err == nil && pid == childBPID {
+			m.info.PGID = infoA.PGID
+		}
+		return m, err
+	}
+
+	proof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: infoA.PGID, StartToken: infoA.StartToken},
+		UID:            infoA.UID,
+		HasUID:         true,
+		SID:            infoA.SID,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers: map[int]string{
+			leaderPID: infoA.StartToken,
+			childAPID: infoA.StartToken,
+			childBPID: infoB.StartToken,
+		},
+	}
+
+	err := stopAdoptedProcessGroupAfterExitTrack(&proof)
+	if !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want EACCES while childB is inaccessible", err)
+	}
+	for wait := 0; wait < 20 && inspectProcess(childAPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childAPID).Alive {
+		t.Fatalf("childA pid %d survived cleanup", childAPID)
+	}
+	if !inspectProcess(childBPID).Alive {
+		t.Fatalf("expected childB pid %d to still be alive under EACCES", childBPID)
+	}
+}
