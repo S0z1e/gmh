@@ -103,19 +103,37 @@ func (e *Executor) CloseJobs(ctx context.Context) error {
 		job.mu.Unlock()
 	}
 	var closeErrs []error
-	for _, stop := range closeStops {
-		if err := stop(); err != nil {
-			closeErrs = append(closeErrs, err)
+	var stopCh chan error
+	if len(closeStops) > 0 {
+		stopCh = make(chan error, len(closeStops))
+		for _, stop := range closeStops {
+			go func(fn func() error) {
+				stopCh <- fn()
+			}(stop)
 		}
 	}
 	for _, stop := range stops {
 		stop()
 	}
-	for _, job := range cancelled {
-		job.persist()
-	}
 	for _, run := range runs {
 		run.cancel()
+	}
+	for range closeStops {
+		select {
+		case err := <-stopCh:
+			if err != nil {
+				closeErrs = append(closeErrs, err)
+			}
+		case <-ctx.Done():
+			for _, job := range cancelled {
+				job.persist()
+			}
+			closeErrs = append(closeErrs, ctx.Err())
+			return errors.Join(closeErrs...)
+		}
+	}
+	for _, job := range cancelled {
+		job.persist()
 	}
 	for _, run := range runs {
 		select {

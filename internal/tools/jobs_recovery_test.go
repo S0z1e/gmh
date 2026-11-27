@@ -3002,4 +3002,98 @@ func TestCrashRecoveryCloseJobsWaitsForStopJobAuditAfterMonitorClosed(t *testing
 	}
 }
 
+func TestCrashRecoveryCloseJobsHonorsDeadlineWhenCloseStopAuditBlocks(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-close-deadline-stop-audit"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	relFile := filepath.Join(root, "rel")
+
+	helperCmd, _ := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("printf 'READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0", relFile),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	var stopCleanupAttempts atomic.Int32
+	inAudit := make(chan struct{})
+	releaseAudit := make(chan struct{})
+	var auditOnce sync.Once
+
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		stopAdoptedGroupAfterExit: func(proof processGroupProof) error {
+			if stopCleanupAttempts.Add(1) == 1 {
+				return errors.New("transient post-exit cleanup failure")
+			}
+			return stopAdoptedProcessGroupAfterExit(proof)
+		},
+		Audit: func(e AuditEntry) {
+			auditOnce.Do(func() {
+				close(inAudit)
+				<-releaseAudit
+			})
+		},
+	}
+	t.Cleanup(func() {
+		select {
+		case <-releaseAudit:
+		default:
+			close(releaseAudit)
+		}
+		_ = exec2.CloseJobs(context.Background())
+	})
+	exec2.SwitchSession(outID)
+
+	rec, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(rec) != 1 {
+		t.Fatalf("recovery = %+v, err=%v; want 1 job", rec, err)
+	}
+	job := exec2.registry().Get(rec[0].ID)
+	if job == nil || job.monitorDone == nil {
+		t.Fatalf("recovered job %q missing monitorDone", rec[0].ID)
+	}
+
+	if err := os.WriteFile(relFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-job.monitorDone:
+	case <-time.After(4 * time.Second):
+		t.Fatal("monitor did not finish after injected post-exit cleanup failure")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	cerr := exec2.CloseJobs(ctx)
+	elapsed := time.Since(start)
+	if !errors.Is(cerr, context.DeadlineExceeded) {
+		t.Fatalf("CloseJobs err = %v, want context.DeadlineExceeded", cerr)
+	}
+	if elapsed > 600*time.Millisecond {
+		t.Fatalf("CloseJobs overran shutdown deadline: took %v (want ~120ms)", elapsed)
+	}
+	select {
+	case <-inAudit:
+	case <-time.After(time.Second):
+		t.Fatal("CloseJobs did not initiate the stop retry audit")
+	}
+	close(releaseAudit)
+	if ferr := exec2.CloseJobs(context.Background()); ferr != nil {
+		t.Fatalf("follow-up CloseJobs failed: %v", ferr)
+	}
+}
+
 var _ = errors.New

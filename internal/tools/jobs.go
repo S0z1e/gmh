@@ -1289,9 +1289,18 @@ func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
 		j.groupProof.VerifiedAt = proof.VerifiedAt
 	}
 	j.groupProof.verifiedFDs = proof.verifiedFDs
+	var staleProof processGroupProof
+	if j.groupProof.jobHandle == 0 && proof.jobHandle != 0 {
+		j.groupProof.jobHandle = proof.jobHandle
+	} else if proof.jobHandle != 0 && proof.jobHandle != j.groupProof.jobHandle {
+		staleProof.jobHandle = proof.jobHandle
+	}
 	changed := len(j.groupProof.KnownMembers) > prevMembers || len(j.groupProof.LeaderPipeTargets) > prevPipes
 	out := j.snapshotGroupProofLocked()
 	j.mu.Unlock()
+	if staleProof.jobHandle != 0 {
+		closeVerifiedGroupProof(&staleProof)
+	}
 	if changed {
 		j.persist()
 	}

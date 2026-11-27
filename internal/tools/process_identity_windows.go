@@ -18,10 +18,30 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+var (
+	kernel32DLL        = windows.NewLazySystemDLL("kernel32.dll")
+	procIsProcessInJob = kernel32DLL.NewProc("IsProcessInJob")
+)
+
 var inspectWindowsProcessFn = inspectProcessErr
 
 func isWindowsProcessMissing(err error) bool {
 	return errors.Is(err, windows.ERROR_INVALID_PARAMETER)
+}
+
+func isWindowsHandleInJob(procHandle, jobHandle windows.Handle) (bool, error) {
+	if procHandle == 0 || jobHandle == 0 {
+		return false, nil
+	}
+	var inJob int32
+	r1, _, e1 := procIsProcessInJob.Call(uintptr(procHandle), uintptr(jobHandle), uintptr(unsafe.Pointer(&inJob)))
+	if r1 == 0 {
+		if e1 == nil || e1 == windows.ERROR_SUCCESS {
+			return false, errors.New("IsProcessInJob failed")
+		}
+		return false, e1
+	}
+	return inJob != 0, nil
 }
 
 func processGroupID(pid int) int {
@@ -31,16 +51,16 @@ func processGroupID(pid int) int {
 	return pid
 }
 
-func openVerifiedWindowsProcess(pid int, expectedToken string, desiredAccess uint32) (windows.Handle, error) {
-	if pid <= 0 || expectedToken == "" {
-		return 0, ErrProcessIdentityMismatch
+func openAndInspectWindowsProcess(pid int, desiredAccess uint32) (windows.Handle, processInfo, error) {
+	if pid <= 0 {
+		return 0, processInfo{}, nil
 	}
 	h, err := windows.OpenProcess(desiredAccess, false, uint32(pid))
 	if err != nil {
 		if isWindowsProcessMissing(err) {
-			return 0, os.ErrProcessDone
+			return 0, processInfo{}, nil
 		}
-		return 0, err
+		return 0, processInfo{}, err
 	}
 	closeHandle := true
 	defer func() {
@@ -51,25 +71,44 @@ func openVerifiedWindowsProcess(pid int, expectedToken string, desiredAccess uin
 	var code uint32
 	if err := windows.GetExitCodeProcess(h, &code); err != nil {
 		if isWindowsProcessMissing(err) {
-			return 0, os.ErrProcessDone
+			return 0, processInfo{}, nil
 		}
-		return 0, err
+		return 0, processInfo{}, err
 	}
 	if code != 259 { // STILL_ACTIVE
-		return 0, os.ErrProcessDone
+		return 0, processInfo{}, nil
 	}
 	var creation, exit, kernel, user windows.Filetime
 	if err := windows.GetProcessTimes(h, &creation, &exit, &kernel, &user); err != nil {
 		if isWindowsProcessMissing(err) {
-			return 0, os.ErrProcessDone
+			return 0, processInfo{}, nil
 		}
-		return 0, err
+		return 0, processInfo{}, err
 	}
-	tok := fmt.Sprintf("%d:%d", creation.LowDateTime, creation.HighDateTime)
-	if tok != expectedToken {
-		return 0, fmt.Errorf("refusing to signal pid %d: %w", pid, ErrProcessIdentityMismatch)
+	info := processInfo{
+		Alive:      true,
+		PGID:       pid,
+		StartToken: fmt.Sprintf("%d:%d", creation.LowDateTime, creation.HighDateTime),
 	}
 	closeHandle = false
+	return h, info, nil
+}
+
+func openVerifiedWindowsProcess(pid int, expectedToken string, desiredAccess uint32) (windows.Handle, error) {
+	if pid <= 0 || expectedToken == "" {
+		return 0, ErrProcessIdentityMismatch
+	}
+	h, info, err := openAndInspectWindowsProcess(pid, desiredAccess)
+	if err != nil {
+		return 0, err
+	}
+	if !info.Alive {
+		return 0, os.ErrProcessDone
+	}
+	if info.StartToken != expectedToken {
+		_ = windows.CloseHandle(h)
+		return 0, fmt.Errorf("refusing to signal pid %d: %w", pid, ErrProcessIdentityMismatch)
+	}
 	return h, nil
 }
 
@@ -148,39 +187,39 @@ func windowsEnvBlockDoubleNulEnded(u16 []uint16) bool {
 	return false
 }
 
+func classifyWindowsPEBReadErr(h windows.Handle, err error) error {
+	if err == nil {
+		return nil
+	}
+	var code uint32
+	if codeErr := windows.GetExitCodeProcess(h, &code); codeErr == nil && code != 259 {
+		return nil
+	}
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) || isWindowsProcessMissing(err) {
+		return nil
+	}
+	return err
+}
+
 func processHasJobTokenWindowsErr(pid int, token string) (bool, error) {
 	if pid <= 0 || token == "" {
 		return false, nil
 	}
-	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_VM_READ, false, uint32(pid))
+	h, info, err := openAndInspectWindowsProcess(pid, windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_VM_READ)
 	if err != nil {
-		if isWindowsProcessMissing(err) || errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
 			return false, nil
 		}
 		return false, err
+	}
+	if !info.Alive {
+		return false, nil
 	}
 	defer windows.CloseHandle(h)
 
-	var code uint32
-	if err := windows.GetExitCodeProcess(h, &code); err != nil {
-		if isWindowsProcessMissing(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	if code != 259 {
-		return false, nil
-	}
-
 	var pbi windows.PROCESS_BASIC_INFORMATION
 	if err := windows.NtQueryInformationProcess(h, 0, unsafe.Pointer(&pbi), uint32(unsafe.Sizeof(pbi)), nil); err != nil {
-		if codeErr := windows.GetExitCodeProcess(h, &code); codeErr == nil && code != 259 {
-			return false, nil
-		}
-		if errors.Is(err, windows.ERROR_ACCESS_DENIED) || isWindowsProcessMissing(err) {
-			return false, nil
-		}
-		return false, err
+		return false, classifyWindowsPEBReadErr(h, err)
 	}
 	if pbi.PebBaseAddress == nil {
 		return false, nil
@@ -188,13 +227,7 @@ func processHasJobTokenWindowsErr(pid int, token string) (bool, error) {
 
 	var peb windows.PEB
 	if err := windows.ReadProcessMemory(h, uintptr(unsafe.Pointer(pbi.PebBaseAddress)), (*byte)(unsafe.Pointer(&peb)), unsafe.Sizeof(peb), nil); err != nil {
-		if codeErr := windows.GetExitCodeProcess(h, &code); codeErr == nil && code != 259 {
-			return false, nil
-		}
-		if errors.Is(err, windows.ERROR_ACCESS_DENIED) || isWindowsProcessMissing(err) {
-			return false, nil
-		}
-		return false, err
+		return false, classifyWindowsPEBReadErr(h, err)
 	}
 	if peb.ProcessParameters == nil {
 		return false, nil
@@ -202,13 +235,7 @@ func processHasJobTokenWindowsErr(pid int, token string) (bool, error) {
 
 	var params windows.RTL_USER_PROCESS_PARAMETERS
 	if err := windows.ReadProcessMemory(h, uintptr(unsafe.Pointer(peb.ProcessParameters)), (*byte)(unsafe.Pointer(&params)), unsafe.Sizeof(params), nil); err != nil {
-		if codeErr := windows.GetExitCodeProcess(h, &code); codeErr == nil && code != 259 {
-			return false, nil
-		}
-		if errors.Is(err, windows.ERROR_ACCESS_DENIED) || isWindowsProcessMissing(err) {
-			return false, nil
-		}
-		return false, err
+		return false, classifyWindowsPEBReadErr(h, err)
 	}
 	if params.Environment == nil {
 		return false, nil
@@ -225,13 +252,7 @@ func processHasJobTokenWindowsErr(pid int, token string) (bool, error) {
 		buf := make([]uint16, words)
 		var bytesRead uintptr
 		if err := windows.ReadProcessMemory(h, uintptr(params.Environment), (*byte)(unsafe.Pointer(&buf[0])), uintptr(words*2), &bytesRead); err != nil {
-			if codeErr := windows.GetExitCodeProcess(h, &code); codeErr == nil && code != 259 {
-				return false, nil
-			}
-			if errors.Is(err, windows.ERROR_ACCESS_DENIED) || isWindowsProcessMissing(err) {
-				return false, nil
-			}
-			return false, err
+			return false, classifyWindowsPEBReadErr(h, err)
 		}
 		return parseWindowsEnvHasToken(buf[:bytesRead/2], target), nil
 	}
@@ -253,61 +274,13 @@ func processHasJobTokenWindowsErr(pid int, token string) (bool, error) {
 			}
 		}
 		if err != nil {
-			if codeErr := windows.GetExitCodeProcess(h, &code); codeErr == nil && code != 259 {
-				return false, nil
-			}
 			if errors.Is(err, windows.ERROR_PARTIAL_COPY) && len(combined) > 0 {
 				return parseWindowsEnvHasToken(combined, target), nil
 			}
-			if errors.Is(err, windows.ERROR_ACCESS_DENIED) || isWindowsProcessMissing(err) {
-				return false, nil
-			}
-			return false, err
+			return false, classifyWindowsPEBReadErr(h, err)
 		}
 	}
 	return parseWindowsEnvHasToken(combined, target), nil
-}
-
-type jobObjectBasicProcessIdListHeader struct {
-	numberOfAssignedProcesses uint32
-	numberOfProcessIdsInList  uint32
-}
-
-func queryWindowsJobObjectPIDs(job windows.Handle) (map[int]bool, error) {
-	if job == 0 {
-		return nil, nil
-	}
-	headerSize := unsafe.Sizeof(jobObjectBasicProcessIdListHeader{})
-	ptrSize := unsafe.Sizeof(uintptr(0))
-	capPIDs := 64
-	for {
-		raw := make([]byte, int(headerSize)+capPIDs*int(ptrSize))
-		err := windows.QueryInformationJobObject(job, windows.JobObjectBasicProcessIdList, uintptr(unsafe.Pointer(&raw[0])), uint32(len(raw)), nil)
-		hdr := (*jobObjectBasicProcessIdListHeader)(unsafe.Pointer(&raw[0]))
-		if errors.Is(err, windows.ERROR_MORE_DATA) {
-			nextCap := int(hdr.numberOfAssignedProcesses) + 16
-			if nextCap <= capPIDs {
-				nextCap = capPIDs * 2
-			}
-			capPIDs = nextCap
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		pids := make(map[int]bool, int(hdr.numberOfProcessIdsInList))
-		for i := 0; i < int(hdr.numberOfProcessIdsInList); i++ {
-			offset := int(headerSize) + i*int(ptrSize)
-			if offset+int(ptrSize) > len(raw) {
-				break
-			}
-			pid := int(*(*uintptr)(unsafe.Pointer(&raw[offset])))
-			if pid > 0 {
-				pids[pid] = true
-			}
-		}
-		return pids, nil
-	}
 }
 
 func assignVerifiedMembersToJobObject(job windows.Handle, members map[int]string) {
@@ -324,15 +297,64 @@ func assignVerifiedMembersToJobObject(job windows.Handle, members map[int]string
 	}
 }
 
-func snapshotWindowsProcesses(leaderNs int64, jobToken string, jobHandle uintptr) ([]windowsProcEntry, error) {
-	var jobPIDs map[int]bool
+func inspectWindowsSnapshotEntry(pid, ppid int, leaderNs int64, jobToken string, jobHandle uintptr) windowsProcEntry {
+	var info processInfo
+	var inJob bool
+	var ierr error
+
+	// Check identity and IsProcessInJob on the same open handle so PID reuse
+	// between inspection and Job Object verification is impossible.
 	if jobHandle != 0 {
-		var jerr error
-		jobPIDs, jerr = queryWindowsJobObjectPIDs(windows.Handle(jobHandle))
-		if jerr != nil {
-			return nil, jerr
+		var h windows.Handle
+		h, info, ierr = openAndInspectWindowsProcess(pid, windows.PROCESS_QUERY_LIMITED_INFORMATION)
+		if ierr == nil && info.Alive {
+			var jerr error
+			inJob, jerr = isWindowsHandleInJob(h, windows.Handle(jobHandle))
+			if jerr != nil && !errors.Is(jerr, windows.ERROR_ACCESS_DENIED) && !isWindowsProcessMissing(jerr) {
+				ierr = jerr
+			}
+		}
+		if h != 0 {
+			_ = windows.CloseHandle(h)
+		}
+	} else {
+		info, ierr = inspectWindowsProcessFn(pid)
+	}
+
+	if ierr != nil {
+		return windowsProcEntry{
+			pid:        pid,
+			ppid:       ppid,
+			inJobObj:   inJob,
+			inspectErr: ierr,
 		}
 	}
+	if !info.Alive {
+		return windowsProcEntry{}
+	}
+	ns, ok := parseWindowsStartToken(info.StartToken)
+	if !ok {
+		return windowsProcEntry{}
+	}
+	entry := windowsProcEntry{
+		pid:        pid,
+		ppid:       ppid,
+		startToken: info.StartToken,
+		startNs:    ns,
+		inJobObj:   inJob,
+	}
+	if jobToken != "" && leaderNs > 0 && ns >= leaderNs && !entry.inJobObj {
+		hasTok, tokErr := processHasJobTokenWindowsErr(pid, jobToken)
+		if tokErr != nil {
+			entry.inspectErr = tokErr
+		} else {
+			entry.hasJobTok = hasTok
+		}
+	}
+	return entry
+}
+
+func snapshotWindowsProcesses(leaderNs int64, jobToken string, jobHandle uintptr) ([]windowsProcEntry, error) {
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		return nil, err
@@ -351,33 +373,9 @@ func snapshotWindowsProcesses(leaderNs int64, jobToken string, jobHandle uintptr
 		pid := int(pe.ProcessID)
 		ppid := int(pe.ParentProcessID)
 		if pid > 0 {
-			info, ierr := inspectWindowsProcessFn(pid)
-			if ierr != nil {
-				out = append(out, windowsProcEntry{
-					pid:        pid,
-					ppid:       ppid,
-					inJobObj:   jobPIDs[pid],
-					inspectErr: ierr,
-				})
-			} else if info.Alive {
-				if ns, ok := parseWindowsStartToken(info.StartToken); ok {
-					entry := windowsProcEntry{
-						pid:        pid,
-						ppid:       ppid,
-						startToken: info.StartToken,
-						startNs:    ns,
-						inJobObj:   jobPIDs[pid],
-					}
-					if jobToken != "" && leaderNs > 0 && ns >= leaderNs && !entry.inJobObj {
-						hasTok, tokErr := processHasJobTokenWindowsErr(pid, jobToken)
-						if tokErr != nil {
-							entry.inspectErr = tokErr
-						} else {
-							entry.hasJobTok = hasTok
-						}
-					}
-					out = append(out, entry)
-				}
+			entry := inspectWindowsSnapshotEntry(pid, ppid, leaderNs, jobToken, jobHandle)
+			if entry.pid > 0 {
+				out = append(out, entry)
 			}
 		}
 		pe.Size = uint32(unsafe.Sizeof(pe))
@@ -391,24 +389,30 @@ func snapshotWindowsProcesses(leaderNs int64, jobToken string, jobHandle uintptr
 	return out, nil
 }
 
-func resolveWindowsGroupDescendants(proof *processGroupProof, id ProcessIdentityInfo, leaderNs int64, _ bool, procs []windowsProcEntry) ([]windowsProcEntry, error) {
+func resolveWindowsGroupDescendants(proof *processGroupProof, id ProcessIdentityInfo, leaderNs int64, _ bool, procs []windowsProcEntry) (verified []windowsProcEntry, inconclusiveErr error, err error) {
 	verifiedMap := make(map[int]windowsProcEntry)
 	reusedKnown := make(map[int]bool)
 
 	for _, e := range procs {
 		if e.pid == id.PID {
 			if e.inspectErr != nil {
-				return nil, e.inspectErr
+				if inconclusiveErr == nil {
+					inconclusiveErr = e.inspectErr
+				}
+				continue
 			}
 			if e.startToken != id.StartToken {
-				return nil, fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+				return nil, nil, fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 			}
 			verifiedMap[e.pid] = e
 			continue
 		}
 		if prevTok, isKnown := proof.KnownMembers[e.pid]; isKnown {
 			if e.inspectErr != nil {
-				return nil, e.inspectErr
+				if inconclusiveErr == nil {
+					inconclusiveErr = e.inspectErr
+				}
+				continue
 			}
 			if e.startToken == prevTok {
 				verifiedMap[e.pid] = e
@@ -424,11 +428,16 @@ func resolveWindowsGroupDescendants(proof *processGroupProof, id ProcessIdentity
 		}
 	}
 
+	// Verify strong instance-independent evidence (JobToken or Job Object
+	// membership) and record any uncertain failures without aborting cleanup of
+	// already-verified group members.
 	for _, e := range procs {
 		if e.inspectErr != nil {
 			_, knownParent := proof.KnownMembers[e.ppid]
 			if !errors.Is(e.inspectErr, windows.ERROR_ACCESS_DENIED) || e.ppid == id.PID || knownParent || e.inJobObj {
-				return nil, e.inspectErr
+				if inconclusiveErr == nil {
+					inconclusiveErr = e.inspectErr
+				}
 			}
 			continue
 		}
@@ -444,8 +453,8 @@ func resolveWindowsGroupDescendants(proof *processGroupProof, id ProcessIdentity
 		added := false
 		for _, e := range procs {
 			if e.inspectErr != nil {
-				if _, ok := verifiedMap[e.ppid]; ok {
-					return nil, e.inspectErr
+				if _, ok := verifiedMap[e.ppid]; ok && inconclusiveErr == nil {
+					inconclusiveErr = e.inspectErr
 				}
 				continue
 			}
@@ -473,15 +482,15 @@ func resolveWindowsGroupDescendants(proof *processGroupProof, id ProcessIdentity
 			proof.KnownMembers[pid] = e.startToken
 		}
 	}
-	verified := make([]windowsProcEntry, 0, len(verifiedMap))
+	verified = make([]windowsProcEntry, 0, len(verifiedMap))
 	for _, e := range verifiedMap {
 		verified = append(verified, e)
 	}
-	return verified, nil
+	return verified, inconclusiveErr, nil
 }
 
-func terminateVerifiedWindowsProcess(pid int, expectedToken string) (signalled bool, err error) {
-	h, err := openVerifiedWindowsProcess(pid, expectedToken, windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE)
+func terminateVerifiedWindowsProcess(cand windowsProcEntry, expectedToken string, jobHandle uintptr) (signalled bool, err error) {
+	h, err := openVerifiedWindowsProcess(cand.pid, expectedToken, windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE)
 	if err != nil {
 		if errors.Is(err, os.ErrProcessDone) {
 			return false, nil
@@ -489,6 +498,20 @@ func terminateVerifiedWindowsProcess(pid int, expectedToken string) (signalled b
 		return false, err
 	}
 	defer windows.CloseHandle(h)
+	// When Job Object membership authenticated this process, re-check it on the
+	// open termination handle itself so PID reuse cannot cross into Signalling.
+	if cand.inJobObj && !cand.hasJobTok && jobHandle != 0 {
+		inJob, jerr := isWindowsHandleInJob(h, windows.Handle(jobHandle))
+		if jerr != nil {
+			if isWindowsProcessMissing(jerr) {
+				return false, nil
+			}
+			return false, jerr
+		}
+		if !inJob {
+			return false, fmt.Errorf("refusing to signal pid %d: %w", cand.pid, ErrProcessIdentityMismatch)
+		}
+	}
 	if err := windows.TerminateProcess(h, 1); err != nil {
 		if isWindowsProcessMissing(err) {
 			return false, nil
@@ -524,7 +547,7 @@ func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
 		return map[int]string{id.PID: id.StartToken}
 	}
 	cloned := cloneGroupProof(proof)
-	if _, rerr := resolveWindowsGroupDescendants(&cloned, id, leaderNs, true, procs); rerr != nil {
+	if _, _, rerr := resolveWindowsGroupDescendants(&cloned, id, leaderNs, true, procs); rerr != nil {
 		return nil
 	}
 	return cloned.KnownMembers
@@ -597,6 +620,7 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	deadline := time.Now().Add(2 * time.Second)
 	anySignalled := false
 	consecutiveEmpty := 0
+	var lastInconclusiveErr error
 	for pass := 0; pass < maxPasses; pass++ {
 		procs, err := snapshotWindowsProcesses(leaderNs, proof.JobToken, proof.jobHandle)
 		if err != nil {
@@ -609,11 +633,21 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 				break
 			}
 		}
-		verified, rerr := resolveWindowsGroupDescendants(proof, id, leaderNs, leaderAlive, procs)
+		verified, inconclusiveErr, rerr := resolveWindowsGroupDescendants(proof, id, leaderNs, leaderAlive, procs)
 		if rerr != nil {
 			return rerr
 		}
 		if len(verified) == 0 {
+			if inconclusiveErr != nil {
+				lastInconclusiveErr = inconclusiveErr
+				consecutiveEmpty = 0
+				if pass == maxPasses-1 || time.Now().After(deadline) {
+					return inconclusiveErr
+				}
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			lastInconclusiveErr = nil
 			consecutiveEmpty++
 			if consecutiveEmpty >= 2 {
 				if anySignalled {
@@ -624,11 +658,12 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 			time.Sleep(2 * time.Millisecond)
 			continue
 		}
+		lastInconclusiveErr = inconclusiveErr
 		consecutiveEmpty = 0
 		var termErr error
 		passSignalled := false
 		for _, cand := range verified {
-			sig, serr := terminateVerifiedWindowsProcess(cand.pid, cand.startToken)
+			sig, serr := terminateVerifiedWindowsProcess(cand, cand.startToken, proof.jobHandle)
 			if serr != nil {
 				if errors.Is(serr, ErrProcessIdentityMismatch) {
 					return serr
@@ -653,6 +688,9 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
+	if lastInconclusiveErr != nil {
+		return lastInconclusiveErr
+	}
 	return fmt.Errorf("verified Windows process tree for pid %d still has live members: %w", id.PID, errGroupMembersStillAlive)
 }
 
@@ -670,11 +708,17 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 		return false, err
 	}
 	cloned := cloneGroupProof(proof)
-	verified, rerr := resolveWindowsGroupDescendants(&cloned, id, leaderNs, false, procs)
+	verified, inconclusiveErr, rerr := resolveWindowsGroupDescendants(&cloned, id, leaderNs, false, procs)
 	if rerr != nil {
 		return false, rerr
 	}
-	return len(verified) > 0, nil
+	if len(verified) > 0 {
+		return true, nil
+	}
+	if inconclusiveErr != nil {
+		return false, inconclusiveErr
+	}
+	return false, nil
 }
 
 func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {
@@ -739,37 +783,9 @@ func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool,
 }
 
 func inspectProcessErr(pid int) (processInfo, error) {
-	if pid <= 0 {
-		return processInfo{}, nil
+	h, info, err := openAndInspectWindowsProcess(pid, windows.PROCESS_QUERY_LIMITED_INFORMATION)
+	if h != 0 {
+		_ = windows.CloseHandle(h)
 	}
-	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
-	if err != nil {
-		if isWindowsProcessMissing(err) {
-			return processInfo{}, nil
-		}
-		return processInfo{}, err
-	}
-	defer windows.CloseHandle(h)
-	var code uint32
-	if err := windows.GetExitCodeProcess(h, &code); err != nil {
-		if isWindowsProcessMissing(err) {
-			return processInfo{}, nil
-		}
-		return processInfo{}, err
-	}
-	if code != 259 { // STILL_ACTIVE
-		return processInfo{}, nil
-	}
-	var creation, exit, kernel, user windows.Filetime
-	if err := windows.GetProcessTimes(h, &creation, &exit, &kernel, &user); err != nil {
-		if isWindowsProcessMissing(err) {
-			return processInfo{}, nil
-		}
-		return processInfo{}, err
-	}
-	return processInfo{
-		Alive:      true,
-		PGID:       pid,
-		StartToken: fmt.Sprintf("%d:%d", creation.LowDateTime, creation.HighDateTime),
-	}, nil
+	return info, err
 }

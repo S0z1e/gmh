@@ -26,19 +26,36 @@ func processGroupID(pid int) int {
 	return pgid
 }
 
+var darwinSysctlKinfoProcSliceFn = unix.SysctlKinfoProcSlice
+
 func inspectProcess(pid int) processInfo {
+	info, _ := inspectProcessErr(pid)
+	return info
+}
+
+func inspectProcessErr(pid int) (processInfo, error) {
 	if pid <= 0 {
-		return processInfo{}
+		return processInfo{}, nil
 	}
-	proc, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
-	if err != nil || int(proc.Proc.P_pid) != pid {
-		return processInfo{}
+	procs, err := darwinSysctlKinfoProcSliceFn("kern.proc.pid", pid)
+	if err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return processInfo{}, nil
+		}
+		return processInfo{}, err
+	}
+	if len(procs) == 0 {
+		return processInfo{}, nil
+	}
+	proc := procs[0]
+	if int(proc.Proc.P_pid) != pid {
+		return processInfo{}, nil
 	}
 	if proc.Proc.P_stat == 5 { // SZOMB in Darwin's sys/proc.h.
-		return processInfo{Zombie: true}
+		return processInfo{Zombie: true}, nil
 	}
 	if proc.Proc.P_starttime.Sec <= 0 && proc.Proc.P_starttime.Usec <= 0 {
-		return processInfo{}
+		return processInfo{}, nil
 	}
 	sid, _ := unix.Getsid(pid)
 	return processInfo{
@@ -49,11 +66,7 @@ func inspectProcess(pid int) processInfo {
 		HasUID:     true,
 		SID:        sid,
 		Sess:       proc.Eproc.Sess,
-	}
-}
-
-func inspectProcessErr(pid int) (processInfo, error) {
-	return inspectProcess(pid), nil
+	}, nil
 }
 
 func parseDarwinStartTime(token string) (sec int64, usec int32, ok bool) {
@@ -82,7 +95,10 @@ func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
 	if !id.Valid() {
 		return ErrProcessIdentityMismatch
 	}
-	info := inspectProcess(id.PID)
+	info, err := inspectProcessErr(id.PID)
+	if err != nil {
+		return err
+	}
 	if !info.Alive {
 		return os.ErrProcessDone
 	}
@@ -306,7 +322,10 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	if !hasLeaderStart {
 		return ErrProcessIdentityMismatch
 	}
-	info := inspectProcess(id.PID)
+	info, err := inspectProcessErr(id.PID)
+	if err != nil {
+		return err
+	}
 	if info.Alive && !id.Matches(info) {
 		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 	}
@@ -360,7 +379,10 @@ func verifyBeforeWait(id ProcessIdentityInfo) error {
 	if !id.Valid() {
 		return ErrProcessIdentityMismatch
 	}
-	info := inspectProcess(id.PID)
+	info, err := inspectProcessErr(id.PID)
+	if err != nil {
+		return err
+	}
 	if !info.Alive {
 		return errAdoptedProcessExited
 	}

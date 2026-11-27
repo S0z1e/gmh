@@ -44,9 +44,9 @@ func TestResolveWindowsGroupDescendantsRejectsPIDReuseReplacementParent(t *testi
 		{pid: 201, ppid: 100, startToken: liveSiblingTok, startNs: liveSiblingNs},
 	}
 
-	verified, err := resolveWindowsGroupDescendants(&proof, id, leaderNs, false, procs)
-	if err != nil {
-		t.Fatalf("resolveWindowsGroupDescendants error = %v", err)
+	verified, inconclusiveErr, err := resolveWindowsGroupDescendants(&proof, id, leaderNs, false, procs)
+	if err != nil || inconclusiveErr != nil {
+		t.Fatalf("resolveWindowsGroupDescendants err=%v inconclusive=%v", err, inconclusiveErr)
 	}
 	if len(verified) != 1 || verified[0].pid != 201 {
 		t.Fatalf("verified = %+v, want only genuine live member [201]", verified)
@@ -101,9 +101,9 @@ func TestResolveWindowsGroupDescendantsTracksSurvivingChildAfterIntermediateExit
 				KnownMembers: map[int]string{100: leaderTok},
 			}
 			procs := []windowsProcEntry{tc.entry}
-			verified, err := resolveWindowsGroupDescendants(&proof, id, leaderNs, false, procs)
-			if err != nil {
-				t.Fatalf("resolveWindowsGroupDescendants error = %v", err)
+			verified, inconclusiveErr, err := resolveWindowsGroupDescendants(&proof, id, leaderNs, false, procs)
+			if err != nil || inconclusiveErr != nil {
+				t.Fatalf("resolveWindowsGroupDescendants err=%v inconclusive=%v", err, inconclusiveErr)
 			}
 			if len(verified) != 1 || verified[0].pid != 300 {
 				t.Fatalf("verified = %+v, want [300]", verified)
@@ -115,6 +115,7 @@ func TestResolveWindowsGroupDescendantsTracksSurvivingChildAfterIntermediateExit
 func TestResolveWindowsGroupDescendantsPreservesInspectionErrors(t *testing.T) {
 	base := time.Unix(1700000200, 0)
 	leaderTok, leaderNs := windowsTokenAt(base)
+	memberTok, memberNs := windowsTokenAt(base.Add(2 * time.Second))
 	id := ProcessIdentityInfo{PID: 100, PGID: 100, StartToken: leaderTok}
 
 	t.Run("descendant_access_denied", func(t *testing.T) {
@@ -122,18 +123,30 @@ func TestResolveWindowsGroupDescendantsPreservesInspectionErrors(t *testing.T) {
 		procs := []windowsProcEntry{
 			{pid: 250, ppid: 100, inspectErr: windows.ERROR_ACCESS_DENIED},
 		}
-		if _, err := resolveWindowsGroupDescendants(&proof, id, leaderNs, false, procs); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
-			t.Fatalf("err = %v, want ERROR_ACCESS_DENIED", err)
+		verified, inconclusiveErr, err := resolveWindowsGroupDescendants(&proof, id, leaderNs, false, procs)
+		if err != nil || len(verified) != 0 || !errors.Is(inconclusiveErr, windows.ERROR_ACCESS_DENIED) {
+			t.Fatalf("got verified=%+v inconclusive=%v err=%v, want inconclusive=ERROR_ACCESS_DENIED", verified, inconclusiveErr, err)
 		}
 	})
 
-	t.Run("non_access_error_propagates", func(t *testing.T) {
-		proof := processGroupProof{Leader: id, KnownMembers: map[int]string{100: leaderTok}}
-		procs := []windowsProcEntry{
-			{pid: 999, ppid: 4, inspectErr: windows.ERROR_NO_SYSTEM_RESOURCES},
+	t.Run("speculative_probe_failure_does_not_block_verified_members", func(t *testing.T) {
+		proof := processGroupProof{
+			Leader:       id,
+			KnownMembers: map[int]string{100: leaderTok, 201: memberTok},
 		}
-		if _, err := resolveWindowsGroupDescendants(&proof, id, leaderNs, false, procs); !errors.Is(err, windows.ERROR_NO_SYSTEM_RESOURCES) {
-			t.Fatalf("err = %v, want ERROR_NO_SYSTEM_RESOURCES", err)
+		procs := []windowsProcEntry{
+			{pid: 999, ppid: 4, inspectErr: windows.ERROR_PARTIAL_COPY},
+			{pid: 201, ppid: 100, startToken: memberTok, startNs: memberNs},
+		}
+		verified, inconclusiveErr, err := resolveWindowsGroupDescendants(&proof, id, leaderNs, false, procs)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if len(verified) != 1 || verified[0].pid != 201 {
+			t.Fatalf("verified = %+v, want proven member [201] even with speculative probe failure", verified)
+		}
+		if !errors.Is(inconclusiveErr, windows.ERROR_PARTIAL_COPY) {
+			t.Fatalf("inconclusiveErr = %v, want ERROR_PARTIAL_COPY", inconclusiveErr)
 		}
 	})
 
@@ -142,9 +155,9 @@ func TestResolveWindowsGroupDescendantsPreservesInspectionErrors(t *testing.T) {
 		procs := []windowsProcEntry{
 			{pid: 4, ppid: 0, inspectErr: windows.ERROR_ACCESS_DENIED},
 		}
-		verified, err := resolveWindowsGroupDescendants(&proof, id, leaderNs, false, procs)
-		if err != nil {
-			t.Fatalf("err = %v, want nil", err)
+		verified, inconclusiveErr, err := resolveWindowsGroupDescendants(&proof, id, leaderNs, false, procs)
+		if err != nil || inconclusiveErr != nil {
+			t.Fatalf("inconclusive=%v err=%v, want nil", inconclusiveErr, err)
 		}
 		if len(verified) != 0 {
 			t.Fatalf("verified = %+v, want empty", verified)
