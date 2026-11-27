@@ -9,9 +9,8 @@ import (
 const jobTokenEnvVar = "GMH_JOB_TOKEN"
 
 var (
-	inspectProcessErrFn          = inspectProcessErr
-	stopVerifiedProcessGroupFn   = stopVerifiedProcessGroupWithProof
-	hasVerifiedLiveGroupMemberFn = hasVerifiedLiveGroupMember
+	inspectProcessErrFn        = inspectProcessErr
+	stopVerifiedProcessGroupFn = stopVerifiedProcessGroupWithProof
 )
 
 // ErrProcessIdentityMismatch reports that an OS process ID no longer matches the

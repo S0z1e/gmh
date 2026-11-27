@@ -803,9 +803,10 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 			captureVerifiedGroupProof(&proof)
 			extraNote := ""
 			if !rec.Unlimited && !rec.Deadline.IsZero() && !time.Now().Before(rec.Deadline) {
-				stopErr := stopVerifiedProcessGroupWithProof(proof)
+				stopErr := stopVerifiedProcessGroupFn(proof)
+				stopMismatchRecovered := errors.Is(stopErr, ErrProcessIdentityMismatch) && hasIndependentGroupProof(proof)
 				switch {
-				case errors.Is(stopErr, ErrProcessIdentityMismatch):
+				case errors.Is(stopErr, ErrProcessIdentityMismatch) && !stopMismatchRecovered:
 					closeVerifiedGroupProof(&proof)
 					reason := fmt.Sprintf("refused to attach to PID %d: process identity, group, or start token mismatch (PID reused)", id.PID)
 					if rec.FinishedAt.IsZero() {
@@ -823,8 +824,10 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 						_ = savePersistedJob(jobsDir, job.persistedSnapshot())
 					}
 					return job, nil
-				case stopErr == nil || errors.Is(stopErr, os.ErrProcessDone):
-					waitForAdoptedProcessGone(id, 2*time.Second)
+				case stopErr == nil || errors.Is(stopErr, os.ErrProcessDone) || stopMismatchRecovered:
+					if !stopMismatchRecovered {
+						waitForAdoptedProcessGone(id, 2*time.Second)
+					}
 					if !proof.VerifiedAt.IsZero() && proof.ExitObservedAt.IsZero() {
 						proof.ExitObservedAt = time.Now()
 					}
@@ -867,11 +870,9 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 					closeVerifiedGroupProof(&proof)
 					timeoutDur := max(0, rec.Deadline.Sub(rec.Started))
 					timeoutErr := &timeoutError{timeout: timeoutDur}
-					note := fmt.Sprintf("adopted job PID %d (pgid %d) exceeded deadline (%s) while harness was down; stopped verified process group; %s",
-						id.PID, id.PGID, rec.Deadline.UTC().Format(time.RFC3339), pipeCaptureEndedNote(rec.OutputFile))
-					summary, preview := formatAdoptedSummaryPreview(rec.OutputFile, rec.Cwd, fmt.Sprintf("(adopted background job stopped on adoption; %s)", note), note)
-					job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
+					job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, "", JobResult{})
 					job.Adopted = true
+					summary, preview := job.prepareAdoptedDowntimeTimeoutSummary(id.PID, id.PGID, rec.Deadline, rec.OutputFile, rec.Cwd)
 					job.finishAdoptedWithAudit(JobResult{
 						Output:   summary,
 						Err:      timeoutErr,
@@ -899,7 +900,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 			liveMember := rec.GroupProof.CleanupPending
 			var scanErr error
 			if !liveMember {
-				liveMember, scanErr = hasVerifiedLiveGroupMemberFn(proof)
+				liveMember, scanErr = hasVerifiedLiveGroupMember(proof)
 			}
 			if errors.Is(scanErr, ErrProcessIdentityMismatch) {
 				liveMember = false
@@ -1325,7 +1326,8 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 	}
 
 	job.mu.Lock()
-	needsProofCapture := job.groupProof.VerifiedAt.IsZero()
+	alreadyPendingCleanup := job.cleanupPending
+	needsProofCapture := !alreadyPendingCleanup && job.groupProof.VerifiedAt.IsZero()
 	job.mu.Unlock()
 	if needsProofCapture {
 		job.proofFDMu.Lock()
@@ -1362,19 +1364,33 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		}()
 	}
 
-	waitFn := e.waitAdopted
-	if waitFn == nil {
-		waitFn = waitAdoptedProcess
+	var exitCode int
+	var exitKnown bool
+	var err error
+	if alreadyPendingCleanup {
+		err = errAdoptedProcessExited
+		exitCode = -1
+	} else {
+		waitFn := e.waitAdopted
+		if waitFn == nil {
+			waitFn = waitAdoptedProcess
+		}
+		exitCode, exitKnown, err = waitFn(ctx, snap.Identity)
 	}
-	exitCode, exitKnown, err := waitFn(ctx, snap.Identity)
 	if stopProofRefresh != nil {
 		close(stopProofRefresh)
 		proofWg.Wait()
 	}
 	if errors.Is(err, ErrProcessIdentityMismatch) {
-		summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
-		job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
-		return
+		if hasIndependentGroupProof(job.snapshotGroupProof()) {
+			err = errAdoptedProcessExited
+			exitCode = -1
+			exitKnown = false
+		} else {
+			summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
+			job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
+			return
+		}
 	}
 
 	deadlineStopMu.Lock()
@@ -1402,16 +1418,22 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		if waitErr == nil {
 			waitErr = errors.New("adopted process wait failed")
 		}
-		info, ierr := inspectProcessErr(snap.Identity.PID)
+		info, ierr := inspectProcessErrFn(snap.Identity.PID)
 		if ierr == nil && !info.Alive {
 			// Leader has already exited; preserve unavailable-exit sentinel.
 			err = errAdoptedProcessExited
 			exitCode = -1
 			exitKnown = false
 		} else if ierr == nil && info.Alive && !snap.Identity.Matches(info) {
-			summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
-			job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
-			return
+			if hasIndependentGroupProof(job.snapshotGroupProof()) {
+				err = errAdoptedProcessExited
+				exitCode = -1
+				exitKnown = false
+			} else {
+				summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
+				job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
+				return
+			}
 		} else {
 			// Leader is still alive or inspection failed with a transient error (such as EMFILE/ENFILE).
 			// Keep WaitError visible and continue supervising via fallback polling so the child group
@@ -1438,7 +1460,7 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 				case <-ctx.Done():
 					leaderExited = true
 				case <-ticker.C:
-					pinfo, perr := inspectProcessErr(snap.Identity.PID)
+					pinfo, perr := inspectProcessErrFn(snap.Identity.PID)
 					if isFDLimitErr(perr) {
 						// Descriptor exhaustion: cannot inspect /proc safely. Retry on next tick;
 						// do not assume process exited.
@@ -1448,9 +1470,13 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 						// Positively established exit.
 						leaderExited = true
 					} else if perr == nil && pinfo.Alive && !snap.Identity.Matches(pinfo) {
-						summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
-						job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
-						return
+						if hasIndependentGroupProof(job.snapshotGroupProof()) {
+							leaderExited = true
+						} else {
+							summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
+							job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
+							return
+						}
 					} else if perr == nil && pinfo.Alive {
 						job.proofFDMu.Lock()
 						job.refreshVerifiedGroupMembersLocked()
