@@ -2204,8 +2204,8 @@ func TestCrashRecoveryVerifiedChildForkedAfterCleanupErrorStillStops(t *testing.
 		"GMH_HELPER_OUTID":     outID,
 		"GMH_HELPER_WAIT_TEXT": "C1-READY",
 		"GMH_HELPER_CMD": fmt.Sprintf(
-			"(touch %q; while [ ! -f %q ]; do sleep 0.02; done; sleep 30 & echo $! > %q; wait) & c1=$!; echo $c1 > %q; printf 'C1-READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0",
-			c1Ready, c1Trigger, c2File, c1File, leaderRel,
+			"((while [ ! -f %q ]; do sleep 0.02; done; (sleep 30 & echo $! > %q; wait) & echo $! > %q; wait) & echo $! > %q) & touch %q; printf 'C1-READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0",
+			c1Trigger, filepath.Join(root, "c3.pid"), c2File, c1File, c1Ready, leaderRel,
 		),
 	})
 	if err := helperCmd.Process.Kill(); err != nil {
@@ -2280,46 +2280,58 @@ func TestCrashRecoveryVerifiedChildForkedAfterCleanupErrorStillStops(t *testing.
 		time.Sleep(15 * time.Millisecond)
 	}
 
-	// Wait past Darwin's 10ms ExitObservedAt tolerance, then have verified c1 fork c2.
+	// Wait past Darwin's 10ms ExitObservedAt tolerance, then have verified c1 fork c2 -> c3 (multi-hop).
 	time.Sleep(30 * time.Millisecond)
 	if err := os.WriteFile(c1Trigger, []byte("go\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	var c2PID int
+	var c2PID, c3PID int
+	c3File := filepath.Join(root, "c3.pid")
 	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
 		if b, err := os.ReadFile(c2File); err == nil {
 			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 && p != c1PID {
 				c2PID = p
-				break
 			}
+		}
+		if b, err := os.ReadFile(c3File); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 && p != c2PID {
+				c3PID = p
+			}
+		}
+		if c2PID > 0 && c3PID > 0 {
+			break
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
-	if c2PID <= 0 {
-		t.Fatal("grandchild c2 did not fork")
+	if c2PID <= 0 || c3PID <= 0 {
+		t.Fatalf("grandchild chain c2 (%d) / c3 (%d) did not fork", c2PID, c3PID)
 	}
-	t.Cleanup(func() {
-		if p, err := os.FindProcess(c2PID); err == nil {
-			_ = p.Kill()
-		}
-	})
+	for _, p := range []int{c2PID, c3PID} {
+		pidCopy := p
+		t.Cleanup(func() {
+			if proc, err := os.FindProcess(pidCopy); err == nil {
+				_ = proc.Kill()
+			}
+		})
+	}
 
-	// Retry via StopJob must verify c2 via c1 ancestry (NOT reject on ExitObservedAt cutoff),
-	// stop both c1 and c2, and finish JobDone.
+	// Retry via StopJob must resolve c1 -> c2 -> c3 transitively (NOT reject on ExitObservedAt cutoff),
+	// stop c1, c2, and c3, and finish JobDone.
 	res, stopErr := exec2.StopJob(meta.JobID)
 	if stopErr != nil {
-		t.Fatalf("StopJob failed after verified descendant forked post-exit child: %v (%s)", stopErr, res.Text)
+		t.Fatalf("StopJob failed after verified descendant forked post-exit chain: %v (%s)", stopErr, res.Text)
 	}
 	if job.Status() != JobDone {
 		t.Fatalf("job status = %q, want done", job.Status())
 	}
 	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
-		if !inspectProcess(c1PID).Alive && !inspectProcess(c2PID).Alive {
+		if !inspectProcess(c1PID).Alive && !inspectProcess(c2PID).Alive && !inspectProcess(c3PID).Alive {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("c1 (%v) or c2 (%v) survived StopJob cleanup", inspectProcess(c1PID).Alive, inspectProcess(c2PID).Alive)
+	t.Fatalf("c1 (%v), c2 (%v), or c3 (%v) survived StopJob cleanup",
+		inspectProcess(c1PID).Alive, inspectProcess(c2PID).Alive, inspectProcess(c3PID).Alive)
 }
 
 func TestCrashRecoveryDeadlineRetriesTransientCleanupFailure(t *testing.T) {
@@ -2367,15 +2379,21 @@ func TestCrashRecoveryDeadlineRetriesTransientCleanupFailure(t *testing.T) {
 
 	var mu sync.Mutex
 	attempts := 0
+	var attemptTimes []time.Time
 	exec2 := &Executor{
 		Root:      root,
 		OutputDir: outDir,
 		OutputID:  outID,
 		JobsDir:   jobsDir,
+		waitAdopted: func(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {
+			<-ctx.Done()
+			return -1, false, ctx.Err()
+		},
 		stopAdoptedGroupAfterExit: func(proof processGroupProof) error {
 			mu.Lock()
 			attempts++
 			n := attempts
+			attemptTimes = append(attemptTimes, time.Now())
 			mu.Unlock()
 			if n <= 2 {
 				return errors.New("injected transient cleanup EMFILE")
@@ -2401,9 +2419,14 @@ func TestCrashRecoveryDeadlineRetriesTransientCleanupFailure(t *testing.T) {
 	}
 	mu.Lock()
 	gotAttempts := attempts
+	timesCopy := append([]time.Time(nil), attemptTimes...)
 	mu.Unlock()
 	if gotAttempts < 3 {
 		t.Fatalf("expected >= 3 cleanup attempts via backoff retry, got %d", gotAttempts)
+	}
+	// Verify backoff (>=100ms) was respected even after waitAdopted returned on timeout cancellation.
+	if len(timesCopy) >= 3 && timesCopy[2].Sub(timesCopy[0]) < 150*time.Millisecond {
+		t.Fatalf("deadline retries busy-spun without backoff: attempt times = %v", timesCopy)
 	}
 	if inspectProcess(childPID).Alive {
 		t.Fatalf("child pid %d survived deadline cleanup retry", childPID)
@@ -2521,6 +2544,197 @@ func TestCrashRecoveryPendingCleanupSurvivesSecondRestart(t *testing.T) {
 	}
 	if inspectProcess(childPID).Alive {
 		t.Fatalf("child pid %d survived cleanup after second restart", childPID)
+	}
+}
+
+func TestCrashRecoveryPendingPersistedBeforeCleanupAndOrphanSurfacesExitedLeader(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-pending-on-entry"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childPIDFile := filepath.Join(root, "child.pid")
+	relFile := filepath.Join(root, "leader.rel")
+
+	helperCmd, meta := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "CHILD-READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("sleep 30 & echo $! > %q; printf 'CHILD-READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0", childPIDFile, relFile),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	b, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	// Check that while leader exits and cleanup enters its VERY FIRST call, the
+	// on-disk snapshot ALREADY has GroupProof.CleanupPending == true, and orphan
+	// scanning surfaces the exited-leader pending group while childPID is alive.
+	enteredCleanup := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	var cleanupOnce sync.Once
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		stopAdoptedGroupAfterExit: func(proof processGroupProof) error {
+			cleanupOnce.Do(func() {
+				close(enteredCleanup)
+				<-releaseCleanup
+			})
+			return errors.New("still blocked")
+		},
+	}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	if _, err := exec2.RecoverSessionJobs(outID, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(relFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-enteredCleanup:
+	case <-time.After(4 * time.Second):
+		t.Fatal("cleanup did not enter")
+	}
+
+	// Simulate crashing INSIDE the first cleanup invocation before stopAdoptedGroupAfterExit returns.
+	onDisk, err := loadPersistedJobs(jobsDir)
+	if err != nil || len(onDisk) != 1 || onDisk[0].GroupProof == nil || !onDisk[0].GroupProof.CleanupPending {
+		t.Fatalf("on-disk job missing persisted CleanupPending before cleanup invocation: %+v, err=%v", onDisk, err)
+	}
+
+	// Cross-session orphan inspection must surface this exited-leader pending group.
+	orphans, err := FindOrphanedRunningJobs(jobsDir, outID, outDir)
+	if err != nil || len(orphans) != 1 || orphans[0].ID != meta.JobID {
+		t.Fatalf("FindOrphanedRunningJobs missed exited-leader pending group: %+v, err=%v", orphans, err)
+	}
+
+	// Reopening from the on-disk snapshot in a third executor must NOT mark JobUnknown;
+	// it stops the surviving child cleanly and emits exactly one completion audit.
+	close(releaseCleanup)
+	var auditMu sync.Mutex
+	var audits3 []AuditEntry
+	exec3 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		Audit: func(e AuditEntry) {
+			auditMu.Lock()
+			audits3 = append(audits3, e)
+			auditMu.Unlock()
+		},
+	}
+	exec3.SwitchSession(outID)
+	defer exec3.CloseJobs(context.Background())
+
+	rec3, err := exec3.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(rec3) != 1 || rec3[0].Status != JobDone {
+		t.Fatalf("harness 3 recovery from first-entry snapshot = %+v, err=%v; want JobDone", rec3, err)
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d survived recovery cleanup", childPID)
+	}
+	auditMu.Lock()
+	auditCount := len(audits3)
+	auditMu.Unlock()
+	if auditCount != 1 {
+		t.Fatalf("audit count = %d, want 1", auditCount)
+	}
+}
+
+func TestCrashRecoveryMonitorAndStopJobEmitSingleAudit(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-single-audit"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	relFile := filepath.Join(root, "rel")
+
+	helperCmd, meta := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("printf 'READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0", relFile),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	var auditMu sync.Mutex
+	var audits []AuditEntry
+	inAudit := make(chan struct{})
+	releaseAudit := make(chan struct{})
+	var auditOnce sync.Once
+
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		Audit: func(e AuditEntry) {
+			auditOnce.Do(func() {
+				close(inAudit)
+				<-releaseAudit
+			})
+			auditMu.Lock()
+			audits = append(audits, e)
+			auditMu.Unlock()
+		},
+	}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	if _, err := exec2.RecoverSessionJobs(outID, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(relFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-inAudit:
+	case <-time.After(4 * time.Second):
+		t.Fatal("monitor did not reach audit")
+	}
+
+	// Call StopJob concurrently while monitor is inside audit callback; StopJob must
+	// not emit a second audit entry because terminal ownership was already claimed.
+	stopDone := make(chan error, 1)
+	go func() {
+		_, err := exec2.StopJob(meta.JobID)
+		stopDone <- err
+	}()
+	time.Sleep(30 * time.Millisecond)
+	close(releaseAudit)
+	if err := <-stopDone; err != nil {
+		t.Fatalf("concurrent StopJob err = %v", err)
+	}
+
+	auditMu.Lock()
+	got := len(audits)
+	auditMu.Unlock()
+	if got != 1 {
+		t.Fatalf("got %d audit entries across monitor + concurrent StopJob, want exactly 1", got)
 	}
 }
 

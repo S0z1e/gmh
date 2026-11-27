@@ -563,6 +563,48 @@ type adoptionMonitor struct {
 	job         *Job
 	ctx         context.Context
 	cancelCause context.CancelCauseFunc
+	closeCh     chan struct{}
+}
+
+func groupProofFromPersisted(rec PersistedJob, id ProcessIdentityInfo, outFile string) processGroupProof {
+	if rec.GroupProof == nil {
+		return processGroupProof{Leader: id, JobToken: rec.JobToken, OutputFile: outFile}
+	}
+	return processGroupProof{
+		Leader:            id,
+		UID:               rec.GroupProof.UID,
+		HasUID:            rec.GroupProof.HasUID,
+		SID:               rec.GroupProof.SID,
+		Sess:              uintptr(rec.GroupProof.Sess),
+		JobToken:          rec.JobToken,
+		OutputFile:        outFile,
+		LeaderPipeTargets: append([]string(nil), rec.GroupProof.LeaderPipeTargets...),
+		KnownMembers:      mergeGroupMembers(nil, rec.GroupProof.KnownMembers),
+		VerifiedAt:        rec.GroupProof.VerifiedAt,
+		ExitObservedAt:    rec.GroupProof.ExitObservedAt,
+	}
+}
+
+func persistedGroupProofFromProof(proof processGroupProof, cleanupPending bool) *PersistedGroupProof {
+	var knownCopy map[int]string
+	if len(proof.KnownMembers) > 0 {
+		knownCopy = make(map[int]string, len(proof.KnownMembers))
+		for k, v := range proof.KnownMembers {
+			knownCopy[k] = v
+		}
+	}
+	return &PersistedGroupProof{
+		UID:               proof.UID,
+		HasUID:            proof.HasUID,
+		SID:               proof.SID,
+		Sess:              uint64(proof.Sess),
+		OutputFile:        proof.OutputFile,
+		LeaderPipeTargets: append([]string(nil), proof.LeaderPipeTargets...),
+		KnownMembers:      knownCopy,
+		VerifiedAt:        proof.VerifiedAt,
+		ExitObservedAt:    proof.ExitObservedAt,
+		CleanupPending:    cleanupPending,
+	}
 }
 
 func effectiveRecoveredDeadline(rec PersistedJob) (time.Time, bool) {
@@ -773,8 +815,20 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 					if !proof.VerifiedAt.IsZero() && proof.ExitObservedAt.IsZero() {
 						proof.ExitObservedAt = time.Now()
 					}
-					groupProof := proof
-					if gerr := stopAdoptedProcessGroupAfterExit(groupProof); errors.Is(gerr, ErrProcessIdentityMismatch) {
+					groupProof := cloneGroupProof(proof)
+					groupProof.verifiedFDs = proof.verifiedFDs
+					if jobsDir != "" {
+						pendingRec := rec
+						pendingRec.GroupProof = persistedGroupProofFromProof(groupProof, true)
+						_ = savePersistedJob(jobsDir, pendingRec)
+					}
+					stopGroupAfterExitTrackFn := stopAdoptedProcessGroupAfterExitTrack
+					if e.stopAdoptedGroupAfterExit != nil {
+						stopGroupAfterExitTrackFn = func(p *processGroupProof) error {
+							return e.stopAdoptedGroupAfterExit(*p)
+						}
+					}
+					if gerr := stopGroupAfterExitTrackFn(&groupProof); errors.Is(gerr, ErrProcessIdentityMismatch) {
 						closeVerifiedGroupProof(&proof)
 						reason := fmt.Sprintf("refused to attach to PID %d: %v", id.PID, gerr)
 						if rec.FinishedAt.IsZero() {
@@ -793,6 +847,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 						}
 						return job, nil
 					} else if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
+						proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, groupProof.KnownMembers)
 						extraNote = fmt.Sprintf("deadline (%s) passed while harness was down, group stop failed (%v); ", rec.Deadline.UTC().Format(time.RFC3339), gerr)
 						break
 					}
@@ -801,44 +856,15 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 					timeoutErr := &timeoutError{timeout: timeoutDur}
 					note := fmt.Sprintf("adopted job PID %d (pgid %d) exceeded deadline (%s) while harness was down; stopped verified process group; %s",
 						id.PID, id.PGID, rec.Deadline.UTC().Format(time.RFC3339), pipeCaptureEndedNote(rec.OutputFile))
-					summary, preview, _, hasFile := summarizeOutputFile(rec.OutputFile, rec.Cwd)
-					if !hasFile {
-						summary = fmt.Sprintf("(adopted background job stopped on adoption; %s)", note)
-					} else {
-						summary += "\n[" + note + "]"
-					}
-					if preview != nil {
-						if preview.Notice != "" {
-							preview.Notice += "\n[" + note + "]"
-						} else {
-							preview.Notice = "[" + note + "]"
-						}
-					}
-					rec.FinishedAt = time.Now()
-					rec.Error = timeoutErr.Error()
-					rec.RecoveryNote = note
-					job := e.newRecoveredJobObject(rec, jobsDir, JobDone, false, adoptionNoticed, note, JobResult{
+					summary, preview := formatAdoptedSummaryPreview(rec.OutputFile, rec.Cwd, fmt.Sprintf("(adopted background job stopped on adoption; %s)", note), note)
+					job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
+					job.Adopted = true
+					job.finishAdoptedWithAudit(JobResult{
 						Output:   summary,
 						Err:      timeoutErr,
 						ExitCode: -1,
 						Preview:  preview,
-					})
-					job.Adopted = true
-					if e.Audit != nil {
-						e.Audit(AuditEntry{
-							InvocationID: job.InvocationID,
-							ToolCallID:   job.ToolCallID,
-							TS:           time.Now(),
-							Kind:         "bash",
-							Tool:         "bash",
-							Args:         truncate(job.Command, 500),
-							ExitCode:     -1,
-							Error:        timeoutErr.Error(),
-						})
-					}
-					if jobsDir != "" {
-						_ = savePersistedJob(jobsDir, job.persistedSnapshot())
-					}
+					}, e.Audit, -1, timeoutErr)
 					return job, nil
 				default:
 					extraNote = fmt.Sprintf("deadline (%s) passed while harness was down, stop failed (%v); ", rec.Deadline.UTC().Format(time.RFC3339), stopErr)
@@ -848,100 +874,72 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 			job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
 			job.groupProof = cloneGroupProof(proof)
 			job.groupProof.verifiedFDs = proof.verifiedFDs
+			if !proof.ExitObservedAt.IsZero() {
+				job.cleanupPending = true
+			}
 			return e.attachAdoptedStopControls(job, jobsDir)
 		}
 
-		if (!info.Alive || info.Zombie) && id.Valid() && rec.GroupProof != nil && rec.GroupProof.CleanupPending && !rec.GroupProof.VerifiedAt.IsZero() {
-			proof := processGroupProof{
-				Leader:            id,
-				UID:               rec.GroupProof.UID,
-				HasUID:            rec.GroupProof.HasUID,
-				SID:               rec.GroupProof.SID,
-				Sess:              uintptr(rec.GroupProof.Sess),
-				JobToken:          rec.JobToken,
-				OutputFile:        rec.OutputFile,
-				LeaderPipeTargets: append([]string(nil), rec.GroupProof.LeaderPipeTargets...),
-				KnownMembers:      mergeGroupMembers(nil, rec.GroupProof.KnownMembers),
-				VerifiedAt:        rec.GroupProof.VerifiedAt,
-				ExitObservedAt:    rec.GroupProof.ExitObservedAt,
-			}
-			if proof.ExitObservedAt.IsZero() {
-				proof.ExitObservedAt = time.Now()
-			}
-			stopGroupAfterExitFn := stopAdoptedProcessGroupAfterExit
-			if e.stopAdoptedGroupAfterExit != nil {
-				stopGroupAfterExitFn = e.stopAdoptedGroupAfterExit
-			}
-			gerr := stopGroupAfterExitFn(proof)
-			if errors.Is(gerr, ErrProcessIdentityMismatch) {
-				reason := fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr)
-				if rec.FinishedAt.IsZero() {
-					rec.FinishedAt = time.Now()
+		if (!info.Alive || info.Zombie) && id.Valid() && rec.GroupProof != nil && !rec.GroupProof.VerifiedAt.IsZero() {
+			proof := groupProofFromPersisted(rec, id, rec.OutputFile)
+			if rec.GroupProof.CleanupPending || hasVerifiedLiveGroupMember(proof) {
+				if rec.GroupProof.CleanupPending && proof.ExitObservedAt.IsZero() {
+					proof.ExitObservedAt = time.Now()
 				}
-				summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
-				job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
-					Output:          summary,
-					Err:             errors.New(reason),
-					ExitCode:        -1,
-					ExitCodeUnknown: true,
-					Preview:         preview,
-				})
-				if jobsDir != "" {
-					_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+				stopGroupAfterExitTrackFn := stopAdoptedProcessGroupAfterExitTrack
+				if e.stopAdoptedGroupAfterExit != nil {
+					stopGroupAfterExitTrackFn = func(p *processGroupProof) error {
+						return e.stopAdoptedGroupAfterExit(*p)
+					}
 				}
-				return job, nil
-			}
-			if gerr == nil || errors.Is(gerr, os.ErrProcessDone) {
-				resErr := error(errAdoptedProcessExited)
-				isTimedOut := !rec.Unlimited && !rec.Deadline.IsZero() && !time.Now().Before(rec.Deadline)
-				if isTimedOut {
-					resErr = &timeoutError{timeout: max(0, rec.Deadline.Sub(rec.Started))}
-				}
-				note := fmt.Sprintf("completed pending post-exit group cleanup for PID %d (pgid %d) after harness restart; %s",
-					id.PID, id.PGID, pipeCaptureEndedNote(rec.OutputFile))
-				summary, preview, _, hasFile := summarizeOutputFile(rec.OutputFile, rec.Cwd)
-				if !hasFile {
-					summary = fmt.Sprintf("(adopted background job exited; %s)", note)
-				} else {
-					summary += "\n[" + note + "]"
-				}
-				rec.FinishedAt = time.Now()
-				rec.Error = resErr.Error()
-				rec.RecoveryNote = note
-				rec.ExitCodeUnknown = !isTimedOut
-				job := e.newRecoveredJobObject(rec, jobsDir, JobDone, false, adoptionNoticed, note, JobResult{
-					Output:          summary,
-					Err:             resErr,
-					ExitCode:        -1,
-					ExitCodeUnknown: !isTimedOut,
-					Preview:         preview,
-				})
-				job.Adopted = true
-				if e.Audit != nil {
-					e.Audit(AuditEntry{
-						InvocationID: job.InvocationID,
-						ToolCallID:   job.ToolCallID,
-						TS:           time.Now(),
-						Kind:         "bash",
-						Tool:         "bash",
-						Args:         truncate(job.Command, 500),
-						ExitCode:     -1,
-						Error:        resErr.Error(),
+				gerr := stopGroupAfterExitTrackFn(&proof)
+				if errors.Is(gerr, ErrProcessIdentityMismatch) {
+					reason := fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr)
+					if rec.FinishedAt.IsZero() {
+						rec.FinishedAt = time.Now()
+					}
+					summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
+					job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
+						Output:          summary,
+						Err:             errors.New(reason),
+						ExitCode:        -1,
+						ExitCodeUnknown: true,
+						Preview:         preview,
 					})
+					if jobsDir != "" {
+						_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+					}
+					return job, nil
 				}
-				if jobsDir != "" {
-					_ = savePersistedJob(jobsDir, job.persistedSnapshot())
+				if gerr == nil || errors.Is(gerr, os.ErrProcessDone) {
+					resErr := error(errAdoptedProcessExited)
+					isTimedOut := !rec.Unlimited && !rec.Deadline.IsZero() && !time.Now().Before(rec.Deadline)
+					if isTimedOut {
+						resErr = &timeoutError{timeout: max(0, rec.Deadline.Sub(rec.Started))}
+					}
+					note := fmt.Sprintf("completed pending post-exit group cleanup for PID %d (pgid %d) after harness restart; %s",
+						id.PID, id.PGID, pipeCaptureEndedNote(rec.OutputFile))
+					summary, preview := formatAdoptedSummaryPreview(rec.OutputFile, rec.Cwd, fmt.Sprintf("(adopted background job exited; %s)", note), note)
+					job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
+					job.Adopted = true
+					job.finishAdoptedWithAudit(JobResult{
+						Output:          summary,
+						Err:             resErr,
+						ExitCode:        -1,
+						ExitCodeUnknown: !isTimedOut,
+						Preview:         preview,
+					}, e.Audit, -1, resErr)
+					return job, nil
 				}
-				return job, nil
+				note := fmt.Sprintf("adopted pending group cleanup for exited PID %d (pgid %d); stop error (%v) — job remains stoppable; %s",
+					id.PID, id.PGID, gerr, pipeCaptureEndedNote(rec.OutputFile))
+				job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
+				job.WaitError = gerr.Error()
+				job.monitorFailed = true
+				job.cleanupPending = true
+				job.groupProof = cloneGroupProof(proof)
+				return e.attachAdoptedStopControls(job, jobsDir)
 			}
-			note := fmt.Sprintf("adopted pending group cleanup for exited PID %d (pgid %d); stop error (%v) — job remains stoppable; %s",
-				id.PID, id.PGID, gerr, pipeCaptureEndedNote(rec.OutputFile))
-			job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
-			job.WaitError = gerr.Error()
-			job.monitorFailed = true
-			job.cleanupPending = true
-			job.groupProof = cloneGroupProof(proof)
-			return e.attachAdoptedStopControls(job, jobsDir)
 		}
 
 		var reason string
@@ -973,9 +971,15 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 
 func (e *Executor) attachAdoptedStopControls(job *Job, jobsDir string) (*Job, *adoptionMonitor) {
 	waitCtx, cancelCause := context.WithCancelCause(context.Background())
+	closeCh := make(chan struct{})
+	var closeOnce sync.Once
+	markClosed := func() {
+		closeOnce.Do(func() { close(closeCh) })
+	}
 	job.monitorDone = make(chan struct{})
 	job.cancel = func() { cancelCause(context.Canceled) }
 	job.closeStop = func() error {
+		markClosed()
 		stopErr := job.stopAdoptedProcess(ErrExecutorClosed, false)
 		if errors.Is(stopErr, ErrProcessIdentityMismatch) {
 			cancelCause(ErrProcessIdentityMismatch)
@@ -994,7 +998,7 @@ func (e *Executor) attachAdoptedStopControls(job *Job, jobsDir string) (*Job, *a
 	if jobsDir != "" {
 		_ = savePersistedJob(jobsDir, job.persistedSnapshot())
 	}
-	return job, &adoptionMonitor{job: job, ctx: waitCtx, cancelCause: cancelCause}
+	return job, &adoptionMonitor{job: job, ctx: waitCtx, cancelCause: cancelCause, closeCh: closeCh}
 }
 
 // JobsDirPath returns the directory storing durable background-job metadata.
@@ -1425,11 +1429,9 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		}
 		timer := time.NewTimer(cleanupBackoff)
 		select {
-		case <-ctx.Done():
+		case <-m.closeCh:
 			timer.Stop()
-			if errors.Is(context.Cause(ctx), ErrExecutorClosed) {
-				return
-			}
+			return
 		case <-job.Done():
 			timer.Stop()
 			return
@@ -1437,46 +1439,16 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		}
 		cleanupBackoff = min(cleanupBackoff*2, 2*time.Second)
 	}
-	if job.Status() != JobRunning {
-		return
-	}
 
-	summary, preview, _, hasFile := summarizeOutputFile(job.OutputFile, job.Cwd)
-	if !hasFile {
-		summary = fmt.Sprintf("(adopted background job exited; %s)", pipeCaptureEndedNote(job.OutputFile))
-	} else {
-		summary += "\n[" + pipeCaptureEndedNote(job.OutputFile) + "]"
-	}
-	if preview != nil {
-		note := "[" + pipeCaptureEndedNote(job.OutputFile) + "]"
-		if preview.Notice != "" {
-			preview.Notice += "\n" + note
-		} else {
-			preview.Notice = note
-		}
-	}
-	if audit != nil {
-		entry := AuditEntry{
-			InvocationID: job.InvocationID,
-			ToolCallID:   job.ToolCallID,
-			TS:           time.Now(),
-			Kind:         "bash",
-			Tool:         "bash",
-			Args:         truncate(job.Command, 500),
-			ExitCode:     exitCode,
-		}
-		if err != nil {
-			entry.Error = err.Error()
-		}
-		audit(entry)
-	}
-	job.finish(JobResult{
+	note := pipeCaptureEndedNote(job.OutputFile)
+	summary, preview := formatAdoptedSummaryPreview(job.OutputFile, job.Cwd, fmt.Sprintf("(adopted background job exited; %s)", note), note)
+	job.finishAdoptedWithAudit(JobResult{
 		Output:          summary,
 		Err:             err,
 		ExitCode:        exitCode,
 		ExitCodeUnknown: !exitKnown && !isTimedOut,
 		Preview:         preview,
-	})
+	}, audit, exitCode, err)
 }
 
 func (j *Job) cleanupAdoptedGroupAfterExit() bool {
@@ -1492,15 +1464,13 @@ func (j *Job) cleanupAdoptedGroupAfterExit() bool {
 		j.mu.Unlock()
 		return false
 	}
-	if j.groupProof.ExitObservedAt.IsZero() {
-		j.groupProof.ExitObservedAt = time.Now()
-	}
-	proof := j.snapshotGroupProofLocked()
+	proof := j.preparePendingPostExitCleanupLocked()
 	outFile, cwd := j.OutputFile, j.Cwd
 	j.mu.Unlock()
 
-	stopGroupAfterExitFn := j.stopGroupAfterExitFn()
-	gerr := stopGroupAfterExitFn(proof)
+	j.persist()
+	gerr := j.runStopGroupAfterExit(&proof)
+	j.mergeLearnedGroupMembers(proof)
 	if errors.Is(gerr, ErrProcessIdentityMismatch) {
 		locked = false
 		j.proofFDMu.Unlock()
@@ -1591,12 +1561,18 @@ func FindOrphanedRunningJobs(jobsDir, outputID, outputDir string) ([]RecoveredJo
 			continue
 		}
 		id := ProcessIdentityInfo{PID: rec.PID, PGID: rec.PGID, StartToken: rec.ProcessStarted}
-		if !id.Matches(inspectProcess(rec.PID)) {
-			continue
-		}
 		outFile := rec.OutputFile
 		if !validRecoveredOutputPath(outFile, rec.OutputID, outputID, outputDir) {
 			outFile = ""
+		}
+		if !id.Matches(inspectProcess(rec.PID)) {
+			if !id.Valid() || rec.GroupProof == nil || rec.GroupProof.VerifiedAt.IsZero() {
+				continue
+			}
+			proof := groupProofFromPersisted(rec, id, outFile)
+			if !hasVerifiedLiveGroupMember(proof) {
+				continue
+			}
 		}
 		out = append(out, RecoveredJob{
 			ID:         rec.ID,

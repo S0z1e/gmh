@@ -689,6 +689,7 @@ type startedBashProcess struct {
 	pid               int
 	pgid              int
 	startToken        string
+	info              processInfo
 }
 
 func (e *Executor) startBashProcess(ctx context.Context, command string, timeout time.Duration, output *bashOutputFile, dir string, extraEnv ...string) (*startedBashProcess, error) {
@@ -773,10 +774,11 @@ func (e *Executor) startBashProcess(ctx context.Context, command string, timeout
 	pid := 0
 	pgid := 0
 	var startToken string
+	var info processInfo
 	if cmd.Process != nil {
 		pid = cmd.Process.Pid
 		pgid = processGroupID(pid)
-		info := inspectProcess(pid)
+		info = inspectProcess(pid)
 		if info.PGID > 0 {
 			pgid = info.PGID
 		}
@@ -801,6 +803,7 @@ func (e *Executor) startBashProcess(ctx context.Context, command string, timeout
 		pid:               pid,
 		pgid:              pgid,
 		startToken:        startToken,
+		info:              info,
 	}, nil
 }
 
@@ -1105,6 +1108,20 @@ func (e *Executor) startBashJob(ctx context.Context, a BashArgs, foreground bool
 		job.PID = proc.pid
 		job.PGID = proc.pgid
 		job.ProcessStarted = proc.startToken
+		id := ProcessIdentityInfo{PID: proc.pid, PGID: proc.pgid, StartToken: proc.startToken}
+		if id.Valid() {
+			job.groupProof = processGroupProof{
+				Leader:       id,
+				UID:          proc.info.UID,
+				HasUID:       proc.info.HasUID,
+				SID:          proc.info.SID,
+				Sess:         proc.info.Sess,
+				JobToken:     jobToken,
+				OutputFile:   job.OutputFile,
+				KnownMembers: map[int]string{id.PID: id.StartToken},
+				VerifiedAt:   time.Now(),
+			}
+		}
 		job.mu.Unlock()
 	}
 	if e.beforeJobPublish != nil {
@@ -1287,11 +1304,96 @@ func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
 	return out
 }
 
-func (j *Job) stopGroupAfterExitFn() func(processGroupProof) error {
+func (j *Job) runStopGroupAfterExit(proof *processGroupProof) error {
 	if j.exec != nil && j.exec.stopAdoptedGroupAfterExit != nil {
-		return j.exec.stopAdoptedGroupAfterExit
+		return j.exec.stopAdoptedGroupAfterExit(*proof)
 	}
-	return stopAdoptedProcessGroupAfterExit
+	return stopAdoptedProcessGroupAfterExitTrack(proof)
+}
+
+func formatAdoptedSummaryPreview(outFile, cwd, emptyMsg, fileNote string) (string, *BashOutputPreview) {
+	summary, preview, _, hasFile := summarizeOutputFile(outFile, cwd)
+	if !hasFile {
+		summary = emptyMsg
+	} else {
+		summary += "\n[" + fileNote + "]"
+	}
+	if preview != nil {
+		note := "[" + fileNote + "]"
+		if preview.Notice != "" {
+			preview.Notice += "\n" + note
+		} else {
+			preview.Notice = note
+		}
+	}
+	return summary, preview
+}
+
+func (j *Job) finishAdoptedWithAudit(r JobResult, auditFn func(AuditEntry), auditCode int, auditErr error) bool {
+	j.mu.Lock()
+	if j.finished || j.unknown {
+		j.mu.Unlock()
+		return false
+	}
+	if j.stopParent != nil {
+		j.stopParent()
+		j.stopParent = nil
+	}
+	if j.stopDeadline != nil {
+		j.stopDeadline()
+		j.stopDeadline = nil
+	}
+	j.result = r
+	j.finished = true
+	j.cleanupPending = false
+	j.finishedAt = time.Now()
+	registry, delivered := j.registry, j.delivered
+	invID, callID, cmd := j.InvocationID, j.ToolCallID, j.Command
+	execRef, outFile, outputDir := j.exec, j.OutputFile, j.outputDir
+	j.mu.Unlock()
+
+	j.closeProofFDs()
+	if execRef != nil && outFile != "" && outputDir != "" {
+		execRef.unmarkActiveOutput(outputDir, outFile)
+	}
+	if delivered && registry != nil {
+		registry.trimDelivered()
+	}
+	j.persist()
+	if auditFn != nil {
+		entry := AuditEntry{
+			InvocationID: invID,
+			ToolCallID:   callID,
+			TS:           time.Now(),
+			Kind:         "bash",
+			Tool:         "bash",
+			Args:         truncate(cmd, 500),
+			ExitCode:     auditCode,
+		}
+		if auditErr != nil {
+			entry.Error = auditErr.Error()
+		}
+		auditFn(entry)
+	}
+	close(j.done)
+	return true
+}
+
+func (j *Job) preparePendingPostExitCleanupLocked() processGroupProof {
+	j.cleanupPending = true
+	if !j.groupProof.VerifiedAt.IsZero() && j.groupProof.ExitObservedAt.IsZero() {
+		j.groupProof.ExitObservedAt = time.Now()
+	}
+	return j.snapshotGroupProofLocked()
+}
+
+func (j *Job) mergeLearnedGroupMembers(proof processGroupProof) {
+	if len(proof.KnownMembers) == 0 {
+		return
+	}
+	j.mu.Lock()
+	j.groupProof.KnownMembers = mergeGroupMembers(j.groupProof.KnownMembers, proof.KnownMembers)
+	j.mu.Unlock()
 }
 
 func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
@@ -1304,7 +1406,7 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	}
 	id := ProcessIdentityInfo{PID: j.PID, PGID: j.PGID, StartToken: j.ProcessStarted}
 	outFile, cwd, monitorFailed := j.OutputFile, j.Cwd, j.monitorFailed
-	execRef, outputDir, auditFn := j.exec, j.outputDir, j.audit
+	auditFn := j.audit
 	started, deadline := j.Started, j.Deadline
 	monitorDone := false
 	if j.monitorDone != nil {
@@ -1316,8 +1418,6 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	}
 	mustFinalize := monitorFailed || monitorDone
 	j.mu.Unlock()
-
-	stopGroupAfterExitFn := j.stopGroupAfterExitFn()
 
 	// Refresh verified PGID members while the leader may still be alive so any
 	// reparented children remain verifiable if the leader exits or wait fails.
@@ -1332,12 +1432,11 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 	}
 	if errors.Is(err, os.ErrProcessDone) {
 		j.mu.Lock()
-		if !j.groupProof.VerifiedAt.IsZero() && j.groupProof.ExitObservedAt.IsZero() {
-			j.groupProof.ExitObservedAt = time.Now()
-		}
-		proof = j.snapshotGroupProofLocked()
+		proof = j.preparePendingPostExitCleanupLocked()
 		j.mu.Unlock()
-		gerr := stopGroupAfterExitFn(proof)
+		j.persist()
+		gerr := j.runStopGroupAfterExit(&proof)
+		j.mergeLearnedGroupMembers(proof)
 		j.proofFDMu.Unlock()
 		if errors.Is(gerr, ErrProcessIdentityMismatch) {
 			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
@@ -1359,17 +1458,16 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 		j.mu.Lock()
 		stillActive := !j.finished && !j.unknown
 		if stillActive {
-			if j.groupProof.ExitObservedAt.IsZero() {
-				j.groupProof.ExitObservedAt = time.Now()
-			}
-			proof = j.snapshotGroupProofLocked()
+			proof = j.preparePendingPostExitCleanupLocked()
 		}
 		j.mu.Unlock()
 		if !stillActive {
 			j.proofFDMu.Unlock()
 			return nil
 		}
-		gerr := stopGroupAfterExitFn(proof)
+		j.persist()
+		gerr := j.runStopGroupAfterExit(&proof)
+		j.mergeLearnedGroupMembers(proof)
 		j.proofFDMu.Unlock()
 		if errors.Is(gerr, ErrProcessIdentityMismatch) {
 			summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
@@ -1384,20 +1482,8 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 		j.proofFDMu.Unlock()
 	}
 	if mustFinalize {
-		summary, preview, _, hasFile := summarizeOutputFile(outFile, cwd)
 		note := pipeCaptureEndedNote(outFile)
-		if !hasFile {
-			summary = fmt.Sprintf("(adopted background job stopped; %s)", note)
-		} else {
-			summary += "\n[" + note + "]"
-		}
-		if preview != nil {
-			if preview.Notice != "" {
-				preview.Notice += "\n[" + note + "]"
-			} else {
-				preview.Notice = "[" + note + "]"
-			}
-		}
+		summary, preview := formatAdoptedSummaryPreview(outFile, cwd, fmt.Sprintf("(adopted background job stopped; %s)", note), note)
 		resErr := cause
 		var exitCode int
 		var exitUnknown bool
@@ -1408,31 +1494,13 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 			exitCode = -1
 			exitUnknown = true
 		}
-		if execRef != nil && outFile != "" && outputDir != "" {
-			execRef.unmarkActiveOutput(outputDir, outFile)
-		}
-		if auditFn != nil {
-			entry := AuditEntry{
-				InvocationID: j.InvocationID,
-				ToolCallID:   j.ToolCallID,
-				TS:           time.Now(),
-				Kind:         "bash",
-				Tool:         "bash",
-				Args:         truncate(j.Command, 500),
-				ExitCode:     -1,
-			}
-			if resErr != nil {
-				entry.Error = resErr.Error()
-			}
-			auditFn(entry)
-		}
-		j.finish(JobResult{
+		j.finishAdoptedWithAudit(JobResult{
 			Output:          summary,
 			Err:             resErr,
 			ExitCode:        exitCode,
 			ExitCodeUnknown: exitUnknown,
 			Preview:         preview,
-		})
+		}, auditFn, -1, resErr)
 		return nil
 	}
 	j.persist()

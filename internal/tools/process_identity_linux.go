@@ -504,7 +504,151 @@ func stopKnownMembersFDFree(proof processGroupProof, origErr error) error {
 	return signalVerifiedGroupByFD(proof, origErr, proof.KnownMembers, false)
 }
 
+type linuxGroupCandidate struct {
+	pid      int
+	meta     linuxProcMeta
+	verified bool
+}
+
+func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentityInfo, leaderBoot string, leaderTicks uint64) (candidates []linuxGroupCandidate, handleErr error, mismatchErr error) {
+	entries, err := readProcDirFn()
+	if err != nil {
+		return nil, err, nil
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() || len(name) == 0 || name[0] < '0' || name[0] > '9' {
+			continue
+		}
+		pid, perr := strconv.Atoi(name)
+		if perr != nil || pid <= 0 {
+			continue
+		}
+		meta, merr := inspectLinuxProcMeta(pid)
+		if merr != nil {
+			handleErr = merr
+			break
+		}
+		if !meta.info.Alive || meta.info.PGID != id.PGID {
+			continue
+		}
+		verified := false
+		if pid == id.PID {
+			if meta.info.StartToken != id.StartToken {
+				return nil, nil, fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+			}
+			verified = true
+		}
+		if proof.HasUID && meta.info.HasUID && meta.info.UID != proof.UID {
+			return nil, nil, fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+		}
+		if proof.SID > 0 && meta.info.SID != proof.SID {
+			return nil, nil, fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+		}
+		mBoot, _, _ := parseLinuxStartToken(meta.info.StartToken)
+		if leaderBoot != "" && mBoot != "" && mBoot != leaderBoot {
+			return nil, nil, fmt.Errorf("refusing to signal pgid %d: boot mismatch: %w", id.PGID, ErrProcessIdentityMismatch)
+		}
+		if meta.startTicks < leaderTicks {
+			return nil, nil, fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+		}
+		if proof.KnownMembers[pid] == meta.info.StartToken {
+			verified = true
+		} else if meta.ppid == id.PID {
+			verified = true
+		}
+		if !verified && proof.JobToken != "" {
+			hasTok, tokErr := processHasJobTokenErr(pid, proof.JobToken)
+			if isFDLimitErr(tokErr) {
+				handleErr = tokErr
+				break
+			}
+			if hasTok {
+				verified = true
+			}
+		}
+		if !verified && (proof.OutputFile != "" || len(proof.LeaderPipeTargets) > 0) {
+			hasFD, fdErr := processHasInheritedFDMatchErr(pid, proof.OutputFile, proof.LeaderPipeTargets)
+			if isFDLimitErr(fdErr) {
+				handleErr = fdErr
+				break
+			}
+			if hasFD {
+				verified = true
+			}
+		}
+		if verified {
+			if proof.KnownMembers == nil {
+				proof.KnownMembers = make(map[int]string)
+			}
+			if proof.KnownMembers[pid] == "" {
+				proof.KnownMembers[pid] = meta.info.StartToken
+			}
+		}
+		candidates = append(candidates, linuxGroupCandidate{pid: pid, meta: meta, verified: verified})
+	}
+	// Resolve multi-hop parent ancestry transitively regardless of /proc PID order,
+	// persisting newly verified identities immediately into proof.KnownMembers.
+	for {
+		added := false
+		for i := range candidates {
+			c := &candidates[i]
+			if c.verified {
+				continue
+			}
+			if parentTok, ok := proof.KnownMembers[c.meta.ppid]; ok {
+				pBoot, pTicks, parsed := parseLinuxStartToken(parentTok)
+				if parsed && (leaderBoot == "" || pBoot == "" || pBoot == leaderBoot) && c.meta.startTicks >= pTicks {
+					c.verified = true
+					if proof.KnownMembers == nil {
+						proof.KnownMembers = make(map[int]string)
+					}
+					if proof.KnownMembers[c.pid] == "" {
+						proof.KnownMembers[c.pid] = c.meta.info.StartToken
+					}
+					added = true
+				}
+			}
+		}
+		if !added {
+			break
+		}
+	}
+	return candidates, handleErr, nil
+}
+
+func hasVerifiedLiveGroupMember(proof processGroupProof) bool {
+	id := proof.Leader
+	if !id.Valid() {
+		return false
+	}
+	leaderBoot, leaderTicks, hasLeaderStart := parseLinuxStartToken(id.StartToken)
+	if !hasLeaderStart {
+		return false
+	}
+	cloned := cloneGroupProof(proof)
+	candidates, handleErr, mismatchErr := collectAndVerifyLinuxCandidates(&cloned, id, leaderBoot, leaderTicks)
+	if mismatchErr != nil || handleErr != nil || len(candidates) == 0 {
+		return false
+	}
+	for _, c := range candidates {
+		if c.verified {
+			return true
+		}
+	}
+	return canRetryIncompleteGroupProof(proof)
+}
+
 func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
+	cloned := cloneGroupProof(proof)
+	cloned.verifiedFDs = proof.verifiedFDs
+	return stopAdoptedProcessGroupAfterExitTrack(&cloned)
+}
+
+func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
+	if proof == nil {
+		return ErrProcessIdentityMismatch
+	}
 	id := proof.Leader
 	if !id.Valid() {
 		return ErrProcessIdentityMismatch
@@ -515,7 +659,7 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	}
 	info, err := inspectProcessErr(id.PID)
 	if isFDLimitErr(err) {
-		return stopKnownMembersFDFree(proof, err)
+		return stopKnownMembersFDFree(*proof, err)
 	}
 	if err != nil {
 		return err
@@ -529,13 +673,16 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 		bootSec, hasBoot = linuxBootUnixSec()
 	}
 
-	// Keep KnownMembers mutable on a cloned copy across passes so verified members
-	// discovered in one pass retain ancestry for grandchildren forked before SIGKILL.
-	scanProof := cloneGroupProof(proof)
+	// Keep KnownMembers mutable on a cloned copy across passes and retain any newly
+	// verified identities back into proof.KnownMembers even if a pass fails mid-way.
+	scanProof := cloneGroupProof(*proof)
 	scanProof.verifiedFDs = proof.verifiedFDs
 	if scanProof.KnownMembers == nil {
 		scanProof.KnownMembers = make(map[int]string)
 	}
+	defer func() {
+		proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, scanProof.KnownMembers)
+	}()
 
 	const maxPasses = 32
 	deadline := time.Now().Add(2 * time.Second)
@@ -580,13 +727,17 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 }
 
 func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessIdentityInfo, leaderBoot string, leaderTicks uint64, bootSec int64, hasBoot bool) (signalled bool, empty bool, liveCount int, err error) {
-	entries, err := os.ReadDir("/proc")
-	if isFDLimitErr(err) {
-		return false, false, 0, stopKnownMembersFDFree(*proof, err)
+	candidates, handleErr, mismatchErr := collectAndVerifyLinuxCandidates(proof, id, leaderBoot, leaderTicks)
+	if mismatchErr != nil {
+		return false, false, 0, mismatchErr
 	}
-	if err != nil {
-		return false, false, 0, err
+	if handleErr != nil && len(candidates) == 0 {
+		if isFDLimitErr(handleErr) {
+			return false, false, 0, stopKnownMembersFDFree(*proof, handleErr)
+		}
+		return false, false, 0, handleErr
 	}
+
 	liveMembers := 0
 	unverifiedMembers := 0
 	goneMembers := 0
@@ -598,96 +749,32 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 			_ = unix.Close(fd)
 		}
 	}()
-	var handleErr error
-	for _, entry := range entries {
-		name := entry.Name()
-		if !entry.IsDir() || len(name) == 0 || name[0] < '0' || name[0] > '9' {
-			continue
-		}
-		pid, perr := strconv.Atoi(name)
-		if perr != nil || pid <= 0 {
-			continue
-		}
-		meta, merr := inspectLinuxProcMeta(pid)
-		if merr != nil {
-			handleErr = merr
-			break
-		}
-		if !meta.info.Alive || meta.info.PGID != id.PGID {
-			continue
-		}
-		memberVerified := false
-		if pid == id.PID {
-			if meta.info.StartToken != id.StartToken {
-				return false, false, liveMembers, fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
-			}
-			memberVerified = true
-		}
-		if proof.HasUID && meta.info.HasUID && meta.info.UID != proof.UID {
-			return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
-		}
-		if proof.SID > 0 && meta.info.SID != proof.SID {
-			return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
-		}
-		mBoot, _, _ := parseLinuxStartToken(meta.info.StartToken)
-		if leaderBoot != "" && mBoot != "" && mBoot != leaderBoot {
-			return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: boot mismatch: %w", id.PGID, ErrProcessIdentityMismatch)
-		}
-		if meta.startTicks < leaderTicks {
-			return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
-		}
-		if proof.KnownMembers[pid] == meta.info.StartToken {
-			memberVerified = true
-		} else if meta.ppid == id.PID {
-			memberVerified = true
-		} else if parentTok, ok := proof.KnownMembers[meta.ppid]; ok {
-			pBoot, pTicks, parsed := parseLinuxStartToken(parentTok)
-			if parsed && (leaderBoot == "" || pBoot == "" || pBoot == leaderBoot) && meta.startTicks >= pTicks {
-				memberVerified = true
-			}
-		} else if proof.JobToken != "" {
-			hasTok, tokErr := processHasJobTokenErr(pid, proof.JobToken)
-			if isFDLimitErr(tokErr) {
-				handleErr = tokErr
-				break
-			}
-			if hasTok {
-				memberVerified = true
-			}
-		}
-		if !memberVerified && (proof.OutputFile != "" || len(proof.LeaderPipeTargets) > 0) {
-			hasFD, fdErr := processHasInheritedFDMatchErr(pid, proof.OutputFile, proof.LeaderPipeTargets)
-			if isFDLimitErr(fdErr) {
-				handleErr = fdErr
-				break
-			}
-			if hasFD {
-				memberVerified = true
-			}
-		}
-		if !memberVerified && !proof.ExitObservedAt.IsZero() && hasBoot {
+	for _, cand := range candidates {
+		pid := cand.pid
+		meta := cand.meta
+		if !cand.verified && !proof.ExitObservedAt.IsZero() && hasBoot {
 			memberStart := time.Unix(bootSec+int64(meta.startTicks/100), int64((meta.startTicks%100)*10_000_000))
 			if memberStart.After(proof.ExitObservedAt.Add(2 * time.Second)) {
 				return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 			}
 		}
 		liveMembers++
-		if !memberVerified {
+		if !cand.verified {
 			unverifiedMembers++
 			continue
 		}
 		groupVerified = true
-		if proof.KnownMembers[pid] == "" {
-			proof.KnownMembers[pid] = meta.info.StartToken
-		}
 		if existing, ok := proof.verifiedFDs[pid]; ok && existing.fd > 0 && existing.startToken == meta.info.StartToken {
 			verifiedFDs = append(verifiedFDs, existing.fd)
+			continue
+		}
+		if handleErr != nil {
 			continue
 		}
 		fd, ferr := unix.PidfdOpen(pid, 0)
 		if isFDLimitErr(ferr) {
 			handleErr = ferr
-			break
+			continue
 		}
 		if errors.Is(ferr, unix.ESRCH) {
 			goneMembers++
@@ -705,7 +792,7 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 			_ = unix.Close(fd)
 			if isFDLimitErr(merr) {
 				handleErr = merr
-				break
+				continue
 			}
 			if handleErr == nil {
 				handleErr = merr

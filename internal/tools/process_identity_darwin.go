@@ -182,7 +182,110 @@ func darwinResolveGroupKillError(pgid int, err error) error {
 	return os.ErrProcessDone
 }
 
+func darwinResolveGroupCandidates(proof processGroupProof, id ProcessIdentityInfo, leaderSec int64, leaderUsec int32, procs []unix.KinfoProc) (known map[int]string, liveCount int, err error) {
+	known = mergeGroupMembers(nil, proof.KnownMembers)
+	for _, p := range procs {
+		if p.Proc.P_stat == 5 {
+			continue
+		}
+		liveCount++
+		pid := int(p.Proc.P_pid)
+		pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
+		tok := fmt.Sprintf("%d:%d", pSec, pUsec)
+		if pid == id.PID {
+			if tok != id.StartToken {
+				return nil, liveCount, fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+			}
+			known[pid] = tok
+		}
+		if proof.HasUID && p.Eproc.Ucred.Uid != proof.UID {
+			return nil, liveCount, fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+		}
+		if proof.Sess != 0 && p.Eproc.Sess != proof.Sess {
+			return nil, liveCount, fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+		}
+		if proof.SID > 0 {
+			if msid, serr := unix.Getsid(pid); serr == nil && msid != proof.SID {
+				return nil, liveCount, fmt.Errorf("refusing to signal pgid %d: member pid %d sid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+			}
+		}
+		if darwinStartTimeBefore(pSec, pUsec, leaderSec, leaderUsec) {
+			return nil, liveCount, fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+		}
+	}
+	// Resolve descendant ancestry transitively so multi-hop children forked after
+	// leader exit (c1 -> c2 -> c3) inherit verification across hops.
+	for {
+		added := false
+		for _, p := range procs {
+			if p.Proc.P_stat == 5 {
+				continue
+			}
+			pid := int(p.Proc.P_pid)
+			pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
+			tok := fmt.Sprintf("%d:%d", pSec, pUsec)
+			if existing, ok := known[pid]; ok && existing == tok {
+				continue
+			}
+			ppid := int(p.Eproc.Ppid)
+			if ppid == id.PID {
+				known[pid] = tok
+				added = true
+			} else if parentTok, ok := known[ppid]; ok {
+				parentSec, parentUsec, parsed := parseDarwinStartTime(parentTok)
+				if parsed && !darwinStartTimeBefore(pSec, pUsec, parentSec, parentUsec) {
+					known[pid] = tok
+					added = true
+				}
+			}
+		}
+		if !added {
+			break
+		}
+	}
+	return known, liveCount, nil
+}
+
+func hasVerifiedLiveGroupMember(proof processGroupProof) bool {
+	id := proof.Leader
+	if !id.Valid() {
+		return false
+	}
+	leaderSec, leaderUsec, hasLeaderStart := parseDarwinStartTime(id.StartToken)
+	if !hasLeaderStart {
+		return false
+	}
+	procs, queryErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", id.PGID)
+	if queryErr != nil {
+		return false
+	}
+	known, liveCount, err := darwinResolveGroupCandidates(proof, id, leaderSec, leaderUsec, procs)
+	if err != nil || liveCount == 0 {
+		return false
+	}
+	for _, p := range procs {
+		if p.Proc.P_stat == 5 {
+			continue
+		}
+		pid := int(p.Proc.P_pid)
+		pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
+		tok := fmt.Sprintf("%d:%d", pSec, pUsec)
+		if known[pid] == tok {
+			return true
+		}
+	}
+	return !proof.VerifiedAt.IsZero() && proof.SID > 0 && proof.SID == id.PID && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken
+}
+
 func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
+	cloned := cloneGroupProof(proof)
+	return stopAdoptedProcessGroupAfterExitTrack(&cloned)
+}
+
+func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
+	if proof == nil {
+		return ErrProcessIdentityMismatch
+	}
 	id := proof.Leader
 	if !id.Valid() {
 		return ErrProcessIdentityMismatch
@@ -203,8 +306,17 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 		return queryErr
 	}
 
-	verifiedMembers := 0
+	known, liveCount, cerr := darwinResolveGroupCandidates(*proof, id, leaderSec, leaderUsec, procs)
+	if cerr != nil {
+		return cerr
+	}
+	if liveCount == 0 {
+		return os.ErrProcessDone
+	}
+	proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, known)
+
 	groupVerified := false
+	hasSetsidProof := !proof.VerifiedAt.IsZero() && proof.SID > 0 && proof.SID == id.PID && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken
 	for _, p := range procs {
 		if p.Proc.P_stat == 5 {
 			continue
@@ -212,55 +324,19 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 		pid := int(p.Proc.P_pid)
 		pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
 		tok := fmt.Sprintf("%d:%d", pSec, pUsec)
-		directVerified := false
-		if pid == id.PID {
-			if tok != id.StartToken {
-				return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
-			}
-			directVerified = true
-		}
-		if proof.HasUID && p.Eproc.Ucred.Uid != proof.UID {
-			return fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
-		}
-		if proof.Sess != 0 && p.Eproc.Sess != proof.Sess {
-			return fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
-		}
-		if proof.SID > 0 {
-			if msid, serr := unix.Getsid(pid); serr == nil && msid != proof.SID {
-				return fmt.Errorf("refusing to signal pgid %d: member pid %d sid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
-			}
-		}
-		if darwinStartTimeBefore(pSec, pUsec, leaderSec, leaderUsec) {
-			return fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
-		}
-		if proof.KnownMembers[pid] == tok {
-			directVerified = true
-		} else if int(p.Eproc.Ppid) == id.PID {
-			directVerified = true
-		} else if parentTok, ok := proof.KnownMembers[int(p.Eproc.Ppid)]; ok {
-			parentSec, parentUsec, parsed := parseDarwinStartTime(parentTok)
-			if parsed && !darwinStartTimeBefore(pSec, pUsec, parentSec, parentUsec) {
-				directVerified = true
-			}
-		}
+		directVerified := known[pid] == tok
 		if !directVerified && !proof.ExitObservedAt.IsZero() {
 			memberStart := time.Unix(pSec, int64(pUsec)*1000)
 			if memberStart.After(proof.ExitObservedAt.Add(10 * time.Millisecond)) {
 				return fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 			}
 		}
-		if directVerified {
-			groupVerified = true
-		} else if !proof.VerifiedAt.IsZero() && proof.SID > 0 && proof.SID == id.PID && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken {
+		if directVerified || hasSetsidProof {
 			groupVerified = true
 		}
-		verifiedMembers++
-	}
-	if verifiedMembers == 0 {
-		return os.ErrProcessDone
 	}
 	if !groupVerified {
-		if canRetryIncompleteGroupProof(proof) {
+		if canRetryIncompleteGroupProof(*proof) {
 			return fmt.Errorf("incomplete verification proof for tokenless pgid %d: %w", id.PGID, errIncompleteGroupProof)
 		}
 		return fmt.Errorf("refusing to signal unverified pgid %d after leader disappeared: %w", id.PGID, ErrProcessIdentityMismatch)

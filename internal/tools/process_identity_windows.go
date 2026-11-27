@@ -102,6 +102,15 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	return stopVerifiedProcessGroup(proof.Leader)
 }
 
+func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
+	if proof == nil {
+		return ErrProcessIdentityMismatch
+	}
+	return stopAdoptedProcessGroupAfterExit(*proof)
+}
+
+func hasVerifiedLiveGroupMember(proof processGroupProof) bool { return false }
+
 func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {
 	if !id.Valid() {
 		return -1, false, ErrProcessIdentityMismatch

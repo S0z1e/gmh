@@ -342,7 +342,7 @@ func TestCaptureVerifiedGroupProofPrunesExitedFDsLinux(t *testing.T) {
 	c1Gone := filepath.Join(root, "c1.gone")
 	c2File := filepath.Join(root, "c2.pid")
 	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf(
-		"sleep 30 & c1=$!; echo $c1 > %q; read _; kill -9 $c1 2>/dev/null; wait $c1 2>/dev/null; touch %q; read _; sleep 30 & echo $! > %q; sleep 30",
+		"sleep 30 & c1=$!; echo $c1 > %q; read _; kill -9 $c1 2>/dev/null; wait $c1 2>/dev/null; printf 'gone\\n' > %q; read _; sleep 30 & echo $! > %q; sleep 30",
 		c1File, c1Gone, c2File,
 	))
 	configureProcess(cmd)
@@ -406,7 +406,7 @@ func TestCaptureVerifiedGroupProofPrunesExitedFDsLinux(t *testing.T) {
 		t.Fatal(err)
 	}
 	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
-		if _, err := os.Stat(c1Gone); err == nil {
+		if b, err := os.ReadFile(c1Gone); err == nil && strings.TrimSpace(string(b)) == "gone" {
 			break
 		}
 		time.Sleep(15 * time.Millisecond)
@@ -559,5 +559,97 @@ func TestStopAdoptedProcessGroupAfterExitTokenlessLegacyAndRetryLinux(t *testing
 	}
 	if !inspectProcess(c2PID).Alive {
 		t.Fatalf("unverified child pid %d should not be killed blindly when proof is incomplete", c2PID)
+	}
+}
+
+func TestStopAdoptedProcessGroupAfterExitMultiHopPastCutoffAndRetainLinux(t *testing.T) {
+	root := t.TempDir()
+	c1File := filepath.Join(root, "c1.pid")
+	c2File := filepath.Join(root, "c2.pid")
+	c3File := filepath.Join(root, "c3.pid")
+	leaderRel := filepath.Join(root, "leader.rel")
+	// Leader spawns c1, waits until proof captures ONLY c1, then c1 spawns c2 -> c3
+	// before leader exits.
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf(
+		"( (sleep 30 & echo $! > %q; wait) & echo $! > %q; wait ) & c1=$!; echo $c1 > %q; while [ ! -f %q ]; do sleep 0.02; done; exit 0",
+		c3File, c2File, c1File, leaderRel,
+	))
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	leaderInfo := inspectProcess(leaderPID)
+
+	var c1PID, c2PID, c3PID int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b1, err := os.ReadFile(c1File); err == nil {
+			c1PID, _ = strconv.Atoi(strings.TrimSpace(string(b1)))
+		}
+		if b2, err := os.ReadFile(c2File); err == nil {
+			c2PID, _ = strconv.Atoi(strings.TrimSpace(string(b2)))
+		}
+		if b3, err := os.ReadFile(c3File); err == nil {
+			c3PID, _ = strconv.Atoi(strings.TrimSpace(string(b3)))
+		}
+		if c1PID > 0 && c2PID > 0 && c3PID > 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if c1PID <= 0 || c2PID <= 0 || c3PID <= 0 {
+		t.Fatalf("expected c1/c2/c3 pids, got %d/%d/%d", c1PID, c2PID, c3PID)
+	}
+	for _, p := range []int{c1PID, c2PID, c3PID} {
+		pidCopy := p
+		t.Cleanup(func() {
+			if proc, err := os.FindProcess(pidCopy); err == nil {
+				_ = proc.Kill()
+			}
+		})
+	}
+
+	c1Info := inspectProcess(c1PID)
+	if !c1Info.Alive {
+		t.Fatalf("c1 %d not alive", c1PID)
+	}
+	if err := os.WriteFile(leaderRel, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	// Seed proof ONLY with leader and c1, and set ExitObservedAt 10s in the past
+	// (well past Linux's 2s cutoff). Transitive resolution must verify c2 and c3
+	// via c1, retain them on EMFILE, and clean up all three when FDs are available.
+	c1Token := c1Info.StartToken
+	proof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: leaderInfo.PGID, StartToken: leaderInfo.StartToken},
+		UID:            leaderInfo.UID,
+		HasUID:         leaderInfo.HasUID,
+		SID:            leaderInfo.SID,
+		KnownMembers:   map[int]string{leaderPID: leaderInfo.StartToken, c1PID: c1Token},
+		VerifiedAt:     time.Now().Add(-15 * time.Second),
+		ExitObservedAt: time.Now().Add(-10 * time.Second),
+	}
+
+	// Simulate EMFILE on PidfdOpen during partial cleanup (0 FDs free after ReadDir):
+	// exhaust to 0 FDs except ReadDir? Use 1 FD free so ReadDir/meta succeed and PidfdOpen fails or revalidation hits EMFILE.
+	cleanupOne := exhaustFDsLeaving(t, 1)
+	emfileErr := stopAdoptedProcessGroupAfterExitTrack(&proof)
+	cleanupOne()
+	if !isFDLimitErr(emfileErr) {
+		t.Fatalf("expected EMFILE preserving learned members, got %v", emfileErr)
+	}
+	if proof.KnownMembers[c2PID] == "" || proof.KnownMembers[c3PID] == "" {
+		t.Fatalf("expected newly verified descendants c2 (%d) and c3 (%d) retained in KnownMembers on EMFILE: %+v", c2PID, c3PID, proof.KnownMembers)
+	}
+
+	if err := stopAdoptedProcessGroupAfterExitTrack(&proof); err != nil {
+		t.Fatalf("multi-hop cleanup past 2s Linux cutoff failed: %v", err)
+	}
+	for _, p := range []int{c1PID, c2PID, c3PID} {
+		if inspectProcess(p).Alive {
+			t.Fatalf("descendant pid %d survived transitive cleanup", p)
+		}
 	}
 }
