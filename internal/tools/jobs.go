@@ -468,15 +468,21 @@ func (r *JobRegistry) abortGeneration() uint64 {
 	return r.abortGen
 }
 
-func (r *JobRegistry) cancelAll() {
+func (r *JobRegistry) prepareCancelAll() func() {
 	r.mu.Lock()
 	r.abortGen++
 	jobs := make([]*Job, len(r.jobs))
 	copy(jobs, r.jobs)
 	r.mu.Unlock()
-	for _, job := range jobs {
-		job.Cancel()
+	return func() {
+		for _, job := range jobs {
+			job.Cancel()
+		}
 	}
+}
+
+func (r *JobRegistry) cancelAll() {
+	r.prepareCancelAll()()
 }
 
 func (r *JobRegistry) add(j *Job) {
@@ -1607,6 +1613,13 @@ func (e *Executor) CancelJobs() {
 // cancel commands from a subsequently selected session.
 func (e *Executor) SessionCanceller() func() {
 	return e.registry().cancelAll
+}
+
+// PrepareSessionCancel advances the registry's abort generation and snapshots
+// currently running jobs so callers holding a turn lock can release the lock
+// before signalling jobs, without racing against jobs started by a queued turn.
+func (e *Executor) PrepareSessionCancel() func() {
+	return e.registry().prepareCancelAll()
 }
 
 // Jobs returns a snapshot of all background jobs for this Executor.

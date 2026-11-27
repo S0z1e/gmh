@@ -553,9 +553,9 @@ func (s *Server) handleSetApprovalMode(req Request) {
 // waiting on a dialog: the loop blocks in ask(), which no context
 // cancellation can reach, so the approval must be failed directly.
 func (s *Server) handleAbort(req Request) {
-	var cancelJobs func()
-	if s.app != nil && s.app.Cfg != nil && s.app.Cfg.Exec != nil {
-		cancelJobs = s.app.Cfg.Exec.SessionCanceller()
+	var execRef *tools.Executor
+	if s.app != nil && s.app.Cfg != nil {
+		execRef = s.app.Cfg.Exec
 	}
 	s.turnMu.Lock()
 	cancel := s.turnCancel
@@ -567,11 +567,18 @@ func (s *Server) handleAbort(req Request) {
 	s.failApprovals(errAborted)
 	s.failContinuations(errAborted)
 	s.failQuestions(errAborted)
+	var stopJobs func()
+	if execRef != nil {
+		// Advance the abort generation and snapshot currently active jobs while
+		// holding turnMu so a queued turn starting immediately after Unlock cannot
+		// have its newly registered background work cancelled.
+		stopJobs = execRef.PrepareSessionCancel()
+	}
 	// Keep the next queued runTurn from registering new waiters until every
 	// waiter owned by the cancelled turn has been detached.
 	s.turnMu.Unlock()
-	if cancelJobs != nil {
-		cancelJobs()
+	if stopJobs != nil {
+		stopJobs()
 	}
 	s.respond(req, map[string]any{"aborted": cancel != nil}, nil)
 }

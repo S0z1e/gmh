@@ -159,6 +159,22 @@ func verifyPreCapturedMemberFD(proof processGroupProof, pid int, expectedToken s
 	} else if kerr != nil {
 		return true, false, kerr
 	}
+	// PidfdSendSignal(0) and Getpgid both succeed for unreaped zombie tasks, so
+	// check pidfd POLLIN readiness (0 FDs) to detect already-exited zombies.
+	for {
+		pfd := []unix.PollFd{{Fd: int32(entry.fd), Events: unix.POLLIN}}
+		_, perr := unix.Poll(pfd, 0)
+		if errors.Is(perr, unix.EINTR) {
+			continue
+		}
+		if perr != nil {
+			return true, false, perr
+		}
+		if pfd[0].Revents&(unix.POLLIN|unix.POLLHUP) != 0 {
+			return true, false, nil
+		}
+		break
+	}
 	pgid, gerr := unix.Getpgid(pid)
 	if errors.Is(gerr, unix.ESRCH) {
 		return true, false, nil
@@ -632,6 +648,20 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 	return candidates, handleErr, nil
 }
 
+func classifyCachedMemberFD(proof processGroupProof, pid int, tok string) (hasFD, alive bool, err error) {
+	hasFD, alive, verr := verifyPreCapturedMemberFD(proof, pid, tok)
+	if !hasFD {
+		return false, false, nil
+	}
+	if verr != nil && !errors.Is(verr, ErrProcessIdentityMismatch) {
+		return true, false, verr
+	}
+	if verr != nil {
+		return true, false, nil
+	}
+	return true, alive, nil
+}
+
 func hasVerifiedLiveKnownMemberLinux(proof processGroupProof) (bool, error) {
 	id := proof.Leader
 	var inspectErr error
@@ -639,15 +669,12 @@ func hasVerifiedLiveKnownMemberLinux(proof processGroupProof) (bool, error) {
 		if pid <= 0 || pid == id.PID || tok == "" {
 			continue
 		}
-		hasFD, alive, verr := verifyPreCapturedMemberFD(proof, pid, tok)
+		hasFD, alive, cerr := classifyCachedMemberFD(proof, pid, tok)
 		if hasFD {
-			if verr != nil && !errors.Is(verr, ErrProcessIdentityMismatch) {
-				if inspectErr == nil {
-					inspectErr = verr
-				}
-				continue
+			if cerr != nil && inspectErr == nil {
+				inspectErr = cerr
 			}
-			if verr == nil && alive {
+			if alive {
 				return true, nil
 			}
 			continue
@@ -679,15 +706,12 @@ func signalVerifiedKnownMembersLinux(proof processGroupProof, id ProcessIdentity
 		if pid <= 0 || pid == id.PID || tok == "" {
 			continue
 		}
-		hasFD, alive, verr := verifyPreCapturedMemberFD(proof, pid, tok)
+		hasFD, alive, cerr := classifyCachedMemberFD(proof, pid, tok)
 		if hasFD {
-			if verr != nil && !errors.Is(verr, ErrProcessIdentityMismatch) {
-				if firstErr == nil {
-					firstErr = verr
-				}
-				continue
+			if cerr != nil && firstErr == nil {
+				firstErr = cerr
 			}
-			if verr == nil && alive {
+			if alive {
 				entry := proof.verifiedFDs[pid]
 				if kerr := unix.PidfdSendSignal(entry.fd, unix.SIGKILL, nil, 0); kerr == nil {
 					anySignalled = true

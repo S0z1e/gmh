@@ -958,33 +958,50 @@ func TestLinuxUnreadableRootRefusesNumericPPIDAndCleansVerifiedPastGroupMismatch
 }
 
 func TestLinuxRecoveryKeepsJobPendingWhenOneKnownMemberRaisesEACCES(t *testing.T) {
-	childACmd := exec.Command("sleep", "30")
-	configureProcess(childACmd)
-	if err := childACmd.Start(); err != nil {
+	tmpDir := t.TempDir()
+	childAPIDFile := filepath.Join(tmpDir, "childA.pid")
+	childBPIDFile := filepath.Join(tmpDir, "childB.pid")
+	groupCmd := exec.Command("bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q; sleep 30 & echo $! > %q", childAPIDFile, childBPIDFile))
+	configureProcess(groupCmd)
+	if err := groupCmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	childAPID := childACmd.Process.Pid
-	t.Cleanup(func() {
-		if p, err := os.FindProcess(childAPID); err == nil {
-			_ = p.Kill()
+	leaderPID := groupCmd.Process.Pid
+	leaderTok := inspectProcess(leaderPID).StartToken
+	readSpawnedPID := func(p string) int {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if b, err := os.ReadFile(p); err == nil {
+				if v, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && v > 0 {
+					return v
+				}
+			}
+			time.Sleep(15 * time.Millisecond)
 		}
-		_ = childACmd.Wait()
+		t.Fatalf("timed out waiting for pid file %s", p)
+		return 0
+	}
+	childAPID := readSpawnedPID(childAPIDFile)
+	childBPID := readSpawnedPID(childBPIDFile)
+	// Wait for the bash leader to exit so childA and childB remain alone in the shared PGID/SID.
+	_ = groupCmd.Wait()
+	if leaderTok == "" {
+		leaderTok = inspectProcess(childAPID).StartToken
+	}
+	t.Cleanup(func() {
+		for _, pid := range []int{childAPID, childBPID} {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
 	})
-	infoA := inspectProcess(childAPID)
 
-	childBCmd := exec.Command("sleep", "30")
-	configureProcess(childBCmd)
-	if err := childBCmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	childBPID := childBCmd.Process.Pid
-	t.Cleanup(func() {
-		if p, err := os.FindProcess(childBPID); err == nil {
-			_ = p.Kill()
-		}
-		_ = childBCmd.Wait()
-	})
+	infoA := inspectProcess(childAPID)
 	infoB := inspectProcess(childBPID)
+	if !infoA.Alive || !infoB.Alive {
+		t.Fatalf("children not alive: A=%+v B=%+v", infoA, infoB)
+	}
+	if infoA.PGID != infoB.PGID || infoA.SID != infoB.SID {
+		t.Fatalf("expected shared process group/session: A=%+v B=%+v", infoA, infoB)
+	}
 
 	intruderCmd := exec.Command("sleep", "30")
 	configureProcess(intruderCmd)
@@ -1006,10 +1023,6 @@ func TestLinuxRecoveryKeepsJobPendingWhenOneKnownMemberRaisesEACCES(t *testing.T
 		inspectProcessErrFn = origInspectErr
 	})
 
-	leaderPID := infoA.PGID
-	if leaderPID == childAPID || leaderPID == childBPID {
-		leaderPID = childBPID + 99998
-	}
 	inspectProcessErrFn = func(pid int) (processInfo, error) {
 		if pid == leaderPID {
 			return processInfo{}, nil
@@ -1031,15 +1044,11 @@ func TestLinuxRecoveryKeepsJobPendingWhenOneKnownMemberRaisesEACCES(t *testing.T
 			}
 			return m, err
 		}
-		m, err := origInspectMeta(pid)
-		if err == nil && pid == childBPID {
-			m.info.PGID = infoA.PGID
-		}
-		return m, err
+		return origInspectMeta(pid)
 	}
 
 	proof := processGroupProof{
-		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: infoA.PGID, StartToken: infoA.StartToken},
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: infoA.PGID, StartToken: leaderTok},
 		UID:            infoA.UID,
 		HasUID:         true,
 		SID:            infoA.SID,
@@ -1056,10 +1065,13 @@ func TestLinuxRecoveryKeepsJobPendingWhenOneKnownMemberRaisesEACCES(t *testing.T
 	if !errors.Is(err, syscall.EACCES) {
 		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want EACCES while childB is inaccessible", err)
 	}
-	for wait := 0; wait < 20 && inspectProcess(childAPID).Alive; wait++ {
+	for wait := 0; wait < 20; wait++ {
+		if m, merr := origInspectMeta(childAPID); merr != nil || !m.info.Alive {
+			break
+		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	if inspectProcess(childAPID).Alive {
+	if m, merr := origInspectMeta(childAPID); merr == nil && m.info.Alive {
 		t.Fatalf("childA pid %d survived cleanup", childAPID)
 	}
 	metaB, errB := origInspectMeta(childBPID)
@@ -1203,5 +1215,51 @@ func TestLinuxCachedPidfdVerificationErrorPreserved(t *testing.T) {
 	}
 	if m, merr := origInspectMeta(childBPID); merr != nil || !m.info.Alive {
 		t.Fatalf("expected childB pid %d to still be alive under cached FD error (meta=%+v, err=%v)", childBPID, m, merr)
+	}
+}
+
+func TestLinuxCachedPidfdTreatsUnreapedZombieAsExited(t *testing.T) {
+	zombieCmd := exec.Command("sh", "-c", "exit 0")
+	configureProcess(zombieCmd)
+	if err := zombieCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	zpid := zombieCmd.Process.Pid
+	zinfo := inspectProcess(zpid)
+	fd, err := unix.PidfdOpen(zpid, 0)
+	if err != nil {
+		_ = zombieCmd.Process.Kill()
+		_ = zombieCmd.Wait()
+		t.Skipf("pidfd_open unsupported: %v", err)
+	}
+	defer unix.Close(fd)
+	defer func() { _ = zombieCmd.Wait() }()
+
+	// Poll until sh exits and becomes an unreaped zombie (do NOT call Wait yet).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		if n, perr := unix.Poll(pfd, 0); perr == nil && n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	proof := processGroupProof{
+		Leader: ProcessIdentityInfo{PID: zpid, PGID: zinfo.PGID, StartToken: zinfo.StartToken},
+		verifiedFDs: map[int]verifiedProcFD{
+			zpid: {fd: fd, startToken: zinfo.StartToken},
+		},
+	}
+	hasFD, alive, verr := verifyPreCapturedMemberFD(proof, zpid, zinfo.StartToken)
+	if verr != nil || !hasFD || alive {
+		t.Fatalf("verifyPreCapturedMemberFD(zombie) = (hasFD=%v, alive=%v, err=%v), want (true, false, nil)", hasFD, alive, verr)
+	}
+	if live, lerr := hasVerifiedLiveKnownMemberLinux(processGroupProof{
+		Leader:       ProcessIdentityInfo{PID: zpid + 1, PGID: zinfo.PGID, StartToken: zinfo.StartToken},
+		KnownMembers: map[int]string{zpid: zinfo.StartToken},
+		verifiedFDs:  proof.verifiedFDs,
+	}); live || lerr != nil {
+		t.Fatalf("hasVerifiedLiveKnownMemberLinux(zombie) = (%v, %v), want (false, nil)", live, lerr)
 	}
 }
