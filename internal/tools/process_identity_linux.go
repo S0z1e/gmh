@@ -617,26 +617,32 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 	return candidates, handleErr, nil
 }
 
-func hasVerifiedLiveGroupMember(proof processGroupProof) bool {
+func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 	id := proof.Leader
 	if !id.Valid() {
-		return false
+		return false, ErrProcessIdentityMismatch
 	}
 	leaderBoot, leaderTicks, hasLeaderStart := parseLinuxStartToken(id.StartToken)
 	if !hasLeaderStart {
-		return false
+		return false, ErrProcessIdentityMismatch
 	}
 	cloned := cloneGroupProof(proof)
 	candidates, handleErr, mismatchErr := collectAndVerifyLinuxCandidates(&cloned, id, leaderBoot, leaderTicks)
-	if mismatchErr != nil || handleErr != nil || len(candidates) == 0 {
-		return false
+	if mismatchErr != nil {
+		return false, mismatchErr
 	}
 	for _, c := range candidates {
 		if c.verified {
-			return true
+			return true, nil
 		}
 	}
-	return canRetryIncompleteGroupProof(proof)
+	if handleErr != nil {
+		return false, handleErr
+	}
+	if len(candidates) > 0 && canRetryIncompleteGroupProof(proof) {
+		return true, nil
+	}
+	return false, nil
 }
 
 func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {

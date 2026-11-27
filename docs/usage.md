@@ -340,9 +340,8 @@
   running after the turn settles until it exits on its
   own, times out, or is stopped, so a dev server started in one turn is still serving in the
   next. Quitting (`/quit`, `/exit`, RPC `quit`) stops running and adopted jobs and saves their results; an explicit RPC `abort` cancels the active session's background jobs. On resume after a harness crash, verifiable live background jobs are safely
-  adopted with their remaining deadline enforced (on Linux, adopted job exit codes are unavailable and reported as `exit status unavailable`) while exited
-  processes or reused PIDs are reported as `unknown` without replaying commands;
-  startup and `/jobs` also surface orphaned running jobs from other sessions in the same workspace, and `/jobs stop <id>` explicitly terminates an active/adopted job. Output files
+  adopted with their remaining deadline enforced (and remaining verified descendants cleaned up when the leader exits across macOS, Linux, and Windows; on Linux, adopted job exit codes are unavailable and reported as `exit status unavailable`). Exited leaders with pending cleanup or surviving verified descendants have their group proof revalidated, clean up remaining descendants to finish `done` (or stay `running` and stoppable on transient failure), while reused PIDs or exited leaders without surviving verified groups are reported as `unknown` without replaying commands;
+  startup and `/jobs` also surface orphaned running jobs (including pending-cleanup groups whose leader exited) from other sessions in the same workspace, and `/jobs stop <id>` explicitly terminates an active/adopted job. Output files
   cap at 64 MiB: past that the run is killed and the call fails, so
   a spewing command cannot fill the disk.
 - Events: the agent loop emits an event stream (`text_delta`,

@@ -882,9 +882,23 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 
 		if (!info.Alive || info.Zombie) && id.Valid() && rec.GroupProof != nil && !rec.GroupProof.VerifiedAt.IsZero() {
 			proof := groupProofFromPersisted(rec, id, rec.OutputFile)
-			if rec.GroupProof.CleanupPending || hasVerifiedLiveGroupMember(proof) {
-				if rec.GroupProof.CleanupPending && proof.ExitObservedAt.IsZero() {
+			liveMember := rec.GroupProof.CleanupPending
+			var scanErr error
+			if !liveMember {
+				liveMember, scanErr = hasVerifiedLiveGroupMember(proof)
+			}
+			if errors.Is(scanErr, ErrProcessIdentityMismatch) {
+				liveMember = false
+				scanErr = nil
+			}
+			if liveMember || scanErr != nil {
+				if proof.ExitObservedAt.IsZero() {
 					proof.ExitObservedAt = time.Now()
+				}
+				if jobsDir != "" {
+					pendingRec := rec
+					pendingRec.GroupProof = persistedGroupProofFromProof(proof, true)
+					_ = savePersistedJob(jobsDir, pendingRec)
 				}
 				stopGroupAfterExitTrackFn := stopAdoptedProcessGroupAfterExitTrack
 				if e.stopAdoptedGroupAfterExit != nil {
@@ -1570,7 +1584,8 @@ func FindOrphanedRunningJobs(jobsDir, outputID, outputDir string) ([]RecoveredJo
 				continue
 			}
 			proof := groupProofFromPersisted(rec, id, outFile)
-			if !hasVerifiedLiveGroupMember(proof) {
+			liveMember, scanErr := hasVerifiedLiveGroupMember(proof)
+			if !liveMember && (scanErr == nil || errors.Is(scanErr, ErrProcessIdentityMismatch)) {
 				continue
 			}
 		}

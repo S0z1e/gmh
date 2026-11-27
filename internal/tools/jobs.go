@@ -251,25 +251,7 @@ func (j *Job) snapshotForPersist() (PersistedJob, string, bool) {
 	}
 	var persistedProof *PersistedGroupProof
 	if status == JobRunning && (j.Adopted || j.cleanupPending || !j.groupProof.VerifiedAt.IsZero()) {
-		var knownCopy map[int]string
-		if len(j.groupProof.KnownMembers) > 0 {
-			knownCopy = make(map[int]string, len(j.groupProof.KnownMembers))
-			for k, v := range j.groupProof.KnownMembers {
-				knownCopy[k] = v
-			}
-		}
-		persistedProof = &PersistedGroupProof{
-			UID:               j.groupProof.UID,
-			HasUID:            j.groupProof.HasUID,
-			SID:               j.groupProof.SID,
-			Sess:              uint64(j.groupProof.Sess),
-			OutputFile:        j.groupProof.OutputFile,
-			LeaderPipeTargets: append([]string(nil), j.groupProof.LeaderPipeTargets...),
-			KnownMembers:      knownCopy,
-			VerifiedAt:        j.groupProof.VerifiedAt,
-			ExitObservedAt:    j.groupProof.ExitObservedAt,
-			CleanupPending:    j.cleanupPending || !j.groupProof.ExitObservedAt.IsZero(),
-		}
+		persistedProof = persistedGroupProofFromProof(j.groupProof, j.cleanupPending || !j.groupProof.ExitObservedAt.IsZero())
 	}
 	return PersistedJob{
 		ID:              j.ID,
@@ -360,10 +342,14 @@ func (j *Job) markUnknown(reason, outputSummary string, preview *BashOutputPrevi
 }
 
 func (j *Job) finish(r JobResult) {
+	j.finishCore(r, nil, nil)
+}
+
+func (j *Job) finishCore(r JobResult, prePersist func(), postPersist func()) bool {
 	j.mu.Lock()
 	if j.finished || j.unknown {
 		j.mu.Unlock()
-		return
+		return false
 	}
 	if j.stopParent != nil {
 		j.stopParent()
@@ -375,15 +361,23 @@ func (j *Job) finish(r JobResult) {
 	}
 	j.result = r
 	j.finished = true
+	j.cleanupPending = false
 	j.finishedAt = time.Now()
 	registry, delivered := j.registry, j.delivered
 	j.mu.Unlock()
 	j.closeProofFDs()
+	if prePersist != nil {
+		prePersist()
+	}
 	if delivered && registry != nil {
 		registry.trimDelivered()
 	}
 	j.persist()
+	if postPersist != nil {
+		postPersist()
+	}
 	close(j.done)
+	return true
 }
 
 func (j *Job) closeProofFDs() {
@@ -1331,52 +1325,31 @@ func formatAdoptedSummaryPreview(outFile, cwd, emptyMsg, fileNote string) (strin
 
 func (j *Job) finishAdoptedWithAudit(r JobResult, auditFn func(AuditEntry), auditCode int, auditErr error) bool {
 	j.mu.Lock()
-	if j.finished || j.unknown {
-		j.mu.Unlock()
-		return false
-	}
-	if j.stopParent != nil {
-		j.stopParent()
-		j.stopParent = nil
-	}
-	if j.stopDeadline != nil {
-		j.stopDeadline()
-		j.stopDeadline = nil
-	}
-	j.result = r
-	j.finished = true
-	j.cleanupPending = false
-	j.finishedAt = time.Now()
-	registry, delivered := j.registry, j.delivered
 	invID, callID, cmd := j.InvocationID, j.ToolCallID, j.Command
 	execRef, outFile, outputDir := j.exec, j.OutputFile, j.outputDir
 	j.mu.Unlock()
 
-	j.closeProofFDs()
-	if execRef != nil && outFile != "" && outputDir != "" {
-		execRef.unmarkActiveOutput(outputDir, outFile)
-	}
-	if delivered && registry != nil {
-		registry.trimDelivered()
-	}
-	j.persist()
-	if auditFn != nil {
-		entry := AuditEntry{
-			InvocationID: invID,
-			ToolCallID:   callID,
-			TS:           time.Now(),
-			Kind:         "bash",
-			Tool:         "bash",
-			Args:         truncate(cmd, 500),
-			ExitCode:     auditCode,
+	return j.finishCore(r, func() {
+		if execRef != nil && outFile != "" && outputDir != "" {
+			execRef.unmarkActiveOutput(outputDir, outFile)
 		}
-		if auditErr != nil {
-			entry.Error = auditErr.Error()
+	}, func() {
+		if auditFn != nil {
+			entry := AuditEntry{
+				InvocationID: invID,
+				ToolCallID:   callID,
+				TS:           time.Now(),
+				Kind:         "bash",
+				Tool:         "bash",
+				Args:         truncate(cmd, 500),
+				ExitCode:     auditCode,
+			}
+			if auditErr != nil {
+				entry.Error = auditErr.Error()
+			}
+			auditFn(entry)
 		}
-		auditFn(entry)
-	}
-	close(j.done)
-	return true
+	})
 }
 
 func (j *Job) preparePendingPostExitCleanupLocked() processGroupProof {

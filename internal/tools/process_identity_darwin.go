@@ -246,22 +246,28 @@ func darwinResolveGroupCandidates(proof processGroupProof, id ProcessIdentityInf
 	return known, liveCount, nil
 }
 
-func hasVerifiedLiveGroupMember(proof processGroupProof) bool {
+func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 	id := proof.Leader
 	if !id.Valid() {
-		return false
+		return false, ErrProcessIdentityMismatch
 	}
 	leaderSec, leaderUsec, hasLeaderStart := parseDarwinStartTime(id.StartToken)
 	if !hasLeaderStart {
-		return false
+		return false, ErrProcessIdentityMismatch
 	}
 	procs, queryErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", id.PGID)
+	if errors.Is(queryErr, unix.ESRCH) {
+		return false, nil
+	}
 	if queryErr != nil {
-		return false
+		return false, queryErr
 	}
 	known, liveCount, err := darwinResolveGroupCandidates(proof, id, leaderSec, leaderUsec, procs)
-	if err != nil || liveCount == 0 {
-		return false
+	if err != nil {
+		return false, err
+	}
+	if liveCount == 0 {
+		return false, nil
 	}
 	for _, p := range procs {
 		if p.Proc.P_stat == 5 {
@@ -271,10 +277,16 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) bool {
 		pSec, pUsec := int64(p.Proc.P_starttime.Sec), int32(p.Proc.P_starttime.Usec)
 		tok := fmt.Sprintf("%d:%d", pSec, pUsec)
 		if known[pid] == tok {
-			return true
+			return true, nil
 		}
 	}
-	return !proof.VerifiedAt.IsZero() && proof.SID > 0 && proof.SID == id.PID && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken
+	if !proof.VerifiedAt.IsZero() && proof.SID > 0 && proof.SID == id.PID && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken {
+		return true, nil
+	}
+	if canRetryIncompleteGroupProof(proof) {
+		return true, nil
+	}
+	return false, nil
 }
 
 func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {

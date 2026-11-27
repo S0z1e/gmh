@@ -34,7 +34,7 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	return ErrProcessIdentityMismatch
 }
 
-func hasVerifiedLiveGroupMember(proof processGroupProof) bool { return false }
+func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) { return false, nil }
 
 func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {
 	return -1, false, ErrProcessIdentityMismatch

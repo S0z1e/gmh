@@ -653,3 +653,91 @@ func TestStopAdoptedProcessGroupAfterExitMultiHopPastCutoffAndRetainLinux(t *tes
 		}
 	}
 }
+
+func TestCrashRecoveryInconclusiveLinuxGroupScanKeepsJobStoppable(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-inconclusive-scan"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(jobsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	c1File := filepath.Join(root, "c1.pid")
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q; exit 0", c1File))
+	jobTok := "inconclusive-scan-tok"
+	cmd.Env = append(os.Environ(), jobTokenEnvVar+"="+jobTok)
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	leaderInfo := inspectProcess(leaderPID)
+	_ = cmd.Wait()
+
+	b, err := os.ReadFile(c1File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	rec := PersistedJob{
+		ID:             "bg-inconclusive",
+		Started:        time.Now().Add(-time.Second),
+		Unlimited:      true,
+		Command:        "inconclusive scan job",
+		Cwd:            root,
+		OutputID:       outID,
+		PID:            leaderPID,
+		PGID:           leaderInfo.PGID,
+		ProcessStarted: leaderInfo.StartToken,
+		JobToken:       jobTok,
+		GroupProof: &PersistedGroupProof{
+			UID:          leaderInfo.UID,
+			HasUID:       leaderInfo.HasUID,
+			SID:          leaderInfo.SID,
+			KnownMembers: map[int]string{leaderPID: leaderInfo.StartToken},
+			VerifiedAt:   time.Now().Add(-time.Second),
+		},
+		Status: JobRunning,
+	}
+	if err := savePersistedJob(jobsDir, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	origReadProcDir := readProcDirFn
+	readProcDirFn = func() ([]os.DirEntry, error) {
+		return nil, syscall.EMFILE
+	}
+	defer func() { readProcDirFn = origReadProcDir }()
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 || recovered[0].Status != JobRunning {
+		t.Fatalf("inconclusive EMFILE scan recovery = %+v, err=%v; want JobRunning", recovered, err)
+	}
+
+	readProcDirFn = origReadProcDir
+	res, stopErr := exec2.StopJob("bg-inconclusive")
+	if stopErr != nil {
+		t.Fatalf("StopJob after inconclusive scan failed: %v (%s)", stopErr, res.Text)
+	}
+	if exec2.registry().Get("bg-inconclusive").Status() != JobDone {
+		t.Fatalf("status after StopJob = %q, want done", exec2.registry().Get("bg-inconclusive").Status())
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d survived StopJob", childPID)
+	}
+}

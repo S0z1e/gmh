@@ -91,6 +91,14 @@ func (e *Executor) CloseJobs(ctx context.Context) error {
 			}
 			cancelled = append(cancelled, job)
 			awaited = append(awaited, job)
+		} else {
+			select {
+			case <-job.done:
+			default:
+				// Terminal transition was claimed (e.g. completion audit in flight)
+				// but j.done is still open: await completion before returning.
+				awaited = append(awaited, job)
+			}
 		}
 		job.mu.Unlock()
 	}

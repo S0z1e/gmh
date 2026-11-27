@@ -2738,4 +2738,162 @@ func TestCrashRecoveryMonitorAndStopJobEmitSingleAudit(t *testing.T) {
 	}
 }
 
+func TestCrashRecoveryLeaderExitsBeforeResumePersistsPendingBeforeCleanup(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-exit-before-resume"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childPIDFile := filepath.Join(root, "child.pid")
+	relFile := filepath.Join(root, "leader.rel")
+
+	helperCmd, meta := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "CHILD-READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("sleep 30 & echo $! > %q; printf 'CHILD-READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0", childPIDFile, relFile),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	b, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	// Let leader exit BEFORE first resume while childPID remains alive.
+	if err := os.WriteFile(relFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if _, _, alive := ProcessIdentity(meta.PID); !alive {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	var diskCheckErr error
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		stopAdoptedGroupAfterExit: func(proof processGroupProof) error {
+			onDisk, err := loadPersistedJobs(jobsDir)
+			if err != nil || len(onDisk) != 1 || onDisk[0].GroupProof == nil || !onDisk[0].GroupProof.CleanupPending || onDisk[0].GroupProof.ExitObservedAt.IsZero() {
+				diskCheckErr = fmt.Errorf("missing CleanupPending/ExitObservedAt on disk inside first cleanup call: %+v, err=%v", onDisk, err)
+			}
+			return stopAdoptedProcessGroupAfterExit(proof)
+		},
+	}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	rec, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diskCheckErr != nil {
+		t.Fatal(diskCheckErr)
+	}
+	if len(rec) != 1 || rec[0].Status != JobDone {
+		t.Fatalf("recovery = %+v, want JobDone after cleaning surviving child", rec)
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d survived recovery cleanup", childPID)
+	}
+}
+
+func TestCrashRecoveryCloseJobsWaitsForAdoptedCompletionAudit(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-close-awaits-audit"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	relFile := filepath.Join(root, "rel")
+
+	helperCmd, _ := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("printf 'READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0", relFile),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	inAudit := make(chan struct{})
+	releaseAudit := make(chan struct{})
+	var auditOnce sync.Once
+	var auditFinished bool
+	var auditMu sync.Mutex
+
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		Audit: func(e AuditEntry) {
+			auditOnce.Do(func() {
+				close(inAudit)
+				<-releaseAudit
+			})
+			auditMu.Lock()
+			auditFinished = true
+			auditMu.Unlock()
+		},
+	}
+	exec2.SwitchSession(outID)
+
+	if _, err := exec2.RecoverSessionJobs(outID, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(relFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-inAudit:
+	case <-time.After(4 * time.Second):
+		t.Fatal("monitor did not reach audit")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		closeDone <- exec2.CloseJobs(ctx)
+	}()
+
+	select {
+	case err := <-closeDone:
+		close(releaseAudit)
+		t.Fatalf("CloseJobs returned early while adopted audit callback was blocked (err=%v)", err)
+	case <-time.After(60 * time.Millisecond):
+	}
+
+	close(releaseAudit)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("CloseJobs failed: %v", err)
+	}
+	auditMu.Lock()
+	done := auditFinished
+	auditMu.Unlock()
+	if !done {
+		t.Fatal("CloseJobs returned before audit finished")
+	}
+}
+
 var _ = errors.New
