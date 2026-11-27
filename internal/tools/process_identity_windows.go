@@ -395,6 +395,7 @@ func snapshotWindowsProcesses(leaderNs int64, jobToken string, jobHandle uintptr
 func resolveWindowsGroupDescendants(proof *processGroupProof, id ProcessIdentityInfo, leaderNs int64, _ bool, procs []windowsProcEntry) (verified []windowsProcEntry, inconclusiveErr error, err error) {
 	verifiedMap := make(map[int]windowsProcEntry)
 	reusedKnown := make(map[int]bool)
+	leaderReplaced := false
 
 	for _, e := range procs {
 		if e.pid == id.PID {
@@ -405,7 +406,12 @@ func resolveWindowsGroupDescendants(proof *processGroupProof, id ProcessIdentity
 				continue
 			}
 			if e.startToken != id.StartToken {
-				return nil, nil, fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+				// Leader PID was recycled after exit: never signal the replacement
+				// process and never treat it as the leader parent instance, while
+				// still resolving independently verified surviving children.
+				leaderReplaced = true
+				reusedKnown[e.pid] = true
+				continue
 			}
 			verifiedMap[e.pid] = e
 			continue
@@ -495,6 +501,9 @@ func resolveWindowsGroupDescendants(proof *processGroupProof, id ProcessIdentity
 		if _, reused := reusedKnown[pid]; !reused {
 			proof.KnownMembers[pid] = e.startToken
 		}
+	}
+	if leaderReplaced && len(verifiedMap) == 0 && len(proof.KnownMembers) == 0 && proof.VerifiedAt.IsZero() && proof.ExitObservedAt.IsZero() && proof.JobToken == "" && proof.jobHandle == 0 {
+		return nil, nil, fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 	}
 	verified = make([]windowsProcEntry, 0, len(verifiedMap))
 	for _, e := range verifiedMap {
@@ -622,13 +631,6 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	if !ok {
 		return ErrProcessIdentityMismatch
 	}
-	info, ierr := inspectWindowsProcessFn(id.PID)
-	if ierr != nil {
-		return ierr
-	}
-	if info.Alive && !id.Matches(info) {
-		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
-	}
 
 	const maxPasses = 16
 	deadline := time.Now().Add(2 * time.Second)
@@ -680,12 +682,12 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 			sig, serr := terminateWindowsProcessFn(cand, cand.startToken, proof.jobHandle)
 			if serr != nil {
 				if errors.Is(serr, ErrProcessIdentityMismatch) {
-					if cand.pid == id.PID {
+					if cand.pid == id.PID && proof.ExitObservedAt.IsZero() && proof.VerifiedAt.IsZero() && len(proof.KnownMembers) <= 1 && proof.JobToken == "" && proof.jobHandle == 0 {
 						return serr
 					}
-					// Non-leader child exited and its PID was recycled between snapshot
-					// and signalling: treat that instance as gone and continue signalling
-					// remaining verified siblings.
+					// Target exited and its PID was recycled between snapshot and
+					// signalling: treat that instance as gone and continue signalling
+					// remaining verified group members.
 					continue
 				}
 				if termErr == nil {

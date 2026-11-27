@@ -269,3 +269,76 @@ func TestStopAdoptedWindowsGroupTreatsRecycledChildExitAsGoneAndStopsSiblings(t 
 		t.Fatal("expected sibling pid 202 to be signalled after pid 201 recycled")
 	}
 }
+
+func TestStopAdoptedWindowsGroupContinuesAfterLeaderPIDRecycled(t *testing.T) {
+	base := time.Unix(1700000400, 0)
+	leaderTok, _ := windowsTokenAt(base)
+	childTok, childNs := windowsTokenAt(base.Add(1 * time.Second))
+	replacementTok, replacementNs := windowsTokenAt(base.Add(10 * time.Second))
+
+	id := ProcessIdentityInfo{PID: 100, PGID: 100, StartToken: leaderTok}
+	proof := processGroupProof{
+		Leader:         id,
+		VerifiedAt:     base.Add(2 * time.Second),
+		ExitObservedAt: base.Add(5 * time.Second),
+		KnownMembers: map[int]string{
+			100: leaderTok,
+			201: childTok,
+		},
+	}
+
+	origInspect := inspectWindowsProcessFn
+	origSnap := snapshotWindowsProcessesFn
+	origTerm := terminateWindowsProcessFn
+	defer func() {
+		inspectWindowsProcessFn = origInspect
+		snapshotWindowsProcessesFn = origSnap
+		terminateWindowsProcessFn = origTerm
+	}()
+
+	// Case 1: replacement process already occupies id.PID at pre-scan time AND during snapshot.
+	inspectWindowsProcessFn = func(pid int) (processInfo, error) {
+		if pid == 100 {
+			return processInfo{Alive: true, PGID: 100, StartToken: replacementTok}, nil
+		}
+		return processInfo{}, nil
+	}
+
+	var childSignalled, replacementSignalled bool
+	pass := 0
+	snapshotWindowsProcessesFn = func(ln int64, jobTok string, jobHandle uintptr) ([]windowsProcEntry, error) {
+		pass++
+		if pass == 1 {
+			return []windowsProcEntry{
+				{pid: 100, ppid: 50, startToken: replacementTok, startNs: replacementNs},
+				{pid: 300, ppid: 100, startToken: replacementTok, startNs: replacementNs},
+				{pid: 201, ppid: 100, startToken: childTok, startNs: childNs},
+			}, nil
+		}
+		return []windowsProcEntry{
+			{pid: 100, ppid: 50, startToken: replacementTok, startNs: replacementNs},
+			{pid: 300, ppid: 100, startToken: replacementTok, startNs: replacementNs},
+		}, nil
+	}
+	terminateWindowsProcessFn = func(cand windowsProcEntry, expectedToken string, jobHandle uintptr) (bool, error) {
+		if cand.pid == 100 || cand.pid == 300 {
+			replacementSignalled = true
+			return false, fmt.Errorf("unexpectedly targeted pid %d", cand.pid)
+		}
+		if cand.pid == 201 {
+			childSignalled = true
+			return true, nil
+		}
+		return false, nil
+	}
+
+	if err := stopAdoptedProcessGroupAfterExitTrack(&proof); err != nil {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want nil", err)
+	}
+	if !childSignalled {
+		t.Fatal("expected verified surviving child 201 to be signalled despite leader PID reuse")
+	}
+	if replacementSignalled {
+		t.Fatal("replacement process at leader PID or its child must never be signalled")
+	}
+}

@@ -83,17 +83,18 @@ type Job struct {
 	audit     func(AuditEntry)
 	persistMu sync.Mutex
 
-	mu             sync.Mutex
-	done           chan struct{}
-	result         JobResult
-	finished       bool
-	unknown        bool
-	monitorFailed  bool
-	cleanupPending bool
-	retained       bool
-	forgotten      bool
-	finishedAt     time.Time
-	registry       *JobRegistry
+	mu                sync.Mutex
+	done              chan struct{}
+	result            JobResult
+	finished          bool
+	unknown           bool
+	monitorFailed     bool
+	cleanupPending    bool
+	expiredOnAdoption bool
+	retained          bool
+	forgotten         bool
+	finishedAt        time.Time
+	registry          *JobRegistry
 	// A later turn must not deliver a recorded result twice.
 	delivered bool
 	// adoptionNoticed ensures an adopted running job sends at most one
@@ -1304,6 +1305,7 @@ func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
 	j.mu.Lock()
 	prevMembers := len(j.groupProof.KnownMembers)
 	prevPipes := len(j.groupProof.LeaderPipeTargets)
+	prevVerified := !j.groupProof.VerifiedAt.IsZero()
 	j.groupProof.KnownMembers = mergeGroupMembers(j.groupProof.KnownMembers, proof.KnownMembers)
 	j.groupProof.LeaderPipeTargets = mergePipeTargets(j.groupProof.LeaderPipeTargets, proof.LeaderPipeTargets)
 	if !j.groupProof.HasUID && proof.HasUID {
@@ -1326,7 +1328,7 @@ func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
 	} else if proof.jobHandle != 0 && proof.jobHandle != j.groupProof.jobHandle {
 		staleProof.jobHandle = proof.jobHandle
 	}
-	changed := len(j.groupProof.KnownMembers) > prevMembers || len(j.groupProof.LeaderPipeTargets) > prevPipes
+	changed := (!prevVerified && !j.groupProof.VerifiedAt.IsZero()) || len(j.groupProof.KnownMembers) > prevMembers || len(j.groupProof.LeaderPipeTargets) > prevPipes
 	out := j.snapshotGroupProofLocked()
 	j.mu.Unlock()
 	if staleProof.jobHandle != 0 {
@@ -1503,6 +1505,20 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 		if isTimeout {
 			resErr = &timeoutError{timeout: max(0, deadline.Sub(started))}
 			exitCode = -1
+			j.mu.Lock()
+			expiredOnAdoption := j.expiredOnAdoption
+			pid, pgid := j.PID, j.PGID
+			j.mu.Unlock()
+			if expiredOnAdoption {
+				timeoutNote := fmt.Sprintf("adopted job PID %d (pgid %d) exceeded deadline (%s) while harness was down; stopped verified process group; %s",
+					pid, pgid, deadline.UTC().Format(time.RFC3339), note)
+				j.mu.Lock()
+				if !j.finished && !j.unknown {
+					j.RecoveryNote = timeoutNote
+				}
+				j.mu.Unlock()
+				summary, preview = formatAdoptedSummaryPreview(outFile, cwd, fmt.Sprintf("(adopted background job stopped; %s)", timeoutNote), timeoutNote)
+			}
 		} else {
 			exitCode = -1
 			exitUnknown = true

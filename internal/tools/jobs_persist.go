@@ -776,13 +776,21 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 	default: // JobRunning: validate live process identity and group before adopting.
 		rec.OutputReceipt = ""
 		id := ProcessIdentityInfo{PID: rec.PID, PGID: rec.PGID, StartToken: rec.ProcessStarted}
+		expiredDuringDowntime := !rec.Unlimited && !rec.Deadline.IsZero() && !time.Now().Before(rec.Deadline)
 		info, inspectErr := inspectProcessErr(rec.PID)
 		if inspectErr != nil && id.Valid() {
 			proof := groupProofFromPersisted(rec, id, rec.OutputFile)
-			note := fmt.Sprintf("adopted process PID %d (pgid %d); process inspection error (%v) — job remains stoppable; %s",
-				id.PID, id.PGID, inspectErr, pipeCaptureEndedNote(rec.OutputFile))
+			var note string
+			if expiredDuringDowntime {
+				note = fmt.Sprintf("adopted process PID %d (pgid %d); deadline (%s) passed while harness was down, process inspection error (%v) — job remains stoppable; %s",
+					id.PID, id.PGID, rec.Deadline.UTC().Format(time.RFC3339), inspectErr, pipeCaptureEndedNote(rec.OutputFile))
+			} else {
+				note = fmt.Sprintf("adopted process PID %d (pgid %d); process inspection error (%v) — job remains stoppable; %s",
+					id.PID, id.PGID, inspectErr, pipeCaptureEndedNote(rec.OutputFile))
+			}
 			job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
 			job.WaitError = inspectErr.Error()
+			job.expiredOnAdoption = expiredDuringDowntime
 			job.groupProof = proof
 			if !proof.ExitObservedAt.IsZero() {
 				job.cleanupPending = true
@@ -790,11 +798,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 			return e.attachAdoptedStopControls(job, jobsDir)
 		}
 		if inspectErr == nil && id.Matches(info) {
-			proof := processGroupProof{
-				Leader:     id,
-				JobToken:   rec.JobToken,
-				OutputFile: rec.OutputFile,
-			}
+			proof := groupProofFromPersisted(rec, id, rec.OutputFile)
 			populateGroupProofIdentity(&proof, info)
 			captureVerifiedGroupProof(&proof)
 			extraNote := ""
@@ -881,6 +885,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 			}
 			note := fmt.Sprintf("adopted live OS process PID %d (pgid %d); %s%s", id.PID, id.PGID, extraNote, pipeCaptureEndedNote(rec.OutputFile))
 			job := e.newRecoveredJobObject(rec, jobsDir, JobRunning, false, adoptionNoticed, note, JobResult{})
+			job.expiredOnAdoption = expiredDuringDowntime
 			job.groupProof = cloneGroupProof(proof)
 			job.groupProof.verifiedFDs = proof.verifiedFDs
 			if !proof.ExitObservedAt.IsZero() {
@@ -1308,11 +1313,53 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		}
 	}
 
+	job.mu.Lock()
+	needsProofCapture := job.groupProof.VerifiedAt.IsZero()
+	job.mu.Unlock()
+	if needsProofCapture {
+		job.proofFDMu.Lock()
+		refreshed := job.refreshVerifiedGroupMembersLocked()
+		job.proofFDMu.Unlock()
+		if !refreshed.VerifiedAt.IsZero() {
+			needsProofCapture = false
+		}
+	}
+	var proofWg sync.WaitGroup
+	var stopProofRefresh chan struct{}
+	if needsProofCapture {
+		stopProofRefresh = make(chan struct{})
+		proofWg.Add(1)
+		go func() {
+			defer proofWg.Done()
+			ticker := time.NewTicker(20 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopProofRefresh:
+					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					job.proofFDMu.Lock()
+					refreshed := job.refreshVerifiedGroupMembersLocked()
+					job.proofFDMu.Unlock()
+					if !refreshed.VerifiedAt.IsZero() {
+						return
+					}
+				}
+			}
+		}()
+	}
+
 	waitFn := e.waitAdopted
 	if waitFn == nil {
 		waitFn = waitAdoptedProcess
 	}
 	exitCode, exitKnown, err := waitFn(ctx, snap.Identity)
+	if stopProofRefresh != nil {
+		close(stopProofRefresh)
+		proofWg.Wait()
+	}
 	if errors.Is(err, ErrProcessIdentityMismatch) {
 		summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
 		job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
@@ -1464,7 +1511,23 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 	}
 
 	note := pipeCaptureEndedNote(job.OutputFile)
-	summary, preview := formatAdoptedSummaryPreview(job.OutputFile, job.Cwd, fmt.Sprintf("(adopted background job exited; %s)", note), note)
+	completionSummary := fmt.Sprintf("(adopted background job exited; %s)", note)
+	summaryNote := note
+	job.mu.Lock()
+	expiredOnAdoption := job.expiredOnAdoption
+	job.mu.Unlock()
+	if isTimedOut && expiredOnAdoption {
+		timeoutNote := fmt.Sprintf("adopted job PID %d (pgid %d) exceeded deadline (%s) while harness was down; stopped verified process group; %s",
+			snap.Identity.PID, snap.Identity.PGID, snap.Deadline.UTC().Format(time.RFC3339), note)
+		job.mu.Lock()
+		if !job.finished && !job.unknown {
+			job.RecoveryNote = timeoutNote
+		}
+		job.mu.Unlock()
+		summaryNote = timeoutNote
+		completionSummary = fmt.Sprintf("(adopted background job stopped on adoption; %s)", timeoutNote)
+	}
+	summary, preview := formatAdoptedSummaryPreview(job.OutputFile, job.Cwd, completionSummary, summaryNote)
 	job.finishAdoptedWithAudit(JobResult{
 		Output:          summary,
 		Err:             err,
