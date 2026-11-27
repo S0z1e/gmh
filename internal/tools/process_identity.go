@@ -161,6 +161,23 @@ func recordFirstMismatch(dst *error, err error) {
 	}
 }
 
+func detachStaleVerifiedFDs(proof *processGroupProof) processGroupProof {
+	if proof == nil || len(proof.verifiedFDs) == 0 || len(proof.KnownMembers) == 0 {
+		return processGroupProof{}
+	}
+	var stale processGroupProof
+	for pid, entry := range proof.verifiedFDs {
+		if tok := proof.KnownMembers[pid]; tok != "" && entry.startToken != tok {
+			if stale.verifiedFDs == nil {
+				stale.verifiedFDs = make(map[int]verifiedProcFD)
+			}
+			stale.verifiedFDs[pid] = entry
+			delete(proof.verifiedFDs, pid)
+		}
+	}
+	return stale
+}
+
 func waitForKnownMembersExit(id ProcessIdentityInfo, signalErr error, checkLive func() (bool, error)) error {
 	var lastLiveErr error
 	for i := 0; i < 20; i++ {

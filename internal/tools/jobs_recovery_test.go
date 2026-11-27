@@ -1982,7 +1982,7 @@ func TestCrashRecoveryTokenlessLegacyChildForkedAfterAdoptionStillStopsOnNormalE
 	readyFile := filepath.Join(root, "ready")
 	childPIDFile := filepath.Join(root, "child.pid")
 	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf(
-		"touch %q; while [ ! -f %q ]; do sleep 0.05; done; (exec 3>&-; sleep 30) & echo $! > %q; exit 0",
+		"touch %q; while [ ! -f %q ]; do sleep 0.05; done; (exec 3>&-; exec sleep 30) & echo $! > %q; exit 0",
 		readyFile, triggerFile, childPIDFile,
 	))
 	configureProcess(cmd)

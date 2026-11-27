@@ -227,6 +227,20 @@ func linuxBootUnixSec() (int64, bool) {
 	return 0, false
 }
 
+func pidfdIsExited(fd int) (bool, error) {
+	for {
+		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		_, perr := unix.Poll(pfd, 0)
+		if errors.Is(perr, unix.EINTR) {
+			continue
+		}
+		if perr != nil {
+			return false, perr
+		}
+		return pfd[0].Revents&(unix.POLLIN|unix.POLLHUP) != 0, nil
+	}
+}
+
 // verifyPreCapturedMemberFD checks that a pre-verified pidfd still points to the
 // same live kernel task in proof.Leader.PGID and matches expectedToken, using 0 FDs.
 func verifyPreCapturedMemberFD(proof processGroupProof, pid int, expectedToken string) (hasFD bool, alive bool, err error) {
@@ -234,8 +248,20 @@ func verifyPreCapturedMemberFD(proof processGroupProof, pid int, expectedToken s
 	if !ok || entry.fd <= 0 {
 		return false, false, nil
 	}
-	if expectedToken == "" || entry.startToken != expectedToken {
+	if expectedToken == "" {
 		return true, false, fmt.Errorf("refusing to signal pid %d: %w", pid, ErrProcessIdentityMismatch)
+	}
+	if entry.startToken != expectedToken {
+		// If the cached pidfd still points to a live task whose StartToken
+		// differs from expectedToken, fail closed; otherwise it refers to an
+		// exited prior process at this PID, so treat it as a cache miss.
+		if kerr := unix.PidfdSendSignal(entry.fd, 0, nil, 0); kerr == nil {
+			if exited, perr := pidfdIsExited(entry.fd); perr == nil && exited {
+				return false, false, nil
+			}
+			return true, false, fmt.Errorf("refusing to signal pid %d: %w", pid, ErrProcessIdentityMismatch)
+		}
+		return false, false, nil
 	}
 	if kerr := unix.PidfdSendSignal(entry.fd, 0, nil, 0); errors.Is(kerr, unix.ESRCH) {
 		return true, false, nil
@@ -244,19 +270,10 @@ func verifyPreCapturedMemberFD(proof processGroupProof, pid int, expectedToken s
 	}
 	// PidfdSendSignal(0) and Getpgid both succeed for unreaped zombie tasks, so
 	// check pidfd POLLIN readiness (0 FDs) to detect already-exited zombies.
-	for {
-		pfd := []unix.PollFd{{Fd: int32(entry.fd), Events: unix.POLLIN}}
-		_, perr := unix.Poll(pfd, 0)
-		if errors.Is(perr, unix.EINTR) {
-			continue
-		}
-		if perr != nil {
-			return true, false, perr
-		}
-		if pfd[0].Revents&(unix.POLLIN|unix.POLLHUP) != 0 {
-			return true, false, nil
-		}
-		break
+	if exited, perr := pidfdIsExited(entry.fd); perr != nil {
+		return true, false, perr
+	} else if exited {
+		return true, false, nil
 	}
 	pgid, gerr := unix.Getpgid(pid)
 	if errors.Is(gerr, unix.ESRCH) {
@@ -1002,6 +1019,8 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	}
 	defer func() {
 		proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, scanProof.KnownMembers)
+		stale := detachStaleVerifiedFDs(proof)
+		closeVerifiedGroupProof(&stale)
 	}()
 
 	const maxPasses = 32

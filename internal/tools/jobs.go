@@ -1423,7 +1423,9 @@ func (j *Job) mergeLearnedGroupMembers(proof processGroupProof) {
 	}
 	j.mu.Lock()
 	j.groupProof.KnownMembers = mergeGroupMembers(j.groupProof.KnownMembers, proof.KnownMembers)
+	stale := detachStaleVerifiedFDs(&j.groupProof)
 	j.mu.Unlock()
+	closeVerifiedGroupProof(&stale)
 }
 
 func hasIndependentGroupProof(proof processGroupProof) bool {

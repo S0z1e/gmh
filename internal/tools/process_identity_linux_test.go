@@ -1758,3 +1758,211 @@ func TestLinuxFreshlyVerifiedMemberOverwritesStalePIDTokenAcrossMismatch(t *test
 		t.Fatalf("intruder pid %d was killed unexpectedly", intruderPID)
 	}
 }
+
+func TestLinuxFreshChildRetrySurvivesEACCESThenEMFILE(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-stale-fd-eacces-emfile"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(jobsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	childPIDFile := filepath.Join(root, "child.pid")
+	jobTok := "linux-eacces-emfile-retry-tok"
+	cmd := exec.Command("bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q", childPIDFile))
+	cmd.Env = append(os.Environ(), jobTokenEnvVar+"="+jobTok)
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	leaderTok := inspectProcess(leaderPID).StartToken
+	var childPID int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(childPIDFile); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				childPID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		t.Fatal("child did not start")
+	}
+	_ = cmd.Wait()
+	t.Cleanup(func() {
+		_ = syscall.Kill(childPID, syscall.SIGKILL)
+	})
+	info := inspectProcess(childPID)
+	if !info.Alive {
+		t.Fatalf("child pid %d not alive", childPID)
+	}
+	if leaderTok == "" {
+		leaderTok = info.StartToken
+	}
+
+	// Obtain a dead pidfd representing an exited earlier process that once held
+	// childPID before childPID was reused by the current JobToken child.
+	exitedCmd := exec.Command("sh", "-c", "exit 0")
+	configureProcess(exitedCmd)
+	if err := exitedCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	staleFD, serr := unix.PidfdOpen(exitedCmd.Process.Pid, 0)
+	_ = exitedCmd.Wait()
+	if serr != nil {
+		t.Skipf("pidfd_open unsupported: %v", serr)
+	}
+	var staleFDOwnedByJob atomic.Bool
+	t.Cleanup(func() {
+		if !staleFDOwnedByJob.Load() {
+			_ = unix.Close(staleFD)
+		}
+	})
+
+	rec := PersistedJob{
+		ID:             "bg-stale-fd-retry",
+		Started:        time.Now().Add(-time.Second),
+		Unlimited:      true,
+		Command:        "eacces then emfile job",
+		Cwd:            root,
+		OutputID:       outID,
+		PID:            leaderPID,
+		PGID:           info.PGID,
+		ProcessStarted: leaderTok,
+		JobToken:       jobTok,
+		GroupProof: &PersistedGroupProof{
+			UID:            info.UID,
+			HasUID:         info.HasUID,
+			SID:            info.SID,
+			KnownMembers:   map[int]string{leaderPID: leaderTok, childPID: "stale-boot:1"},
+			VerifiedAt:     time.Now().Add(-time.Second),
+			CleanupPending: true,
+		},
+		Status: JobRunning,
+	}
+	if err := savePersistedJob(jobsDir, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	origPidfdOpen := pidfdOpenFn
+	origOpenHandle := openLinuxProcHandleFn
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	origReadProcDir := readProcDirFn
+	var forceChildEACCES atomic.Bool
+	var forceLeaderEMFILE atomic.Bool
+	var recoverEMFILE atomic.Bool
+	recoverEMFILE.Store(true)
+	t.Cleanup(func() {
+		pidfdOpenFn = origPidfdOpen
+		openLinuxProcHandleFn = origOpenHandle
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+		readProcDirFn = origReadProcDir
+	})
+
+	// Hold recovery open in JobRunning initially so we can seed verifiedFDs on job
+	// before driving StopJob retries.
+	readProcDirFn = func() ([]os.DirEntry, error) {
+		if recoverEMFILE.Load() {
+			return nil, syscall.EMFILE
+		}
+		return origReadProcDir()
+	}
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			if forceLeaderEMFILE.Load() {
+				return processInfo{}, syscall.EMFILE
+			}
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == leaderPID {
+			if forceLeaderEMFILE.Load() {
+				return linuxProcMeta{}, syscall.EMFILE
+			}
+			return linuxProcMeta{}, nil
+		}
+		return origInspectMeta(pid)
+	}
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	var recoveredJob *Job
+	t.Cleanup(func() {
+		recoverEMFILE.Store(false)
+		forceChildEACCES.Store(false)
+		forceLeaderEMFILE.Store(false)
+		_ = exec2.CloseJobs(context.Background())
+		if recoveredJob != nil && recoveredJob.monitorDone != nil {
+			<-recoveredJob.monitorDone
+		}
+	})
+	if _, err := exec2.RecoverSessionJobs(outID, nil, nil, nil); err != nil {
+		t.Fatalf("RecoverSessionJobs: %v", err)
+	}
+	recoveredJob = exec2.registry().Get("bg-stale-fd-retry")
+	if recoveredJob == nil || recoveredJob.Status() != JobRunning {
+		t.Fatalf("expected running adopted job, got %+v", recoveredJob)
+	}
+	recoveredJob.proofFDMu.Lock()
+	recoveredJob.mu.Lock()
+	recoveredJob.groupProof.verifiedFDs = map[int]verifiedProcFD{
+		childPID: {fd: staleFD, startToken: "stale-boot:1"},
+	}
+	staleFDOwnedByJob.Store(true)
+	recoveredJob.mu.Unlock()
+	recoveredJob.proofFDMu.Unlock()
+
+	// Step 1: StopJob learns info.StartToken for childPID via JobToken and then
+	// encounters EACCES on signal handle open; job must stay running with staleFD evicted.
+	recoverEMFILE.Store(false)
+	forceChildEACCES.Store(true)
+	pidfdOpenFn = func(pid int, flags int) (int, error) {
+		if pid == childPID && forceChildEACCES.Load() {
+			return -1, syscall.EACCES
+		}
+		return origPidfdOpen(pid, flags)
+	}
+	if _, stopErr := exec2.StopJob("bg-stale-fd-retry"); !errors.Is(stopErr, syscall.EACCES) {
+		t.Fatalf("first StopJob err = %v, want EACCES", stopErr)
+	}
+	if recoveredJob.Status() != JobRunning {
+		t.Fatalf("job status after first EACCES = %q, want running", recoveredJob.Status())
+	}
+
+	// Step 2: Next StopJob hits EMFILE on leader inspection; must preserve EMFILE
+	// and stay running/stoppable rather than returning ErrProcessIdentityMismatch.
+	forceLeaderEMFILE.Store(true)
+	if _, stopErr := exec2.StopJob("bg-stale-fd-retry"); !isFDLimitErr(stopErr) {
+		t.Fatalf("second StopJob under EMFILE err = %v, want EMFILE/ENFILE", stopErr)
+	}
+	if recoveredJob.Status() != JobRunning {
+		t.Fatalf("job status under EMFILE = %q, want running (not unknown)", recoveredJob.Status())
+	}
+	if !inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d unexpectedly dead before final retry", childPID)
+	}
+
+	// Step 3: Clear faults and verify final StopJob cleans childPID and finishes JobDone.
+	forceLeaderEMFILE.Store(false)
+	forceChildEACCES.Store(false)
+	if _, stopErr := exec2.StopJob("bg-stale-fd-retry"); stopErr != nil {
+		t.Fatalf("final StopJob err = %v, want nil", stopErr)
+	}
+	if recoveredJob.Status() != JobDone {
+		t.Fatalf("final status = %q, want done", recoveredJob.Status())
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("child pid %d survived final StopJob", childPID)
+	}
+}

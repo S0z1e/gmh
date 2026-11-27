@@ -78,15 +78,17 @@ cancels background jobs belonging to the active session; normal turn cleanup
 leaves them running. Switching sessions isolates job results, approval guards,
 read snapshots and queued images. Background completions keep their owner's
 audit destination after a switch. Job ownership survives switches within the
-process. On session reopen after a crash or restart, persisted jobs are only
-re-adopted when live OS process identity (`PID`, `PGID`, and start token) can
-be verified; reused PIDs and exited processes with no pending cleanup or
-surviving verified group are marked `unknown` without sending signals or
-replaying commands. When an exited leader has pending cleanup or surviving
-descendants matching the persisted group proof, recovery revalidates those
-descendants, stops them and marks the job `done` (or keeps it `running` and
-stoppable on transient cleanup failure, marking it `unknown` only on identity
-mismatch). Output captured before the crash remains readable via its
+process. On session reopen after a crash or restart, persisted jobs are re-adopted once
+live OS process identity (`PID`, `PGID`, and start token) is verified (with
+transient initial inspection errors keeping the job `running` and stoppable
+under guarded stop checks rather than marking it `unknown`). Both exited leaders
+and reused leader PIDs with no pending cleanup and no independent surviving
+verified group are marked `unknown` without sending signals or replaying
+commands. When an exited or PID-reused leader has pending cleanup or surviving
+descendants matching an independent persisted group proof, recovery revalidates
+those descendants, stops them and marks the job `done` (or keeps it `running`
+and stoppable on transient cleanup failure, marking it `unknown` only on
+identity mismatch). Output captured before the crash remains readable via its
 session-owned path (with the live stdout/stderr pipe having closed at process
 exit).
 
