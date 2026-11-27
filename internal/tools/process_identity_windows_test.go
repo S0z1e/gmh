@@ -487,13 +487,14 @@ func TestWindowsRecoveryAndStopAdoptedContinueAfterLeaderPIDReused(t *testing.T)
 			Cwd:            root,
 			OutputFile:     outFile,
 			Started:        base,
-			Deadline:       base.Add(10 * time.Minute),
+			Deadline:       time.Now().Add(10 * time.Minute),
 			PID:            100,
 			PGID:           100,
 			ProcessStarted: leaderTok,
 			Status:         JobRunning,
 			GroupProof: &PersistedGroupProof{
 				VerifiedAt:     base.Add(2 * time.Second),
+				ExitObservedAt: base.Add(4 * time.Second),
 				CleanupPending: true,
 				KnownMembers: map[int]string{
 					100: leaderTok,
@@ -506,10 +507,12 @@ func TestWindowsRecoveryAndStopAdoptedContinueAfterLeaderPIDReused(t *testing.T)
 		}
 
 		origInspectErr := inspectProcessErrFn
+		origStopGroup := stopVerifiedProcessGroupFn
 		origSnap := snapshotWindowsProcessesFn
 		origTerm := terminateWindowsProcessFn
 		defer func() {
 			inspectProcessErrFn = origInspectErr
+			stopVerifiedProcessGroupFn = origStopGroup
 			snapshotWindowsProcessesFn = origSnap
 			terminateWindowsProcessFn = origTerm
 		}()
@@ -520,9 +523,16 @@ func TestWindowsRecoveryAndStopAdoptedContinueAfterLeaderPIDReused(t *testing.T)
 			}
 			return processInfo{}, nil
 		}
+		// If StopJob tries to open/signal the recycled leader PID with TERMINATE
+		// rights first, simulate ERROR_ACCESS_DENIED to prove pending cleanup
+		// retries descendant cleanup directly instead.
+		var leaderSignalled atomic.Bool
+		stopVerifiedProcessGroupFn = func(proof processGroupProof) error {
+			leaderSignalled.Store(true)
+			return windows.ERROR_ACCESS_DENIED
+		}
 
-		var failFirstCleanup atomic.Bool
-		failFirstCleanup.Store(true)
+		var allowTerminate atomic.Bool
 		var childSignalled atomic.Bool
 		snapshotWindowsProcessesFn = func(ln int64, jobTok string, jobHandle uintptr) ([]windowsProcEntry, error) {
 			if !childSignalled.Load() {
@@ -537,7 +547,130 @@ func TestWindowsRecoveryAndStopAdoptedContinueAfterLeaderPIDReused(t *testing.T)
 		}
 		terminateWindowsProcessFn = func(cand windowsProcEntry, expectedToken string, jobHandle uintptr) (bool, error) {
 			if cand.pid == 201 {
-				if failFirstCleanup.Swap(false) {
+				if !allowTerminate.Load() {
+					return false, windows.ERROR_ACCESS_DENIED
+				}
+				childSignalled.Store(true)
+				return true, nil
+			}
+			return false, nil
+		}
+
+		exec2 := &Executor{
+			Root:      root,
+			OutputDir: outDir,
+			OutputID:  outID,
+			JobsDir:   jobsDir,
+		}
+		exec2.SwitchSession(outID)
+		defer exec2.CloseJobs(context.Background())
+
+		recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+		if err != nil || len(recovered) != 1 || recovered[0].Status != JobRunning {
+			t.Fatalf("RecoverSessionJobs = %+v, err=%v; want JobRunning after transient cleanup failure", recovered, err)
+		}
+		job := exec2.registry().Get("bg-1")
+		if job == nil || job.monitorDone == nil {
+			t.Fatal("missing recovered job or monitorDone")
+		}
+		<-job.monitorDone
+		if job.Status() != JobRunning {
+			t.Fatalf("monitor marked job %q after transient cleanup failure + reused leader PID; want JobRunning", job.Status())
+		}
+
+		allowTerminate.Store(true)
+		if _, err := exec2.StopJob("bg-1"); err != nil {
+			t.Fatalf("StopJob retry failed: %v", err)
+		}
+		if job.Status() != JobDone || !childSignalled.Load() {
+			t.Fatalf("status=%q childSignalled=%v, want done + true", job.Status(), childSignalled.Load())
+		}
+		if leaderSignalled.Load() {
+			t.Fatal("pending cleanup retry attempted to open/signal leader PID before descendant cleanup")
+		}
+	})
+
+	t.Run("monitor_wait_mismatch_routes_to_cleanup_and_stays_stoppable", func(t *testing.T) {
+		root := t.TempDir()
+		sessionBase := t.TempDir()
+		outID := "sess-win-wait-mismatch-retry"
+		outDir := filepath.Join(sessionBase, outID, "bash-output")
+		jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+		if err := os.MkdirAll(outDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(jobsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		outFile := filepath.Join(outDir, "bash-1.log")
+		if err := os.WriteFile(outFile, []byte("out\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		rec := PersistedJob{
+			ID:             "bg-1",
+			OutputID:       outID,
+			Command:        "sleep 30",
+			Cwd:            root,
+			OutputFile:     outFile,
+			Started:        base,
+			Deadline:       time.Now().Add(10 * time.Minute),
+			PID:            100,
+			PGID:           100,
+			ProcessStarted: leaderTok,
+			Status:         JobRunning,
+			GroupProof: &PersistedGroupProof{
+				VerifiedAt:     base.Add(2 * time.Second),
+				CleanupPending: false,
+				KnownMembers: map[int]string{
+					100: leaderTok,
+					201: childTok,
+				},
+			},
+		}
+		if err := savePersistedJob(jobsDir, rec); err != nil {
+			t.Fatal(err)
+		}
+
+		origInspectErr := inspectProcessErrFn
+		origInspectWin := inspectWindowsProcessFn
+		origSnap := snapshotWindowsProcessesFn
+		origTerm := terminateWindowsProcessFn
+		defer func() {
+			inspectProcessErrFn = origInspectErr
+			inspectWindowsProcessFn = origInspectWin
+			snapshotWindowsProcessesFn = origSnap
+			terminateWindowsProcessFn = origTerm
+		}()
+
+		inspectProcessErrFn = func(pid int) (processInfo, error) {
+			if pid == 100 {
+				return processInfo{Alive: true, PGID: 100, StartToken: leaderTok}, nil
+			}
+			return processInfo{}, nil
+		}
+		inspectWindowsProcessFn = func(pid int) (processInfo, error) {
+			if pid == 100 {
+				return processInfo{Alive: true, PGID: 100, StartToken: leaderTok}, nil
+			}
+			return processInfo{}, nil
+		}
+
+		var allowTerminate atomic.Bool
+		var childSignalled atomic.Bool
+		snapshotWindowsProcessesFn = func(ln int64, jobTok string, jobHandle uintptr) ([]windowsProcEntry, error) {
+			if !childSignalled.Load() {
+				return []windowsProcEntry{
+					{pid: 100, ppid: 50, startToken: replacementTok, startNs: replacementNs},
+					{pid: 201, ppid: 100, startToken: childTok, startNs: childNs},
+				}, nil
+			}
+			return []windowsProcEntry{
+				{pid: 100, ppid: 50, startToken: replacementTok, startNs: replacementNs},
+			}, nil
+		}
+		terminateWindowsProcessFn = func(cand windowsProcEntry, expectedToken string, jobHandle uintptr) (bool, error) {
+			if cand.pid == 201 {
+				if !allowTerminate.Load() {
 					return false, windows.ERROR_ACCESS_DENIED
 				}
 				childSignalled.Store(true)
@@ -560,7 +693,7 @@ func TestWindowsRecoveryAndStopAdoptedContinueAfterLeaderPIDReused(t *testing.T)
 
 		recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
 		if err != nil || len(recovered) != 1 || recovered[0].Status != JobRunning {
-			t.Fatalf("RecoverSessionJobs = %+v, err=%v; want JobRunning after transient cleanup failure", recovered, err)
+			t.Fatalf("RecoverSessionJobs = %+v, err=%v; want JobRunning", recovered, err)
 		}
 		job := exec2.registry().Get("bg-1")
 		if job == nil || job.monitorDone == nil {
@@ -568,8 +701,10 @@ func TestWindowsRecoveryAndStopAdoptedContinueAfterLeaderPIDReused(t *testing.T)
 		}
 		<-job.monitorDone
 		if job.Status() != JobRunning {
-			t.Fatalf("monitor marked job %q after transient cleanup failure + reused leader PID; want JobRunning", job.Status())
+			t.Fatalf("monitor marked job %q on wait mismatch with surviving child; want JobRunning", job.Status())
 		}
+
+		allowTerminate.Store(true)
 		if _, err := exec2.StopJob("bg-1"); err != nil {
 			t.Fatalf("StopJob retry failed: %v", err)
 		}

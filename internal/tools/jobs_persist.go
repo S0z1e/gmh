@@ -1382,15 +1382,12 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		proofWg.Wait()
 	}
 	if errors.Is(err, ErrProcessIdentityMismatch) {
-		if hasIndependentGroupProof(job.snapshotGroupProof()) {
-			err = errAdoptedProcessExited
-			exitCode = -1
-			exitKnown = false
-		} else {
-			summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
-			job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
+		if !job.handleAdoptedLeaderIdentityMismatch(job.OutputFile, job.Cwd) {
 			return
 		}
+		err = errAdoptedProcessExited
+		exitCode = -1
+		exitKnown = false
 	}
 
 	deadlineStopMu.Lock()
@@ -1425,15 +1422,12 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 			exitCode = -1
 			exitKnown = false
 		} else if ierr == nil && info.Alive && !snap.Identity.Matches(info) {
-			if hasIndependentGroupProof(job.snapshotGroupProof()) {
-				err = errAdoptedProcessExited
-				exitCode = -1
-				exitKnown = false
-			} else {
-				summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
-				job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
+			if !job.handleAdoptedLeaderIdentityMismatch(job.OutputFile, job.Cwd) {
 				return
 			}
+			err = errAdoptedProcessExited
+			exitCode = -1
+			exitKnown = false
 		} else {
 			// Leader is still alive or inspection failed with a transient error (such as EMFILE/ENFILE).
 			// Keep WaitError visible and continue supervising via fallback polling so the child group
@@ -1470,13 +1464,10 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 						// Positively established exit.
 						leaderExited = true
 					} else if perr == nil && pinfo.Alive && !snap.Identity.Matches(pinfo) {
-						if hasIndependentGroupProof(job.snapshotGroupProof()) {
-							leaderExited = true
-						} else {
-							summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
-							job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
+						if !job.handleAdoptedLeaderIdentityMismatch(job.OutputFile, job.Cwd) {
 							return
 						}
+						leaderExited = true
 					} else if perr == nil && pinfo.Alive {
 						job.proofFDMu.Lock()
 						job.refreshVerifiedGroupMembersLocked()

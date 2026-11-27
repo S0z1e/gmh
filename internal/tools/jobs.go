@@ -1263,10 +1263,19 @@ func (j *Job) snapshotGroupProofLocked() processGroupProof {
 	return proof
 }
 
-func (j *Job) snapshotGroupProof() processGroupProof {
+func (j *Job) handleAdoptedLeaderIdentityMismatch(outFile, cwd string) bool {
+	j.proofFDMu.Lock()
 	j.mu.Lock()
-	defer j.mu.Unlock()
-	return j.snapshotGroupProofLocked()
+	proof := j.snapshotGroupProofLocked()
+	j.mu.Unlock()
+	hasProof := hasIndependentGroupProof(proof)
+	j.proofFDMu.Unlock()
+	if hasProof {
+		return true
+	}
+	summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
+	j.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
+	return false
 }
 
 func populateGroupProofIdentity(proof *processGroupProof, info processInfo) {
@@ -1456,15 +1465,24 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 		}
 	}
 	mustFinalize := monitorFailed || monitorDone
+	pendingCleanup := j.cleanupPending || !j.groupProof.ExitObservedAt.IsZero()
+	var proof processGroupProof
+	if pendingCleanup {
+		proof = j.preparePendingPostExitCleanupLocked()
+	}
 	j.mu.Unlock()
 
-	// Refresh verified PGID members while the leader may still be alive so any
-	// reparented children remain verifiable if the leader exits or wait fails.
-	proof := j.refreshVerifiedGroupMembersLocked()
-
-	err := stopVerifiedProcessGroupFn(proof)
-	if errors.Is(err, ErrProcessIdentityMismatch) && hasIndependentGroupProof(proof) {
+	var err error
+	if pendingCleanup {
 		err = os.ErrProcessDone
+	} else {
+		// Refresh verified PGID members while the leader may still be alive so any
+		// reparented children remain verifiable if the leader exits or wait fails.
+		proof = j.refreshVerifiedGroupMembersLocked()
+		err = stopVerifiedProcessGroupFn(proof)
+		if errors.Is(err, ErrProcessIdentityMismatch) && hasIndependentGroupProof(proof) {
+			err = os.ErrProcessDone
+		}
 	}
 	if errors.Is(err, ErrProcessIdentityMismatch) {
 		j.proofFDMu.Unlock()

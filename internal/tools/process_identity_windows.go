@@ -125,6 +125,11 @@ func stopVerifiedProcessGroup(id ProcessIdentityInfo) error {
 	}
 	h, err := openVerifiedWindowsProcess(id.PID, id.StartToken, windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE)
 	if err != nil {
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			if info, ierr := inspectWindowsProcessFn(id.PID); ierr == nil && info.Alive && !id.Matches(info) {
+				return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+			}
+		}
 		return err
 	}
 	defer windows.CloseHandle(h)
@@ -565,7 +570,7 @@ func captureVerifiedGroupMembers(proof processGroupProof) map[int]string {
 	if ierr != nil || !id.Matches(info) {
 		return nil
 	}
-	procs, err := snapshotWindowsProcesses(leaderNs, proof.JobToken, proof.jobHandle)
+	procs, err := snapshotWindowsProcessesFn(leaderNs, proof.JobToken, proof.jobHandle)
 	if err != nil {
 		return map[int]string{id.PID: id.StartToken}
 	}
@@ -725,7 +730,7 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 	if !ok {
 		return false, ErrProcessIdentityMismatch
 	}
-	procs, err := snapshotWindowsProcesses(leaderNs, proof.JobToken, proof.jobHandle)
+	procs, err := snapshotWindowsProcessesFn(leaderNs, proof.JobToken, proof.jobHandle)
 	if err != nil {
 		return false, err
 	}
