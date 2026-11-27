@@ -1517,12 +1517,7 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 			gerr := j.runStopGroupAfterExit(&descProof)
 			j.mergeLearnedGroupMembers(descProof)
 			j.proofFDMu.Unlock()
-			if errors.Is(gerr, ErrProcessIdentityMismatch) {
-				summary, preview, _, _ := summarizeOutputFile(outFile, cwd)
-				j.markUnknown(fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr), summary, preview)
-				return gerr
-			}
-			if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
+			if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) && !errors.Is(gerr, ErrProcessIdentityMismatch) {
 				j.recordStopError(gerr)
 				return gerr
 			}

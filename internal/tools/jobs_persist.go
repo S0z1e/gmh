@@ -884,12 +884,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 						}
 						gerr := stopGroupAfterExitTrackFn(&descProof)
 						proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, descProof.KnownMembers)
-						if errors.Is(gerr, ErrProcessIdentityMismatch) {
-							closeVerifiedGroupProof(&proof)
-							reason := fmt.Sprintf("refused to attach to PID %d: %v", id.PID, gerr)
-							return e.finishRecoveredJobUnknown(rec, jobsDir, unknownNoticed, adoptionNoticed, reason), nil
-						}
-						if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) {
+						if gerr != nil && !errors.Is(gerr, os.ErrProcessDone) && !errors.Is(gerr, ErrProcessIdentityMismatch) {
 							reportErr = gerr
 						}
 					}
@@ -938,21 +933,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 				gerr := stopGroupAfterExitTrackFn(&proof)
 				if errors.Is(gerr, ErrProcessIdentityMismatch) {
 					reason := fmt.Sprintf("refused to signal PID %d: %v", id.PID, gerr)
-					if rec.FinishedAt.IsZero() {
-						rec.FinishedAt = time.Now()
-					}
-					summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
-					job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
-						Output:          summary,
-						Err:             errors.New(reason),
-						ExitCode:        -1,
-						ExitCodeUnknown: true,
-						Preview:         preview,
-					})
-					if jobsDir != "" {
-						_ = savePersistedJob(jobsDir, job.persistedSnapshot())
-					}
-					return job, nil
+					return e.finishRecoveredJobUnknown(rec, jobsDir, unknownNoticed, adoptionNoticed, reason), nil
 				}
 				if gerr == nil || errors.Is(gerr, os.ErrProcessDone) {
 					resErr := error(errAdoptedProcessExited)
@@ -1005,21 +986,7 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 		default:
 			reason = fmt.Sprintf("previous process PID %d is no longer running (exited while harness was down; exit status unavailable)", id.PID)
 		}
-		if rec.FinishedAt.IsZero() {
-			rec.FinishedAt = time.Now()
-		}
-		summary, preview, _, _ := summarizeOutputFile(rec.OutputFile, rec.Cwd)
-		job := e.newRecoveredJobObject(rec, jobsDir, JobUnknown, unknownNoticed, adoptionNoticed, reason, JobResult{
-			Output:          summary,
-			Err:             errors.New(reason),
-			ExitCode:        -1,
-			ExitCodeUnknown: true,
-			Preview:         preview,
-		})
-		if jobsDir != "" {
-			_ = savePersistedJob(jobsDir, job.persistedSnapshot())
-		}
-		return job, nil
+		return e.finishRecoveredJobUnknown(rec, jobsDir, unknownNoticed, adoptionNoticed, reason), nil
 	}
 }
 

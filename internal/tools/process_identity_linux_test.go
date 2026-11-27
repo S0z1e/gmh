@@ -809,3 +809,119 @@ func TestLinuxAccessDeniedCleanupSignalsVerifiedChildrenAndKeepsLeaderPending(t 
 		t.Fatalf("verified child pid %d survived Linux cleanup under leader EACCES", childPID)
 	}
 }
+
+func TestLinuxUnreadableRootRefusesNumericPPIDAndCleansVerifiedPastGroupMismatch(t *testing.T) {
+	unrelatedCmd := exec.Command("sleep", "30")
+	configureProcess(unrelatedCmd)
+	if err := unrelatedCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedPID := unrelatedCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(unrelatedPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = unrelatedCmd.Wait()
+	})
+	unrelatedInfo := inspectProcess(unrelatedPID)
+	if !unrelatedInfo.Alive {
+		t.Fatalf("unrelated pid %d not alive", unrelatedPID)
+	}
+
+	verifiedCmd := exec.Command("sleep", "30")
+	configureProcess(verifiedCmd)
+	if err := verifiedCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	verifiedPID := verifiedCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(verifiedPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = verifiedCmd.Wait()
+	})
+	verifiedInfo := inspectProcess(verifiedPID)
+	if !verifiedInfo.Alive {
+		t.Fatalf("verified pid %d not alive", verifiedPID)
+	}
+
+	// Simulate an unreadable leader PID inside /proc alongside an intruder with a
+	// mismatched UID in the same PGID and an unverified process whose numeric PPID
+	// happens to equal leaderPID.
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	t.Cleanup(func() {
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+	})
+
+	leaderPID := verifiedInfo.PGID
+	if leaderPID == verifiedPID || leaderPID == unrelatedPID {
+		leaderPID = verifiedPID + 99998
+	}
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, syscall.EACCES
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == leaderPID {
+			return linuxProcMeta{}, syscall.EACCES
+		}
+		if pid == unrelatedPID {
+			m, err := origInspectMeta(pid)
+			if err == nil {
+				m.ppid = leaderPID
+				m.info.PGID = leaderPID
+			}
+			return m, err
+		}
+		return origInspectMeta(pid)
+	}
+
+	// Subcase 1: unverified unrelatedPID sharing numeric PPID/PGID with unreadable
+	// leaderPID must NEVER be verified or signalled.
+	unverifiedProof := processGroupProof{
+		Leader:       ProcessIdentityInfo{PID: leaderPID, PGID: leaderPID, StartToken: unrelatedInfo.StartToken},
+		UID:          unrelatedInfo.UID,
+		HasUID:       unrelatedInfo.HasUID,
+		SID:          unrelatedInfo.SID,
+		VerifiedAt:   time.Now().Add(-5 * time.Second),
+		KnownMembers: map[int]string{leaderPID: unrelatedInfo.StartToken},
+	}
+	candidates, _, merr := collectAndVerifyLinuxCandidates(&unverifiedProof, unverifiedProof.Leader, "", 0)
+	if merr != nil {
+		t.Fatalf("unexpected mismatch err: %v", merr)
+	}
+	for _, c := range candidates {
+		if c.pid == unrelatedPID && c.verified {
+			t.Fatalf("unrelated pid %d verified via unreadable root numeric ppid", unrelatedPID)
+		}
+	}
+
+	// Subcase 2: even when another member causes a UID mismatch under leader
+	// EACCES, individually verified KnownMembers child is still cleaned up while
+	// leader EACCES stays unresolved.
+	mixedProof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: verifiedInfo.PGID, StartToken: verifiedInfo.StartToken},
+		UID:            verifiedInfo.UID + 1, // forces UID mismatch during whole-group scan
+		HasUID:         true,
+		SID:            verifiedInfo.SID,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers:   map[int]string{leaderPID: verifiedInfo.StartToken, verifiedPID: verifiedInfo.StartToken},
+	}
+	if err := stopAdoptedProcessGroupAfterExitTrack(&mixedProof); !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want EACCES keeping leader pending", err)
+	}
+	for wait := 0; wait < 20 && inspectProcess(verifiedPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(verifiedPID).Alive {
+		t.Fatalf("verified child pid %d survived cleanup after group UID mismatch under leader EACCES", verifiedPID)
+	}
+	if !inspectProcess(unrelatedPID).Alive {
+		t.Fatalf("unrelated pid %d was killed despite unverified numeric ppid", unrelatedPID)
+	}
+}

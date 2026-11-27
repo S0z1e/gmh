@@ -261,6 +261,134 @@ func TestDarwinAccessDeniedCleanupSignalsVerifiedChildrenAndKeepsLeaderPending(t
 	}
 }
 
+func TestDarwinAccessDeniedGroupUIDMismatchStillKillsVerifiedKnownMember(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-darwin-eacces-uid-mismatch"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	childPIDFile := filepath.Join(root, "child.pid")
+	relFile := filepath.Join(root, "release")
+
+	cmd, _ := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("sleep 30 & echo $! > %q; printf 'READY\\n'; while [ ! -f %q ]; do sleep 0.02; done; exit 0", childPIDFile, relFile),
+	})
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	pidData, err := os.ReadFile(childPIDFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+	if err != nil || childPID <= 0 {
+		t.Fatalf("invalid child pid %q: %v", string(pidData), err)
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	childInfo := inspectProcess(childPID)
+	if !childInfo.Alive {
+		t.Fatalf("child pid %d not alive", childPID)
+	}
+	recs, err := loadPersistedJobs(jobsDir)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("loadPersistedJobs = %+v, err=%v", recs, err)
+	}
+	rec := recs[0]
+	leaderPID := rec.PID
+
+	// Release leader so child stays alive alone.
+	if err := os.WriteFile(relFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for wait := 0; wait < 40 && inspectProcess(leaderPID).Alive; wait++ {
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	origSlice := darwinSysctlKinfoProcSliceFn
+	origInspect := inspectProcessErrFn
+	origStopGroup := stopVerifiedProcessGroupFn
+	t.Cleanup(func() {
+		darwinSysctlKinfoProcSliceFn = origSlice
+		inspectProcessErrFn = origInspect
+		stopVerifiedProcessGroupFn = origStopGroup
+	})
+
+	// Inject a foreign UID on pgrp lookup to force darwinResolveGroupCandidates to
+	// fail with UID mismatch while leader inspection returns EACCES.
+	darwinSysctlKinfoProcSliceFn = func(name string, args ...int) ([]unix.KinfoProc, error) {
+		procs, err := origSlice(name, args...)
+		if name == "kern.proc.pgrp" && len(procs) > 0 {
+			for i := range procs {
+				procs[i].Eproc.Ucred.Uid = childInfo.UID + 1
+			}
+		}
+		return procs, err
+	}
+	var leaderGone atomic.Bool
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if !leaderGone.Load() && pid == leaderPID {
+			return processInfo{}, syscall.EACCES
+		}
+		return origInspect(pid)
+	}
+	stopVerifiedProcessGroupFn = func(proof processGroupProof) error {
+		if !leaderGone.Load() && proof.Leader.PID == leaderPID {
+			return syscall.EACCES
+		}
+		return os.ErrProcessDone
+	}
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	job := exec2.newRecoveredJobObject(rec, jobsDir, JobRunning, false, true, "adopted", JobResult{})
+	job.groupProof = processGroupProof{
+		Leader:       ProcessIdentityInfo{PID: leaderPID, PGID: rec.PGID, StartToken: rec.ProcessStarted},
+		UID:          childInfo.UID,
+		HasUID:       true,
+		SID:          childInfo.SID,
+		Sess:         childInfo.Sess,
+		VerifiedAt:   time.Now().Add(-5 * time.Second),
+		KnownMembers: map[int]string{leaderPID: rec.ProcessStarted, childPID: childInfo.StartToken},
+	}
+
+	stopErr := job.stopAdoptedProcess(nil, false)
+	if !errors.Is(stopErr, syscall.EACCES) {
+		t.Fatalf("stopAdoptedProcess err = %v, want EACCES keeping job retryable", stopErr)
+	}
+	if job.Status() != JobRunning {
+		t.Fatalf("job status = %q after group UID mismatch under leader EACCES, want JobRunning", job.Status())
+	}
+	for wait := 0; wait < 20 && inspectProcess(childPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("verified child pid %d survived Darwin cleanup after UID mismatch under leader EACCES", childPID)
+	}
+
+	// Retry after leader exits cleanly must succeed without failing on old UID mismatch.
+	leaderGone.Store(true)
+	if err := job.stopAdoptedProcess(nil, false); err != nil {
+		t.Fatalf("follow-up stopAdoptedProcess err = %v", err)
+	}
+	if job.Status() != JobDone {
+		t.Fatalf("status after retry = %q, want done", job.Status())
+	}
+}
+
 func TestDarwinNativeWaitCapturesGroupProofAfterInitialInspectError(t *testing.T) {
 	root := t.TempDir()
 	sessionBase := t.TempDir()

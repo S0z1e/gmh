@@ -379,6 +379,10 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 
 	known, liveCount, cerr := darwinResolveGroupCandidates(*proof, id, leaderSec, leaderUsec, procs)
 	if cerr != nil {
+		if leaderErr != nil && isProcessAccessError(leaderErr) {
+			_ = darwinSignalVerifiedKnownMembers(*proof, id)
+			return leaderErr
+		}
 		return cerr
 	}
 	if liveCount == 0 {

@@ -106,8 +106,10 @@ func inspectLinuxProcMeta(pid int) (linuxProcMeta, error) {
 	}, nil
 }
 
+var inspectLinuxProcMetaFn = inspectLinuxProcMeta
+
 func inspectProcessErr(pid int) (processInfo, error) {
-	meta, err := inspectLinuxProcMeta(pid)
+	meta, err := inspectLinuxProcMetaFn(pid)
 	return meta.info, err
 }
 
@@ -519,6 +521,9 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 	if err != nil {
 		return nil, err, nil
 	}
+	// liveVerified records only members positively verified in this scan so that
+	// ancestry propagation never trusts stale or unreadable root/parent tokens.
+	liveVerified := make(map[int]string)
 	for _, entry := range entries {
 		name := entry.Name()
 		if !entry.IsDir() || len(name) == 0 || name[0] < '0' || name[0] > '9' {
@@ -528,7 +533,7 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 		if perr != nil || pid <= 0 {
 			continue
 		}
-		meta, merr := inspectLinuxProcMeta(pid)
+		meta, merr := inspectLinuxProcMetaFn(pid)
 		if merr != nil {
 			if isProcessAccessError(merr) {
 				if pid == id.PID || proof.KnownMembers[pid] != "" {
@@ -564,8 +569,6 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 		}
 		if proof.KnownMembers[pid] == meta.info.StartToken {
 			verified = true
-		} else if meta.ppid == id.PID {
-			verified = true
 		}
 		if !verified && proof.JobToken != "" {
 			hasTok, tokErr := processHasJobTokenErr(pid, proof.JobToken)
@@ -588,6 +591,7 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 			}
 		}
 		if verified {
+			liveVerified[pid] = meta.info.StartToken
 			if proof.KnownMembers == nil {
 				proof.KnownMembers = make(map[int]string)
 			}
@@ -597,8 +601,8 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 		}
 		candidates = append(candidates, linuxGroupCandidate{pid: pid, meta: meta, verified: verified})
 	}
-	// Resolve multi-hop parent ancestry transitively regardless of /proc PID order,
-	// persisting newly verified identities immediately into proof.KnownMembers.
+	// Resolve multi-hop parent ancestry transitively using only live verified
+	// parent instances from this scan, persisting newly verified identities.
 	for {
 		added := false
 		for i := range candidates {
@@ -606,10 +610,11 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 			if c.verified {
 				continue
 			}
-			if parentTok, ok := proof.KnownMembers[c.meta.ppid]; ok {
+			if parentTok, ok := liveVerified[c.meta.ppid]; ok {
 				pBoot, pTicks, parsed := parseLinuxStartToken(parentTok)
 				if parsed && (leaderBoot == "" || pBoot == "" || pBoot == leaderBoot) && c.meta.startTicks >= pTicks {
 					c.verified = true
+					liveVerified[c.pid] = c.meta.info.StartToken
 					if proof.KnownMembers == nil {
 						proof.KnownMembers = make(map[int]string)
 					}
@@ -712,6 +717,10 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 			anySignalled = true
 		}
 		if perr != nil {
+			if errors.Is(perr, ErrProcessIdentityMismatch) && leaderErr != nil && isProcessAccessError(leaderErr) {
+				_ = stopKnownMembersFDFree(*proof, leaderErr)
+				return leaderErr
+			}
 			return perr
 		}
 		if empty {
