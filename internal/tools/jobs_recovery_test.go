@@ -1948,4 +1948,215 @@ func TestCrashRecoveryWaitErrorAuditPreservesUnavailableExit(t *testing.T) {
 	}
 }
 
+func TestCrashRecoveryTokenlessLegacyChildForkedAfterAdoptionStillStopsOnNormalExit(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-legacy-tokenless-late-fork"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(jobsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	outFile := filepath.Join(outDir, "bg-legacy.log")
+	logF, err := os.OpenFile(outFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logF.Close()
+
+	triggerFile := filepath.Join(root, "fork-and-exit")
+	readyFile := filepath.Join(root, "ready")
+	childPIDFile := filepath.Join(root, "child.pid")
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf(
+		"touch %q; while [ ! -f %q ]; do sleep 0.05; done; (exec 3>&-; sleep 30) & echo $! > %q; exit 0",
+		readyFile, triggerFile, childPIDFile,
+	))
+	configureProcess(cmd)
+	cmd.Stdout = logF
+	cmd.Stderr = logF
+	// Ensure no GMH_JOB_TOKEN is present in the environment, matching a pre-upgrade job.
+	var cleanEnv []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, jobTokenEnvVar+"=") {
+			cleanEnv = append(cleanEnv, kv)
+		}
+	}
+	cmd.Env = cleanEnv
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	waitLeaderDone := make(chan error, 1)
+	go func() { waitLeaderDone <- cmd.Wait() }()
+	t.Cleanup(func() { _ = killProcessTree(cmd) })
+
+	readyBy := time.Now().Add(3 * time.Second)
+	for time.Now().Before(readyBy) {
+		if _, err := os.Stat(readyFile); err == nil {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	pgid, startTok, alive := ProcessIdentity(leaderPID)
+	if !alive {
+		t.Fatalf("legacy leader PID %d not alive", leaderPID)
+	}
+
+	// Write a legacy persisted job JSON with empty JobToken.
+	rec := PersistedJob{
+		ID:             "bg-legacy",
+		Started:        time.Now().Add(-time.Second),
+		Unlimited:      true,
+		Command:        "legacy tokenless job",
+		Cwd:            root,
+		OutputFile:     outFile,
+		OutputID:       outID,
+		PID:            leaderPID,
+		PGID:           pgid,
+		ProcessStarted: startTok,
+		JobToken:       "",
+		Status:         JobRunning,
+	}
+	if err := savePersistedJob(jobsDir, rec); err != nil {
+		t.Fatal(err)
+	}
+	_ = logF.Close()
+
+	exec2 := &Executor{Root: root, OutputDir: outDir, OutputID: outID, JobsDir: jobsDir}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 || recovered[0].Status != JobRunning {
+		t.Fatalf("recovered = %+v, err=%v", recovered, err)
+	}
+	job := exec2.registry().Get("bg-legacy")
+	if job == nil || job.JobToken != "" {
+		t.Fatalf("expected tokenless adopted job, got %+v", job)
+	}
+
+	if err := os.WriteFile(triggerFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	<-waitLeaderDone
+
+	var childPID int
+	childPoll := time.Now().Add(3 * time.Second)
+	for time.Now().Before(childPoll) {
+		if b, rerr := os.ReadFile(childPIDFile); rerr == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				childPID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		t.Fatal("child PID file was not written")
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	select {
+	case <-job.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("tokenless legacy job did not finish after leader exit (status=%q waitErr=%q)", job.Status(), job.Snapshot().WaitError)
+	}
+	if job.Status() != JobDone {
+		t.Fatalf("tokenless legacy job status = %q, want done (recoveryNote=%q waitErr=%q)", job.Status(), job.Snapshot().RecoveryNote, job.Snapshot().WaitError)
+	}
+	childDeadBy := time.Now().Add(3 * time.Second)
+	for time.Now().Before(childDeadBy) {
+		if _, _, childAlive := ProcessIdentity(childPID); !childAlive {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("child PID %d forked from tokenless legacy job survived leader exit", childPID)
+}
+
+func TestCrashRecoveryIncompleteProofKeepsJobStoppable(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-incomplete-retry"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	releaseFile := filepath.Join(root, "release")
+
+	helperCmd, meta := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "READY",
+		"GMH_HELPER_CMD":       fmt.Sprintf("printf 'READY\\n'; while [ ! -f %q ]; do sleep 0.05; done; exit 0", releaseFile),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	var attemptsMu sync.Mutex
+	attempts := 0
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		stopAdoptedGroupAfterExit: func(proof processGroupProof) error {
+			attemptsMu.Lock()
+			attempts++
+			n := attempts
+			attemptsMu.Unlock()
+			if n == 1 {
+				return fmt.Errorf("incomplete verification proof for tokenless pgid %d: %w", proof.Leader.PGID, errIncompleteGroupProof)
+			}
+			return os.ErrProcessDone
+		},
+	}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 || recovered[0].Status != JobRunning {
+		t.Fatalf("recovered = %+v, err=%v", recovered, err)
+	}
+	job := exec2.registry().Get(meta.JobID)
+
+	if err := os.WriteFile(releaseFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := job.Snapshot()
+		if snap.WaitError != "" {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	snap := job.Snapshot()
+	if snap.Status != JobRunning {
+		t.Fatalf("status after incomplete-proof cleanup = %q, want running (must not mark unknown)", snap.Status)
+	}
+	if !strings.Contains(snap.WaitError, "incomplete") {
+		t.Fatalf("WaitError = %q, want incomplete-proof message", snap.WaitError)
+	}
+
+	// Retry via StopJob must remain allowed and finalize cleanly once group clears.
+	res, stopErr := exec2.StopJob(meta.JobID)
+	if stopErr != nil {
+		t.Fatalf("retry StopJob after incomplete proof failed: %v (%s)", stopErr, res.Text)
+	}
+	if job.Status() != JobDone {
+		t.Fatalf("status after retry StopJob = %q, want done", job.Status())
+	}
+}
+
 var _ = errors.New

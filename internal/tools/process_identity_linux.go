@@ -330,9 +330,33 @@ func captureVerifiedGroupProof(proof *processGroupProof) {
 	if proof == nil {
 		return
 	}
+	// Prune already-exited kernel pidfds immediately (zero extra FDs) so
+	// short-lived children cannot accumulate open descriptors.
+	for pid, entry := range proof.verifiedFDs {
+		if entry.fd <= 0 {
+			delete(proof.verifiedFDs, pid)
+			continue
+		}
+		if kerr := unix.PidfdSendSignal(entry.fd, 0, nil, 0); errors.Is(kerr, unix.ESRCH) {
+			_ = unix.Close(entry.fd)
+			delete(proof.verifiedFDs, pid)
+		}
+	}
 	members := captureVerifiedGroupMembers(*proof)
 	if len(members) == 0 {
 		return
+	}
+	// Also prune any descriptor whose PID exited, left the PGID, became a zombie,
+	// or changed identity since the previous snapshot, while keeping KnownMembers
+	// historical ancestry intact.
+	for pid, entry := range proof.verifiedFDs {
+		liveTok, ok := members[pid]
+		if !ok || liveTok != entry.startToken {
+			if entry.fd > 0 {
+				_ = unix.Close(entry.fd)
+			}
+			delete(proof.verifiedFDs, pid)
+		}
 	}
 	proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, members)
 	if proof.KnownMembers[proof.Leader.PID] == proof.Leader.StartToken {
@@ -391,6 +415,36 @@ func processHasJobTokenErr(pid int, token string) (bool, error) {
 	return false, nil
 }
 
+func processHasOutputFileFDErr(pid int, outputFile string) (bool, error) {
+	if pid <= 0 || outputFile == "" {
+		return false, nil
+	}
+	outStat, outErr := os.Stat(outputFile)
+	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
+	entries, err := os.ReadDir(fdDir)
+	if err != nil {
+		if os.IsNotExist(err) || errors.Is(err, syscall.ESRCH) {
+			return false, nil
+		}
+		return false, err
+	}
+	deletedTarget := outputFile + " (deleted)"
+	for _, entry := range entries {
+		fdPath := fdDir + "/" + entry.Name()
+		if outErr == nil {
+			if st, serr := os.Stat(fdPath); serr == nil && os.SameFile(outStat, st) {
+				return true, nil
+			}
+		}
+		if target, lerr := os.Readlink(fdPath); lerr == nil {
+			if target == outputFile || target == deletedTarget {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 func stopKnownMembersFDFree(proof processGroupProof, origErr error) error {
 	if len(proof.KnownMembers) == 0 {
 		return origErr
@@ -417,17 +471,58 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	if info.Alive && !id.Matches(info) {
 		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 	}
-	entries, err := os.ReadDir("/proc")
-	if isFDLimitErr(err) {
-		return stopKnownMembersFDFree(proof, err)
-	}
-	if err != nil {
-		return err
-	}
 	var bootSec int64
 	var hasBoot bool
 	if !proof.ExitObservedAt.IsZero() {
 		bootSec, hasBoot = linuxBootUnixSec()
+	}
+
+	// Keep KnownMembers mutable on a cloned copy across passes so verified members
+	// discovered in one pass retain ancestry for grandchildren forked before SIGKILL.
+	scanProof := cloneGroupProof(proof)
+	scanProof.verifiedFDs = proof.verifiedFDs
+	if scanProof.KnownMembers == nil {
+		scanProof.KnownMembers = make(map[int]string)
+	}
+
+	const maxPasses = 32
+	deadline := time.Now().Add(2 * time.Second)
+	anySignalled := false
+	lastLiveMembers := 0
+	for pass := 0; pass < maxPasses; pass++ {
+		signalled, empty, liveMembers, perr := stopAdoptedProcessGroupAfterExitPass(&scanProof, id, leaderBoot, leaderTicks, bootSec, hasBoot)
+		lastLiveMembers = liveMembers
+		if signalled {
+			anySignalled = true
+		}
+		if perr != nil {
+			return perr
+		}
+		if empty {
+			if anySignalled {
+				return nil
+			}
+			return os.ErrProcessDone
+		}
+		if pass == maxPasses-1 || time.Now().After(deadline) {
+			break
+		}
+		if signalled {
+			time.Sleep(10 * time.Millisecond)
+		} else {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	return fmt.Errorf("pgid %d still has %d live member(s) after signalling: %w", id.PGID, lastLiveMembers, errGroupMembersStillAlive)
+}
+
+func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessIdentityInfo, leaderBoot string, leaderTicks uint64, bootSec int64, hasBoot bool) (signalled bool, empty bool, liveCount int, err error) {
+	entries, err := os.ReadDir("/proc")
+	if isFDLimitErr(err) {
+		return false, false, 0, stopKnownMembersFDFree(*proof, err)
+	}
+	if err != nil {
+		return false, false, 0, err
 	}
 	liveMembers := 0
 	unverifiedMembers := 0
@@ -461,27 +556,27 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 		memberVerified := false
 		if pid == id.PID {
 			if meta.info.StartToken != id.StartToken {
-				return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
+				return false, false, liveMembers, fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 			}
 			memberVerified = true
 		}
 		if proof.HasUID && meta.info.HasUID && meta.info.UID != proof.UID {
-			return fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+			return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: member pid %d uid mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 		}
 		if proof.SID > 0 && meta.info.SID != proof.SID {
-			return fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+			return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: member pid %d session mismatch: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 		}
 		mBoot, _, _ := parseLinuxStartToken(meta.info.StartToken)
 		if leaderBoot != "" && mBoot != "" && mBoot != leaderBoot {
-			return fmt.Errorf("refusing to signal pgid %d: boot mismatch: %w", id.PGID, ErrProcessIdentityMismatch)
+			return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: boot mismatch: %w", id.PGID, ErrProcessIdentityMismatch)
 		}
 		if meta.startTicks < leaderTicks {
-			return fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+			return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: member pid %d predates job: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 		}
 		if !proof.ExitObservedAt.IsZero() && hasBoot {
 			memberStart := time.Unix(bootSec+int64(meta.startTicks/100), int64((meta.startTicks%100)*10_000_000))
 			if memberStart.After(proof.ExitObservedAt.Add(2 * time.Second)) {
-				return fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+				return false, false, liveMembers, fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, pid, ErrProcessIdentityMismatch)
 			}
 		}
 		if proof.KnownMembers[pid] == meta.info.StartToken {
@@ -503,12 +598,25 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 				memberVerified = true
 			}
 		}
+		if !memberVerified && proof.OutputFile != "" {
+			hasOutFD, outErr := processHasOutputFileFDErr(pid, proof.OutputFile)
+			if isFDLimitErr(outErr) {
+				handleErr = outErr
+				break
+			}
+			if hasOutFD {
+				memberVerified = true
+			}
+		}
 		liveMembers++
 		if !memberVerified {
 			unverifiedMembers++
 			continue
 		}
 		groupVerified = true
+		if proof.KnownMembers[pid] == "" {
+			proof.KnownMembers[pid] = meta.info.StartToken
+		}
 		if existing, ok := proof.verifiedFDs[pid]; ok && existing.fd > 0 && existing.startToken == meta.info.StartToken {
 			verifiedFDs = append(verifiedFDs, existing.fd)
 			continue
@@ -548,7 +656,7 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 		}
 		if meta2.info.StartToken != meta.info.StartToken {
 			_ = unix.Close(fd)
-			return fmt.Errorf("refusing to signal pid %d: %w", pid, ErrProcessIdentityMismatch)
+			return false, false, liveMembers, fmt.Errorf("refusing to signal pid %d: %w", pid, ErrProcessIdentityMismatch)
 		}
 		openedFDs = append(openedFDs, fd)
 		verifiedFDs = append(verifiedFDs, fd)
@@ -566,31 +674,28 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 
 	if handleErr != nil {
 		if isFDLimitErr(handleErr) {
-			if fdErr := stopKnownMembersFDFree(proof, handleErr); fdErr != nil {
-				return fdErr
+			if fdErr := stopKnownMembersFDFree(*proof, handleErr); fdErr != nil {
+				return anySignalled, false, liveMembers, fdErr
 			}
 		}
-		return handleErr
+		return anySignalled, false, liveMembers, handleErr
 	}
 	if liveMembers == 0 {
-		return os.ErrProcessDone
+		return false, true, 0, nil
 	}
-	if !groupVerified {
-		return fmt.Errorf("refusing to signal unverified pgid %d after leader disappeared: %w", id.PGID, ErrProcessIdentityMismatch)
-	}
-	if unverifiedMembers > 0 {
-		return fmt.Errorf("refusing to complete cleanup for pgid %d: %d unverified live member(s): %w", id.PGID, unverifiedMembers, ErrProcessIdentityMismatch)
+	if !groupVerified || unverifiedMembers > 0 {
+		if canRetryIncompleteGroupProof(*proof) {
+			return anySignalled, false, liveMembers, fmt.Errorf("incomplete verification proof for tokenless pgid %d (%d unverified live member(s)): %w", id.PGID, unverifiedMembers, errIncompleteGroupProof)
+		}
+		return anySignalled, false, liveMembers, fmt.Errorf("refusing to signal unverified pgid %d after leader disappeared: %w", id.PGID, ErrProcessIdentityMismatch)
 	}
 	if sigErr != nil {
-		return sigErr
+		return anySignalled, false, liveMembers, sigErr
 	}
 	if len(verifiedFDs)+goneMembers != liveMembers {
-		return fmt.Errorf("incomplete cleanup for pgid %d (%d/%d members accounted): %w", id.PGID, len(verifiedFDs)+goneMembers, liveMembers, ErrProcessIdentityMismatch)
+		return anySignalled, false, liveMembers, fmt.Errorf("incomplete cleanup for pgid %d (%d/%d members accounted): %w", id.PGID, len(verifiedFDs)+goneMembers, liveMembers, ErrProcessIdentityMismatch)
 	}
-	if !anySignalled {
-		return os.ErrProcessDone
-	}
-	return nil
+	return anySignalled, false, liveMembers, nil
 }
 
 func waitAdoptedProcess(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {

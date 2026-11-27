@@ -12,6 +12,10 @@ const jobTokenEnvVar = "GMH_JOB_TOKEN"
 // recorded process group or OS start token (such as after PID reuse).
 var ErrProcessIdentityMismatch = errors.New("process identity mismatch")
 
+var errIncompleteGroupProof = errors.New("incomplete process group verification proof")
+
+var errGroupMembersStillAlive = errors.New("verified process group members still alive after signalling")
+
 var errAdoptedProcessExited = errors.New("adopted background job exited after harness restart; exit status unavailable")
 
 // ProcessIdentityInfo captures the immutable OS process identity recorded for a
@@ -57,10 +61,18 @@ type processGroupProof struct {
 	SID            int
 	Sess           uintptr
 	JobToken       string
+	OutputFile     string
 	KnownMembers   map[int]string
 	VerifiedAt     time.Time
 	verifiedFDs    map[int]verifiedProcFD
 	ExitObservedAt time.Time
+}
+
+func canRetryIncompleteGroupProof(proof processGroupProof) bool {
+	return proof.JobToken == "" &&
+		!proof.VerifiedAt.IsZero() &&
+		!proof.ExitObservedAt.IsZero() &&
+		proof.KnownMembers[proof.Leader.PID] == proof.Leader.StartToken
 }
 
 func cloneGroupProof(p processGroupProof) processGroupProof {

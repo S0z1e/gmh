@@ -256,6 +256,9 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 		return os.ErrProcessDone
 	}
 	if !groupVerified {
+		if canRetryIncompleteGroupProof(proof) {
+			return fmt.Errorf("incomplete verification proof for tokenless pgid %d: %w", id.PGID, errIncompleteGroupProof)
+		}
 		return fmt.Errorf("refusing to signal unverified pgid %d after leader disappeared: %w", id.PGID, ErrProcessIdentityMismatch)
 	}
 	return darwinResolveGroupKillError(id.PGID, syscall.Kill(-id.PGID, syscall.SIGKILL))

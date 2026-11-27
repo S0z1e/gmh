@@ -335,3 +335,179 @@ func TestStopAdoptedProcessGroupAfterExitEMFILEBoundsAndPartialCleanupLinux(t *t
 		t.Fatalf("c2 pid %d should still be alive after 1-FD revalidation EMFILE", c2PID)
 	}
 }
+
+func TestCaptureVerifiedGroupProofPrunesExitedFDsLinux(t *testing.T) {
+	root := t.TempDir()
+	c1File := filepath.Join(root, "c1.pid")
+	c1Rel := filepath.Join(root, "c1.rel")
+	c2File := filepath.Join(root, "c2.pid")
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf(
+		"sleep 30 & c1=$!; echo $c1 > %q; while [ ! -f %q ]; do sleep 0.02; done; kill -9 $c1 2>/dev/null; wait $c1 2>/dev/null; sleep 30 & echo $! > %q; sleep 30",
+		c1File, c1Rel, c2File,
+	))
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = killProcessTree(cmd) })
+
+	leaderPID := cmd.Process.Pid
+	leaderInfo := inspectProcess(leaderPID)
+	if !leaderInfo.Alive {
+		t.Fatal("leader not inspectable")
+	}
+	var c1PID int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(c1File); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				c1PID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if c1PID <= 0 {
+		t.Fatal("c1 did not start")
+	}
+
+	proof := processGroupProof{
+		Leader: ProcessIdentityInfo{PID: leaderPID, PGID: leaderInfo.PGID, StartToken: leaderInfo.StartToken},
+		UID:    leaderInfo.UID,
+		HasUID: leaderInfo.HasUID,
+		SID:    leaderInfo.SID,
+	}
+	captureVerifiedGroupProof(&proof)
+	defer closeVerifiedGroupProof(&proof)
+
+	c1Entry, ok := proof.verifiedFDs[c1PID]
+	if !ok || c1Entry.fd <= 0 {
+		t.Fatalf("expected c1 %d in verifiedFDs: %+v", c1PID, proof.verifiedFDs)
+	}
+
+	if err := os.WriteFile(c1Rel, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var c2PID int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(c2File); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				c2PID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if c2PID <= 0 {
+		t.Fatal("c2 did not start")
+	}
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline) && inspectProcess(c1PID).Alive; {
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	captureVerifiedGroupProof(&proof)
+	if _, stillCached := proof.verifiedFDs[c1PID]; stillCached {
+		t.Fatalf("exited child c1 %d pidfd was not pruned from verifiedFDs", c1PID)
+	}
+	if _, historyKept := proof.KnownMembers[c1PID]; !historyKept {
+		t.Fatalf("c1 %d historical KnownMembers entry should be preserved", c1PID)
+	}
+	if c2Entry, hasC2 := proof.verifiedFDs[c2PID]; !hasC2 || c2Entry.fd <= 0 {
+		t.Fatalf("expected live child c2 %d in verifiedFDs", c2PID)
+	}
+	// Verify c1Entry.fd was actually closed in the process FD table.
+	if _, err := unix.FcntlInt(uintptr(c1Entry.fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("pruned fd %d still open (fcntl err=%v)", c1Entry.fd, err)
+	}
+}
+
+func TestStopAdoptedProcessGroupAfterExitTokenlessLegacyAndRetryLinux(t *testing.T) {
+	root := t.TempDir()
+	outFile := filepath.Join(root, "legacy.log")
+	logF, err := os.OpenFile(outFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logF.Close()
+
+	// Part A: Tokenless child inheriting OutputFile (while closing FD 3) is positively
+	// verified via /proc/<pid>/fd and stopped, and empty group is confirmed.
+	c1File := filepath.Join(root, "c1.pid")
+	cmdA := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf("(exec 3>&-; sleep 30) & echo $! > %q", c1File))
+	configureProcess(cmdA)
+	cmdA.Stdout = logF
+	cmdA.Stderr = logF
+	if err := cmdA.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderAPID := cmdA.Process.Pid
+	leaderAInfo := inspectProcess(leaderAPID)
+	_ = cmdA.Wait()
+	b, err := os.ReadFile(c1File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1PID, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(c1PID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	proofA := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderAPID, PGID: leaderAInfo.PGID, StartToken: leaderAInfo.StartToken},
+		UID:            leaderAInfo.UID,
+		HasUID:         leaderAInfo.HasUID,
+		SID:            leaderAInfo.SID,
+		OutputFile:     outFile,
+		KnownMembers:   map[int]string{leaderAPID: leaderAInfo.StartToken},
+		VerifiedAt:     time.Now(),
+		ExitObservedAt: time.Now(),
+	}
+	if err := stopAdoptedProcessGroupAfterExit(proofA); err != nil {
+		t.Fatalf("tokenless OutputFile-backed cleanup err = %v, want nil", err)
+	}
+	if inspectProcess(c1PID).Alive {
+		t.Fatalf("child pid %d survived tokenless OutputFile cleanup", c1PID)
+	}
+
+	// Part B: Tokenless child closing stdout/stderr (> /dev/null) with no KnownMembers/ppid
+	// returns retryable errIncompleteGroupProof (NOT ErrProcessIdentityMismatch) when leader
+	// was live-verified and exit observed, preserving /jobs stop retryability without killing blindly.
+	c2File := filepath.Join(root, "c2.pid")
+	cmdB := exec.CommandContext(t.Context(), "bash", "-c", fmt.Sprintf("(exec >/dev/null 2>&1; sleep 30) & echo $! > %q", c2File))
+	configureProcess(cmdB)
+	if err := cmdB.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderBPID := cmdB.Process.Pid
+	leaderBInfo := inspectProcess(leaderBPID)
+	_ = cmdB.Wait()
+	b2, err := os.ReadFile(c2File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2PID, _ := strconv.Atoi(strings.TrimSpace(string(b2)))
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(c2PID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	proofB := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderBPID, PGID: leaderBInfo.PGID, StartToken: leaderBInfo.StartToken},
+		UID:            leaderBInfo.UID,
+		HasUID:         leaderBInfo.HasUID,
+		SID:            leaderBInfo.SID,
+		OutputFile:     outFile,
+		KnownMembers:   map[int]string{leaderBPID: leaderBInfo.StartToken},
+		VerifiedAt:     time.Now(),
+		ExitObservedAt: time.Now(),
+	}
+	errB := stopAdoptedProcessGroupAfterExit(proofB)
+	if !errors.Is(errB, errIncompleteGroupProof) || errors.Is(errB, ErrProcessIdentityMismatch) {
+		t.Fatalf("tokenless child without FD/ancestry err = %v, want errIncompleteGroupProof (not ErrProcessIdentityMismatch)", errB)
+	}
+	if !inspectProcess(c2PID).Alive {
+		t.Fatalf("unverified child pid %d should not be killed blindly when proof is incomplete", c2PID)
+	}
+}

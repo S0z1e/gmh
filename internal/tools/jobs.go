@@ -1218,6 +1218,9 @@ func (j *Job) snapshotGroupProofLocked() processGroupProof {
 	if proof.JobToken == "" {
 		proof.JobToken = j.JobToken
 	}
+	if proof.OutputFile == "" {
+		proof.OutputFile = j.OutputFile
+	}
 	return proof
 }
 
@@ -1244,9 +1247,7 @@ func (j *Job) refreshVerifiedGroupMembersLocked() processGroupProof {
 	if !proof.VerifiedAt.IsZero() {
 		j.groupProof.VerifiedAt = proof.VerifiedAt
 	}
-	if len(proof.verifiedFDs) > 0 {
-		j.groupProof.verifiedFDs = proof.verifiedFDs
-	}
+	j.groupProof.verifiedFDs = proof.verifiedFDs
 	out := j.snapshotGroupProofLocked()
 	j.mu.Unlock()
 	return out
@@ -1296,7 +1297,6 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 		return err
 	}
 	if errors.Is(err, os.ErrProcessDone) {
-		proof.ExitObservedAt = time.Time{}
 		gerr := stopGroupAfterExitFn(proof)
 		j.proofFDMu.Unlock()
 		if errors.Is(gerr, ErrProcessIdentityMismatch) {
@@ -1319,6 +1319,9 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 		j.mu.Lock()
 		stillActive := !j.finished && !j.unknown
 		if stillActive {
+			if j.groupProof.ExitObservedAt.IsZero() {
+				j.groupProof.ExitObservedAt = time.Now()
+			}
 			proof = j.snapshotGroupProofLocked()
 		}
 		j.mu.Unlock()
@@ -1326,7 +1329,6 @@ func (j *Job) stopAdoptedProcess(cause error, isTimeout bool) error {
 			j.proofFDMu.Unlock()
 			return nil
 		}
-		proof.ExitObservedAt = time.Now()
 		gerr := stopGroupAfterExitFn(proof)
 		j.proofFDMu.Unlock()
 		if errors.Is(gerr, ErrProcessIdentityMismatch) {

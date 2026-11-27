@@ -721,12 +721,13 @@ func (e *Executor) resolveRecoveredJob(rec PersistedJob, d DeliveryStatus, jobsD
 		info := inspectProcess(rec.PID)
 		if id.Matches(info) {
 			proof := processGroupProof{
-				Leader:   id,
-				UID:      info.UID,
-				HasUID:   info.HasUID,
-				SID:      info.SID,
-				Sess:     info.Sess,
-				JobToken: rec.JobToken,
+				Leader:     id,
+				UID:        info.UID,
+				HasUID:     info.HasUID,
+				SID:        info.SID,
+				Sess:       info.Sess,
+				JobToken:   rec.JobToken,
+				OutputFile: rec.OutputFile,
 			}
 			captureVerifiedGroupProof(&proof)
 			extraNote := ""
@@ -1328,11 +1329,13 @@ func (j *Job) cleanupAdoptedGroupAfterExit() bool {
 		j.mu.Unlock()
 		return false
 	}
+	if j.groupProof.ExitObservedAt.IsZero() {
+		j.groupProof.ExitObservedAt = time.Now()
+	}
 	proof := j.snapshotGroupProofLocked()
 	outFile, cwd := j.OutputFile, j.Cwd
 	j.mu.Unlock()
 
-	proof.ExitObservedAt = time.Now()
 	stopGroupAfterExitFn := j.stopGroupAfterExitFn()
 	gerr := stopGroupAfterExitFn(proof)
 	if errors.Is(gerr, ErrProcessIdentityMismatch) {
