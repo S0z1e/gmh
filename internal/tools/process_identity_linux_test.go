@@ -19,12 +19,20 @@ import (
 )
 
 func exhaustFDsUntilEMFILE(t *testing.T) func() {
+	return exhaustFDsLeaving(t, 0)
+}
+
+func exhaustFDsLeaving(t *testing.T, leave int) func() {
 	t.Helper()
 	var openFDs []*os.File
 	for range 4096 {
 		f, err := os.Open("/dev/null")
 		if err != nil {
 			if errors.Is(err, syscall.EMFILE) {
+				for i := 0; i < leave && len(openFDs) > 0; i++ {
+					_ = openFDs[len(openFDs)-1].Close()
+					openFDs = openFDs[:len(openFDs)-1]
+				}
 				return func() {
 					for _, of := range openFDs {
 						_ = of.Close()
@@ -200,5 +208,130 @@ func TestStopAdoptedProcessGroupAfterExitRefusesEqualIDReusedSessionLinux(t *tes
 	}
 	if !inspectProcess(childPID).Alive {
 		t.Fatalf("child pid %d was killed by stale equal-ID proof", childPID)
+	}
+}
+
+func TestStopAdoptedProcessGroupAfterExitEMFILEBoundsAndPartialCleanupLinux(t *testing.T) {
+	var oldLim unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &oldLim); err != nil {
+		t.Fatal(err)
+	}
+	if oldLim.Cur > 256 {
+		newLim := oldLim
+		newLim.Cur = 256
+		if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &newLim); err == nil {
+			defer func() { _ = unix.Setrlimit(unix.RLIMIT_NOFILE, &oldLim) }()
+		}
+	}
+
+	root := t.TempDir()
+	c1File := filepath.Join(root, "c1.pid")
+	c2File := filepath.Join(root, "c2.pid")
+	releaseFile := filepath.Join(root, "release")
+	jobTok := "test-emfile-job-token"
+	cmd := exec.CommandContext(t.Context(), "bash", "-c",
+		fmt.Sprintf("sleep 30 & echo $! > %q; while [ ! -f %q ]; do sleep 0.02; done; sleep 30 & echo $! > %q", c1File, releaseFile, c2File),
+	)
+	cmd.Env = append(os.Environ(), jobTokenEnvVar+"="+jobTok)
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	leaderInfo := inspectProcess(leaderPID)
+	if !leaderInfo.Alive {
+		t.Fatalf("leader pid %d not inspectable", leaderPID)
+	}
+
+	var c1PID int
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(c1File); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				c1PID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if c1PID <= 0 {
+		t.Fatal("c1 did not start")
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(c1PID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	// Capture proof while only leader and c1 exist (c1 has a cached pidfd).
+	proof := processGroupProof{
+		Leader:   ProcessIdentityInfo{PID: leaderPID, PGID: leaderInfo.PGID, StartToken: leaderInfo.StartToken},
+		UID:      leaderInfo.UID,
+		HasUID:   leaderInfo.HasUID,
+		SID:      leaderInfo.SID,
+		JobToken: jobTok,
+	}
+	captureVerifiedGroupProof(&proof)
+	defer closeVerifiedGroupProof(&proof)
+	if _, ok := proof.verifiedFDs[c1PID]; !ok {
+		t.Fatalf("expected cached pidfd for c1 %d in %+v", c1PID, proof.verifiedFDs)
+	}
+
+	// Fork uncaptured c2 and let leader exit.
+	if err := os.WriteFile(releaseFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	var c2PID int
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(c2File); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				c2PID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if c2PID <= 0 {
+		t.Fatal("c2 did not start")
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(c2PID); err == nil {
+			_ = p.Kill()
+		}
+	})
+
+	// With 0 FDs free: post-exit cleanup MUST kill cached c1 via PidfdSendSignal,
+	// MUST NOT use numeric kill(-PGID) (so uncaptured c2 remains alive), and MUST
+	// return EMFILE rather than nil.
+	cleanupZero := exhaustFDsUntilEMFILE(t)
+	errZero := stopAdoptedProcessGroupAfterExit(proof)
+	cleanupZero()
+	if !isFDLimitErr(errZero) {
+		t.Fatalf("0-FD post-exit cleanup err = %v, want EMFILE/ENFILE", errZero)
+	}
+	c1DeadBy := time.Now().Add(2 * time.Second)
+	for time.Now().Before(c1DeadBy) && inspectProcess(c1PID).Alive {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if inspectProcess(c1PID).Alive {
+		t.Fatalf("cached c1 pid %d survived post-exit EMFILE cleanup", c1PID)
+	}
+	if !inspectProcess(c2PID).Alive {
+		t.Fatalf("uncaptured c2 pid %d was killed by numeric kill(-PGID) during 0-FD EMFILE cleanup", c2PID)
+	}
+
+	// With exactly 1 FD free: PidfdOpen on c2 consumes the last FD and /proc
+	// revalidation hits EMFILE. Cleanup MUST preserve EMFILE rather than returning nil.
+	cleanupOne := exhaustFDsLeaving(t, 1)
+	errOne := stopAdoptedProcessGroupAfterExit(proof)
+	cleanupOne()
+	if !isFDLimitErr(errOne) {
+		t.Fatalf("1-FD partial cleanup err = %v, want EMFILE/ENFILE", errOne)
+	}
+	if !inspectProcess(c2PID).Alive {
+		t.Fatalf("c2 pid %d should still be alive after 1-FD revalidation EMFILE", c2PID)
 	}
 }

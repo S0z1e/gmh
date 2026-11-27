@@ -169,6 +169,8 @@ func verifyPreCapturedMemberFD(proof processGroupProof, pid int, expectedToken s
 func signalVerifiedGroupByFD(proof processGroupProof, origErr error, members map[int]string, allowDoneOnAllExited bool) error {
 	anyVerifiedHandle := false
 	verifiedAlive := false
+	var lastErr error
+	anySignalled := false
 	for pid, tok := range members {
 		hasFD, alive, verr := verifyPreCapturedMemberFD(proof, pid, tok)
 		if verr != nil {
@@ -177,35 +179,10 @@ func signalVerifiedGroupByFD(proof processGroupProof, origErr error, members map
 		if hasFD {
 			anyVerifiedHandle = true
 		}
-		if alive {
-			verifiedAlive = true
-			break
-		}
-	}
-	if !anyVerifiedHandle {
-		return origErr
-	}
-	if !verifiedAlive {
-		if allowDoneOnAllExited {
-			return os.ErrProcessDone
-		}
-		return origErr
-	}
-	if kerr := syscall.Kill(-proof.Leader.PGID, syscall.SIGKILL); kerr == nil {
-		return nil
-	} else if !errors.Is(kerr, syscall.ESRCH) {
-		return kerr
-	}
-	var lastErr error
-	anySignalled := false
-	for pid, tok := range members {
-		hasFD, alive, verr := verifyPreCapturedMemberFD(proof, pid, tok)
-		if verr != nil {
-			return verr
-		}
 		if !hasFD || !alive {
 			continue
 		}
+		verifiedAlive = true
 		entry := proof.verifiedFDs[pid]
 		if kerr := unix.PidfdSendSignal(entry.fd, unix.SIGKILL, nil, 0); kerr == nil {
 			anySignalled = true
@@ -213,8 +190,23 @@ func signalVerifiedGroupByFD(proof processGroupProof, origErr error, members map
 			lastErr = kerr
 		}
 	}
+	if !anyVerifiedHandle {
+		return origErr
+	}
 	if lastErr != nil {
 		return lastErr
+	}
+	if !verifiedAlive {
+		if allowDoneOnAllExited {
+			return os.ErrProcessDone
+		}
+		return origErr
+	}
+	if !allowDoneOnAllExited {
+		// Post-exit descriptor exhaustion could not scan /proc to rule out
+		// uncaptured descendants; preserve the retryable FD-limit error after
+		// signalling cached verified handles.
+		return origErr
 	}
 	if anySignalled {
 		return nil
@@ -382,21 +374,21 @@ func closeVerifiedGroupProof(proof *processGroupProof) {
 	}
 }
 
-func processHasJobToken(pid int, token string) bool {
+func processHasJobTokenErr(pid int, token string) (bool, error) {
 	if pid <= 0 || token == "" {
-		return false
+		return false, nil
 	}
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
 	if err != nil {
-		return false
+		return false, err
 	}
 	target := jobTokenEnvVar + "=" + token
 	for _, entry := range strings.Split(string(data), "\x00") {
 		if entry == target {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func stopKnownMembersFDFree(proof processGroupProof, origErr error) error {
@@ -437,7 +429,9 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 	if !proof.ExitObservedAt.IsZero() {
 		bootSec, hasBoot = linuxBootUnixSec()
 	}
-	verifiedMembers := 0
+	liveMembers := 0
+	unverifiedMembers := 0
+	goneMembers := 0
 	groupVerified := false
 	var verifiedFDs []int
 	var openedFDs []int
@@ -446,6 +440,7 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 			_ = unix.Close(fd)
 		}
 	}()
+	var handleErr error
 	for _, entry := range entries {
 		name := entry.Name()
 		if !entry.IsDir() || len(name) == 0 || name[0] < '0' || name[0] > '9' {
@@ -456,11 +451,9 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 			continue
 		}
 		meta, merr := inspectLinuxProcMeta(pid)
-		if isFDLimitErr(merr) {
-			return stopKnownMembersFDFree(proof, merr)
-		}
 		if merr != nil {
-			return merr
+			handleErr = merr
+			break
 		}
 		if !meta.info.Alive || meta.info.PGID != id.PGID {
 			continue
@@ -500,53 +493,99 @@ func stopAdoptedProcessGroupAfterExit(proof processGroupProof) error {
 			if parsed && (leaderBoot == "" || pBoot == "" || pBoot == leaderBoot) && meta.startTicks >= pTicks {
 				memberVerified = true
 			}
-		} else if proof.JobToken != "" && processHasJobToken(pid, proof.JobToken) {
-			memberVerified = true
-		}
-		if memberVerified {
-			groupVerified = true
-			if entry, ok := proof.verifiedFDs[pid]; ok && entry.fd > 0 && entry.startToken == meta.info.StartToken {
-				verifiedFDs = append(verifiedFDs, entry.fd)
-			} else {
-				fd, ferr := unix.PidfdOpen(pid, 0)
-				if isFDLimitErr(ferr) {
-					return stopKnownMembersFDFree(proof, ferr)
-				}
-				if ferr == nil {
-					// Revalidate opened pidfd handle before accepting it.
-					meta2, merr := inspectLinuxProcMeta(pid)
-					if merr == nil && meta2.info.Alive && meta2.info.StartToken == meta.info.StartToken && meta2.info.PGID == id.PGID {
-						openedFDs = append(openedFDs, fd)
-						verifiedFDs = append(verifiedFDs, fd)
-					} else {
-						_ = unix.Close(fd)
-					}
-				}
+		} else if proof.JobToken != "" {
+			hasTok, tokErr := processHasJobTokenErr(pid, proof.JobToken)
+			if isFDLimitErr(tokErr) {
+				handleErr = tokErr
+				break
+			}
+			if hasTok {
+				memberVerified = true
 			}
 		}
-		verifiedMembers++
+		liveMembers++
+		if !memberVerified {
+			unverifiedMembers++
+			continue
+		}
+		groupVerified = true
+		if existing, ok := proof.verifiedFDs[pid]; ok && existing.fd > 0 && existing.startToken == meta.info.StartToken {
+			verifiedFDs = append(verifiedFDs, existing.fd)
+			continue
+		}
+		fd, ferr := unix.PidfdOpen(pid, 0)
+		if isFDLimitErr(ferr) {
+			handleErr = ferr
+			break
+		}
+		if errors.Is(ferr, unix.ESRCH) {
+			goneMembers++
+			continue
+		}
+		if ferr != nil {
+			if handleErr == nil {
+				handleErr = ferr
+			}
+			continue
+		}
+		// Revalidate opened pidfd handle before accepting it.
+		meta2, merr := inspectLinuxProcMeta(pid)
+		if merr != nil {
+			_ = unix.Close(fd)
+			if isFDLimitErr(merr) {
+				handleErr = merr
+				break
+			}
+			if handleErr == nil {
+				handleErr = merr
+			}
+			continue
+		}
+		if !meta2.info.Alive || meta2.info.PGID != id.PGID {
+			_ = unix.Close(fd)
+			goneMembers++
+			continue
+		}
+		if meta2.info.StartToken != meta.info.StartToken {
+			_ = unix.Close(fd)
+			return fmt.Errorf("refusing to signal pid %d: %w", pid, ErrProcessIdentityMismatch)
+		}
+		openedFDs = append(openedFDs, fd)
+		verifiedFDs = append(verifiedFDs, fd)
 	}
-	if verifiedMembers == 0 {
+
+	var sigErr error
+	anySignalled := false
+	for _, fd := range verifiedFDs {
+		if kerr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); kerr == nil {
+			anySignalled = true
+		} else if !errors.Is(kerr, unix.ESRCH) && sigErr == nil {
+			sigErr = kerr
+		}
+	}
+
+	if handleErr != nil {
+		if isFDLimitErr(handleErr) {
+			if fdErr := stopKnownMembersFDFree(proof, handleErr); fdErr != nil {
+				return fdErr
+			}
+		}
+		return handleErr
+	}
+	if liveMembers == 0 {
 		return os.ErrProcessDone
 	}
 	if !groupVerified {
 		return fmt.Errorf("refusing to signal unverified pgid %d after leader disappeared: %w", id.PGID, ErrProcessIdentityMismatch)
 	}
-	if len(verifiedFDs) == 0 {
-		return fmt.Errorf("refusing to signal pgid %d: no verified process handles: %w", id.PGID, ErrProcessIdentityMismatch)
+	if unverifiedMembers > 0 {
+		return fmt.Errorf("refusing to complete cleanup for pgid %d: %d unverified live member(s): %w", id.PGID, unverifiedMembers, ErrProcessIdentityMismatch)
 	}
-
-	var lastErr error
-	anySignalled := false
-	for _, fd := range verifiedFDs {
-		if kerr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); kerr == nil {
-			anySignalled = true
-		} else if !errors.Is(kerr, unix.ESRCH) {
-			lastErr = kerr
-		}
+	if sigErr != nil {
+		return sigErr
 	}
-	if lastErr != nil {
-		return lastErr
+	if len(verifiedFDs)+goneMembers != liveMembers {
+		return fmt.Errorf("incomplete cleanup for pgid %d (%d/%d members accounted): %w", id.PGID, len(verifiedFDs)+goneMembers, liveMembers, ErrProcessIdentityMismatch)
 	}
 	if !anySignalled {
 		return os.ErrProcessDone

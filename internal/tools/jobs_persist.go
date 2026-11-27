@@ -1168,23 +1168,16 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 	deadlineStopMu.Unlock()
 
 	if errors.Is(context.Cause(ctx), ErrExecutorClosed) {
-		if job.cleanupAdoptedGroupAfterExit() {
-			return
-		}
 		err = ErrExecutorClosed
+		exitCode = -1
+		exitKnown = false
 	} else if isTimedOut {
-		if job.cleanupAdoptedGroupAfterExit() {
-			return
-		}
 		err = &timeoutError{timeout: max(0, snap.Deadline.Sub(snap.Started))}
 		exitCode = -1
 		exitKnown = false
 	} else if exitKnown || errors.Is(err, errAdoptedProcessExited) {
 		if !exitKnown && err == nil {
 			err = errAdoptedProcessExited
-		}
-		if job.cleanupAdoptedGroupAfterExit() {
-			return
 		}
 	} else {
 		waitErr := err
@@ -1196,12 +1189,9 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 		}
 		info, ierr := inspectProcessErr(snap.Identity.PID)
 		if ierr == nil && !info.Alive {
-			// Leader has already exited. Clean up remaining processes in group and finish.
-			if job.cleanupAdoptedGroupAfterExit() {
-				return
-			}
-			err = nil
-			exitCode = 0
+			// Leader has already exited; preserve unavailable-exit sentinel.
+			err = errAdoptedProcessExited
+			exitCode = -1
 			exitKnown = false
 		} else if ierr == nil && info.Alive && !snap.Identity.Matches(info) {
 			summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
@@ -1232,7 +1222,6 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 				select {
 				case <-ctx.Done():
 					leaderExited = true
-					break
 				case <-ticker.C:
 					pinfo, perr := inspectProcessErr(snap.Identity.PID)
 					if isFDLimitErr(perr) {
@@ -1243,14 +1232,11 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 					if perr == nil && !pinfo.Alive {
 						// Positively established exit.
 						leaderExited = true
-						break
-					}
-					if perr == nil && pinfo.Alive && !snap.Identity.Matches(pinfo) {
+					} else if perr == nil && pinfo.Alive && !snap.Identity.Matches(pinfo) {
 						summary, preview, _, _ := summarizeOutputFile(job.OutputFile, job.Cwd)
 						job.markUnknown("process identity changed unexpectedly during observation (possible PID reuse)", summary, preview)
 						return
-					}
-					if perr == nil && pinfo.Alive {
+					} else if perr == nil && pinfo.Alive {
 						job.proofFDMu.Lock()
 						job.refreshVerifiedGroupMembersLocked()
 						job.proofFDMu.Unlock()
@@ -1258,59 +1244,37 @@ func (e *Executor) monitorAdoptedJob(m adoptionMonitor, audit func(AuditEntry)) 
 				}
 			}
 
-			// Funnel fallback exit and cancellation through terminal handling,
-			// reading the stop and timeout outcome when polling ends.
+			// Select terminal result once after fallback polling ends.
 			deadlineStopMu.Lock()
 			isTimedOut = timedOut
-			if deadlineStopErr != nil {
-				stopErr = deadlineStopErr
-			}
 			deadlineStopMu.Unlock()
 
 			cause := context.Cause(ctx)
-			if errors.Is(cause, ErrExecutorClosed) {
-				if job.cleanupAdoptedGroupAfterExit() {
-					return
-				}
+			switch {
+			case errors.Is(cause, ErrExecutorClosed):
 				err = ErrExecutorClosed
-				exitCode = -1
-				exitKnown = false
-			} else if isTimedOut {
-				if job.cleanupAdoptedGroupAfterExit() {
-					return
-				}
+			case isTimedOut:
 				err = &timeoutError{timeout: max(0, snap.Deadline.Sub(snap.Started))}
-				exitCode = -1
-				exitKnown = false
-			} else if cause != nil && !errors.Is(cause, context.Canceled) {
-				if job.cleanupAdoptedGroupAfterExit() {
-					return
-				}
+			case cause != nil && !errors.Is(cause, context.Canceled):
 				err = cause
-				exitCode = -1
-				exitKnown = false
-			} else if ctx.Err() != nil {
+			case ctx.Err() != nil:
 				job.mu.Lock()
 				settled := job.finished || job.unknown
 				job.mu.Unlock()
 				if settled {
 					return
 				}
-				if job.cleanupAdoptedGroupAfterExit() {
-					return
-				}
 				err = ctx.Err()
-				exitCode = -1
-				exitKnown = false
-			} else {
-				if job.cleanupAdoptedGroupAfterExit() {
-					return
-				}
-				err = nil
-				exitCode = 0
-				exitKnown = false
+			default:
+				err = errAdoptedProcessExited
 			}
+			exitCode = -1
+			exitKnown = false
 		}
+	}
+
+	if job.cleanupAdoptedGroupAfterExit() {
+		return
 	}
 
 	summary, preview, _, hasFile := summarizeOutputFile(job.OutputFile, job.Cwd)

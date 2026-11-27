@@ -1856,4 +1856,96 @@ func TestCrashRecoveryCloseJobsStopFailureRemainsRunningAndRetryable(t *testing.
 	}
 }
 
+func TestCrashRecoveryWaitErrorAuditPreservesUnavailableExit(t *testing.T) {
+	root := t.TempDir()
+	sessionBase := t.TempDir()
+	outID := "sess-wait-err-audit"
+	outDir := filepath.Join(sessionBase, outID, "bash-output")
+	jobsDir := filepath.Join(sessionBase, outID, "bash-output-jobs")
+	releaseFile := filepath.Join(root, "release")
+
+	helperCmd, meta := spawnCrashHelper(t, map[string]string{
+		"GMH_HELPER_ROOT":      root,
+		"GMH_HELPER_OUTDIR":    outDir,
+		"GMH_HELPER_JOBSDIR":   jobsDir,
+		"GMH_HELPER_OUTID":     outID,
+		"GMH_HELPER_WAIT_TEXT": "READY",
+		"GMH_HELPER_CMD": fmt.Sprintf(
+			"printf 'READY\\n'; while [ ! -f %q ]; do sleep 0.05; done; exit 17",
+			releaseFile,
+		),
+	})
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helperCmd.Wait()
+
+	var auditMu sync.Mutex
+	var auditEntries []AuditEntry
+	auditFn := func(e AuditEntry) {
+		auditMu.Lock()
+		auditEntries = append(auditEntries, e)
+		auditMu.Unlock()
+	}
+
+	waitCalled := make(chan struct{})
+	exec2 := &Executor{
+		Root:      root,
+		OutputDir: outDir,
+		OutputID:  outID,
+		JobsDir:   jobsDir,
+		Audit:     auditFn,
+		waitAdopted: func(ctx context.Context, id ProcessIdentityInfo) (int, bool, error) {
+			close(waitCalled)
+			return -1, false, errors.New("injected kevent EACCES")
+		},
+	}
+	exec2.SwitchSession(outID)
+	defer exec2.CloseJobs(context.Background())
+
+	recovered, err := exec2.RecoverSessionJobs(outID, nil, nil, nil)
+	if err != nil || len(recovered) != 1 || recovered[0].Status != JobRunning {
+		t.Fatalf("recovered = %+v, err=%v", recovered, err)
+	}
+	<-waitCalled
+
+	job := exec2.registry().Get(meta.JobID)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if job.Snapshot().WaitError != "" {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if job.Snapshot().WaitError == "" {
+		t.Fatal("expected WaitError before release")
+	}
+
+	if err := os.WriteFile(releaseFile, []byte("go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-job.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("adopted job did not finish after non-zero exit under fallback polling")
+	}
+
+	res, ok := job.Result()
+	if !ok {
+		t.Fatal("expected job result")
+	}
+	if res.ExitCode != -1 || !res.ExitCodeUnknown || !errors.Is(res.Err, errAdoptedProcessExited) {
+		t.Fatalf("Result = %+v, want ExitCode=-1 ExitCodeUnknown=true Err=errAdoptedProcessExited", res)
+	}
+
+	auditMu.Lock()
+	defer auditMu.Unlock()
+	if len(auditEntries) != 1 {
+		t.Fatalf("audit entries = %+v, want 1 entry", auditEntries)
+	}
+	if auditEntries[0].ExitCode != -1 || auditEntries[0].Error != errAdoptedProcessExited.Error() {
+		t.Fatalf("audit entry = %+v, want ExitCode=-1 and Error=%q", auditEntries[0], errAdoptedProcessExited.Error())
+	}
+}
+
 var _ = errors.New
