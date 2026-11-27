@@ -1478,3 +1478,154 @@ func TestLinuxCleanupWithoutPidfdVerifiesIdentityAndRefusesReuse(t *testing.T) {
 		}
 	}
 }
+
+func TestLinuxMismatchRetryTracksNewlyVerifiedChildAndKeepsPending(t *testing.T) {
+	tmpDir := t.TempDir()
+	childAPIDFile := filepath.Join(tmpDir, "childA.pid")
+	childBPIDFile := filepath.Join(tmpDir, "childB.pid")
+	childCPIDFile := filepath.Join(tmpDir, "childC.pid")
+	jobTok := "linux-mismatch-scanproof-tok"
+	groupCmd := exec.Command("bash", "-c", fmt.Sprintf(
+		"sleep 30 & echo $! > %q; sleep 30 & echo $! > %q; sleep 30 & echo $! > %q",
+		childAPIDFile, childBPIDFile, childCPIDFile,
+	))
+	groupCmd.Env = append(os.Environ(), jobTokenEnvVar+"="+jobTok)
+	configureProcess(groupCmd)
+	if err := groupCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := groupCmd.Process.Pid
+	leaderTok := inspectProcess(leaderPID).StartToken
+	readSpawnedPID := func(p string) int {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if b, err := os.ReadFile(p); err == nil {
+				if v, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && v > 0 {
+					return v
+				}
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for pid file %s", p)
+		return 0
+	}
+	childAPID := readSpawnedPID(childAPIDFile)
+	childBPID := readSpawnedPID(childBPIDFile)
+	childCPID := readSpawnedPID(childCPIDFile)
+	_ = groupCmd.Wait()
+	t.Cleanup(func() {
+		for _, pid := range []int{childAPID, childBPID, childCPID} {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+
+	infoA := inspectProcess(childAPID)
+	infoB := inspectProcess(childBPID)
+	infoC := inspectProcess(childCPID)
+	if !infoA.Alive || !infoB.Alive || !infoC.Alive {
+		t.Fatalf("children not alive: A=%+v B=%+v C=%+v", infoA, infoB, infoC)
+	}
+	if leaderTok == "" {
+		leaderTok = infoA.StartToken
+	}
+
+	origPidfdOpen := pidfdOpenFn
+	origOpenHandle := openLinuxProcHandleFn
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	t.Cleanup(func() {
+		pidfdOpenFn = origPidfdOpen
+		openLinuxProcHandleFn = origOpenHandle
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+	})
+
+	pidfdOpenFn = func(int, int) (int, error) {
+		return -1, syscall.ENOSYS
+	}
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == leaderPID {
+			return linuxProcMeta{}, nil
+		}
+		return origInspectMeta(pid)
+	}
+
+	var blockC atomic.Bool
+	blockC.Store(true)
+	openLinuxProcHandleFn = func(pid int) (int, linuxProcMeta, error) {
+		if pid == childCPID && blockC.Load() {
+			return -1, linuxProcMeta{}, syscall.EACCES
+		}
+		fd, m, err := origOpenHandle(pid)
+		if err == nil && pid == childBPID && m.info.Alive {
+			// Simulate childB PID reuse during revalidation while childC (newly
+			// discovered via JobToken) must stay in scope across mismatch retry.
+			m.info.StartToken = m.info.StartToken + "-reused"
+		}
+		return fd, m, err
+	}
+
+	// Seed proof with childA and childB only (childC is NOT in initial KnownMembers).
+	proof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: infoA.PGID, StartToken: leaderTok},
+		UID:            infoA.UID,
+		HasUID:         true,
+		SID:            infoA.SID,
+		JobToken:       jobTok,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers: map[int]string{
+			leaderPID: leaderTok,
+			childAPID: infoA.StartToken,
+			childBPID: infoB.StartToken,
+		},
+	}
+
+	err := stopAdoptedProcessGroupAfterExitTrack(&proof)
+	if !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want EACCES while newly verified childC cannot be signalled", err)
+	}
+	if proof.KnownMembers[childCPID] != infoC.StartToken {
+		t.Fatalf("expected newly verified childC (%d) retained in proof.KnownMembers: %+v", childCPID, proof.KnownMembers)
+	}
+	for wait := 0; wait < 20; wait++ {
+		if m, merr := origInspectMeta(childAPID); merr != nil || !m.info.Alive {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if m, merr := origInspectMeta(childAPID); merr == nil && m.info.Alive {
+		t.Fatalf("childA pid %d survived cleanup", childAPID)
+	}
+	if m, merr := origInspectMeta(childCPID); merr != nil || !m.info.Alive {
+		t.Fatalf("childC pid %d should still be alive under EACCES (meta=%+v, err=%v)", childCPID, m, merr)
+	}
+	if m, merr := origInspectMeta(childBPID); merr != nil || !m.info.Alive {
+		t.Fatalf("reused childB pid %d should remain alive (meta=%+v, err=%v)", childBPID, m, merr)
+	}
+
+	// After clearing EACCES, retry stops newly verified childC even while childB
+	// still fails revalidation, keeping reused childB untouched.
+	blockC.Store(false)
+	if rerr := stopAdoptedProcessGroupAfterExitTrack(&proof); rerr != nil {
+		t.Fatalf("retry stopAdoptedProcessGroupAfterExitTrack err = %v, want nil after newly verified childC is stopped", rerr)
+	}
+	for wait := 0; wait < 20; wait++ {
+		if m, merr := origInspectMeta(childCPID); merr != nil || !m.info.Alive {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if m, merr := origInspectMeta(childCPID); merr == nil && m.info.Alive {
+		t.Fatalf("newly verified childC pid %d survived mismatch retry", childCPID)
+	}
+	if m, merr := origInspectMeta(childBPID); merr != nil || !m.info.Alive {
+		t.Fatalf("reused childB pid %d was killed on retry (meta=%+v, err=%v)", childBPID, m, merr)
+	}
+}
