@@ -1868,13 +1868,20 @@ func TestLinuxFreshChildRetrySurvivesEACCESThenEMFILE(t *testing.T) {
 		readProcDirFn = origReadProcDir
 	})
 
-	// Hold recovery open in JobRunning initially so we can seed verifiedFDs on job
-	// before driving StopJob retries.
+	// Hold recovery open in JobRunning initially and install all function hooks
+	// before starting recovery so the monitor exits deterministically under EMFILE
+	// without racing on hook assignments or manual StopJob calls.
 	readProcDirFn = func() ([]os.DirEntry, error) {
 		if recoverEMFILE.Load() {
 			return nil, syscall.EMFILE
 		}
 		return origReadProcDir()
+	}
+	pidfdOpenFn = func(pid int, flags int) (int, error) {
+		if pid == childPID && forceChildEACCES.Load() {
+			return -1, syscall.EACCES
+		}
+		return origPidfdOpen(pid, flags)
 	}
 	inspectProcessErrFn = func(pid int) (processInfo, error) {
 		if pid == leaderPID {
@@ -1914,6 +1921,13 @@ func TestLinuxFreshChildRetrySurvivesEACCESThenEMFILE(t *testing.T) {
 	if recoveredJob == nil || recoveredJob.Status() != JobRunning {
 		t.Fatalf("expected running adopted job, got %+v", recoveredJob)
 	}
+	if recoveredJob.monitorDone != nil {
+		select {
+		case <-recoveredJob.monitorDone:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for initial monitor to stop under EMFILE")
+		}
+	}
 	recoveredJob.proofFDMu.Lock()
 	recoveredJob.mu.Lock()
 	recoveredJob.groupProof.verifiedFDs = map[int]verifiedProcFD{
@@ -1927,12 +1941,6 @@ func TestLinuxFreshChildRetrySurvivesEACCESThenEMFILE(t *testing.T) {
 	// encounters EACCES on signal handle open; job must stay running with staleFD evicted.
 	recoverEMFILE.Store(false)
 	forceChildEACCES.Store(true)
-	pidfdOpenFn = func(pid int, flags int) (int, error) {
-		if pid == childPID && forceChildEACCES.Load() {
-			return -1, syscall.EACCES
-		}
-		return origPidfdOpen(pid, flags)
-	}
 	if _, stopErr := exec2.StopJob("bg-stale-fd-retry"); !errors.Is(stopErr, syscall.EACCES) {
 		t.Fatalf("first StopJob err = %v, want EACCES", stopErr)
 	}
