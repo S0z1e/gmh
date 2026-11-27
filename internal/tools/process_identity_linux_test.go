@@ -1636,3 +1636,125 @@ func TestLinuxMismatchRetryTracksNewlyVerifiedChildAndKeepsPending(t *testing.T)
 		t.Fatalf("reused childB pid %d was killed on retry (meta=%+v, err=%v)", childBPID, m, merr)
 	}
 }
+
+func TestLinuxFreshlyVerifiedMemberOverwritesStalePIDTokenAcrossMismatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	childPIDFile := filepath.Join(tmpDir, "child.pid")
+	jobTok := "linux-stale-pid-token-tok"
+	cmd := exec.Command("bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q", childPIDFile))
+	cmd.Env = append(os.Environ(), jobTokenEnvVar+"="+jobTok)
+	configureProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := cmd.Process.Pid
+	leaderTok := inspectProcess(leaderPID).StartToken
+	var childPID int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(childPIDFile); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				childPID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		t.Fatal("child did not start")
+	}
+	_ = cmd.Wait()
+	t.Cleanup(func() {
+		_ = syscall.Kill(childPID, syscall.SIGKILL)
+	})
+	info := inspectProcess(childPID)
+	if !info.Alive {
+		t.Fatalf("child pid %d not alive", childPID)
+	}
+	if leaderTok == "" {
+		leaderTok = info.StartToken
+	}
+
+	intruderCmd := exec.Command("sleep", "30")
+	configureProcess(intruderCmd)
+	if err := intruderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	intruderPID := intruderCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(intruderPID); err == nil {
+			_ = p.Kill()
+		}
+		_ = intruderCmd.Wait()
+	})
+
+	nullFile, err := os.Open("/dev/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nullFile.Close()
+
+	origInspectMeta := inspectLinuxProcMetaFn
+	origInspectErr := inspectProcessErrFn
+	t.Cleanup(func() {
+		inspectLinuxProcMetaFn = origInspectMeta
+		inspectProcessErrFn = origInspectErr
+	})
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == leaderPID {
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == leaderPID {
+			return linuxProcMeta{}, nil
+		}
+		if pid == intruderPID {
+			m, merr := origInspectMeta(pid)
+			if merr == nil {
+				m.info.PGID = info.PGID
+				m.info.UID = info.UID + 1
+				m.info.HasUID = true
+			}
+			return m, merr
+		}
+		return origInspectMeta(pid)
+	}
+
+	// Seed KnownMembers AND verifiedFDs at childPID with an older saved token
+	// (simulating an exited earlier child at the same PID). JobToken verification
+	// must overwrite KnownMembers[childPID], drop the stale verifiedFD entry,
+	// and stop childPID past the intruder mismatch.
+	proof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: info.PGID, StartToken: leaderTok},
+		UID:            info.UID,
+		HasUID:         true,
+		SID:            info.SID,
+		JobToken:       jobTok,
+		VerifiedAt:     time.Now().Add(-5 * time.Second),
+		ExitObservedAt: time.Now().Add(-2 * time.Second),
+		KnownMembers: map[int]string{
+			leaderPID: leaderTok,
+			childPID:  "stale-boot:1",
+		},
+		verifiedFDs: map[int]verifiedProcFD{
+			childPID: {fd: int(nullFile.Fd()), startToken: "stale-boot:1"},
+		},
+	}
+
+	if rerr := stopAdoptedProcessGroupAfterExitTrack(&proof); rerr != nil {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want nil", rerr)
+	}
+	if proof.KnownMembers[childPID] != info.StartToken {
+		t.Fatalf("KnownMembers[%d] = %q, want updated %q", childPID, proof.KnownMembers[childPID], info.StartToken)
+	}
+	for wait := 0; wait < 20 && inspectProcess(childPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("freshly verified child pid %d survived mismatch cleanup despite JobToken", childPID)
+	}
+	if !inspectProcess(intruderPID).Alive {
+		t.Fatalf("intruder pid %d was killed unexpectedly", intruderPID)
+	}
+}

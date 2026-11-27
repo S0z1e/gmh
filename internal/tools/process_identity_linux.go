@@ -636,6 +636,25 @@ func stopKnownMembersFDFree(proof processGroupProof, origErr error) error {
 	return signalVerifiedGroupByFD(proof, origErr, proof.KnownMembers, false)
 }
 
+func recordVerifiedLinuxCandidate(proof *processGroupProof, liveVerified map[int]string, pid int, tok string) {
+	liveVerified[pid] = tok
+	if proof.KnownMembers == nil {
+		proof.KnownMembers = make(map[int]string)
+	}
+	proof.KnownMembers[pid] = tok
+	if entry, ok := proof.verifiedFDs[pid]; ok && entry.startToken != tok {
+		// Drop any stale pre-captured pidfd from a prior exited process at pid
+		// without mutating the caller's underlying map.
+		clonedFDs := make(map[int]verifiedProcFD, len(proof.verifiedFDs))
+		for k, v := range proof.verifiedFDs {
+			if k != pid {
+				clonedFDs[k] = v
+			}
+		}
+		proof.verifiedFDs = clonedFDs
+	}
+}
+
 type linuxGroupCandidate struct {
 	pid      int
 	meta     linuxProcMeta
@@ -721,13 +740,7 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 			}
 		}
 		if verified {
-			liveVerified[pid] = meta.info.StartToken
-			if proof.KnownMembers == nil {
-				proof.KnownMembers = make(map[int]string)
-			}
-			if proof.KnownMembers[pid] == "" {
-				proof.KnownMembers[pid] = meta.info.StartToken
-			}
+			recordVerifiedLinuxCandidate(proof, liveVerified, pid, meta.info.StartToken)
 		}
 		candidates = append(candidates, linuxGroupCandidate{pid: pid, meta: meta, verified: verified})
 	}
@@ -744,13 +757,7 @@ func collectAndVerifyLinuxCandidates(proof *processGroupProof, id ProcessIdentit
 				pBoot, pTicks, parsed := parseLinuxStartToken(parentTok)
 				if parsed && (leaderBoot == "" || pBoot == "" || pBoot == leaderBoot) && c.meta.startTicks >= pTicks {
 					c.verified = true
-					liveVerified[c.pid] = c.meta.info.StartToken
-					if proof.KnownMembers == nil {
-						proof.KnownMembers = make(map[int]string)
-					}
-					if proof.KnownMembers[c.pid] == "" {
-						proof.KnownMembers[c.pid] = c.meta.info.StartToken
-					}
+					recordVerifiedLinuxCandidate(proof, liveVerified, c.pid, c.meta.info.StartToken)
 					added = true
 				}
 			}
@@ -930,19 +937,6 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 	cloned := cloneGroupProof(proof)
 	cloned.verifiedFDs = proof.verifiedFDs
 	candidates, handleErr, mismatchErr := collectAndVerifyLinuxCandidates(&cloned, id, leaderBoot, leaderTicks)
-	if mismatchErr != nil {
-		for _, c := range candidates {
-			if c.verified {
-				return true, nil
-			}
-		}
-		if ok, lerr := hasVerifiedLiveKnownMemberLinux(cloned); ok {
-			return true, nil
-		} else if lerr != nil {
-			return false, lerr
-		}
-		return false, mismatchErr
-	}
 	for _, c := range candidates {
 		if c.verified {
 			return true, nil
@@ -952,6 +946,9 @@ func hasVerifiedLiveGroupMember(proof processGroupProof) (bool, error) {
 		return true, nil
 	} else if lerr != nil {
 		return false, lerr
+	}
+	if mismatchErr != nil {
+		return false, mismatchErr
 	}
 	if handleErr != nil {
 		return false, handleErr

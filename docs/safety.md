@@ -80,10 +80,15 @@ read snapshots and queued images. Background completions keep their owner's
 audit destination after a switch. Job ownership survives switches within the
 process. On session reopen after a crash or restart, persisted jobs are only
 re-adopted when live OS process identity (`PID`, `PGID`, and start token) can
-be verified; mismatched (reused) or exited processes are marked `unknown`
-without sending signals or replaying commands. Output captured before the crash
-remains readable via its session-owned path (with the live stdout/stderr pipe
-having closed at process exit).
+be verified; reused PIDs and exited processes with no pending cleanup or
+surviving verified group are marked `unknown` without sending signals or
+replaying commands. When an exited leader has pending cleanup or surviving
+descendants matching the persisted group proof, recovery revalidates those
+descendants, stops them and marks the job `done` (or keeps it `running` and
+stoppable on transient cleanup failure, marking it `unknown` only on identity
+mismatch). Output captured before the crash remains readable via its
+session-owned path (with the live stdout/stderr pipe having closed at process
+exit).
 
 Search subprocesses are not an OS sandbox: a concurrent path replacement
 after validation remains a race. Use the sandbox or a disposable workspace

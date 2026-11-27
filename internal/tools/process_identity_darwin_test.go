@@ -1394,3 +1394,105 @@ func TestDarwinMismatchRetryTracksNewlyVerifiedChildAndKeepsPending(t *testing.T
 		t.Fatalf("intruder pid %d was killed unexpectedly on retry", intruderPID)
 	}
 }
+
+func TestDarwinLateUnverifiedMemberStillCleansVerifiedSiblings(t *testing.T) {
+	tmpDir := t.TempDir()
+	childPIDFile := filepath.Join(tmpDir, "child.pid")
+	leaderCmd := exec.Command("bash", "-c", fmt.Sprintf("sleep 30 & echo $! > %q", childPIDFile))
+	configureProcess(leaderCmd)
+	if err := leaderCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	leaderPID := leaderCmd.Process.Pid
+	leaderInfo := inspectProcess(leaderPID)
+	var childPID int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(childPIDFile); err == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				childPID = p
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		t.Fatal("child did not start")
+	}
+	_ = leaderCmd.Wait()
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(childPID); err == nil {
+			_ = p.Kill()
+		}
+	})
+	childInfo := inspectProcess(childPID)
+	if !childInfo.Alive {
+		t.Fatalf("child pid %d not alive", childPID)
+	}
+
+	// Spawn a separate process injected into kern.proc.pgrp whose start time is
+	// after ExitObservedAt + 10ms and without KnownMembers/parent ancestry.
+	lateCmd := exec.Command("sleep", "30")
+	configureProcess(lateCmd)
+	if err := lateCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	latePID := lateCmd.Process.Pid
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(latePID); err == nil {
+			_ = p.Kill()
+		}
+		_ = lateCmd.Wait()
+	})
+	lateSlice, err := unix.SysctlKinfoProcSlice("kern.proc.pid", latePID)
+	if err != nil || len(lateSlice) == 0 {
+		t.Fatalf("sysctl late pid %d failed: %v", latePID, err)
+	}
+	lateProc := lateSlice[0]
+	lateProc.Eproc.Pgid = int32(childInfo.PGID)
+	lateProc.Eproc.Ucred.Uid = childInfo.UID
+	lateProc.Eproc.Sess = childInfo.Sess
+
+	origSlice := darwinSysctlKinfoProcSliceFn
+	t.Cleanup(func() { darwinSysctlKinfoProcSliceFn = origSlice })
+	darwinSysctlKinfoProcSliceFn = func(name string, args ...int) ([]unix.KinfoProc, error) {
+		procs, err := origSlice(name, args...)
+		if err != nil {
+			return nil, err
+		}
+		if name == "kern.proc.pgrp" && len(args) == 1 && args[0] == childInfo.PGID && inspectProcess(latePID).Alive {
+			return append(procs, lateProc), nil
+		}
+		return procs, nil
+	}
+
+	leaderTok := leaderInfo.StartToken
+	if leaderTok == "" {
+		leaderTok = childInfo.StartToken
+	}
+	proof := processGroupProof{
+		Leader:         ProcessIdentityInfo{PID: leaderPID, PGID: childInfo.PGID, StartToken: leaderTok},
+		UID:            childInfo.UID,
+		HasUID:         true,
+		SID:            childInfo.SID,
+		Sess:           childInfo.Sess,
+		VerifiedAt:     time.Now().Add(-10 * time.Second),
+		ExitObservedAt: time.Now().Add(-5 * time.Second),
+		KnownMembers: map[int]string{
+			leaderPID: leaderTok,
+			childPID:  childInfo.StartToken,
+		},
+	}
+
+	if err := stopAdoptedProcessGroupAfterExitTrack(&proof); err != nil {
+		t.Fatalf("stopAdoptedProcessGroupAfterExitTrack err = %v, want nil after stopping verified sibling", err)
+	}
+	for wait := 0; wait < 20 && inspectProcess(childPID).Alive; wait++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if inspectProcess(childPID).Alive {
+		t.Fatalf("verified child pid %d survived cleanup past late unverified member", childPID)
+	}
+	if !inspectProcess(latePID).Alive {
+		t.Fatalf("late unverified pid %d was killed unexpectedly", latePID)
+	}
+}

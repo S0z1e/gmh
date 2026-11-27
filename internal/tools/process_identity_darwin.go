@@ -397,6 +397,22 @@ func darwinSignalVerifiedKnownMembers(proof processGroupProof, id ProcessIdentit
 	return anySignalled, firstErr
 }
 
+func darwinCleanupKnownMembersOnMismatch(proof *processGroupProof, id ProcessIdentityInfo, leaderErr, mismatchErr error) error {
+	sig, serr := darwinSignalVerifiedKnownMembers(*proof, id)
+	if leaderErr != nil && isProcessAccessError(leaderErr) {
+		return leaderErr
+	}
+	if sig {
+		return waitForKnownMembersExit(id, serr, func() (bool, error) {
+			return hasVerifiedLiveKnownMemberDarwin(*proof)
+		})
+	}
+	if serr != nil {
+		return serr
+	}
+	return mismatchErr
+}
+
 func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	if proof == nil {
 		return ErrProcessIdentityMismatch
@@ -434,19 +450,7 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	known, liveCount, cerr := darwinResolveGroupCandidates(*proof, id, leaderSec, leaderUsec, procs)
 	proof.KnownMembers = mergeGroupMembers(proof.KnownMembers, known)
 	if cerr != nil {
-		sig, serr := darwinSignalVerifiedKnownMembers(*proof, id)
-		if leaderErr != nil && isProcessAccessError(leaderErr) {
-			return leaderErr
-		}
-		if sig {
-			return waitForKnownMembersExit(id, serr, func() (bool, error) {
-				return hasVerifiedLiveKnownMemberDarwin(*proof)
-			})
-		}
-		if serr != nil {
-			return serr
-		}
-		return cerr
+		return darwinCleanupKnownMembersOnMismatch(proof, id, leaderErr, cerr)
 	}
 	if liveCount == 0 {
 		if leaderErr != nil {
@@ -457,6 +461,7 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 	}
 
 	groupVerified := false
+	var postExitMismatchErr error
 	hasSetsidProof := !proof.VerifiedAt.IsZero() && proof.SID > 0 && proof.SID == id.PID && id.PGID == id.PID && proof.KnownMembers[id.PID] == id.StartToken
 	for _, p := range procs {
 		if p.Proc.P_stat == 5 {
@@ -469,12 +474,15 @@ func stopAdoptedProcessGroupAfterExitTrack(proof *processGroupProof) error {
 		if !directVerified && !proof.ExitObservedAt.IsZero() {
 			memberStart := time.Unix(pSec, int64(pUsec)*1000)
 			if memberStart.After(proof.ExitObservedAt.Add(10 * time.Millisecond)) {
-				return fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, pid, ErrProcessIdentityMismatch)
+				recordFirstMismatch(&postExitMismatchErr, fmt.Errorf("refusing to signal pgid %d: member pid %d started after leader exit: %w", id.PGID, pid, ErrProcessIdentityMismatch))
 			}
 		}
 		if directVerified || hasSetsidProof {
 			groupVerified = true
 		}
+	}
+	if postExitMismatchErr != nil {
+		return darwinCleanupKnownMembersOnMismatch(proof, id, leaderErr, postExitMismatchErr)
 	}
 	if !groupVerified {
 		if canRetryIncompleteGroupProof(*proof) {
