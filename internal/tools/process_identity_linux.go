@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -21,7 +22,10 @@ func isPidfdUnavailableErr(err error) bool {
 	return errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM)
 }
 
-var pidfdOpenFn = unix.PidfdOpen
+var (
+	pidfdOpenFn       = unix.PidfdOpen
+	pidfdSendSignalFn = unix.PidfdSendSignal
+)
 
 func processGroupID(pid int) int {
 	if pid <= 0 {
@@ -53,31 +57,20 @@ type linuxProcMeta struct {
 	startTicks uint64
 }
 
-func inspectLinuxProcMeta(pid int) (linuxProcMeta, error) {
-	if pid <= 0 {
-		return linuxProcMeta{}, nil
-	}
-	procDir := fmt.Sprintf("/proc/%d", pid)
-	stat, err := os.ReadFile(procDir + "/stat")
-	if err != nil {
-		if os.IsNotExist(err) || errors.Is(err, syscall.ESRCH) {
-			return linuxProcMeta{}, nil
-		}
-		return linuxProcMeta{}, err
-	}
+func parseLinuxProcStat(stat []byte, uid uint32, hasUID bool) linuxProcMeta {
 	end := strings.LastIndexByte(string(stat), ')')
 	if end < 0 {
-		return linuxProcMeta{}, nil
+		return linuxProcMeta{}
 	}
 	fields := strings.Fields(string(stat[end+1:]))
 	// fields[0] is state (field 3), fields[1] is ppid (field 4),
 	// fields[2] is pgrp (field 5), fields[3] is session (field 6),
 	// fields[19] is starttime (field 22).
 	if len(fields) <= 19 {
-		return linuxProcMeta{}, nil
+		return linuxProcMeta{}
 	}
 	if fields[0] == "Z" || fields[0] == "X" || fields[0] == "x" {
-		return linuxProcMeta{info: processInfo{Zombie: true}}, nil
+		return linuxProcMeta{info: processInfo{Zombie: true}}
 	}
 	ppid, _ := strconv.Atoi(fields[1])
 	pgid, err := strconv.Atoi(fields[2])
@@ -90,14 +83,6 @@ func inspectLinuxProcMeta(pid int) (linuxProcMeta, error) {
 	if boot := linuxBootID(); boot != "" {
 		token = boot + ":" + fields[19]
 	}
-	var uid uint32
-	var hasUID bool
-	if dirInfo, serr := os.Stat(procDir); serr == nil {
-		if st, ok := dirInfo.Sys().(*syscall.Stat_t); ok {
-			uid = st.Uid
-			hasUID = true
-		}
-	}
 	return linuxProcMeta{
 		info: processInfo{
 			Alive:      true,
@@ -109,10 +94,102 @@ func inspectLinuxProcMeta(pid int) (linuxProcMeta, error) {
 		},
 		ppid:       ppid,
 		startTicks: startTicks,
-	}, nil
+	}
 }
 
-var inspectLinuxProcMetaFn = inspectLinuxProcMeta
+func inspectLinuxProcMeta(pid int) (linuxProcMeta, error) {
+	if pid <= 0 {
+		return linuxProcMeta{}, nil
+	}
+	procDir := fmt.Sprintf("/proc/%d", pid)
+	stat, err := os.ReadFile(procDir + "/stat")
+	if err != nil {
+		if os.IsNotExist(err) || errors.Is(err, syscall.ESRCH) {
+			return linuxProcMeta{}, nil
+		}
+		return linuxProcMeta{}, err
+	}
+	var uid uint32
+	var hasUID bool
+	if dirInfo, serr := os.Stat(procDir); serr == nil {
+		if st, ok := dirInfo.Sys().(*syscall.Stat_t); ok {
+			uid = st.Uid
+			hasUID = true
+		}
+	}
+	return parseLinuxProcStat(stat, uid, hasUID), nil
+}
+
+// openAndInspectLinuxProcHandle opens /proc/<pid> as a directory descriptor pinned
+// to that task instance and reads UID and stat strictly through that handle.
+func openAndInspectLinuxProcHandle(pid int) (int, linuxProcMeta, error) {
+	if pid <= 0 {
+		return -1, linuxProcMeta{}, nil
+	}
+	procDir := fmt.Sprintf("/proc/%d", pid)
+	var procFD int
+	var err error
+	for {
+		procFD, err = unix.Open(procDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		if os.IsNotExist(err) || errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESRCH) {
+			return -1, linuxProcMeta{}, nil
+		}
+		return -1, linuxProcMeta{}, err
+	}
+
+	var uid uint32
+	var hasUID bool
+	var st unix.Stat_t
+	if serr := unix.Fstat(procFD, &st); serr == nil {
+		uid = st.Uid
+		hasUID = true
+	} else if os.IsNotExist(serr) || errors.Is(serr, unix.ENOENT) || errors.Is(serr, unix.ESRCH) {
+		_ = unix.Close(procFD)
+		return -1, linuxProcMeta{}, nil
+	}
+
+	var statFD int
+	for {
+		statFD, err = unix.Openat(procFD, "stat", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		_ = unix.Close(procFD)
+		if os.IsNotExist(err) || errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESRCH) {
+			return -1, linuxProcMeta{}, nil
+		}
+		return -1, linuxProcMeta{}, err
+	}
+	statFile := os.NewFile(uintptr(statFD), procDir+"/stat")
+	statData, rerr := io.ReadAll(statFile)
+	_ = statFile.Close()
+	if rerr != nil {
+		_ = unix.Close(procFD)
+		if os.IsNotExist(rerr) || errors.Is(rerr, unix.ENOENT) || errors.Is(rerr, unix.ESRCH) {
+			return -1, linuxProcMeta{}, nil
+		}
+		return -1, linuxProcMeta{}, rerr
+	}
+
+	meta := parseLinuxProcStat(statData, uid, hasUID)
+	if !meta.info.Alive {
+		_ = unix.Close(procFD)
+		return -1, meta, nil
+	}
+	return procFD, meta, nil
+}
+
+var (
+	inspectLinuxProcMetaFn = inspectLinuxProcMeta
+	openLinuxProcHandleFn  = openAndInspectLinuxProcHandle
+)
 
 func inspectProcessErr(pid int) (processInfo, error) {
 	meta, err := inspectLinuxProcMetaFn(pid)
@@ -293,30 +370,36 @@ func stopVerifiedProcessGroupWithProof(proof processGroupProof) error {
 			return signalVerifiedGroupByFD(proof, fdErr, map[int]string{id.PID: id.StartToken}, true)
 		}
 		if isPidfdUnavailableErr(fdErr) {
-			return stopVerifiedLeaderByProc(id)
+			return stopVerifiedLeaderByProcHandle(id)
 		}
 		return fdErr
 	}
 	defer unix.Close(fd)
-	if kerr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); errors.Is(kerr, unix.ESRCH) {
+	if kerr := pidfdSendSignalFn(fd, unix.SIGKILL, nil, 0); errors.Is(kerr, unix.ESRCH) {
 		return os.ErrProcessDone
 	} else {
 		return kerr
 	}
 }
 
-func stopVerifiedLeaderByProc(id ProcessIdentityInfo) error {
-	info, err := inspectProcessErrFn(id.PID)
+func stopVerifiedLeaderByProcHandle(id ProcessIdentityInfo) error {
+	procFD, meta, err := openLinuxProcHandleFn(id.PID)
+	if procFD >= 0 {
+		defer func() { _ = unix.Close(procFD) }()
+	}
 	if err != nil {
 		return err
 	}
-	if !info.Alive {
+	if !meta.info.Alive {
 		return os.ErrProcessDone
 	}
-	if !id.Matches(info) {
+	if !id.Matches(meta.info) {
 		return fmt.Errorf("refusing to signal pid %d: %w", id.PID, ErrProcessIdentityMismatch)
 	}
-	if kerr := syscall.Kill(id.PID, syscall.SIGKILL); errors.Is(kerr, syscall.ESRCH) {
+	if procFD < 0 {
+		return unix.EBADF
+	}
+	if kerr := pidfdSendSignalFn(procFD, unix.SIGKILL, nil, 0); errors.Is(kerr, unix.ESRCH) {
 		return os.ErrProcessDone
 	} else {
 		return kerr
@@ -702,15 +785,26 @@ func linuxProcMatchesMember(proof processGroupProof, id ProcessIdentityInfo, met
 		(proof.SID <= 0 || meta.info.SID == proof.SID)
 }
 
-// revalidateAndSignalLinuxMember re-reads /proc/<pid> metadata to verify identity
-// immediately before signalling and sends SIGKILL via fd (if hasFD) or pid.
+// revalidateAndSignalLinuxMember verifies identity (via inspectLinuxProcMetaFn when
+// holding a pidfd, or through a newly opened pinned /proc/<pid> handle when
+// pidfd_open is unavailable) and signals the verified handle via pidfd_send_signal.
 func revalidateAndSignalLinuxMember(proof processGroupProof, id ProcessIdentityInfo, pid int, tok string, fd int, hasFD bool, failOnReuse bool) (signalled, gone, fdLimited bool, err error) {
-	meta, merr := inspectLinuxProcMetaFn(pid)
+	var meta linuxProcMeta
+	var merr error
+	handleFD := fd
+	if hasFD {
+		meta, merr = inspectLinuxProcMetaFn(pid)
+	} else {
+		handleFD, meta, merr = openLinuxProcHandleFn(pid)
+		if handleFD >= 0 {
+			defer func() { _ = unix.Close(handleFD) }()
+		}
+	}
 	if merr != nil {
 		if isFDLimitErr(merr) {
 			return false, false, true, merr
 		}
-		if errors.Is(merr, unix.ESRCH) {
+		if errors.Is(merr, unix.ESRCH) || os.IsNotExist(merr) {
 			return false, true, false, nil
 		}
 		return false, false, false, merr
@@ -724,16 +818,14 @@ func revalidateAndSignalLinuxMember(proof processGroupProof, id ProcessIdentityI
 		}
 		return false, true, false, nil
 	}
-	var kerr error
-	if hasFD {
-		kerr = unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
-	} else {
-		kerr = syscall.Kill(pid, syscall.SIGKILL)
+	if handleFD < 0 {
+		return false, false, false, unix.EBADF
 	}
+	kerr := pidfdSendSignalFn(handleFD, unix.SIGKILL, nil, 0)
 	if kerr == nil {
 		return true, false, false, nil
 	}
-	if errors.Is(kerr, unix.ESRCH) || errors.Is(kerr, syscall.ESRCH) {
+	if errors.Is(kerr, unix.ESRCH) {
 		return false, true, false, nil
 	}
 	return false, false, false, kerr
@@ -1081,7 +1173,7 @@ func stopAdoptedProcessGroupAfterExitPass(proof *processGroupProof, id ProcessId
 	var sigErr error
 	anySignalled := false
 	for _, fd := range verifiedFDs {
-		if kerr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); kerr == nil {
+		if kerr := pidfdSendSignalFn(fd, unix.SIGKILL, nil, 0); kerr == nil {
 			anySignalled = true
 		} else if !errors.Is(kerr, unix.ESRCH) && sigErr == nil {
 			sigErr = kerr

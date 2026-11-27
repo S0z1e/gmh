@@ -1285,10 +1285,14 @@ func TestCrashRecoveryAdoptedLeaderExitStopsBackgroundChildWithoutPidfdLinux(t *
 
 func TestLinuxCleanupWithoutPidfdVerifiesIdentityAndRefusesReuse(t *testing.T) {
 	origPidfdOpen := pidfdOpenFn
+	origPidfdSendSignal := pidfdSendSignalFn
+	origOpenHandle := openLinuxProcHandleFn
 	origInspectMeta := inspectLinuxProcMetaFn
 	origInspectErr := inspectProcessErrFn
 	t.Cleanup(func() {
 		pidfdOpenFn = origPidfdOpen
+		pidfdSendSignalFn = origPidfdSendSignal
+		openLinuxProcHandleFn = origOpenHandle
 		inspectLinuxProcMetaFn = origInspectMeta
 		inspectProcessErrFn = origInspectErr
 	})
@@ -1296,9 +1300,9 @@ func TestLinuxCleanupWithoutPidfdVerifiesIdentityAndRefusesReuse(t *testing.T) {
 		return -1, syscall.ENOSYS
 	}
 
-	// Subcase 1: when a verified child PID is reused (StartToken changes) between
-	// candidate verification and signalling under ENOSYS, cleanup refuses to kill
-	// the replacement process and returns ErrProcessIdentityMismatch.
+	// Subcase 1: when a verified child PID is reused (StartToken changes when
+	// inspected through its opened /proc/<pid> handle) under ENOSYS, cleanup
+	// refuses to kill the replacement process and returns ErrProcessIdentityMismatch.
 	reusedCmd := exec.Command("sleep", "30")
 	configureProcess(reusedCmd)
 	if err := reusedCmd.Start(); err != nil {
@@ -1322,16 +1326,18 @@ func TestLinuxCleanupWithoutPidfdVerifiesIdentityAndRefusesReuse(t *testing.T) {
 		}
 		return origInspectErr(pid)
 	}
-	var calls atomic.Int32
 	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
 		if pid == fakeLeaderPID {
 			return linuxProcMeta{}, nil
 		}
-		m, err := origInspectMeta(pid)
-		if err == nil && pid == reusedPID && calls.Add(1) > 1 {
+		return origInspectMeta(pid)
+	}
+	openLinuxProcHandleFn = func(pid int) (int, linuxProcMeta, error) {
+		fd, m, err := origOpenHandle(pid)
+		if err == nil && pid == reusedPID && m.info.Alive {
 			m.info.StartToken = m.info.StartToken + "-reused"
 		}
-		return m, err
+		return fd, m, err
 	}
 	reusedProof := processGroupProof{
 		Leader:         ProcessIdentityInfo{PID: fakeLeaderPID, PGID: reusedInfo.PGID, StartToken: reusedInfo.StartToken},
@@ -1353,12 +1359,13 @@ func TestLinuxCleanupWithoutPidfdVerifiesIdentityAndRefusesReuse(t *testing.T) {
 	}
 
 	// Subcase 2: signalVerifiedKnownMembersLinux still stops verified children
-	// past an intruder mismatch when pidfd_open returns EPERM.
+	// past an intruder mismatch when pidfd_open returns EPERM using the pinned
+	// /proc/<pid> handle + pidfd_send_signal.
 	pidfdOpenFn = func(int, int) (int, error) {
 		return -1, syscall.EPERM
 	}
+	openLinuxProcHandleFn = origOpenHandle
 	inspectLinuxProcMetaFn = origInspectMeta
-	calls.Store(0)
 
 	verifiedCmd := exec.Command("sleep", "30")
 	configureProcess(verifiedCmd)
@@ -1432,5 +1439,42 @@ func TestLinuxCleanupWithoutPidfdVerifiesIdentityAndRefusesReuse(t *testing.T) {
 	}
 	if m, merr := origInspectMeta(intruderPID); merr != nil || !m.info.Alive {
 		t.Fatalf("intruder pid %d was killed unexpectedly (meta=%+v, err=%v)", intruderPID, m, merr)
+	}
+
+	// Subcase 3: when handle-based signalling itself is unavailable
+	// (pidfd_send_signal returns ENOSYS/EPERM), both cleanup and leader handle
+	// signalling preserve a retryable error rather than falling back to kill(pid).
+	inspectProcessErrFn = func(pid int) (processInfo, error) {
+		if pid == fakeLeaderPID {
+			return processInfo{}, nil
+		}
+		return origInspectErr(pid)
+	}
+	inspectLinuxProcMetaFn = func(pid int) (linuxProcMeta, error) {
+		if pid == fakeLeaderPID {
+			return linuxProcMeta{}, nil
+		}
+		return origInspectMeta(pid)
+	}
+	for _, sigErr := range []error{syscall.ENOSYS, syscall.EPERM} {
+		pidfdOpenFn = func(int, int) (int, error) {
+			return -1, syscall.ENOSYS
+		}
+		pidfdSendSignalFn = func(int, unix.Signal, *unix.Siginfo, int) error {
+			return sigErr
+		}
+		if err := stopAdoptedProcessGroupAfterExit(reusedProof); !errors.Is(err, sigErr) {
+			t.Fatalf("stopAdoptedProcessGroupAfterExit without pidfd_send_signal err = %v, want retryable %v", err, sigErr)
+		}
+		if err := stopVerifiedLeaderByProcHandle(ProcessIdentityInfo{
+			PID:        reusedPID,
+			PGID:       reusedInfo.PGID,
+			StartToken: reusedInfo.StartToken,
+		}); !errors.Is(err, sigErr) {
+			t.Fatalf("stopVerifiedLeaderByProcHandle without pidfd_send_signal err = %v, want retryable %v", err, sigErr)
+		}
+		if m, merr := origInspectMeta(reusedPID); merr != nil || !m.info.Alive {
+			t.Fatalf("pid %d was killed despite unavailable pidfd_send_signal (%v)", reusedPID, sigErr)
+		}
 	}
 }
