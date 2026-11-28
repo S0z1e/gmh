@@ -504,13 +504,37 @@ func (s *Server) enqueue(req Request, kind workKind) {
 	}
 }
 
-func (s *Server) handleApprovalResponse(req Request) {
-	s.approvalsMu.Lock()
-	pending, ok := s.approvals[req.ApprovalID]
-	if ok {
-		delete(s.approvals, req.ApprovalID)
+func (s *Server) scopedRequestID(prefix string, seq int) string {
+	scope := s.connectionID
+	if scope == "" {
+		scope = rand.Text()
 	}
-	s.approvalsMu.Unlock()
+	return fmt.Sprintf("%s-%s-%d", prefix, scope, seq)
+}
+
+func (s *Server) checkResponseConnection(req Request, kind, id string) error {
+	if req.ConnectionID != "" && req.ConnectionID != s.connectionID {
+		return fmt.Errorf("%s id %q belongs to connection %q, not current connection %q", kind, id, req.ConnectionID, s.connectionID)
+	}
+	return nil
+}
+
+func popPending[T any](mu *sync.Mutex, pending *map[string]T, id string) (T, bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	val, ok := (*pending)[id]
+	if ok {
+		delete(*pending, id)
+	}
+	return val, ok
+}
+
+func (s *Server) handleApprovalResponse(req Request) {
+	if err := s.checkResponseConnection(req, "approval", req.ApprovalID); err != nil {
+		s.respond(req, nil, err)
+		return
+	}
+	pending, ok := popPending(&s.approvalsMu, &s.approvals, req.ApprovalID)
 	if !ok {
 		s.respond(req, nil, fmt.Errorf("unknown approval id %q", req.ApprovalID))
 		return
@@ -1023,7 +1047,7 @@ func (s *Server) ask(req agent.ApprovalRequest) (bool, error) {
 		return false, err
 	}
 	s.apprSeq++
-	id := fmt.Sprintf("appr-%d", s.apprSeq)
+	id := s.scopedRequestID("appr", s.apprSeq)
 	ch := make(chan approvalAnswer, 1)
 	s.approvals[id] = pendingApproval{ch: ch, req: req}
 	s.approvalsMu.Unlock()
@@ -1080,7 +1104,7 @@ func (s *Server) confirmContinuation(req agent.ContinuationRequest) (agent.Conti
 		return agent.ContinuationDecision{Outcome: agent.ContinuationDeny}, agent.ErrApprovalDetached
 	}
 	s.contSeq++
-	id := fmt.Sprintf("cont-%d", s.contSeq)
+	id := s.scopedRequestID("cont", s.contSeq)
 	ch := make(chan agent.ContinuationDecision, 1)
 	errCh := make(chan error, 1)
 	s.continuations[id] = continuationWait{ch: ch, err: errCh}
@@ -1121,6 +1145,10 @@ func (s *Server) confirmContinuation(req agent.ContinuationRequest) (agent.Conti
 }
 
 func (s *Server) handleContinuationResponse(req Request) {
+	if err := s.checkResponseConnection(req, "continuation", req.ContinuationID); err != nil {
+		s.respond(req, nil, err)
+		return
+	}
 	dec := agent.ContinuationDecision{Outcome: agent.ContinuationOutcome(req.Decision), UpdatedArgs: req.UpdatedArgs}
 	switch dec.Outcome {
 	case agent.ContinuationOnce, agent.ContinuationSession, agent.ContinuationDeny:
@@ -1135,12 +1163,7 @@ func (s *Server) handleContinuationResponse(req Request) {
 			return
 		}
 	}
-	s.continuationsMu.Lock()
-	wait, ok := s.continuations[req.ContinuationID]
-	if ok {
-		delete(s.continuations, req.ContinuationID)
-	}
-	s.continuationsMu.Unlock()
+	wait, ok := popPending(&s.continuationsMu, &s.continuations, req.ContinuationID)
 	if !ok {
 		s.respond(req, nil, fmt.Errorf("unknown continuation id %q", req.ContinuationID))
 		return
@@ -1172,7 +1195,7 @@ func (s *Server) askQuestion(req agent.QuestionRequest) (agent.QuestionAnswers, 
 		return agent.QuestionAnswers{}, agent.ErrApprovalDetached
 	}
 	s.questSeq++
-	id := fmt.Sprintf("quest-%d", s.questSeq)
+	id := s.scopedRequestID("quest", s.questSeq)
 	ch := make(chan questionAnswer, 1)
 	s.questions[id] = ch
 	s.questionsMu.Unlock()
@@ -1203,12 +1226,11 @@ func (s *Server) askQuestion(req agent.QuestionRequest) (agent.QuestionAnswers, 
 }
 
 func (s *Server) handleQuestionResponse(req Request) {
-	s.questionsMu.Lock()
-	ch, ok := s.questions[req.QuestionID]
-	if ok {
-		delete(s.questions, req.QuestionID)
+	if err := s.checkResponseConnection(req, "question", req.QuestionID); err != nil {
+		s.respond(req, nil, err)
+		return
 	}
-	s.questionsMu.Unlock()
+	ch, ok := popPending(&s.questionsMu, &s.questions, req.QuestionID)
 	if !ok {
 		s.respond(req, nil, fmt.Errorf("unknown question id %q", req.QuestionID))
 		return
