@@ -203,7 +203,7 @@ func openLocked(id string, opts OpenOptions, replaceHeader func(*Store, *Header,
 		}
 	}
 	s.header = header
-	if _, err := s.UsageTotals(); err != nil {
+	if err := s.loadInitialUsageLocked(); err != nil {
 		if !(opts.RepairDamagedUsage && errors.Is(err, ErrUsageDamaged)) {
 			s.Close()
 			return nil, fmt.Errorf("load session usage: %w", err)

@@ -56,7 +56,7 @@ func (c *Config) startBudgetWithPolicy(parent context.Context, policy *turnbudge
 			c.resources.failure = unavail
 			return parent, func() {}, unavail
 		}
-		costComplete := totals.UnpricedAttempts() == 0 && !totals.LegacyHistory && !totals.RecoveryGap
+		costComplete := totals.UnpricedAttempts() == 0 && !totals.LegacyHistory && !totals.RecoveryGap && !totals.LowerBound
 		if totals.RecoveryGap {
 			recovery, recErr := c.Session.UsageRecovery()
 			if recErr != nil {
@@ -75,7 +75,32 @@ func (c *Config) startBudgetWithPolicy(parent context.Context, policy *turnbudge
 				return parent, func() {}, unavail
 			}
 		}
-		if err := b.SeedSessionUsage(int64(totals.Usage.TotalTokens), totals.ExactCost(), totals.TokenCountsComplete(), costComplete); err != nil {
+		tokensComplete := totals.TokenCountsComplete()
+		seed := b.SeedSessionUsage
+		if limits.StrictMetering {
+			needTokensBlock := limits.SessionTokens > 0 && !tokensComplete && !totals.LowerBoundTokensAccepted()
+			needCostBlock := limits.SessionCostUSD > 0 && !costComplete && !totals.LowerBoundCostAccepted()
+			if needTokensBlock || needCostBlock {
+				resource := "session_tokens"
+				if !needTokensBlock {
+					resource = "session_cost_usd"
+				}
+				rootHint := "<project>"
+				if c.Exec != nil && c.Exec.Root != "" {
+					rootHint = c.Exec.Root
+				}
+				unavail := &turnbudget.Unavailable{
+					Resource: resource,
+					Reason:   session.IncompleteUsageError(c.Session.ID, rootHint, totals),
+				}
+				c.resources.failure = unavail
+				return parent, func() {}, unavail
+			}
+			if (limits.SessionTokens > 0 && !tokensComplete) || (limits.SessionCostUSD > 0 && !costComplete) {
+				seed = b.SeedSessionLowerBound
+			}
+		}
+		if err := seed(int64(totals.Usage.TotalTokens), totals.ExactCost(), tokensComplete, costComplete); err != nil {
 			c.resources.failure = err
 			return parent, func() {}, err
 		}

@@ -43,6 +43,7 @@ type Store struct {
 	usageChainDigest     string
 	usageChainOn         bool
 	usageCommitted       []string
+	recoveredQuarantine  *UsageReconciliation
 }
 
 // AuditPath is the sidecar file holding approval/bash audit records
@@ -61,15 +62,24 @@ func (s *Store) Audit(v any) error {
 }
 
 func (s *Store) auditLocked(v any) error {
-	unlock, err := lockManagement()
-	if err != nil {
-		return err
+	return s.auditWithOptionsLocked(v, false, false)
+}
+
+func (s *Store) auditWithOptionsLocked(v any, holdingManagementLock, syncDurable bool) error {
+	if !holdingManagementLock {
+		unlock, err := lockManagement()
+		if err != nil {
+			return err
+		}
+		defer unlock()
 	}
-	defer unlock()
 
 	if !s.closed && s.file == nil {
 		return ErrOperationPending
 	}
+	auditPath := s.AuditPath()
+	_, statErr := os.Lstat(auditPath)
+	newlyCreated := os.IsNotExist(statErr)
 	if s.closed {
 		release, err := s.lockClosedStore()
 		if err != nil {
@@ -81,16 +91,26 @@ func (s *Store) auditLocked(v any) error {
 		if err != nil {
 			return err
 		}
-		f, err := openAuditSidecar(s.AuditPath())
+		f, err := openAuditSidecar(auditPath)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		_, err = f.Write(append(b, '\n'))
-		return err
+		if _, err := f.Write(append(b, '\n')); err != nil {
+			return err
+		}
+		if syncDurable {
+			if err := f.Sync(); err != nil {
+				return err
+			}
+			if newlyCreated {
+				return syncRecoveryDirectory(filepath.Dir(auditPath))
+			}
+		}
+		return nil
 	}
 	if s.auditFile == nil {
-		f, err := openAuditSidecar(s.AuditPath())
+		f, err := openAuditSidecar(auditPath)
 		if err != nil {
 			return err
 		}
@@ -100,8 +120,18 @@ func (s *Store) auditLocked(v any) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.auditFile.Write(append(b, '\n'))
-	return err
+	if _, err := s.auditFile.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	if syncDurable {
+		if err := s.auditFile.Sync(); err != nil {
+			return err
+		}
+		if newlyCreated {
+			return syncRecoveryDirectory(filepath.Dir(auditPath))
+		}
+	}
+	return nil
 }
 
 // A closed store can service a late audit or archive request while its

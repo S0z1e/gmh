@@ -52,7 +52,7 @@ func (r *Runner) accountRun(usage llm.Usage, previousCost float64) float64 {
 
 func (r *Runner) usageCoverage() string {
 	t := r.SessionMetering
-	return fmt.Sprintf("attempts=%d unreported=%d partial=%d invalid=%d priced=%d legacy_history=%t recovery_gap=%t", t.Attempts, t.UnreportedAttempts, t.PartialAttempts, t.InvalidAttempts, t.PricedAttempts, t.LegacyHistory, t.RecoveryGap)
+	return fmt.Sprintf("attempts=%d unreported=%d partial=%d invalid=%d priced=%d legacy_history=%t recovery_gap=%t lower_bound=%t", t.Attempts, t.UnreportedAttempts, t.PartialAttempts, t.InvalidAttempts, t.PricedAttempts, t.LegacyHistory, t.RecoveryGap, t.LowerBound)
 }
 
 func (r *Runner) sessionCostLine() string {
@@ -62,7 +62,7 @@ func (r *Runner) sessionCostLine() string {
 	if r.SessionMetering.PricedAttempts == 0 {
 		return "fee: " + r.App.Cfg.Client.ProviderName() + " price unverified"
 	}
-	if r.SessionMetering.UnpricedAttempts() != 0 || (r.SessionMetering.LegacyHistory || r.SessionMetering.RecoveryGap) {
+	if r.SessionMetering.UnpricedAttempts() != 0 || r.SessionMetering.LegacyHistory || r.SessionMetering.RecoveryGap || r.SessionMetering.LowerBound {
 		return fmt.Sprintf("est. recorded subtotal: ~$%.4f (pricing incomplete; provider price unverified)", r.SessionCost)
 	}
 	return fmt.Sprintf("est. cost: ~$%.4f (rates: recorded attempt schedules; provider price unverified)", r.SessionCost)
@@ -71,7 +71,7 @@ func (r *Runner) sessionCostLine() string {
 // A nil cost means at least one attempt in this run could not be priced.
 // An empty run and explicitly configured free rates both have a known zero.
 func (r *Runner) CurrentRunCost() *float64 {
-	if !r.MeteringAvailable || r.SessionMetering.RecoveryGap && !r.runBaseline.RecoveryGap {
+	if !r.MeteringAvailable || (r.SessionMetering.RecoveryGap && !r.runBaseline.RecoveryGap) || (r.SessionMetering.LowerBound && !r.runBaseline.LowerBound) {
 		return nil
 	}
 	if r.SessionMetering.UnpricedAttempts() != r.runBaseline.UnpricedAttempts() {
@@ -124,7 +124,7 @@ func (r *Runner) sessionUsageLine() string {
 // Historical gaps stay visible on lifetime totals without tainting a new run.
 func (r *Runner) RunUsageComplete() bool {
 	t, b := r.SessionMetering, r.runBaseline
-	return r.MeteringAvailable && t.UnreportedAttempts == b.UnreportedAttempts && t.PartialAttempts == b.PartialAttempts && t.InvalidAttempts == b.InvalidAttempts && (!t.RecoveryGap || b.RecoveryGap) && (!t.LegacyHistory || b.LegacyHistory)
+	return r.MeteringAvailable && t.UnreportedAttempts == b.UnreportedAttempts && t.PartialAttempts == b.PartialAttempts && t.InvalidAttempts == b.InvalidAttempts && (!t.RecoveryGap || b.RecoveryGap) && (!t.LegacyHistory || b.LegacyHistory) && (!t.LowerBound || b.LowerBound)
 }
 func (r *Runner) runUsageLine() string {
 	if !r.MeteringAvailable {

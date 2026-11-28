@@ -10,39 +10,84 @@ import (
 	"minimalharness/internal/session"
 )
 
-// usageRepair quarantines one named usage artifact and prints the artifacts
-// that still block strict metering. It is idempotent: quarantining an artifact
-// that is already gone reports the remaining set instead of deleting evidence.
+// usageRepair quarantines one named usage artifact or accepts a lower-bound
+// baseline and prints the artifacts/gaps that still block strict metering.
+// Quarantining backups and pending markers is idempotent when already gone;
+// quarantining a healthy usage journal is refused unless --allow-healthy is set.
 func usageRepair(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("usage-repair", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	sessionID := fs.String("session", "", "session id whose usage journal is repaired")
 	root := fs.String("root", ".", "workspace root bound to the session")
 	artifact := fs.String("quarantine", "", "artifact path named by the strict metering error")
+	allowHealthy := fs.Bool("allow-healthy", false, "allow quarantining a usage journal that loads cleanly (audited)")
+	acceptLowerBound := fs.Bool("accept-lower-bound", false, "acknowledge an incomplete or quarantined lower-bound baseline so strict metering enforces caps against recorded totals (audited)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *sessionID == "" || *artifact == "" {
-		return fmt.Errorf("usage-repair requires --session and --quarantine")
+	if *sessionID == "" || (*artifact == "" && !*acceptLowerBound) {
+		return fmt.Errorf("usage-repair requires --session and --quarantine or --accept-lower-bound")
 	}
 	store, err := session.Open(*sessionID, session.OpenOptions{Workspace: *root, Existing: true, RepairDamagedUsage: true})
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	report, err := store.RepairUsage(session.UsageRepairQuarantine, *artifact)
+	if *artifact != "" {
+		report, err := store.RepairUsageWithOptions(session.UsageRepairQuarantine, *artifact, session.UsageRepairOptions{
+			ForceHealthy: *allowHealthy,
+		})
+		if err != nil {
+			return err
+		}
+		if report.HealthyOverride {
+			fmt.Fprintf(stdout, "quarantined %s (healthy override audited)\n", *artifact)
+		} else {
+			fmt.Fprintf(stdout, "quarantined %s\n", *artifact)
+		}
+		if report.CarryForward != nil {
+			fmt.Fprintf(stdout, "carried forward %d attempt(s), %d tokens ($%.4f) to %s\n", report.CarryForward.Attempts, report.CarryForward.Usage.TotalTokens, report.CarryForward.EstimateUSD, report.CarryForward.QuarantinedFile)
+		}
+	}
+	if *acceptLowerBound {
+		_, changed, err := store.AcceptUsageLowerBound()
+		if err != nil {
+			return err
+		}
+		if changed {
+			fmt.Fprintf(stdout, "accepted lower-bound baseline for session %s\n", *sessionID)
+		} else {
+			fmt.Fprintf(stdout, "lower-bound baseline already accepted or complete for session %s\n", *sessionID)
+		}
+	}
+	recovery, err := store.UsageRecovery()
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "quarantined %s\n", *artifact)
-	if len(report.Artifacts) == 0 {
-		fmt.Fprintln(stdout, "recovery gap cleared")
+	totals, err := store.UsageTotals()
+	if err != nil {
+		return err
+	}
+	if len(recovery.Artifacts) > 0 {
+		fmt.Fprintln(stdout, "still blocking strict metering:")
+		for _, item := range recovery.Artifacts {
+			fmt.Fprintf(stdout, "%s\t%s\t%s\n", item.Path, item.Kind, strings.ReplaceAll(item.Reason, "\n", " "))
+		}
 		return nil
 	}
-	fmt.Fprintln(stdout, "still blocking strict metering:")
-	for _, item := range report.Artifacts {
-		fmt.Fprintf(stdout, "%s\t%s\t%s\n", item.Path, item.Kind, strings.ReplaceAll(item.Reason, "\n", " "))
+	if !totals.TokenCountsComplete() && !totals.LowerBoundTokensAccepted() {
+		fmt.Fprintf(stdout, "strict metering still blocked: %s\n", session.IncompleteUsageError(*sessionID, *root, totals))
+		return nil
 	}
+	if totals.UnpricedAttempts() > 0 && !totals.LowerBoundCostAccepted() {
+		fmt.Fprintf(stdout, "strict metering still blocked for cost caps: %s\n", session.IncompleteUsageError(*sessionID, *root, totals))
+		return nil
+	}
+	if !totals.TokenCountsComplete() || totals.UnpricedAttempts() > 0 {
+		fmt.Fprintln(stdout, "persisted lower-bound usage baseline ready (strict session caps enforce against recorded totals when required rates are configured)")
+		return nil
+	}
+	fmt.Fprintln(stdout, "recovery gap cleared")
 	return nil
 }
 

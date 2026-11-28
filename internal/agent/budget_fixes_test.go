@@ -361,3 +361,84 @@ func TestMalformedProviderUsageDoesNotKillAnUncappedTurn(t *testing.T) {
 		})
 	}
 }
+
+func TestDamagedJournalQuarantinePreservesCapsInNonStrictAndStrictMode(t *testing.T) {
+	for _, strict := range []bool{false, true} {
+		t.Run(fmt.Sprintf("strict=%t", strict), func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("USERPROFILE", t.TempDir())
+			c := budgetConfig(t, &turnbudget.Policy{MaxSessionTokens: capInt(100), StrictMetering: capBool(strict)})
+			store, err := session.Open("quarantine-cap", session.OpenOptions{Workspace: c.Exec.Root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Append(llm.Message{Role: "user", Content: "prior turn"}); err != nil {
+				t.Fatal(err)
+			}
+			for i, id := range []string{"FIRSTID", "SECONDID"} {
+				tokens := 40 + i*10
+				if err := store.RecordUsage(session.UsageAttempt{
+					ID:      id,
+					Request: llm.RequestTrace{ID: id, Usage: &llm.Usage{PromptTokens: tokens, TotalTokens: tokens}, TokensComplete: true},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			journalPath := filepath.Join(session.Dir(), store.OutputID(), "usage.jsonl")
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			f, err := os.OpenFile(journalPath, os.O_APPEND|os.O_WRONLY, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteString("broken\n"); err != nil {
+				t.Fatal(err)
+			}
+			f.Close()
+
+			store, err = session.Open("quarantine-cap", session.OpenOptions{Workspace: c.Exec.Root, Existing: true, RepairDamagedUsage: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			report, err := store.RepairUsage(session.UsageRepairQuarantine, journalPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.CarryForward == nil || report.CarryForward.Usage.TotalTokens != 90 {
+				t.Fatalf("carry-forward lost valid prefix: %+v", report)
+			}
+			c.Session = store
+			history := []llm.Message{{Role: "user", Content: "continue"}}
+
+			if strict {
+				c.Client = fakeBudgetClient(func(*http.Request) (*http.Response, error) {
+					t.Fatal("strict mode dispatched before lower-bound acknowledgment")
+					return nil, io.EOF
+				})
+				_, _, err = c.Run(t.Context(), history)
+				var unavailable *turnbudget.Unavailable
+				if !errors.As(err, &unavailable) || !strings.Contains(err.Error(), report.CarryForward.QuarantinedFile) || !strings.Contains(err.Error(), "--accept-lower-bound") {
+					t.Fatalf("strict error did not name quarantined file and way out: %v", err)
+				}
+				if _, _, err := store.AcceptUsageLowerBound(); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			calls := 0
+			c.Client = fakeBudgetClient(func(*http.Request) (*http.Response, error) {
+				calls++
+				return budgetResponse(budgetSSE("ok", nil, newInt(15), true)), nil
+			})
+			var events []Event
+			c.OnEvent = func(e Event) { events = append(events, e) }
+			_, _, err = c.Run(t.Context(), history)
+			requireBudgetStop(t, c, events, err, TerminalBudgetExceeded)
+			if calls != 1 || c.LastTurnBudget == nil || c.LastTurnBudget.SessionReportedTokens != 105 || !c.LastTurnBudget.LowerBound || !c.LastTurnBudget.BaselineIncomplete {
+				t.Fatalf("carried-forward cap was not enforced with lower-bound semantics: calls=%d state=%+v err=%v", calls, c.LastTurnBudget, err)
+			}
+		})
+	}
+}
