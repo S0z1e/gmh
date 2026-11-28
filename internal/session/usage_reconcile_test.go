@@ -357,12 +357,226 @@ func TestDamagedJournalNamesArtifactAndQuarantinesIdempotently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.RecoveryGap {
-		t.Fatalf("quarantine left a gap: %+v", report)
+	if report.RecoveryGap || report.CarryForward == nil || report.CarryForward.Attempts != 1 || report.CarryForward.Usage.TotalTokens != 1 || !report.CarryForward.LowerBound {
+		t.Fatalf("unexpected quarantine report: %+v", report)
 	}
-	again, err := s.RepairUsage(UsageRepairQuarantine, path)
+	totals, err := s.UsageTotals()
+	if err != nil || totals.Attempts != 1 || totals.Usage.TotalTokens != 1 || !totals.LowerBound || totals.TokenCountsComplete() || totals.QuarantinedFile == "" {
+		t.Fatalf("totals after quarantine=%+v err=%v", totals, err)
+	}
+	if _, err := s.RepairUsage(UsageRepairQuarantine, path); !errors.Is(err, ErrUsageHealthy) {
+		t.Fatalf("healthy replacement journal was quarantined without override: %v", err)
+	}
+}
+
+func TestTornTailBackupQuarantineIsIdempotent(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("torn-idem", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("ONEATTEMPT", 1)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"version":1,"id":"torn`); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	s, err = Open("torn-idem", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	recovery, err := s.UsageRecovery()
+	if err != nil || len(recovery.Artifacts) != 1 {
+		t.Fatalf("%+v %v", recovery, err)
+	}
+	report, err := s.RepairUsage(UsageRepairQuarantine, recovery.Artifacts[0].Path)
+	if err != nil || report.RecoveryGap {
+		t.Fatalf("first backup quarantine=%+v err=%v", report, err)
+	}
+	again, err := s.RepairUsage(UsageRepairQuarantine, recovery.Artifacts[0].Path)
 	if err != nil || again.RecoveryGap {
-		t.Fatalf("second quarantine was not idempotent: %+v %v", again, err)
+		t.Fatalf("second backup quarantine was not idempotent: %+v %v", again, err)
+	}
+}
+
+func TestDamagedJournalQuarantineCarriesForwardValidPrefixAndSurvivesReopen(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("carry", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(llm.Message{Role: "user", Content: "prior turn"}); err != nil {
+		t.Fatal(err)
+	}
+	cost1 := 0.25
+	a1 := usageAttempt("FIRSTID", 40)
+	a1.EstimateUSD = &cost1
+	a1.ExactEstimateUSD = "1/4"
+	cost2 := 0.15
+	a2 := usageAttempt("SECONDID", 60)
+	a2.EstimateUSD = &cost2
+	a2.ExactEstimateUSD = "3/20"
+	for _, a := range []UsageAttempt{a1, a2} {
+		if err := s.RecordUsage(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := s.usagePathLocked()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s, err = Open("carry", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := s.RepairUsage(UsageRepairQuarantine, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.CarryForward == nil || report.CarryForward.Attempts != 2 || report.CarryForward.Usage.TotalTokens != 100 || !report.CarryForward.LowerBound {
+		t.Fatalf("unexpected carry-forward: %+v", report.CarryForward)
+	}
+	if _, err := os.Stat(report.CarryForward.QuarantinedFile); err != nil {
+		t.Fatalf("quarantined file missing: %v", err)
+	}
+	totals, err := s.UsageTotals()
+	if err != nil || totals.Attempts != 2 || totals.Usage.TotalTokens != 100 || totals.EstimateUSD != 0.4 || totals.ExactCost().RatString() != "2/5" || !totals.LowerBound || totals.LegacyHistory || totals.TokenCountsComplete() {
+		t.Fatalf("totals=%+v exact=%s err=%v", totals, totals.ExactCost().RatString(), err)
+	}
+
+	cost3 := 0.10
+	a3 := usageAttempt("THIRDID", 25)
+	a3.EstimateUSD = &cost3
+	a3.ExactEstimateUSD = "1/10"
+	if err := s.RecordUsage(a3); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s, err = Open("carry", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	totals, err = s.UsageTotals()
+	if err != nil || totals.Attempts != 3 || totals.Usage.TotalTokens != 125 || totals.ExactCost().RatString() != "1/2" || !totals.LowerBound {
+		t.Fatalf("reopened totals=%+v exact=%s err=%v", totals, totals.ExactCost().RatString(), err)
+	}
+	recovery, err := s.UsageRecovery()
+	if err != nil || recovery.ChainSequences != 1 {
+		t.Fatalf("expected new journal chain to restart cleanly at 1: %+v %v", recovery, err)
+	}
+}
+
+func TestHealthyJournalQuarantineRefusedWithoutOverrideAndAuditedWithOverride(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("healthy-q", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cost := 0.5
+	a := usageAttempt("FIRSTID", 50)
+	a.EstimateUSD = &cost
+	a.ExactEstimateUSD = "1/2"
+	if err := s.RecordUsage(a); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	if _, err := s.RepairUsage(UsageRepairQuarantine, path); !errors.Is(err, ErrUsageHealthy) {
+		t.Fatalf("healthy journal quarantine was not refused: %v", err)
+	}
+	report, err := s.RepairUsageWithOptions(UsageRepairQuarantine, path, UsageRepairOptions{ForceHealthy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.HealthyOverride || report.CarryForward == nil || report.CarryForward.LowerBound || report.CarryForward.Attempts != 1 || report.CarryForward.Usage.TotalTokens != 50 {
+		t.Fatalf("unexpected override report: %+v", report)
+	}
+	totals, err := s.UsageTotals()
+	if err != nil || totals.Attempts != 1 || totals.Usage.TotalTokens != 50 || totals.ExactCost().RatString() != "1/2" || !totals.TokenCountsComplete() {
+		t.Fatalf("totals=%+v err=%v", totals, err)
+	}
+	auditData, err := os.ReadFile(s.AuditPath())
+	if err != nil || !strings.Contains(string(auditData), `"healthy_override":true`) {
+		t.Fatalf("healthy override was not audited: %s %v", string(auditData), err)
+	}
+	s.Close()
+}
+
+func TestAcceptUsageLowerBoundIsAuditedAndBlocksNewGaps(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("ack", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 30)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s, err = Open("ack", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RepairUsage(UsageRepairQuarantine, path); err != nil {
+		t.Fatal(err)
+	}
+	totals, changed, err := s.AcceptUsageLowerBound()
+	if err != nil || !changed || !totals.LowerBoundTokensAccepted() || !totals.LowerBoundCostAccepted() || totals.TokenCountsComplete() {
+		t.Fatalf("accept=%+v changed=%t err=%v", totals, changed, err)
+	}
+	if err := s.RecordUsage(usageAttempt("SECONDID", 10)); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s, err = Open("ack", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	totals, err = s.UsageTotals()
+	if err != nil || !totals.LowerBoundTokensAccepted() || totals.Usage.TotalTokens != 40 {
+		t.Fatalf("reopened=%+v err=%v", totals, err)
+	}
+	if err := s.RecordUsage(UsageAttempt{ID: "UNREPORTED", Request: llm.RequestTrace{ID: "UNREPORTED"}}); err != nil {
+		t.Fatal(err)
+	}
+	totals, err = s.UsageTotals()
+	if err != nil || totals.LowerBoundTokensAccepted() {
+		t.Fatalf("new unreported attempt did not invalidate lower-bound acceptance: %+v %v", totals, err)
+	}
+	auditData, err := os.ReadFile(s.AuditPath())
+	if err != nil || !strings.Contains(string(auditData), `"accept_lower_bound"`) {
+		t.Fatalf("lower-bound acknowledgment was not audited: %s %v", string(auditData), err)
 	}
 }
 

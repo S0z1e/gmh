@@ -1,7 +1,6 @@
 package session
 
 import (
-	"bufio"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -14,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"minimalharness/internal/llm"
 )
@@ -22,25 +22,59 @@ import (
 // It is not journal corruption: the record was written, with the counters omitted.
 var ErrInvalidProviderUsage = errors.New("invalid or overflowing provider usage recorded as unknown")
 
+// ErrUsageHealthy is returned when quarantining a usage journal that loads cleanly
+// without an explicit override.
+var ErrUsageHealthy = errors.New("usage journal is healthy")
+
 // SetUsageAppendFault installs a test fault that fails an append after the
 // record is sealed and before it is written. Nil restores normal writes.
 func SetUsageAppendFault(fault func() error) { usageAppendFault = fault }
 
 var usageAppendFault func() error
 
+// UsageCarryForward preserves verified prefix totals when a damaged or
+// overridden usage journal is quarantined, so session caps never reset to zero.
+// It is stored on the header record (ID == "") of the replacement journal.
+type UsageCarryForward struct {
+	Usage              llm.Usage `json:"usage"`
+	Attempts           int       `json:"attempts,omitempty"`
+	InvalidAttempts    int       `json:"invalid_attempts,omitempty"`
+	UnreportedAttempts int       `json:"unreported_attempts,omitempty"`
+	PartialAttempts    int       `json:"partial_attempts,omitempty"`
+	PricedAttempts     int       `json:"priced_attempts,omitempty"`
+	RejectedAttempts   int       `json:"rejected_attempts,omitempty"`
+	TransientAttempts  int       `json:"transient_attempts,omitempty"`
+	EstimateUSD        float64   `json:"estimate_usd,omitempty"`
+	ExactEstimateUSD   string    `json:"exact_estimate_usd,omitempty"`
+	QuarantinedFile    string    `json:"quarantined_file"`
+	QuarantinedAt      time.Time `json:"quarantined_at"`
+	LowerBound         bool      `json:"lower_bound,omitempty"`
+	LowerBoundAccepted bool      `json:"lower_bound_accepted,omitempty"`
+	DamageReason       string    `json:"damage_reason,omitempty"`
+}
+
 // UsageAttempt is a content-free ledger entry for one actual provider request.
 // Nil Usage records missing metering, never a fabricated zero-token request.
 type UsageAttempt struct {
-	Version          int              `json:"version"`
-	ID               string           `json:"id"`
-	Operation        string           `json:"operation"`
-	Attempt          int              `json:"attempt"`
-	Request          llm.RequestTrace `json:"request"`
-	EstimateUSD      *float64         `json:"estimate_usd,omitempty"`
-	ExactEstimateUSD string           `json:"exact_estimate_usd,omitempty"`
-	RateSource       string           `json:"rate_source,omitempty"`
-	InvalidUsage     bool             `json:"invalid_usage,omitempty"`
-	LegacyHistory    bool             `json:"legacy_history,omitempty"`
+	Version          int                `json:"version"`
+	ID               string             `json:"id"`
+	Operation        string             `json:"operation"`
+	Attempt          int                `json:"attempt"`
+	Request          llm.RequestTrace   `json:"request"`
+	EstimateUSD      *float64           `json:"estimate_usd,omitempty"`
+	ExactEstimateUSD string             `json:"exact_estimate_usd,omitempty"`
+	RateSource       string             `json:"rate_source,omitempty"`
+	InvalidUsage     bool               `json:"invalid_usage,omitempty"`
+	LegacyHistory    bool               `json:"legacy_history,omitempty"`
+	CarryForward     *UsageCarryForward `json:"carry_forward,omitempty"`
+	AcceptLowerBound bool               `json:"accept_lower_bound,omitempty"`
+}
+
+type acceptedBaseline struct {
+	unreportedAttempts int
+	partialAttempts    int
+	invalidAttempts    int
+	unpricedAttempts   int
 }
 
 type UsageTotals struct {
@@ -55,12 +89,80 @@ type UsageTotals struct {
 	EstimateUSD        float64   `json:"estimate_usd"`
 	RecoveryGap        bool      `json:"recovery_gap"`
 	LegacyHistory      bool      `json:"legacy_history"`
-	exactEstimateUSD   *big.Rat  // replaced on each update so snapshots stay immutable
+	LowerBound         bool      `json:"lower_bound,omitempty"`
+	QuarantinedFile    string    `json:"quarantined_file,omitempty"`
+	LowerBoundAccepted bool      `json:"lower_bound_accepted,omitempty"`
+	accepted           acceptedBaseline
+	exactEstimateUSD   *big.Rat // replaced on each update so snapshots stay immutable
+}
+
+func (t *UsageTotals) addCost(cost *big.Rat) error {
+	if cost == nil {
+		return nil
+	}
+	sum := new(big.Rat).Set(cost)
+	if t.exactEstimateUSD != nil {
+		sum.Add(sum, t.exactEstimateUSD)
+	}
+	amount, _ := sum.Float64()
+	if math.IsInf(amount, 0) {
+		return fmt.Errorf("usage cost overflow")
+	}
+	t.exactEstimateUSD = sum
+	t.EstimateUSD = amount
+	return nil
+}
+
+func (t *UsageTotals) markLowerBoundAccepted() {
+	t.LowerBoundAccepted = true
+	t.accepted = acceptedBaseline{
+		unreportedAttempts: t.UnreportedAttempts,
+		partialAttempts:    t.PartialAttempts,
+		invalidAttempts:    t.InvalidAttempts,
+		unpricedAttempts:   t.UnpricedAttempts(),
+	}
+}
+
+func (t *UsageTotals) addCarryForward(cf *UsageCarryForward) error {
+	if err := cf.validate(); err != nil {
+		return err
+	}
+	if !t.Usage.CanAdd(cf.Usage) {
+		return fmt.Errorf("invalid or overflowing carry-forward usage counters")
+	}
+	cost, err := cf.exactCost()
+	if err != nil {
+		return err
+	}
+	t.Usage.Add(cf.Usage)
+	t.Attempts += cf.Attempts
+	t.InvalidAttempts += cf.InvalidAttempts
+	t.UnreportedAttempts += cf.UnreportedAttempts
+	t.PartialAttempts += cf.PartialAttempts
+	t.PricedAttempts += cf.PricedAttempts
+	t.RejectedAttempts += cf.RejectedAttempts
+	t.TransientAttempts += cf.TransientAttempts
+	if err := t.addCost(cost); err != nil {
+		return err
+	}
+	t.LowerBound = t.LowerBound || cf.LowerBound
+	t.QuarantinedFile = cf.QuarantinedFile
+	if cf.LowerBoundAccepted {
+		t.markLowerBoundAccepted()
+	}
+	return nil
 }
 
 func (t *UsageTotals) add(a UsageAttempt) error {
 	if a.ID == "" {
 		t.LegacyHistory = t.LegacyHistory || a.LegacyHistory
+		if a.CarryForward != nil {
+			return t.addCarryForward(a.CarryForward)
+		}
+		return nil
+	}
+	if a.AcceptLowerBound {
+		t.markLowerBoundAccepted()
 		return nil
 	}
 	cost, err := a.exactCost()
@@ -85,34 +187,27 @@ func (t *UsageTotals) add(a UsageAttempt) error {
 		}
 	}
 	if cost != nil {
-		if t.exactEstimateUSD != nil {
-			cost.Add(cost, t.exactEstimateUSD)
+		if err := t.addCost(cost); err != nil {
+			return err
 		}
-		amount, _ := cost.Float64()
-		if math.IsInf(amount, 0) {
-			return fmt.Errorf("usage cost overflow")
-		}
-		t.exactEstimateUSD = cost
 		t.PricedAttempts++
-		t.EstimateUSD = amount
 	}
 	return nil
 }
 
-func (a UsageAttempt) exactCost() (*big.Rat, error) {
-	if a.EstimateUSD == nil && a.ExactEstimateUSD == "" {
+func parseUsageCost(estimate *float64, raw string, rejected bool) (*big.Rat, error) {
+	if estimate == nil && raw == "" {
 		return nil, nil
 	}
-	if a.EstimateUSD == nil || *a.EstimateUSD < 0 || math.IsNaN(*a.EstimateUSD) || math.IsInf(*a.EstimateUSD, 0) || a.Request.RejectedBeforeInference() {
+	if estimate == nil || *estimate < 0 || math.IsNaN(*estimate) || math.IsInf(*estimate, 0) || rejected {
 		return nil, fmt.Errorf("invalid usage cost")
 	}
-	if a.ExactEstimateUSD == "" {
+	if raw == "" {
 		// Older ledgers store per-attempt float estimates. Interpret each
 		// estimate as a decimal before summing it, as turn budgets do.
-		cost, _ := new(big.Rat).SetString(strconv.FormatFloat(*a.EstimateUSD, 'g', -1, 64))
+		cost, _ := new(big.Rat).SetString(strconv.FormatFloat(*estimate, 'g', -1, 64))
 		return cost, nil
 	}
-	raw := a.ExactEstimateUSD
 	if len(raw) > 2048 || strings.ContainsFunc(raw, func(r rune) bool { return r != '/' && (r < '0' || r > '9') }) {
 		return nil, fmt.Errorf("invalid exact usage cost")
 	}
@@ -120,10 +215,55 @@ func (a UsageAttempt) exactCost() (*big.Rat, error) {
 	if !ok || cost.RatString() != raw {
 		return nil, fmt.Errorf("invalid exact usage cost")
 	}
-	if amount, _ := cost.Float64(); amount != *a.EstimateUSD {
+	if amount, _ := cost.Float64(); amount != *estimate {
 		return nil, fmt.Errorf("exact usage cost does not match estimate")
 	}
 	return cost, nil
+}
+
+func (a UsageAttempt) exactCost() (*big.Rat, error) {
+	return parseUsageCost(a.EstimateUSD, a.ExactEstimateUSD, a.Request.RejectedBeforeInference())
+}
+
+func (cf UsageCarryForward) exactCost() (*big.Rat, error) {
+	if cf.EstimateUSD == 0 && cf.ExactEstimateUSD == "" {
+		return nil, nil
+	}
+	est := cf.EstimateUSD
+	return parseUsageCost(&est, cf.ExactEstimateUSD, false)
+}
+
+func (cf UsageCarryForward) validate() error {
+	if cf.QuarantinedFile == "" {
+		return fmt.Errorf("carry-forward record missing quarantined file")
+	}
+	if !cf.Usage.Valid() {
+		return fmt.Errorf("invalid carry-forward usage counters")
+	}
+	for _, n := range []int{cf.Attempts, cf.InvalidAttempts, cf.UnreportedAttempts, cf.PartialAttempts, cf.PricedAttempts, cf.RejectedAttempts, cf.TransientAttempts} {
+		if n < 0 {
+			return fmt.Errorf("negative carry-forward attempt count")
+		}
+	}
+	if cf.InvalidAttempts > cf.Attempts || cf.UnreportedAttempts > cf.Attempts || cf.PartialAttempts > cf.Attempts || cf.PricedAttempts+cf.RejectedAttempts > cf.Attempts || cf.TransientAttempts > cf.UnreportedAttempts {
+		return fmt.Errorf("inconsistent carry-forward attempt counts")
+	}
+	if _, err := cf.exactCost(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func exactCostFields(cost *big.Rat) (float64, string) {
+	if cost == nil || cost.Sign() == 0 {
+		return 0, ""
+	}
+	amount, _ := cost.Float64()
+	raw := cost.RatString()
+	if len(raw) > 2048 {
+		return amount, ""
+	}
+	return amount, raw
 }
 
 func (s *Store) usagePathLocked() string {
@@ -132,6 +272,21 @@ func (s *Store) usagePathLocked() string {
 		id = s.header.OutputID
 	}
 	return filepath.Join(Dir(), id, "usage.jsonl")
+}
+
+func (s *Store) transcriptHasMessagesLocked() (bool, error) {
+	r, err := os.Open(s.Path)
+	if err != nil {
+		return false, err
+	}
+	defer r.Close()
+	hasMessages := false
+	_, _, _, err = scanRecords(r, func(_ []byte, m llm.Message) {
+		if m.Role != headerRole {
+			hasMessages = true
+		}
+	})
+	return hasMessages, err
 }
 
 // loadUsageLocked validates/reconciles the journal once per writer acquisition.
@@ -144,19 +299,11 @@ func (s *Store) loadUsageLocked() error {
 	if os.IsNotExist(err) {
 		// Existing histories predate metering. Keep that coverage gap visible.
 		s.usageTotals = UsageTotals{}
-		r, err := os.Open(s.Path)
+		hasMessages, err := s.transcriptHasMessagesLocked()
 		if err != nil {
 			return err
 		}
-		defer r.Close()
-		_, _, _, err = scanRecords(r, func(_ []byte, m llm.Message) {
-			if m.Role != headerRole {
-				s.usageTotals.LegacyHistory = true
-			}
-		})
-		if err != nil {
-			return err
-		}
+		s.usageTotals.LegacyHistory = hasMessages
 		pending, err := s.pendingUsageIDsLocked()
 		if err != nil {
 			return err
@@ -195,54 +342,21 @@ func (s *Store) loadUsageLocked() error {
 	if err != nil {
 		return err
 	}
-	totals := UsageTotals{}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 4096), 64<<10)
-	first := true
-	var previous string
-	var want int64 = 1
-	var chainStarted bool
-	for sc.Scan() {
-		line := append([]byte(nil), sc.Bytes()...)
-		record, chain, _, chainErr := unwrapUsageRecord(line)
-		if chainErr != nil {
-			return s.damagedJournal(chainErr.Error())
-		}
-		if err := linkUsageChain(chain, want, previous, chainStarted); err != nil {
-			return s.damagedJournal(err.Error())
-		}
-		var a UsageAttempt
-		if err := json.Unmarshal(record, &a); err != nil {
-			return s.damagedJournal(err.Error())
-		}
-		if a.Version != 1 || (first && a.ID != "") || (!first && (a.ID == "" || a.Request.ID != a.ID)) {
-			return s.damagedJournal("invalid usage journal record")
-		}
-		if chain != nil {
-			chainStarted = true
-			previous = hashUsageRecord(append(append([]byte(nil), line...), '\n'))
-			want = chain.Sequence + 1
-		}
-		if a.Request.Usage != nil && (!a.Request.Usage.Valid() || !totals.Usage.CanAdd(*a.Request.Usage)) {
-			return s.damagedJournal("invalid or overflowing usage counters")
-		}
-		if a.InvalidUsage && (a.Request.Usage != nil || a.EstimateUSD != nil || a.ExactEstimateUSD != "") {
-			return s.damagedJournal("invalid usage marker")
-		}
-		if err := totals.add(a); err != nil {
-			return s.damagedJournal(err.Error())
-		}
-		if pending[a.ID] {
+	scan, err := scanUsageJournal(f, func(a UsageAttempt) error {
+		if a.ID != "" && pending[a.ID] {
 			if err := s.clearPendingUsageLocked(a.ID); err != nil {
 				return err
 			}
 			delete(pending, a.ID)
 			s.rememberCommitted(a.ID)
 		}
-		first = false
-	}
-	if err := sc.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return err
+	}
+	if scan.damaged {
+		return s.damagedJournal(scan.damageReason)
 	}
 	// A marker removed before dispatch is not missing usage. Clear it on open
 	// so a crash cannot leave RecoveryGap set for a request that never left.
@@ -259,32 +373,38 @@ func (s *Store) loadUsageLocked() error {
 		}
 		delete(pending, id)
 	}
-	if first {
+	if !scan.hasHeader && !scan.hasNonHeader {
 		// An empty file is not history. It is created before the first request
 		// and must not look like a session that predates metering.
 		if info, statErr := f.Stat(); statErr == nil && info.Size() > 0 {
-			totals.LegacyHistory = true
+			scan.totals.LegacyHistory = true
 		}
 	}
-	s.usageChainOn = chainStarted
-	s.usageChainDigest = previous
-	if chainStarted {
-		s.usageChainSeq = want - 1
-	} else if !first && totals.Attempts == 0 {
-		// A header written before the first attempt is not a legacy journal.
-		// Keep chaining so the next record is sequence 1.
+	s.usageChainOn = scan.chainStarted
+	s.usageChainDigest = scan.lastDigest
+	if scan.chainStarted {
+		s.usageChainSeq = scan.sequences
+	} else if scan.hasHeader && !scan.hasNonHeader {
+		// A header written before the first attempt (including carry-forward) is
+		// not a legacy journal. Keep chaining so the next record is sequence 1.
 		s.usageChainOn = true
 		s.usageChainSeq = 0
 		s.usageChainDigest = ""
 	}
 	artifacts := usageArtifactsLocked(f.Name(), pending, backups)
-	totals.RecoveryGap = len(artifacts) > 0
-	s.usageRecovery = UsageReconciliation{SessionID: s.ID, Artifacts: artifacts, RecoveryGap: totals.RecoveryGap, ChainSequences: s.usageChainSeq}
+	scan.totals.RecoveryGap = len(artifacts) > 0
+	s.usageRecovery = UsageReconciliation{
+		SessionID:      s.ID,
+		Artifacts:      artifacts,
+		RecoveryGap:    scan.totals.RecoveryGap,
+		ChainSequences: s.usageChainSeq,
+		CarryForward:   scan.carryForward,
+	}
 	s.usageInfo, err = f.Stat()
 	if err != nil {
 		return err
 	}
-	s.usageTotals = totals
+	s.usageTotals = scan.totals
 	s.usageLoaded = true
 	return nil
 }
@@ -365,6 +485,32 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 	if err != nil {
 		return err
 	}
+	if err := s.appendJournalLineLocked(data, s.usageTotals.LegacyHistory); err != nil {
+		return err
+	}
+	if err := s.clearPendingUsageLocked(a.ID); err != nil {
+		return err
+	}
+	if s.usageRecovery.Artifacts != nil {
+		kept := s.usageRecovery.Artifacts[:0]
+		for _, artifact := range s.usageRecovery.Artifacts {
+			if !strings.HasSuffix(artifact.Path, usagePendingPrefix+a.ID) {
+				kept = append(kept, artifact)
+			}
+		}
+		s.usageRecovery.Artifacts = kept
+		s.usageRecovery.RecoveryGap = len(kept) > 0
+		nextTotals.RecoveryGap = s.usageRecovery.RecoveryGap
+	}
+	s.usageTotals = nextTotals
+	recorded = true
+	if a.InvalidUsage {
+		return ErrInvalidProviderUsage
+	}
+	return nil
+}
+
+func (s *Store) appendJournalLineLocked(data []byte, legacyHistory bool) error {
 	if len(data) >= 64<<10 {
 		return fmt.Errorf("usage record exceeds limit")
 	}
@@ -385,7 +531,7 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 		return err
 	}
 	if info.Size() == 0 {
-		header, err := json.Marshal(UsageAttempt{Version: 1, LegacyHistory: s.usageTotals.LegacyHistory})
+		header, err := json.Marshal(UsageAttempt{Version: 1, LegacyHistory: legacyHistory})
 		if err != nil {
 			return err
 		}
@@ -432,31 +578,74 @@ func (s *Store) RecordUsage(a UsageAttempt) (writeErr error) {
 	if err != nil {
 		return err
 	}
-	if err := s.clearPendingUsageLocked(a.ID); err != nil {
-		return err
-	}
-	if s.usageRecovery.Artifacts != nil {
-		kept := s.usageRecovery.Artifacts[:0]
-		for _, artifact := range s.usageRecovery.Artifacts {
-			if !strings.HasSuffix(artifact.Path, usagePendingPrefix+a.ID) {
-				kept = append(kept, artifact)
-			}
-		}
-		s.usageRecovery.Artifacts = kept
-		s.usageRecovery.RecoveryGap = len(kept) > 0
-		nextTotals.RecoveryGap = s.usageRecovery.RecoveryGap
-	}
 	if s.usageChainOn || info.Size() == 0 {
 		s.usageChainSeq++
 		s.usageChainDigest = hashUsageRecord(append(append([]byte(nil), data...), '\n'))
 		s.usageChainOn = true
 	}
-	s.usageTotals = nextTotals
-	recorded = true
-	if a.InvalidUsage {
-		return ErrInvalidProviderUsage
-	}
 	return nil
+}
+
+// AcceptUsageLowerBound records an audited acknowledgment of a historical
+// metering gap or carried-forward lower bound so strict metering can proceed
+// while enforcing session caps against the recorded subtotal. Any remaining
+// unquarantined artifact or subsequent incomplete attempt blocks again.
+func (s *Store) AcceptUsageLowerBound() (totals UsageTotals, changed bool, acceptErr error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recorded := false
+	defer func() {
+		if acceptErr != nil && !recorded {
+			s.usageLoaded = false
+			s.usageWriteFailed = true
+			s.usageFailureReported = false
+		}
+	}()
+	if s.usageWriteFailed {
+		if err := s.reopenUsageAfterWriteFailureLocked(); err != nil {
+			return UsageTotals{}, false, err
+		}
+	}
+	if s.closed {
+		return UsageTotals{}, false, os.ErrClosed
+	}
+	if err := s.loadUsageLocked(); err != nil {
+		return UsageTotals{}, false, err
+	}
+	if s.usageTotals.RecoveryGap {
+		return UsageTotals{}, false, BlockingUsageError(s.usageRecovery.Artifacts)
+	}
+	if (s.usageTotals.TokenCountsComplete() && s.usageTotals.UnpricedAttempts() == 0) || s.usageTotals.LowerBoundBaselineReady() {
+		recorded = true
+		return s.usageTotals, false, nil
+	}
+	id := rand.Text()
+	ack := UsageAttempt{
+		Version:          1,
+		ID:               id,
+		Operation:        "usage_repair_accept_lower_bound",
+		Request:          llm.RequestTrace{ID: id},
+		AcceptLowerBound: true,
+	}
+	nextTotals := s.usageTotals
+	if err := nextTotals.add(ack); err != nil {
+		return UsageTotals{}, false, err
+	}
+	data, err := json.Marshal(ack)
+	if err != nil {
+		return UsageTotals{}, false, err
+	}
+	if err := s.appendJournalLineLocked(data, s.usageTotals.LegacyHistory); err != nil {
+		return UsageTotals{}, false, err
+	}
+	s.usageTotals = nextTotals
+	s.usageRecovery.LowerBoundAccepted = true
+	s.usageRecovery.ChainSequences = s.usageChainSeq
+	recorded = true
+	if err := s.auditUsageActionLocked("accept_lower_bound", s.usageRecovery); err != nil {
+		return UsageTotals{}, true, err
+	}
+	return s.usageTotals, true, nil
 }
 
 // Resolve only within the session root and reject aliasing of another owner's
@@ -528,7 +717,32 @@ func (s *Store) openUsageLocked(create bool) (*os.File, error) {
 // writer/journal is available. A recovery backup is durable evidence that a
 // final attempt was lost, even after its invalid tail has been truncated.
 func (t UsageTotals) TokenCountsComplete() bool {
-	return !t.LegacyHistory && !t.RecoveryGap && t.UnreportedAttempts == 0 && t.PartialAttempts == 0 && t.InvalidAttempts == 0
+	return !t.LegacyHistory && !t.RecoveryGap && !t.LowerBound && t.UnreportedAttempts == 0 && t.PartialAttempts == 0 && t.InvalidAttempts == 0
+}
+
+// LowerBoundTokensAccepted reports whether historical token metering gaps have
+// been explicitly acknowledged and no unquarantined gap or newer incomplete
+// attempt occurred since that acknowledgment.
+func (t UsageTotals) LowerBoundTokensAccepted() bool {
+	if !t.LowerBoundAccepted || t.RecoveryGap {
+		return false
+	}
+	return t.UnreportedAttempts == t.accepted.unreportedAttempts &&
+		t.PartialAttempts == t.accepted.partialAttempts &&
+		t.InvalidAttempts == t.accepted.invalidAttempts
+}
+
+// LowerBoundCostAccepted reports whether historical cost metering gaps have
+// been explicitly acknowledged and no unquarantined gap or newer unpriced or
+// incomplete attempt occurred since that acknowledgment.
+func (t UsageTotals) LowerBoundCostAccepted() bool {
+	return t.LowerBoundTokensAccepted() && t.UnpricedAttempts() == t.accepted.unpricedAttempts
+}
+
+// LowerBoundBaselineReady reports whether both historical token and cost gaps
+// are covered by the latest lower-bound acknowledgment.
+func (t UsageTotals) LowerBoundBaselineReady() bool {
+	return t.LowerBoundCostAccepted()
 }
 
 // UnpricedAttempts counts requests whose cost is unknown.

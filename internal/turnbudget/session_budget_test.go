@@ -52,4 +52,24 @@ func TestSessionBudgetIncompleteBaselineBestEffortVsStrict(t *testing.T) {
 	// Strict mode: incomplete baseline fails closed immediately.
 	strict := tracker(t, &Policy{MaxSessionTokens: number(100), StrictMetering: boolPtr(true)})
 	unavailable(t, strict.SeedSessionUsage(80, big.NewRat(0, 1), false, true), "session_tokens")
+
+	// Strict mode with acknowledged lower-bound baseline enforces caps against
+	// recorded totals while still rejecting new incomplete attempts.
+	ack := tracker(t, &Policy{MaxSessionTokens: number(100), MaxSessionCostUSD: dollars(1.0), StrictMetering: boolPtr(true)})
+	if err := ack.SeedSessionLowerBound(80, big.NewRat(3, 4), false, false); err != nil {
+		t.Fatalf("acknowledged lower-bound baseline rejected: %v", err)
+	}
+	if !ack.State().BaselineIncomplete || !ack.State().LowerBound {
+		t.Fatalf("expected explicit lower-bound flags: %+v", ack.State())
+	}
+	if err := ack.RecordUsage(Usage{Tokens: number(10), CostUSD: dollars(0.1)}); err != nil {
+		t.Fatalf("complete attempt under acknowledged lower bound failed: %v", err)
+	}
+	exhausted(t, ack.RecordUsage(Usage{Tokens: number(20), CostUSD: dollars(0.2)}), "session_tokens")
+
+	ackMissing := tracker(t, &Policy{MaxTokens: number(0), MaxSessionTokens: number(100), StrictMetering: boolPtr(true)})
+	if err := ackMissing.SeedSessionLowerBound(80, big.NewRat(0, 1), false, true); err != nil {
+		t.Fatal(err)
+	}
+	unavailable(t, ackMissing.RecordUsage(Usage{}), "session_tokens")
 }

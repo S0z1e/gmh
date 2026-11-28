@@ -205,10 +205,12 @@ type Tracker struct {
 	// Interpret each finite float's shortest round-trip decimal as its USD
 	// amount. Accumulate and compare those decimals exactly, without rounding
 	// each request to a fixed unit (which could erase tiny billable amounts).
-	cost             big.Rat
-	costLimit        big.Rat
-	sessionCost      big.Rat
-	sessionCostLimit big.Rat
+	cost                   big.Rat
+	costLimit              big.Rat
+	sessionCost            big.Rat
+	sessionCostLimit       big.Rat
+	strictLowerBoundTokens bool
+	strictLowerBoundCost   bool
 }
 
 func New(policy *Policy, started time.Time, ratesAvailable bool) (*Tracker, error) {
@@ -254,6 +256,18 @@ func New(policy *Policy, started time.Time, ratesAvailable bool) (*Tracker, erro
 // SeedSessionUsage initializes cumulative session counters from the persisted
 // usage journal so session-level caps survive across turns and --resume.
 func (b *Tracker) SeedSessionUsage(tokens int64, costUSD *big.Rat, tokensComplete, costComplete bool) error {
+	return b.seedSessionUsage(tokens, costUSD, tokensComplete, costComplete, false)
+}
+
+// SeedSessionLowerBound initializes cumulative session counters from an
+// explicitly acknowledged lower-bound baseline, keeping LowerBound and
+// BaselineIncomplete visible while allowing strict metering to enforce caps
+// against the recorded subtotal and subsequent complete attempts.
+func (b *Tracker) SeedSessionLowerBound(tokens int64, costUSD *big.Rat, tokensComplete, costComplete bool) error {
+	return b.seedSessionUsage(tokens, costUSD, tokensComplete, costComplete, true)
+}
+
+func (b *Tracker) seedSessionUsage(tokens int64, costUSD *big.Rat, tokensComplete, costComplete, allowStrictLowerBound bool) error {
 	amount, _ := costUSD.Float64()
 	if tokens < 0 || costUSD.Sign() < 0 || !finiteNonnegative(amount) {
 		b.state.SessionTokensComplete = false
@@ -276,6 +290,11 @@ func (b *Tracker) SeedSessionUsage(tokens int64, costUSD *big.Rat, tokensComplet
 		b.state.LowerBound = true
 	}
 	if b.state.Limits.StrictMetering {
+		if allowStrictLowerBound {
+			b.strictLowerBoundTokens = !tokensComplete
+			b.strictLowerBoundCost = !b.state.SessionCostComplete
+			return nil
+		}
 		if b.state.Limits.SessionTokens > 0 && !tokensComplete {
 			return b.unmetered("session_tokens", "persisted session usage is incomplete")
 		}
@@ -452,13 +471,13 @@ func (b *Tracker) RecordUsage(u Usage) error {
 		if l.Tokens > 0 && !s.TokensComplete {
 			return b.unmetered("tokens", "provider usage is incomplete")
 		}
-		if l.SessionTokens > 0 && !s.SessionTokensComplete {
+		if l.SessionTokens > 0 && !s.SessionTokensComplete && (!b.strictLowerBoundTokens || !s.TokensComplete) {
 			return b.unmetered("session_tokens", "provider usage is incomplete")
 		}
 		if l.CostUSD > 0 && !s.CostComplete {
 			return b.unmetered("cost_usd", "usage or pricing evidence is incomplete")
 		}
-		if l.SessionCostUSD > 0 && !s.SessionCostComplete {
+		if l.SessionCostUSD > 0 && !s.SessionCostComplete && (!b.strictLowerBoundCost || !s.CostComplete) {
 			return b.unmetered("session_cost_usd", "usage or pricing evidence is incomplete")
 		}
 	}

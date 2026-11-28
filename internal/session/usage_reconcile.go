@@ -6,13 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
-
-	"minimalharness/internal/llm"
 )
 
 const (
@@ -33,19 +32,29 @@ type UsageArtifact struct {
 	Reason string `json:"reason"`
 }
 
+// UsageRepairOptions configures RepairUsageWithOptions.
+type UsageRepairOptions struct {
+	// ForceHealthy overrides the refusal to quarantine a usage journal that
+	// loads cleanly. Overrides are audited.
+	ForceHealthy bool
+}
+
 // UsageReconciliation is the audited result of matching pending markers to the
 // journal. Committed means the attempt is in the ledger. NotDispatched means
 // the marker was created and removed before any provider request. Unknown means
 // the marker may still represent real usage and must not be deleted.
 type UsageReconciliation struct {
-	SessionID      string            `json:"session_id"`
-	RecordedAt     time.Time         `json:"recorded_at"`
-	States         map[string]string `json:"states"`
-	Cleared        []string          `json:"cleared,omitempty"`
-	Quarantined    []string          `json:"quarantined,omitempty"`
-	Artifacts      []UsageArtifact   `json:"artifacts,omitempty"`
-	RecoveryGap    bool              `json:"recovery_gap"`
-	ChainSequences int64             `json:"chain_sequences"`
+	SessionID          string             `json:"session_id"`
+	RecordedAt         time.Time          `json:"recorded_at"`
+	States             map[string]string  `json:"states"`
+	Cleared            []string           `json:"cleared,omitempty"`
+	Quarantined        []string           `json:"quarantined,omitempty"`
+	Artifacts          []UsageArtifact    `json:"artifacts,omitempty"`
+	RecoveryGap        bool               `json:"recovery_gap"`
+	ChainSequences     int64              `json:"chain_sequences"`
+	CarryForward       *UsageCarryForward `json:"carry_forward,omitempty"`
+	HealthyOverride    bool               `json:"healthy_override,omitempty"`
+	LowerBoundAccepted bool               `json:"lower_bound_accepted,omitempty"`
 }
 
 func (r UsageReconciliation) blockingArtifacts() []UsageArtifact {
@@ -165,7 +174,8 @@ func (s *Store) reconcileUsageLocked(action string) (UsageReconciliation, error)
 	slices.Sort(cleared)
 	report := UsageReconciliation{
 		SessionID: s.ID, RecordedAt: time.Now().UTC(), States: states, Cleared: cleared,
-		ChainSequences: journal.sequences,
+		ChainSequences: journal.sequences, CarryForward: journal.carryForward,
+		LowerBoundAccepted: journal.totals.LowerBoundBaselineReady(),
 	}
 	for id, state := range states {
 		if state != usageStateUnknown {
@@ -199,92 +209,121 @@ func (s *Store) reconcileUsageLocked(action string) (UsageReconciliation, error)
 	return report, nil
 }
 
-type usageJournalView struct {
+type usageJournalScan struct {
 	ids          map[string]bool
+	totals       UsageTotals
+	carryForward *UsageCarryForward
 	sequences    int64
-	usage        llm.Usage
+	chainStarted bool
+	lastDigest   string
+	hasHeader    bool
+	hasNonHeader bool
 	damaged      bool
 	damageReason string
 }
 
-func (s *Store) readUsageJournalLocked() (usageJournalView, error) {
-	view := usageJournalView{ids: map[string]bool{}}
-	f, err := s.openUsageLocked(false)
-	if os.IsNotExist(err) {
-		return view, nil
-	}
-	if err != nil {
-		return view, err
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
+func scanUsageJournal(r io.Reader, onValid func(UsageAttempt) error) (usageJournalScan, error) {
+	scan := usageJournalScan{ids: map[string]bool{}}
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 4096), 64<<10)
 	first := true
 	var previous string
 	var want int64 = 1
-	var chainStarted bool
 	for sc.Scan() {
 		line := append([]byte(nil), sc.Bytes()...)
 		record, chain, _, err := unwrapUsageRecord(line)
 		if err != nil {
-			view.damaged = true
-			view.damageReason = err.Error()
+			scan.damaged = true
+			scan.damageReason = err.Error()
 			break
 		}
-		if err := linkUsageChain(chain, want, previous, chainStarted); err != nil {
-			view.damaged = true
-			view.damageReason = err.Error()
+		if err := linkUsageChain(chain, want, previous, scan.chainStarted); err != nil {
+			scan.damaged = true
+			scan.damageReason = err.Error()
 			break
 		}
 		var a UsageAttempt
 		if err := json.Unmarshal(record, &a); err != nil {
-			view.damaged = true
-			view.damageReason = "journal line is not valid JSON"
+			scan.damaged = true
+			scan.damageReason = "journal line is not valid JSON"
 			break
 		}
 		if a.Version != 1 || (first && a.ID != "") || (!first && (a.ID == "" || a.Request.ID != a.ID)) {
-			view.damaged = true
-			view.damageReason = "invalid usage journal record"
+			scan.damaged = true
+			scan.damageReason = "invalid usage journal record"
 			break
 		}
-		if a.Request.Usage != nil && !a.Request.Usage.Valid() {
-			view.damaged = true
-			view.damageReason = "invalid or overflowing usage counters"
+		if first && (a.AcceptLowerBound || a.InvalidUsage || a.Request.Usage != nil || a.EstimateUSD != nil || a.ExactEstimateUSD != "") {
+			scan.damaged = true
+			scan.damageReason = "invalid usage journal header"
 			break
 		}
-		if !first && a.Request.Usage != nil && !view.usage.CanAdd(*a.Request.Usage) {
-			view.damaged = true
-			view.damageReason = "invalid or overflowing usage counters"
+		if !first && (a.CarryForward != nil || a.LegacyHistory) {
+			scan.damaged = true
+			scan.damageReason = "invalid usage journal record"
 			break
 		}
-		if !first && a.Request.Usage != nil {
-			view.usage.Add(*a.Request.Usage)
+		if !first && a.AcceptLowerBound && (a.Request.Usage != nil || a.EstimateUSD != nil || a.ExactEstimateUSD != "" || a.InvalidUsage) {
+			scan.damaged = true
+			scan.damageReason = "invalid usage acknowledgment record"
+			break
+		}
+		if a.Request.Usage != nil && (!a.Request.Usage.Valid() || !scan.totals.Usage.CanAdd(*a.Request.Usage)) {
+			scan.damaged = true
+			scan.damageReason = "invalid or overflowing usage counters"
+			break
 		}
 		if a.InvalidUsage && (a.Request.Usage != nil || a.EstimateUSD != nil || a.ExactEstimateUSD != "") {
-			view.damaged = true
-			view.damageReason = "invalid usage marker"
+			scan.damaged = true
+			scan.damageReason = "invalid usage marker"
 			break
 		}
-		if _, err := a.exactCost(); err != nil {
-			view.damaged = true
-			view.damageReason = err.Error()
+		nextTotals := scan.totals
+		if err := nextTotals.add(a); err != nil {
+			scan.damaged = true
+			scan.damageReason = err.Error()
 			break
 		}
+		scan.totals = nextTotals
 		if chain != nil {
-			chainStarted = true
+			scan.chainStarted = true
 			previous = hashUsageRecord(append(append([]byte(nil), line...), '\n'))
+			scan.lastDigest = previous
 			want = chain.Sequence + 1
-			view.sequences = chain.Sequence
+			scan.sequences = chain.Sequence
 		}
-		if !first && a.ID != "" {
-			view.ids[a.ID] = true
+		if first {
+			scan.hasHeader = true
+			scan.carryForward = a.CarryForward
+		} else {
+			scan.hasNonHeader = true
+			if !a.AcceptLowerBound && a.ID != "" {
+				scan.ids[a.ID] = true
+			}
+		}
+		if onValid != nil {
+			if err := onValid(a); err != nil {
+				return scan, err
+			}
 		}
 		first = false
 	}
 	if err := sc.Err(); err != nil {
-		return view, err
+		return scan, err
 	}
-	return view, nil
+	return scan, nil
+}
+
+func (s *Store) readUsageJournalLocked() (usageJournalScan, error) {
+	f, err := s.openUsageLocked(false)
+	if os.IsNotExist(err) {
+		return usageJournalScan{ids: map[string]bool{}}, nil
+	}
+	if err != nil {
+		return usageJournalScan{}, err
+	}
+	defer f.Close()
+	return scanUsageJournal(f, nil)
 }
 
 // MarkUsageNotDispatched records that a pending marker was removed before any
@@ -330,6 +369,12 @@ func (s *Store) notDispatchedUsageLocked(id string) (bool, error) {
 // marker, without deleting the bytes. Quarantine is the only path that clears
 // RecoveryGap for evidence that is not already in the journal.
 func (s *Store) RepairUsage(action, artifact string) (UsageReconciliation, error) {
+	return s.RepairUsageWithOptions(action, artifact, UsageRepairOptions{})
+}
+
+// RepairUsageWithOptions behaves like RepairUsage with explicit repair options
+// such as ForceHealthy to quarantine a journal that loads cleanly.
+func (s *Store) RepairUsageWithOptions(action, artifact string, opts UsageRepairOptions) (UsageReconciliation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -340,13 +385,30 @@ func (s *Store) RepairUsage(action, artifact string) (UsageReconciliation, error
 	}
 	switch action {
 	case usageRepairQuarantine:
-		moved, err := s.quarantineUsageLocked(artifact)
+		res, err := s.quarantineUsageLocked(artifact, opts)
 		if err != nil {
 			return UsageReconciliation{}, err
 		}
-		s.usageLoaded = false
-		s.usageInfo = nil
-		s.usageTotals = UsageTotals{}
+		if res.moved {
+			pending, err := s.pendingUsageIDsLocked()
+			if err != nil {
+				return UsageReconciliation{}, err
+			}
+			for id := range res.committedIDs {
+				s.rememberCommitted(id)
+				if pending[id] {
+					if err := s.clearPendingUsageLocked(id); err != nil {
+						return UsageReconciliation{}, err
+					}
+				}
+			}
+			s.usageLoaded = false
+			s.usageInfo = nil
+			s.usageTotals = UsageTotals{}
+			s.usageChainSeq = 0
+			s.usageChainDigest = ""
+			s.usageChainOn = false
+		}
 		if err := s.loadUsageLocked(); err != nil && !errors.Is(err, errUsageDamaged) {
 			return UsageReconciliation{}, err
 		}
@@ -354,9 +416,14 @@ func (s *Store) RepairUsage(action, artifact string) (UsageReconciliation, error
 		if err != nil {
 			return UsageReconciliation{}, err
 		}
-		if moved {
+		if res.moved {
 			report.Quarantined = append(report.Quarantined, artifact)
+			report.HealthyOverride = res.healthyOverride
+			if res.carryForward != nil {
+				report.CarryForward = res.carryForward
+			}
 		}
+		s.usageRecovery = report
 		if err := s.auditUsageActionLocked(action, report); err != nil {
 			return UsageReconciliation{}, err
 		}
@@ -378,43 +445,117 @@ func (s *Store) damagedJournal(reason string) error {
 	}}))
 }
 
-func (s *Store) quarantineUsageLocked(artifact string) (bool, error) {
+type quarantineResult struct {
+	moved           bool
+	healthyOverride bool
+	carryForward    *UsageCarryForward
+	committedIDs    map[string]bool
+}
+
+func (s *Store) quarantineUsageLocked(artifact string, opts UsageRepairOptions) (quarantineResult, error) {
 	if artifact == "" {
-		return false, fmt.Errorf("quarantine needs the artifact path named by the strict error")
+		return quarantineResult{}, fmt.Errorf("quarantine needs the artifact path named by the strict error")
 	}
 	clean := filepath.Clean(artifact)
 	family := filepath.Dir(s.usagePathLocked())
 	rel, err := filepath.Rel(family, clean)
 	if err != nil || rel == "." || rel == ".." || strings.Contains(rel, string(os.PathSeparator)) {
-		return false, fmt.Errorf("artifact %s is outside this session usage family", artifact)
+		return quarantineResult{}, fmt.Errorf("artifact %s is outside this session usage family", artifact)
 	}
 	base := filepath.Base(clean)
 	allowed := base == "usage.jsonl" || strings.HasPrefix(base, usagePendingPrefix) || strings.Contains(base, ".jsonl-torn-")
 	if !allowed || strings.Contains(base, "..") {
-		return false, fmt.Errorf("artifact %s is not a usage journal, marker, or recovery backup", artifact)
+		return quarantineResult{}, fmt.Errorf("artifact %s is not a usage journal, marker, or recovery backup", artifact)
 	}
 	info, err := os.Lstat(clean)
 	if os.IsNotExist(err) {
-		return false, nil
+		return quarantineResult{}, nil
 	}
 	if err != nil {
-		return false, err
+		return quarantineResult{}, err
 	}
 	if !info.Mode().IsRegular() {
-		return false, fmt.Errorf("artifact %s is not a regular file", artifact)
+		return quarantineResult{}, fmt.Errorf("artifact %s is not a regular file", artifact)
 	}
 	destDir := s.quarantinePathLocked()
-	if err := os.MkdirAll(destDir, 0700); err != nil {
-		return false, err
-	}
 	dest := filepath.Join(destDir, time.Now().UTC().Format("20060102T150405.000000000Z")+"-"+rand.Text()+"-"+base)
+	if base == "usage.jsonl" {
+		view, err := s.readUsageJournalLocked()
+		if err != nil {
+			return quarantineResult{}, err
+		}
+		if !view.damaged && !opts.ForceHealthy {
+			return quarantineResult{}, fmt.Errorf("%w: %s loads cleanly; pass --allow-healthy to override", ErrUsageHealthy, clean)
+		}
+		legacyHistory := view.totals.LegacyHistory
+		if !view.hasHeader {
+			if hasMsgs, msgErr := s.transcriptHasMessagesLocked(); msgErr == nil && hasMsgs {
+				legacyHistory = true
+			}
+		}
+		estUSD, exactUSD := exactCostFields(view.totals.ExactCost())
+		cf := &UsageCarryForward{
+			Usage:              view.totals.Usage,
+			Attempts:           view.totals.Attempts,
+			InvalidAttempts:    view.totals.InvalidAttempts,
+			UnreportedAttempts: view.totals.UnreportedAttempts,
+			PartialAttempts:    view.totals.PartialAttempts,
+			PricedAttempts:     view.totals.PricedAttempts,
+			RejectedAttempts:   view.totals.RejectedAttempts,
+			TransientAttempts:  view.totals.TransientAttempts,
+			EstimateUSD:        estUSD,
+			ExactEstimateUSD:   exactUSD,
+			QuarantinedFile:    dest,
+			QuarantinedAt:      time.Now().UTC(),
+			LowerBound:         view.damaged || view.totals.LowerBound,
+			LowerBoundAccepted: !view.damaged && view.totals.LowerBoundBaselineReady(),
+			DamageReason:       view.damageReason,
+		}
+		header := UsageAttempt{
+			Version:       1,
+			LegacyHistory: legacyHistory,
+			CarryForward:  cf,
+		}
+		temp := clean + ".tmp-" + rand.Text()
+		if err := writePrivateJSONNoRename(temp, header); err != nil {
+			return quarantineResult{}, err
+		}
+		if err := os.MkdirAll(destDir, 0700); err != nil {
+			os.Remove(temp)
+			return quarantineResult{}, err
+		}
+		if err := os.Rename(clean, dest); err != nil {
+			os.Remove(temp)
+			return quarantineResult{}, err
+		}
+		if err := syncRecoveryDirectory(destDir); err != nil {
+			return quarantineResult{}, err
+		}
+		if err := os.Rename(temp, clean); err != nil {
+			_ = os.Rename(dest, clean)
+			os.Remove(temp)
+			return quarantineResult{}, err
+		}
+		if err := syncRecoveryDirectory(family); err != nil {
+			return quarantineResult{}, err
+		}
+		return quarantineResult{
+			moved:           true,
+			healthyOverride: !view.damaged && opts.ForceHealthy,
+			carryForward:    cf,
+			committedIDs:    view.ids,
+		}, nil
+	}
+	if err := os.MkdirAll(destDir, 0700); err != nil {
+		return quarantineResult{}, err
+	}
 	if err := os.Rename(clean, dest); err != nil {
-		return false, err
+		return quarantineResult{}, err
 	}
 	if err := syncRecoveryDirectory(destDir); err != nil {
-		return false, err
+		return quarantineResult{}, err
 	}
-	return true, syncRecoveryDirectory(family)
+	return quarantineResult{moved: true}, syncRecoveryDirectory(family)
 }
 
 func (s *Store) auditUsageActionLocked(action string, report UsageReconciliation) error {
@@ -425,14 +566,13 @@ func (s *Store) auditUsageActionLocked(action string, report UsageReconciliation
 	}{"usage_reconciliation", action, report})
 }
 
-func writePrivateJSON(path string, v any) error {
+func writePrivateJSONNoRename(path string, v any) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-	temp := path + ".tmp-" + rand.Text()
-	f, err := os.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
@@ -440,8 +580,16 @@ func writePrivateJSON(path string, v any) error {
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if writeErr != nil || syncErr != nil || closeErr != nil {
-		os.Remove(temp)
+		os.Remove(path)
 		return errors.Join(writeErr, syncErr, closeErr)
+	}
+	return nil
+}
+
+func writePrivateJSON(path string, v any) error {
+	temp := path + ".tmp-" + rand.Text()
+	if err := writePrivateJSONNoRename(temp, v); err != nil {
+		return err
 	}
 	if err := os.Rename(temp, path); err != nil {
 		os.Remove(temp)
@@ -461,11 +609,47 @@ func formatUsageArtifacts(artifacts []UsageArtifact) string {
 	return strings.Join(parts, "; ")
 }
 
-// blockingUsageError is the strict-mode failure. It names each artifact and the
+// BlockingUsageError is the strict-mode failure. It names each artifact and the
 // repair that clears it, so a repeated cap failure is actionable.
 func BlockingUsageError(artifacts []UsageArtifact) error {
 	if len(artifacts) == 0 {
 		return nil
 	}
 	return fmt.Errorf("strict metering blocked by %s; repair: harness usage-repair --root <project> --session <id> --quarantine <artifact>", formatUsageArtifacts(artifacts))
+}
+
+// IncompleteUsageError formats an actionable strict-metering failure when no
+// unquarantined artifact remains, naming any quarantined journal and the way out.
+func IncompleteUsageError(sessionID, root string, totals UsageTotals) string {
+	if root == "" {
+		root = "<project>"
+	}
+	repairCmd := fmt.Sprintf("harness usage-repair --root %s --session %s --accept-lower-bound", root, sessionID)
+	if totals.QuarantinedFile != "" {
+		return fmt.Sprintf("persisted session usage is a lower bound after quarantining %s (%d tokens carried forward); acknowledge lower-bound accounting with %q, or set strictMetering: false / maxSessionTokens: 0", totals.QuarantinedFile, totals.Usage.TotalTokens, repairCmd)
+	}
+	var reasons []string
+	if totals.LegacyHistory {
+		reasons = append(reasons, "legacy_history")
+	}
+	if totals.LowerBound {
+		reasons = append(reasons, "lower_bound")
+	}
+	if totals.UnreportedAttempts > 0 {
+		reasons = append(reasons, fmt.Sprintf("unreported=%d", totals.UnreportedAttempts))
+	}
+	if totals.PartialAttempts > 0 {
+		reasons = append(reasons, fmt.Sprintf("partial=%d", totals.PartialAttempts))
+	}
+	if totals.InvalidAttempts > 0 {
+		reasons = append(reasons, fmt.Sprintf("invalid=%d", totals.InvalidAttempts))
+	}
+	if totals.UnpricedAttempts() > 0 {
+		reasons = append(reasons, fmt.Sprintf("unpriced=%d", totals.UnpricedAttempts()))
+	}
+	detail := "incomplete usage"
+	if len(reasons) > 0 {
+		detail = strings.Join(reasons, ", ")
+	}
+	return fmt.Sprintf("persisted session usage is incomplete (%s); acknowledge lower-bound accounting with %q, or set strictMetering: false / start a new session", detail, repairCmd)
 }

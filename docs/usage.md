@@ -72,12 +72,30 @@
   the cap is not enforced and must not present a zero subtotal as a met cap. A damaged usage journal, torn-tail backup, or unmatched
   pending marker keeps that gap until it is quarantined:
   `harness usage-repair --root <project> --session <id> --quarantine <artifact>`.
-  The strict error names the artifact. Quarantine moves it aside and keeps the
-  bytes; it does not delete evidence. If you relied on an existing cap stopping whenever usage
+  The strict error names the artifact. Quarantine moves the artifact aside into
+  `usage-quarantine/` and keeps the bytes; it does not delete evidence. When
+  quarantining a damaged `usage.jsonl`, the verified valid prefix (tokens,
+  attempt counts, and exact cost) is carried forward into the replacement
+  journal's header (`carry_forward`, pointing at `quarantined_file`) instead of
+  resetting session totals to zero, and everything past that prefix is marked as
+  a lower bound (`lower_bound: true`). Quarantining a `usage.jsonl` that loads
+  cleanly is refused unless `--allow-healthy` is passed (which is audited in the
+  session audit sidecar and still carries forward all totals so session caps
+  cannot be reset). In non-strict mode, session token and cost caps continue
+  enforcing against the carried-forward lower-bound totals plus later turns.
+  If you relied on an existing cap stopping whenever usage
   or pricing was incomplete, set `strictMetering: true` in `turnBudget` when
   upgrading. Strict mode stops with `budget_unavailable` when metering required
-  by an active cap is incomplete. Exhaustion stops with `budget_exceeded`. Both save an
-  `incomplete` task outcome with the budget snapshot and send no extra grace call.
+  by an active cap is incomplete, naming any blocking artifact, any quarantined
+  lower-bound file, and the documented way out: either run
+  `harness usage-repair --root <project> --session <id> --accept-lower-bound`
+  (audited, so strict mode enforces caps against the carried-forward lower-bound
+  baseline while still failing closed on any new gap), set
+  `strictMetering: false` / disable the session cap, or start a new session.
+  `harness usage-repair` prints the real state and never prints
+  `recovery gap cleared` while strict metering remains blocked. Exhaustion stops
+  with `budget_exceeded`. Both save an `incomplete` task outcome with the budget
+  snapshot and send no extra grace call.
   Manual `/compact` uses the same turn token cap, dollar cap, and strict-metering
   setting as a model turn, plus the session caps. It does not apply the turn's
   wall-clock deadline. Negative, malformed, or overflowing provider usage is
