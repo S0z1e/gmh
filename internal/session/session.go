@@ -61,11 +61,17 @@ func (s *Store) Audit(v any) error {
 }
 
 func (s *Store) auditLocked(v any) error {
-	unlock, err := lockManagement()
-	if err != nil {
-		return err
+	return s.auditWithManagementLocked(v, false)
+}
+
+func (s *Store) auditWithManagementLocked(v any, holdingManagementLock bool) error {
+	if !holdingManagementLock {
+		unlock, err := lockManagement()
+		if err != nil {
+			return err
+		}
+		defer unlock()
 	}
-	defer unlock()
 
 	if !s.closed && s.file == nil {
 		return ErrOperationPending

@@ -79,14 +79,15 @@ func usageRepair(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "strict metering still blocked: %s\n", session.IncompleteUsageError(*sessionID, *root, totals))
 		return nil
 	}
-	if !totals.TokenCountsComplete() {
+	if totals.UnpricedAttempts() > 0 && !totals.LowerBoundCostAccepted() {
+		fmt.Fprintf(stdout, "strict metering still blocked for cost caps: %s\n", session.IncompleteUsageError(*sessionID, *root, totals))
+		return nil
+	}
+	if !totals.TokenCountsComplete() || totals.UnpricedAttempts() > 0 {
 		fmt.Fprintln(stdout, "strict metering unblocked with lower-bound baseline")
 		return nil
 	}
 	fmt.Fprintln(stdout, "recovery gap cleared")
-	if totals.UnpricedAttempts() > 0 && !totals.LowerBoundCostAccepted() {
-		fmt.Fprintf(stdout, "note: %d unpriced attempt(s) remain if a strict session cost cap is active (acknowledge with --accept-lower-bound)\n", totals.UnpricedAttempts())
-	}
 	return nil
 }
 

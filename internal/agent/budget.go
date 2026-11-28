@@ -95,12 +95,11 @@ func (c *Config) startBudgetWithPolicy(parent context.Context, policy *turnbudge
 				c.resources.failure = unavail
 				return parent, func() {}, unavail
 			}
+			seed := b.SeedSessionUsage
 			if (limits.SessionTokens > 0 && !tokensComplete) || (limits.SessionCostUSD > 0 && !costComplete) {
-				if err := b.SeedSessionLowerBound(int64(totals.Usage.TotalTokens), totals.ExactCost(), tokensComplete, costComplete); err != nil {
-					c.resources.failure = err
-					return parent, func() {}, err
-				}
-			} else if err := b.SeedSessionUsage(int64(totals.Usage.TotalTokens), totals.ExactCost(), tokensComplete, costComplete); err != nil {
+				seed = b.SeedSessionLowerBound
+			}
+			if err := seed(int64(totals.Usage.TotalTokens), totals.ExactCost(), tokensComplete, costComplete); err != nil {
 				c.resources.failure = err
 				return parent, func() {}, err
 			}

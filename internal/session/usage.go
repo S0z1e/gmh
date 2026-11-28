@@ -32,6 +32,11 @@ func SetUsageAppendFault(fault func() error) { usageAppendFault = fault }
 
 var usageAppendFault func() error
 
+const (
+	maxAttemptExactCostBytes      = 2048
+	maxCarryForwardExactCostBytes = 32 << 10
+)
+
 // UsageCarryForward preserves verified prefix totals when a damaged or
 // overridden usage journal is quarantined, so session caps never reset to zero.
 // It is stored on the header record (ID == "") of the replacement journal.
@@ -50,6 +55,7 @@ type UsageCarryForward struct {
 	QuarantinedAt      time.Time `json:"quarantined_at"`
 	LowerBound         bool      `json:"lower_bound,omitempty"`
 	LowerBoundAccepted bool      `json:"lower_bound_accepted,omitempty"`
+	HealthyOverride    bool      `json:"healthy_override,omitempty"`
 	DamageReason       string    `json:"damage_reason,omitempty"`
 }
 
@@ -195,7 +201,7 @@ func (t *UsageTotals) add(a UsageAttempt) error {
 	return nil
 }
 
-func parseUsageCost(estimate *float64, raw string, rejected bool) (*big.Rat, error) {
+func parseUsageCost(estimate *float64, raw string, rejected bool, maxExactBytes int) (*big.Rat, error) {
 	if estimate == nil && raw == "" {
 		return nil, nil
 	}
@@ -208,7 +214,7 @@ func parseUsageCost(estimate *float64, raw string, rejected bool) (*big.Rat, err
 		cost, _ := new(big.Rat).SetString(strconv.FormatFloat(*estimate, 'g', -1, 64))
 		return cost, nil
 	}
-	if len(raw) > 2048 || strings.ContainsFunc(raw, func(r rune) bool { return r != '/' && (r < '0' || r > '9') }) {
+	if len(raw) > maxExactBytes || strings.ContainsFunc(raw, func(r rune) bool { return r != '/' && (r < '0' || r > '9') }) {
 		return nil, fmt.Errorf("invalid exact usage cost")
 	}
 	cost, ok := new(big.Rat).SetString(raw)
@@ -222,7 +228,7 @@ func parseUsageCost(estimate *float64, raw string, rejected bool) (*big.Rat, err
 }
 
 func (a UsageAttempt) exactCost() (*big.Rat, error) {
-	return parseUsageCost(a.EstimateUSD, a.ExactEstimateUSD, a.Request.RejectedBeforeInference())
+	return parseUsageCost(a.EstimateUSD, a.ExactEstimateUSD, a.Request.RejectedBeforeInference(), maxAttemptExactCostBytes)
 }
 
 func (cf UsageCarryForward) exactCost() (*big.Rat, error) {
@@ -230,7 +236,7 @@ func (cf UsageCarryForward) exactCost() (*big.Rat, error) {
 		return nil, nil
 	}
 	est := cf.EstimateUSD
-	return parseUsageCost(&est, cf.ExactEstimateUSD, false)
+	return parseUsageCost(&est, cf.ExactEstimateUSD, false, maxCarryForwardExactCostBytes)
 }
 
 func (cf UsageCarryForward) validate() error {
@@ -254,16 +260,19 @@ func (cf UsageCarryForward) validate() error {
 	return nil
 }
 
-func exactCostFields(cost *big.Rat) (float64, string) {
+func exactCostFields(cost *big.Rat) (float64, string, error) {
 	if cost == nil || cost.Sign() == 0 {
-		return 0, ""
+		return 0, "", nil
 	}
 	amount, _ := cost.Float64()
-	raw := cost.RatString()
-	if len(raw) > 2048 {
-		return amount, ""
+	if math.IsNaN(amount) || math.IsInf(amount, 0) || amount < 0 {
+		return 0, "", fmt.Errorf("carry-forward cost overflow")
 	}
-	return amount, raw
+	raw := cost.RatString()
+	if len(raw) > maxCarryForwardExactCostBytes {
+		return 0, "", fmt.Errorf("carry-forward exact cost exceeds %d-byte limit", maxCarryForwardExactCostBytes)
+	}
+	return amount, raw, nil
 }
 
 func (s *Store) usagePathLocked() string {
@@ -289,9 +298,34 @@ func (s *Store) transcriptHasMessagesLocked() (bool, error) {
 	return hasMessages, err
 }
 
+// loadInitialUsageLocked runs inside openLocked while the caller already holds
+// lockManagement. Ordinary callers use loadUsageLocked instead.
+func (s *Store) loadInitialUsageLocked() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return os.ErrClosed
+	}
+	return s.loadUsageWithMgmtLocked(true)
+}
+
 // loadUsageLocked validates/reconciles the journal once per writer acquisition.
 // The transcript can be compacted or rolled back without erasing spent tokens.
 func (s *Store) loadUsageLocked() error {
+	return s.loadUsageWithMgmtLocked(false)
+}
+
+func (s *Store) loadUsageWithMgmtLocked(holdingMgmt bool) error {
+	if s.usageLoaded {
+		return nil
+	}
+	if _, _, err := s.recoverPendingQuarantineWithMgmtLocked(holdingMgmt); err != nil {
+		return err
+	}
+	return s.loadUsageAfterRecoveryLocked()
+}
+
+func (s *Store) loadUsageAfterRecoveryLocked() error {
 	if s.usageLoaded {
 		return nil
 	}

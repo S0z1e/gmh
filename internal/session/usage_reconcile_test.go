@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 	"errors"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -577,6 +578,216 @@ func TestAcceptUsageLowerBoundIsAuditedAndBlocksNewGaps(t *testing.T) {
 	auditData, err := os.ReadFile(s.AuditPath())
 	if err != nil || !strings.Contains(string(auditData), `"accept_lower_bound"`) {
 		t.Fatalf("lower-bound acknowledgment was not audited: %s %v", string(auditData), err)
+	}
+}
+
+func TestInterruptedQuarantineRecoversStagedHeaderOnReopen(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("interrupted", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 45)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s, err = Open("interrupted", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	plan, _, staged, err := s.stageQuarantineLocked(path, UsageRepairOptions{})
+	if err != nil || !staged {
+		s.mu.Unlock()
+		t.Fatalf("stage=%t err=%v", staged, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(plan.Dest), 0700); err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	// Simulate crash right after moving usage.jsonl to quarantine and before
+	// moving stagedHeader into place.
+	if err := os.Rename(plan.Source, plan.Dest); err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	s.Close()
+
+	reopened, err := Open("interrupted", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatalf("reopen failed after interrupted quarantine: %v", err)
+	}
+	defer reopened.Close()
+	totals, err := reopened.UsageTotals()
+	if err != nil || totals.Attempts != 1 || totals.Usage.TotalTokens != 45 || !totals.LowerBound || totals.QuarantinedFile != plan.Dest {
+		t.Fatalf("interrupted quarantine lost baseline: %+v %v", totals, err)
+	}
+	if _, err := os.Stat(reopened.quarantinePlanPathLocked()); !os.IsNotExist(err) {
+		t.Fatalf("pending plan was not cleaned up: %v", err)
+	}
+}
+
+func TestHealthyOverrideAuditFailureRetainsRecoverableEvidence(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("audit-fail", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 25)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	auditPath := s.AuditPath()
+	s.Close()
+	if err := os.MkdirAll(auditPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open("audit-fail", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RepairUsageWithOptions(UsageRepairQuarantine, path, UsageRepairOptions{ForceHealthy: true}); err == nil {
+		t.Fatal("expected audit write failure to fail override quarantine")
+	}
+	planPath := s.quarantinePlanPathLocked()
+	if _, err := os.Stat(planPath); err != nil {
+		t.Fatalf("pending quarantine plan missing after audit failure: %v", err)
+	}
+	s.Close()
+
+	if err := os.RemoveAll(auditPath); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open("audit-fail", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	report, err := s.RepairUsageWithOptions(UsageRepairQuarantine, path, UsageRepairOptions{ForceHealthy: true})
+	if err != nil {
+		t.Fatalf("retry after restoring audit path failed: %v", err)
+	}
+	if !report.HealthyOverride || report.CarryForward == nil || report.CarryForward.Usage.TotalTokens != 25 {
+		t.Fatalf("unexpected retry report: %+v", report)
+	}
+	auditData, err := os.ReadFile(auditPath)
+	if err != nil || !strings.Contains(string(auditData), `"healthy_override":true`) {
+		t.Fatalf("healthy override audit missing after recovery: %s %v", string(auditData), err)
+	}
+}
+
+func TestOversizedDamagedRecordRetainsValidPrefix(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("oversized", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 30)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("SECONDID", 40)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(strings.Repeat("x", 70*1024) + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	if _, err := Open("oversized", OpenOptions{Workspace: root}); !errors.Is(err, ErrUsageDamaged) {
+		t.Fatalf("expected ErrUsageDamaged on oversized line, got: %v", err)
+	}
+	s, err = Open("oversized", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	report, err := s.RepairUsage(UsageRepairQuarantine, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.CarryForward == nil || report.CarryForward.Attempts != 2 || report.CarryForward.Usage.TotalTokens != 70 {
+		t.Fatalf("oversized line discarded valid prefix: %+v", report)
+	}
+}
+
+func TestCarryForwardPreservesExactRationalOver2048Bytes(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("exact-rat", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Each denominator is >1024 digits and coprime, so each attempt's
+	// ExactEstimateUSD is < 2048 bytes while their sum exceeds 2048 bytes.
+	d1 := new(big.Int).Exp(big.NewInt(10), big.NewInt(1050), nil)
+	d1.Add(d1, big.NewInt(1))
+	d2 := new(big.Int).Exp(big.NewInt(10), big.NewInt(1050), nil)
+	d2.Add(d2, big.NewInt(3))
+	r1 := new(big.Rat).SetFrac(big.NewInt(1), d1)
+	r2 := new(big.Rat).SetFrac(big.NewInt(1), d2)
+	wantSum := new(big.Rat).Add(r1, r2)
+	if len(wantSum.RatString()) <= 2048 {
+		t.Fatalf("test setup sum too short: %d", len(wantSum.RatString()))
+	}
+	for i, r := range []*big.Rat{r1, r2} {
+		id := []string{"FIRSTID", "SECONDID"}[i]
+		f, _ := r.Float64()
+		a := usageAttempt(id, 10)
+		a.EstimateUSD = &f
+		a.ExactEstimateUSD = r.RatString()
+		if err := s.RecordUsage(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := s.usagePathLocked()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s, err = Open("exact-rat", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RepairUsage(UsageRepairQuarantine, path); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	reopened, err := Open("exact-rat", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	totals, err := reopened.UsageTotals()
+	if err != nil || totals.ExactCost().Cmp(wantSum) != 0 {
+		t.Fatalf("carry-forward lost exact rational precision: got=%s want=%s err=%v", totals.ExactCost().RatString(), wantSum.RatString(), err)
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 const (
 	usageReconcileDir       = "usage-reconcile"
 	usageQuarantineDir      = "usage-quarantine"
+	usageQuarantinePlanFile = "usage-quarantine-pending.json"
 	usageStateCommitted     = "committed"
 	usageStateNotDispatched = "not_dispatched"
 	usageStateUnknown       = "unknown"
@@ -309,6 +310,11 @@ func scanUsageJournal(r io.Reader, onValid func(UsageAttempt) error) (usageJourn
 		first = false
 	}
 	if err := sc.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			scan.damaged = true
+			scan.damageReason = "usage journal record exceeds 64 KiB limit"
+			return scan, nil
+		}
 		return scan, err
 	}
 	return scan, nil
@@ -380,54 +386,38 @@ func (s *Store) RepairUsageWithOptions(action, artifact string, opts UsageRepair
 	if s.closed {
 		return UsageReconciliation{}, os.ErrClosed
 	}
-	if err := s.loadUsageLocked(); err != nil && !errors.Is(err, errUsageDamaged) {
-		return UsageReconciliation{}, err
-	}
 	switch action {
 	case usageRepairQuarantine:
-		res, err := s.quarantineUsageLocked(artifact, opts)
+		pendingReport, recovered, err := s.recoverPendingQuarantineLocked()
 		if err != nil {
 			return UsageReconciliation{}, err
 		}
-		if res.moved {
-			pending, err := s.pendingUsageIDsLocked()
+		if recovered && len(pendingReport.Quarantined) > 0 && filepath.Clean(pendingReport.Quarantined[0]) == filepath.Clean(artifact) {
+			return pendingReport, nil
+		}
+		if err := s.loadUsageAfterRecoveryLocked(); err != nil && !errors.Is(err, errUsageDamaged) {
+			return UsageReconciliation{}, err
+		}
+		plan, planPath, staged, err := s.stageQuarantineLocked(artifact, opts)
+		if err != nil {
+			return UsageReconciliation{}, err
+		}
+		if !staged {
+			report, err := s.reconcileUsageLocked(action)
 			if err != nil {
 				return UsageReconciliation{}, err
 			}
-			for id := range res.committedIDs {
-				s.rememberCommitted(id)
-				if pending[id] {
-					if err := s.clearPendingUsageLocked(id); err != nil {
-						return UsageReconciliation{}, err
-					}
-				}
+			s.usageRecovery = report
+			if err := s.auditUsageActionLocked(action, report); err != nil {
+				return UsageReconciliation{}, err
 			}
-			s.usageLoaded = false
-			s.usageInfo = nil
-			s.usageTotals = UsageTotals{}
-			s.usageChainSeq = 0
-			s.usageChainDigest = ""
-			s.usageChainOn = false
+			return report, nil
 		}
-		if err := s.loadUsageLocked(); err != nil && !errors.Is(err, errUsageDamaged) {
+		if err := s.executeQuarantineMovesLocked(plan); err != nil {
 			return UsageReconciliation{}, err
 		}
-		report, err := s.reconcileUsageLocked(action)
-		if err != nil {
-			return UsageReconciliation{}, err
-		}
-		if res.moved {
-			report.Quarantined = append(report.Quarantined, artifact)
-			report.HealthyOverride = res.healthyOverride
-			if res.carryForward != nil {
-				report.CarryForward = res.carryForward
-			}
-		}
-		s.usageRecovery = report
-		if err := s.auditUsageActionLocked(action, report); err != nil {
-			return UsageReconciliation{}, err
-		}
-		return report, nil
+		report, _, err := s.finishQuarantineLocked(plan, planPath, false)
+		return report, err
 	default:
 		return UsageReconciliation{}, fmt.Errorf("unknown usage repair %q; use %s", action, usageRepairQuarantine)
 	}
@@ -445,47 +435,61 @@ func (s *Store) damagedJournal(reason string) error {
 	}}))
 }
 
-type quarantineResult struct {
-	moved           bool
-	healthyOverride bool
-	carryForward    *UsageCarryForward
-	committedIDs    map[string]bool
+type pendingUsageQuarantine struct {
+	Version         int                `json:"version"`
+	Artifact        string             `json:"artifact"`
+	Source          string             `json:"source"`
+	Dest            string             `json:"dest"`
+	StagedHeader    string             `json:"staged_header,omitempty"`
+	HealthyOverride bool               `json:"healthy_override,omitempty"`
+	CarryForward    *UsageCarryForward `json:"carry_forward,omitempty"`
+	CommittedIDs    []string           `json:"committed_ids,omitempty"`
 }
 
-func (s *Store) quarantineUsageLocked(artifact string, opts UsageRepairOptions) (quarantineResult, error) {
+func (s *Store) quarantinePlanPathLocked() string {
+	return filepath.Join(filepath.Dir(s.usagePathLocked()), usageQuarantinePlanFile)
+}
+
+func (s *Store) stageQuarantineLocked(artifact string, opts UsageRepairOptions) (pendingUsageQuarantine, string, bool, error) {
 	if artifact == "" {
-		return quarantineResult{}, fmt.Errorf("quarantine needs the artifact path named by the strict error")
+		return pendingUsageQuarantine{}, "", false, fmt.Errorf("quarantine needs the artifact path named by the strict error")
 	}
 	clean := filepath.Clean(artifact)
 	family := filepath.Dir(s.usagePathLocked())
 	rel, err := filepath.Rel(family, clean)
 	if err != nil || rel == "." || rel == ".." || strings.Contains(rel, string(os.PathSeparator)) {
-		return quarantineResult{}, fmt.Errorf("artifact %s is outside this session usage family", artifact)
+		return pendingUsageQuarantine{}, "", false, fmt.Errorf("artifact %s is outside this session usage family", artifact)
 	}
 	base := filepath.Base(clean)
 	allowed := base == "usage.jsonl" || strings.HasPrefix(base, usagePendingPrefix) || strings.Contains(base, ".jsonl-torn-")
 	if !allowed || strings.Contains(base, "..") {
-		return quarantineResult{}, fmt.Errorf("artifact %s is not a usage journal, marker, or recovery backup", artifact)
+		return pendingUsageQuarantine{}, "", false, fmt.Errorf("artifact %s is not a usage journal, marker, or recovery backup", artifact)
 	}
 	info, err := os.Lstat(clean)
 	if os.IsNotExist(err) {
-		return quarantineResult{}, nil
+		return pendingUsageQuarantine{}, "", false, nil
 	}
 	if err != nil {
-		return quarantineResult{}, err
+		return pendingUsageQuarantine{}, "", false, err
 	}
 	if !info.Mode().IsRegular() {
-		return quarantineResult{}, fmt.Errorf("artifact %s is not a regular file", artifact)
+		return pendingUsageQuarantine{}, "", false, fmt.Errorf("artifact %s is not a regular file", artifact)
 	}
 	destDir := s.quarantinePathLocked()
 	dest := filepath.Join(destDir, time.Now().UTC().Format("20060102T150405.000000000Z")+"-"+rand.Text()+"-"+base)
+	plan := pendingUsageQuarantine{
+		Version:  1,
+		Artifact: artifact,
+		Source:   clean,
+		Dest:     dest,
+	}
 	if base == "usage.jsonl" {
 		view, err := s.readUsageJournalLocked()
 		if err != nil {
-			return quarantineResult{}, err
+			return pendingUsageQuarantine{}, "", false, err
 		}
 		if !view.damaged && !opts.ForceHealthy {
-			return quarantineResult{}, fmt.Errorf("%w: %s loads cleanly; pass --allow-healthy to override", ErrUsageHealthy, clean)
+			return pendingUsageQuarantine{}, "", false, fmt.Errorf("%w: %s loads cleanly; pass --allow-healthy to override", ErrUsageHealthy, clean)
 		}
 		legacyHistory := view.totals.LegacyHistory
 		if !view.hasHeader {
@@ -493,7 +497,11 @@ func (s *Store) quarantineUsageLocked(artifact string, opts UsageRepairOptions) 
 				legacyHistory = true
 			}
 		}
-		estUSD, exactUSD := exactCostFields(view.totals.ExactCost())
+		estUSD, exactUSD, err := exactCostFields(view.totals.ExactCost())
+		if err != nil {
+			return pendingUsageQuarantine{}, "", false, err
+		}
+		healthyOverride := !view.damaged && opts.ForceHealthy
 		cf := &UsageCarryForward{
 			Usage:              view.totals.Usage,
 			Attempts:           view.totals.Attempts,
@@ -509,6 +517,7 @@ func (s *Store) quarantineUsageLocked(artifact string, opts UsageRepairOptions) 
 			QuarantinedAt:      time.Now().UTC(),
 			LowerBound:         view.damaged || view.totals.LowerBound,
 			LowerBoundAccepted: !view.damaged && view.totals.LowerBoundBaselineReady(),
+			HealthyOverride:    healthyOverride,
 			DamageReason:       view.damageReason,
 		}
 		header := UsageAttempt{
@@ -516,54 +525,189 @@ func (s *Store) quarantineUsageLocked(artifact string, opts UsageRepairOptions) 
 			LegacyHistory: legacyHistory,
 			CarryForward:  cf,
 		}
-		temp := clean + ".tmp-" + rand.Text()
-		if err := writePrivateJSONNoRename(temp, header); err != nil {
-			return quarantineResult{}, err
+		headerBytes, err := json.Marshal(header)
+		if err != nil {
+			return pendingUsageQuarantine{}, "", false, err
 		}
-		if err := os.MkdirAll(destDir, 0700); err != nil {
-			os.Remove(temp)
-			return quarantineResult{}, err
+		if len(headerBytes) >= 64<<10 {
+			return pendingUsageQuarantine{}, "", false, fmt.Errorf("carry-forward header exceeds 64 KiB journal record limit")
 		}
-		if err := os.Rename(clean, dest); err != nil {
-			os.Remove(temp)
-			return quarantineResult{}, err
-		}
-		if err := syncRecoveryDirectory(destDir); err != nil {
-			return quarantineResult{}, err
-		}
-		if err := os.Rename(temp, clean); err != nil {
-			_ = os.Rename(dest, clean)
-			os.Remove(temp)
-			return quarantineResult{}, err
+		stagedHeader := clean + ".tmp-" + rand.Text()
+		if err := writePrivateJSONNoRename(stagedHeader, header); err != nil {
+			return pendingUsageQuarantine{}, "", false, err
 		}
 		if err := syncRecoveryDirectory(family); err != nil {
-			return quarantineResult{}, err
+			os.Remove(stagedHeader)
+			return pendingUsageQuarantine{}, "", false, err
 		}
-		return quarantineResult{
-			moved:           true,
-			healthyOverride: !view.damaged && opts.ForceHealthy,
-			carryForward:    cf,
-			committedIDs:    view.ids,
-		}, nil
+		plan.StagedHeader = stagedHeader
+		plan.HealthyOverride = healthyOverride
+		plan.CarryForward = cf
+		for id := range view.ids {
+			plan.CommittedIDs = append(plan.CommittedIDs, id)
+		}
+		slices.Sort(plan.CommittedIDs)
 	}
+	planPath := s.quarantinePlanPathLocked()
+	if err := writePrivateJSON(planPath, plan); err != nil {
+		if plan.StagedHeader != "" {
+			os.Remove(plan.StagedHeader)
+		}
+		return pendingUsageQuarantine{}, "", false, err
+	}
+	return plan, planPath, true, nil
+}
+
+func (s *Store) executeQuarantineMovesLocked(plan pendingUsageQuarantine) error {
+	destDir := filepath.Dir(plan.Dest)
 	if err := os.MkdirAll(destDir, 0700); err != nil {
-		return quarantineResult{}, err
+		return err
 	}
-	if err := os.Rename(clean, dest); err != nil {
-		return quarantineResult{}, err
+	if _, err := os.Lstat(plan.Source); err == nil {
+		if err := os.Rename(plan.Source, plan.Dest); err != nil {
+			return err
+		}
+		if err := syncRecoveryDirectory(destDir); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
-	if err := syncRecoveryDirectory(destDir); err != nil {
-		return quarantineResult{}, err
+	if plan.StagedHeader != "" {
+		if _, err := os.Lstat(plan.StagedHeader); err == nil {
+			if err := os.Rename(plan.StagedHeader, plan.Source); err != nil {
+				return err
+			}
+			if err := syncRecoveryDirectory(filepath.Dir(plan.Source)); err != nil {
+				return err
+			}
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	} else {
+		if err := syncRecoveryDirectory(filepath.Dir(plan.Source)); err != nil {
+			return err
+		}
 	}
-	return quarantineResult{moved: true}, syncRecoveryDirectory(family)
+	return nil
+}
+
+func (s *Store) finishQuarantineLocked(plan pendingUsageQuarantine, planPath string, holdingMgmt bool) (UsageReconciliation, bool, error) {
+	if len(plan.CommittedIDs) > 0 {
+		pending, err := s.pendingUsageIDsLocked()
+		if err != nil {
+			return UsageReconciliation{}, false, err
+		}
+		for _, id := range plan.CommittedIDs {
+			s.rememberCommitted(id)
+			if pending[id] {
+				if err := s.clearPendingUsageLocked(id); err != nil {
+					return UsageReconciliation{}, false, err
+				}
+			}
+		}
+	}
+	s.usageLoaded = false
+	s.usageInfo = nil
+	s.usageTotals = UsageTotals{}
+	s.usageChainSeq = 0
+	s.usageChainDigest = ""
+	s.usageChainOn = false
+	if err := s.loadUsageAfterRecoveryLocked(); err != nil && !errors.Is(err, errUsageDamaged) {
+		return UsageReconciliation{}, false, err
+	}
+	report, err := s.reconcileUsageLocked(usageRepairQuarantine)
+	if err != nil {
+		return UsageReconciliation{}, false, err
+	}
+	report.Quarantined = append(report.Quarantined, plan.Artifact)
+	report.HealthyOverride = plan.HealthyOverride
+	if plan.CarryForward != nil {
+		report.CarryForward = plan.CarryForward
+	}
+	s.usageRecovery = report
+	if err := s.auditUsageActionWithMgmtLocked(usageRepairQuarantine, report, holdingMgmt); err != nil {
+		return UsageReconciliation{}, false, err
+	}
+	if err := os.Remove(planPath); err != nil && !os.IsNotExist(err) {
+		return UsageReconciliation{}, false, err
+	}
+	if err := syncRecoveryDirectory(filepath.Dir(planPath)); err != nil {
+		return UsageReconciliation{}, false, err
+	}
+	return report, true, nil
+}
+
+func (s *Store) recoverPendingQuarantineLocked() (UsageReconciliation, bool, error) {
+	return s.recoverPendingQuarantineWithMgmtLocked(false)
+}
+
+func (s *Store) recoverPendingQuarantineWithMgmtLocked(holdingMgmt bool) (UsageReconciliation, bool, error) {
+	planPath := s.quarantinePlanPathLocked()
+	info, err := os.Lstat(planPath)
+	if os.IsNotExist(err) {
+		return UsageReconciliation{}, false, nil
+	}
+	if err != nil {
+		return UsageReconciliation{}, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return UsageReconciliation{}, false, fmt.Errorf("pending quarantine plan must be a regular file")
+	}
+	data, err := os.ReadFile(planPath)
+	if err != nil {
+		return UsageReconciliation{}, false, err
+	}
+	var plan pendingUsageQuarantine
+	if err := json.Unmarshal(data, &plan); err != nil {
+		return UsageReconciliation{}, false, err
+	}
+	if plan.Version != 1 || plan.Source == "" || plan.Dest == "" {
+		return UsageReconciliation{}, false, fmt.Errorf("invalid pending quarantine plan")
+	}
+	_, srcErr := os.Lstat(plan.Source)
+	_, dstErr := os.Lstat(plan.Dest)
+	if srcErr == nil && os.IsNotExist(dstErr) {
+		// Interrupted before moving the original artifact; roll back staged files.
+		if plan.StagedHeader != "" {
+			_ = os.Remove(plan.StagedHeader)
+		}
+		if err := os.Remove(planPath); err != nil && !os.IsNotExist(err) {
+			return UsageReconciliation{}, false, err
+		}
+		return UsageReconciliation{}, false, syncRecoveryDirectory(filepath.Dir(planPath))
+	}
+	if srcErr != nil && !os.IsNotExist(srcErr) {
+		return UsageReconciliation{}, false, srcErr
+	}
+	if dstErr != nil {
+		return UsageReconciliation{}, false, dstErr
+	}
+	if plan.StagedHeader != "" {
+		if _, err := os.Lstat(plan.StagedHeader); err == nil {
+			if err := os.Rename(plan.StagedHeader, plan.Source); err != nil {
+				return UsageReconciliation{}, false, err
+			}
+			if err := syncRecoveryDirectory(filepath.Dir(plan.Source)); err != nil {
+				return UsageReconciliation{}, false, err
+			}
+		} else if !os.IsNotExist(err) {
+			return UsageReconciliation{}, false, err
+		}
+	}
+	return s.finishQuarantineLocked(plan, planPath, holdingMgmt)
 }
 
 func (s *Store) auditUsageActionLocked(action string, report UsageReconciliation) error {
-	return s.auditLocked(struct {
+	return s.auditUsageActionWithMgmtLocked(action, report, false)
+}
+
+func (s *Store) auditUsageActionWithMgmtLocked(action string, report UsageReconciliation, holdingMgmt bool) error {
+	return s.auditWithManagementLocked(struct {
 		Kind   string              `json:"kind"`
 		Action string              `json:"action"`
 		Report UsageReconciliation `json:"report"`
-	}{"usage_reconciliation", action, report})
+	}{"usage_reconciliation", action, report}, holdingMgmt)
 }
 
 func writePrivateJSONNoRename(path string, v any) error {
