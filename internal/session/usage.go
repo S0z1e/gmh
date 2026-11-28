@@ -99,6 +99,7 @@ type UsageTotals struct {
 	QuarantinedFile    string    `json:"quarantined_file,omitempty"`
 	LowerBoundAccepted bool      `json:"lower_bound_accepted,omitempty"`
 	accepted           acceptedBaseline
+	lastAcceptID       string
 	exactEstimateUSD   *big.Rat // replaced on each update so snapshots stay immutable
 }
 
@@ -169,6 +170,7 @@ func (t *UsageTotals) add(a UsageAttempt) error {
 	}
 	if a.AcceptLowerBound {
 		t.markLowerBoundAccepted()
+		t.lastAcceptID = a.ID
 		return nil
 	}
 	cost, err := a.exactCost()
@@ -654,7 +656,19 @@ func (s *Store) AcceptUsageLowerBound() (totals UsageTotals, changed bool, accep
 	if s.usageTotals.RecoveryGap {
 		return UsageTotals{}, false, BlockingUsageError(s.usageRecovery.Artifacts)
 	}
-	if (s.usageTotals.TokenCountsComplete() && s.usageTotals.UnpricedAttempts() == 0) || s.usageTotals.LowerBoundBaselineReady() {
+	if s.usageTotals.TokenCountsComplete() && s.usageTotals.UnpricedAttempts() == 0 {
+		recorded = true
+		return s.usageTotals, false, nil
+	}
+	if s.usageTotals.LowerBoundBaselineReady() {
+		if s.usageTotals.lastAcceptID != "" && !s.hasCommittedAcceptAuditLocked(s.usageTotals.lastAcceptID) {
+			if err := s.auditAcceptLowerBoundLocked("accept_lower_bound", s.usageTotals.lastAcceptID, s.usageRecovery); err != nil {
+				recorded = true
+				return UsageTotals{}, false, err
+			}
+			recorded = true
+			return s.usageTotals, true, nil
+		}
 		recorded = true
 		return s.usageTotals, false, nil
 	}
@@ -674,11 +688,9 @@ func (s *Store) AcceptUsageLowerBound() (totals UsageTotals, changed bool, accep
 	if err != nil {
 		return UsageTotals{}, false, err
 	}
-	previewRecovery := s.usageRecovery
-	previewRecovery.LowerBoundAccepted = true
-	previewRecovery.ChainSequences = s.usageChainSeq + 1
-	if err := s.auditUsageActionWithMgmtLocked("accept_lower_bound", previewRecovery, false); err != nil {
-		// Audit failed before modifying usage.jsonl; keep baseline unaccepted so retry works.
+	intentReport := s.usageRecovery
+	intentReport.LowerBoundAccepted = false
+	if err := s.auditAcceptLowerBoundLocked("accept_lower_bound_intent", id, intentReport); err != nil {
 		recorded = true
 		return UsageTotals{}, false, err
 	}
@@ -686,8 +698,12 @@ func (s *Store) AcceptUsageLowerBound() (totals UsageTotals, changed bool, accep
 		return UsageTotals{}, false, err
 	}
 	s.usageTotals = nextTotals
-	s.usageRecovery = previewRecovery
+	s.usageRecovery.LowerBoundAccepted = true
+	s.usageRecovery.ChainSequences = s.usageChainSeq
 	recorded = true
+	if err := s.auditAcceptLowerBoundLocked("accept_lower_bound", id, s.usageRecovery); err != nil {
+		return UsageTotals{}, true, err
+	}
 	return s.usageTotals, true, nil
 }
 

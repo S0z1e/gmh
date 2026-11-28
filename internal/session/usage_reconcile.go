@@ -18,6 +18,7 @@ const (
 	usageReconcileDir       = "usage-reconcile"
 	usageQuarantineDir      = "usage-quarantine"
 	usageQuarantinePlanFile = "usage-quarantine-pending.json"
+	maxQuarantinePlanBytes  = 4 << 20
 	usageStateCommitted     = "committed"
 	usageStateNotDispatched = "not_dispatched"
 	usageStateUnknown       = "unknown"
@@ -421,12 +422,12 @@ func (s *Store) RepairUsageWithOptions(action, artifact string, opts UsageRepair
 		if err := s.executeQuarantineMovesLocked(plan); err != nil {
 			return UsageReconciliation{}, err
 		}
-		familyRoot, family, err := s.openUsageFamilyRootLocked(false)
+		familyRoot, _, err := s.openUsageFamilyRootLocked(false)
 		if err != nil {
 			return UsageReconciliation{}, err
 		}
 		defer familyRoot.Close()
-		report, _, err := s.finishQuarantineLocked(familyRoot, family, plan, planPath, false)
+		report, _, err := s.finishQuarantineLocked(familyRoot, plan, planPath, false)
 		return report, err
 	default:
 		return UsageReconciliation{}, fmt.Errorf("unknown usage repair %q; use %s", action, usageRepairQuarantine)
@@ -583,15 +584,22 @@ func verifyReplacementJournalHeader(root *os.Root, name string, plan pendingUsag
 	if scan.damaged || !scan.hasHeader {
 		return false, nil
 	}
-	return carryForwardMatches(scan.carryForward, plan.CarryForward), nil
+	return scan.totals.LegacyHistory == plan.LegacyHistory && carryForwardMatches(scan.carryForward, plan.CarryForward), nil
 }
 
-func writePrivateJSONInRootNoRename(root *os.Root, name string, v any) error {
+func marshalPrivateJSON(v any) ([]byte, error) {
 	data, err := json.Marshal(v)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	data = append(data, '\n')
+	if len(data) > maxQuarantinePlanBytes {
+		return nil, fmt.Errorf("pending quarantine metadata exceeds %d-byte limit", maxQuarantinePlanBytes)
+	}
+	return data, nil
+}
+
+func writePrivateJSONBytesInRootNoRename(root *os.Root, name string, data []byte) error {
 	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
@@ -606,16 +614,28 @@ func writePrivateJSONInRootNoRename(root *os.Root, name string, v any) error {
 	return nil
 }
 
-func writePrivateJSONInRoot(root *os.Root, dirPath, name string, v any) error {
+func writePrivateJSONInRootNoRename(root *os.Root, name string, v any) error {
+	data, err := marshalPrivateJSON(v)
+	if err != nil {
+		return err
+	}
+	return writePrivateJSONBytesInRootNoRename(root, name, data)
+}
+
+func writePrivateJSONInRoot(root *os.Root, name string, v any) error {
+	data, err := marshalPrivateJSON(v)
+	if err != nil {
+		return err
+	}
 	temp := name + ".tmp-" + rand.Text()
-	if err := writePrivateJSONInRootNoRename(root, temp, v); err != nil {
+	if err := writePrivateJSONBytesInRootNoRename(root, temp, data); err != nil {
 		return err
 	}
 	if err := root.Rename(temp, name); err != nil {
 		_ = root.Remove(temp)
 		return err
 	}
-	return syncRecoveryDirectory(dirPath)
+	return syncRootDirectory(root)
 }
 
 func (s *Store) validatePendingQuarantineLocked(familyRoot *os.Root, plan pendingUsageQuarantine) error {
@@ -764,7 +784,7 @@ func (s *Store) stageQuarantineLocked(artifact string, opts UsageRepairOptions) 
 		if err := writePrivateJSONInRootNoRename(familyRoot, stagedBase, header); err != nil {
 			return pendingUsageQuarantine{}, "", false, err
 		}
-		if err := syncRecoveryDirectory(family); err != nil {
+		if err := syncRootDirectory(familyRoot); err != nil {
 			_ = familyRoot.Remove(stagedBase)
 			return pendingUsageQuarantine{}, "", false, err
 		}
@@ -772,12 +792,19 @@ func (s *Store) stageQuarantineLocked(artifact string, opts UsageRepairOptions) 
 		plan.LegacyHistory = legacyHistory
 		plan.HealthyOverride = healthyOverride
 		plan.CarryForward = cf
-		for id := range view.ids {
-			plan.CommittedIDs = append(plan.CommittedIDs, id)
+		pending, err := s.pendingUsageIDsLocked()
+		if err != nil {
+			_ = familyRoot.Remove(stagedBase)
+			return pendingUsageQuarantine{}, "", false, err
+		}
+		for id := range pending {
+			if view.ids[id] {
+				plan.CommittedIDs = append(plan.CommittedIDs, id)
+			}
 		}
 		slices.Sort(plan.CommittedIDs)
 	}
-	if err := writePrivateJSONInRoot(familyRoot, family, usageQuarantinePlanFile, plan); err != nil {
+	if err := writePrivateJSONInRoot(familyRoot, usageQuarantinePlanFile, plan); err != nil {
 		if plan.StagedHeader != "" {
 			_ = familyRoot.Remove(filepath.Base(plan.StagedHeader))
 		}
@@ -787,7 +814,7 @@ func (s *Store) stageQuarantineLocked(artifact string, opts UsageRepairOptions) 
 }
 
 func (s *Store) executeQuarantineMovesLocked(plan pendingUsageQuarantine) error {
-	familyRoot, family, err := s.openUsageFamilyRootLocked(false)
+	familyRoot, _, err := s.openUsageFamilyRootLocked(false)
 	if err != nil {
 		return err
 	}
@@ -797,6 +824,10 @@ func (s *Store) executeQuarantineMovesLocked(plan pendingUsageQuarantine) error 
 		return err
 	}
 	defer qRoot.Close()
+	qBefore, err := qRoot.Stat(".")
+	if err != nil {
+		return err
+	}
 	sourceBase := filepath.Base(plan.Source)
 	destBase := filepath.Base(plan.Dest)
 	if info, err := checkRootRegularOrMissing(familyRoot, sourceBase, "quarantine source"); err != nil {
@@ -805,7 +836,14 @@ func (s *Store) executeQuarantineMovesLocked(plan pendingUsageQuarantine) error 
 		if err := familyRoot.Rename(sourceBase, filepath.Join(usageQuarantineDir, destBase)); err != nil {
 			return err
 		}
-		if err := syncRecoveryDirectory(filepath.Join(family, usageQuarantineDir)); err != nil {
+		qAfter, statErr := qRoot.Stat(".")
+		if statErr != nil || !os.SameFile(qBefore, qAfter) {
+			return fmt.Errorf("quarantine directory changed during move")
+		}
+		if _, err := qRoot.Lstat(destBase); err != nil {
+			return fmt.Errorf("quarantined artifact missing from verified directory: %w", err)
+		}
+		if err := syncRootDirectory(qRoot); err != nil {
 			return err
 		}
 	}
@@ -817,19 +855,19 @@ func (s *Store) executeQuarantineMovesLocked(plan pendingUsageQuarantine) error 
 			if err := familyRoot.Rename(stagedBase, sourceBase); err != nil {
 				return err
 			}
-			if err := syncRecoveryDirectory(family); err != nil {
+			if err := syncRootDirectory(familyRoot); err != nil {
 				return err
 			}
 		}
 	} else {
-		if err := syncRecoveryDirectory(family); err != nil {
+		if err := syncRootDirectory(familyRoot); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Store) finishQuarantineLocked(familyRoot *os.Root, family string, plan pendingUsageQuarantine, planPath string, holdingMgmt bool) (UsageReconciliation, bool, error) {
+func (s *Store) finishQuarantineLocked(familyRoot *os.Root, plan pendingUsageQuarantine, planPath string, holdingMgmt bool) (UsageReconciliation, bool, error) {
 	if len(plan.CommittedIDs) > 0 {
 		pending, err := s.pendingUsageIDsLocked()
 		if err != nil {
@@ -853,7 +891,7 @@ func (s *Store) finishQuarantineLocked(familyRoot *os.Root, family string, plan 
 	if err := s.loadUsageAfterRecoveryLocked(); err != nil && !errors.Is(err, errUsageDamaged) {
 		return UsageReconciliation{}, false, err
 	}
-	if plan.CarryForward != nil && !carryForwardMatches(s.usageRecovery.CarryForward, plan.CarryForward) {
+	if plan.CarryForward != nil && (!carryForwardMatches(s.usageRecovery.CarryForward, plan.CarryForward) || s.usageTotals.LegacyHistory != plan.LegacyHistory) {
 		return UsageReconciliation{}, false, fmt.Errorf("pending quarantine plan %s does not match loaded carry-forward baseline", planPath)
 	}
 	report, err := s.reconcileUsageLocked(usageRepairQuarantine)
@@ -872,7 +910,7 @@ func (s *Store) finishQuarantineLocked(familyRoot *os.Root, family string, plan 
 	if err := familyRoot.Remove(usageQuarantinePlanFile); err != nil && !os.IsNotExist(err) {
 		return UsageReconciliation{}, false, err
 	}
-	if err := syncRecoveryDirectory(family); err != nil {
+	if err := syncRootDirectory(familyRoot); err != nil {
 		return UsageReconciliation{}, false, err
 	}
 	return report, true, nil
@@ -884,7 +922,7 @@ func (s *Store) recoverPendingQuarantineLocked() (UsageReconciliation, bool, err
 
 func (s *Store) recoverPendingQuarantineWithMgmtLocked(holdingMgmt bool) (UsageReconciliation, bool, error) {
 	planPath := s.quarantinePlanPathLocked()
-	familyRoot, family, err := s.openUsageFamilyRootLocked(false)
+	familyRoot, _, err := s.openUsageFamilyRootLocked(false)
 	if os.IsNotExist(err) {
 		return UsageReconciliation{}, false, nil
 	}
@@ -903,17 +941,20 @@ func (s *Store) recoverPendingQuarantineWithMgmtLocked(holdingMgmt bool) (UsageR
 	if err != nil {
 		return UsageReconciliation{}, false, err
 	}
-	data, readErr := io.ReadAll(io.LimitReader(f, (4<<20)+1))
+	data, readErr := io.ReadAll(io.LimitReader(f, maxQuarantinePlanBytes+1))
 	closeErr := f.Close()
 	if readErr != nil || closeErr != nil {
-		return UsageReconciliation{}, false, errors.Join(readErr, closeErr)
+		return UsageReconciliation{}, false, fmt.Errorf("read pending quarantine plan %s: %w", planPath, errors.Join(readErr, closeErr))
+	}
+	if len(data) > maxQuarantinePlanBytes {
+		return UsageReconciliation{}, false, fmt.Errorf("pending quarantine plan %s exceeds %d-byte limit", planPath, maxQuarantinePlanBytes)
 	}
 	var plan pendingUsageQuarantine
 	if err := json.Unmarshal(data, &plan); err != nil {
-		return UsageReconciliation{}, false, err
+		return UsageReconciliation{}, false, fmt.Errorf("decode pending quarantine plan %s: %w", planPath, err)
 	}
 	if err := s.validatePendingQuarantineLocked(familyRoot, plan); err != nil {
-		return UsageReconciliation{}, false, err
+		return UsageReconciliation{}, false, fmt.Errorf("invalid pending quarantine plan %s: %w", planPath, err)
 	}
 	sourceBase := filepath.Base(plan.Source)
 	destBase := filepath.Base(plan.Dest)
@@ -941,7 +982,7 @@ func (s *Store) recoverPendingQuarantineWithMgmtLocked(holdingMgmt bool) (UsageR
 		if err := familyRoot.Remove(usageQuarantinePlanFile); err != nil && !os.IsNotExist(err) {
 			return UsageReconciliation{}, false, err
 		}
-		return UsageReconciliation{}, false, syncRecoveryDirectory(family)
+		return UsageReconciliation{}, false, syncRootDirectory(familyRoot)
 	}
 	if dstInfo == nil {
 		return UsageReconciliation{}, false, fmt.Errorf("pending quarantine plan %s missing quarantined artifact %s", planPath, plan.Dest)
@@ -964,7 +1005,7 @@ func (s *Store) recoverPendingQuarantineWithMgmtLocked(holdingMgmt bool) (UsageR
 				if err := familyRoot.Rename(stagedBase, sourceBase); err != nil {
 					return err
 				}
-				return syncRecoveryDirectory(family)
+				return syncRootDirectory(familyRoot)
 			}
 			if plan.CarryForward == nil {
 				return fmt.Errorf("pending quarantine plan %s missing replacement header and carry-forward data", planPath)
@@ -974,12 +1015,12 @@ func (s *Store) recoverPendingQuarantineWithMgmtLocked(holdingMgmt bool) (UsageR
 				LegacyHistory: plan.LegacyHistory,
 				CarryForward:  plan.CarryForward,
 			}
-			if err := writePrivateJSONInRoot(familyRoot, family, sourceBase, header); err != nil {
+			if err := writePrivateJSONInRoot(familyRoot, sourceBase, header); err != nil {
 				return err
 			}
 			if stagedInfo != nil {
 				_ = familyRoot.Remove(stagedBase)
-				_ = syncRecoveryDirectory(family)
+				_ = syncRootDirectory(familyRoot)
 			}
 			return nil
 		}
@@ -1002,11 +1043,11 @@ func (s *Store) recoverPendingQuarantineWithMgmtLocked(holdingMgmt bool) (UsageR
 				}
 			} else if stagedInfo != nil {
 				_ = familyRoot.Remove(stagedBase)
-				_ = syncRecoveryDirectory(family)
+				_ = syncRootDirectory(familyRoot)
 			}
 		}
 	}
-	return s.finishQuarantineLocked(familyRoot, family, plan, planPath, holdingMgmt)
+	return s.finishQuarantineLocked(familyRoot, plan, planPath, holdingMgmt)
 }
 
 func (s *Store) auditUsageActionLocked(action string, report UsageReconciliation) error {
@@ -1019,6 +1060,36 @@ func (s *Store) auditUsageActionWithMgmtLocked(action string, report UsageReconc
 		Action string              `json:"action"`
 		Report UsageReconciliation `json:"report"`
 	}{"usage_reconciliation", action, report}, holdingMgmt, true)
+}
+
+func (s *Store) auditAcceptLowerBoundLocked(action, attemptID string, report UsageReconciliation) error {
+	return s.auditWithOptionsLocked(struct {
+		Kind      string              `json:"kind"`
+		Action    string              `json:"action"`
+		AttemptID string              `json:"attempt_id"`
+		Report    UsageReconciliation `json:"report"`
+	}{"usage_reconciliation", action, attemptID, report}, false, true)
+}
+
+func (s *Store) hasCommittedAcceptAuditLocked(attemptID string) bool {
+	f, err := os.Open(s.AuditPath())
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 4096), 4<<20)
+	for sc.Scan() {
+		var rec struct {
+			Kind      string `json:"kind"`
+			Action    string `json:"action"`
+			AttemptID string `json:"attempt_id"`
+		}
+		if json.Unmarshal(sc.Bytes(), &rec) == nil && rec.Kind == "usage_reconciliation" && rec.Action == "accept_lower_bound" && rec.AttemptID == attemptID {
+			return true
+		}
+	}
+	return false
 }
 
 func writePrivateJSONNoRename(path string, v any) error {

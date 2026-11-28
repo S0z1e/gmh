@@ -953,6 +953,155 @@ func TestAcceptUsageLowerBoundAuditFailureRemainsRetryable(t *testing.T) {
 	}
 }
 
+func TestRecoveryRejectsInstalledHeaderMissingLegacyHistoryFlag(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("legacy-check", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(llm.Message{Role: "user", Content: "pre-metering history"}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// Reopen without usage.jsonl so LegacyHistory=true is recorded in the new journal.
+	s, err = Open("legacy-check", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 20)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	s.mu.Lock()
+	plan, _, staged, err := s.stageQuarantineLocked(path, UsageRepairOptions{ForceHealthy: true})
+	if err != nil || !staged || !plan.LegacyHistory {
+		s.mu.Unlock()
+		t.Fatalf("stage=%t legacy=%t err=%v", staged, plan.LegacyHistory, err)
+	}
+	if err := s.executeQuarantineMovesLocked(plan); err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	// Replace installed header with LegacyHistory=false.
+	if err := writePrivateJSON(path, UsageAttempt{Version: 1, LegacyHistory: false, CarryForward: plan.CarryForward}); err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	s.Close()
+
+	if _, err := Open("legacy-check", OpenOptions{Workspace: root}); err == nil || !strings.Contains(err.Error(), usageQuarantinePlanFile) {
+		t.Fatalf("expected error naming plan when LegacyHistory mismatched, got: %v", err)
+	}
+}
+
+func TestQuarantinePlanExcludesCommittedAttemptsWithoutPendingMarkers(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("bounded-plan", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		id := string(rune('A'+i%26)) + "ATTEMPT" + string(rune('0'+i%10))
+		if err := s.RecordUsage(usageAttempt(id, 1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := s.usagePathLocked()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s, err = Open("bounded-plan", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.mu.Lock()
+	plan, _, staged, err := s.stageQuarantineLocked(path, UsageRepairOptions{})
+	s.mu.Unlock()
+	if err != nil || !staged {
+		t.Fatalf("stage=%t err=%v", staged, err)
+	}
+	if len(plan.CommittedIDs) != 0 {
+		t.Fatalf("expected no committed IDs in plan without pending markers, got %d", len(plan.CommittedIDs))
+	}
+}
+
+func TestAcceptUsageLowerBoundAppendFailureRecordsIntentOnly(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("ack-intent", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 30)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	auditPath := s.AuditPath()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s, err = Open("ack-intent", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RepairUsage(UsageRepairQuarantine, path); err != nil {
+		t.Fatal(err)
+	}
+	SetUsageAppendFault(func() error { return os.ErrPermission })
+	if _, _, err := s.AcceptUsageLowerBound(); err == nil {
+		SetUsageAppendFault(nil)
+		t.Fatal("expected AcceptUsageLowerBound to fail when journal append fails")
+	}
+	SetUsageAppendFault(nil)
+	s.Close()
+
+	auditData, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditStr := string(auditData)
+	if !strings.Contains(auditStr, `"accept_lower_bound_intent"`) || strings.Contains(auditStr, `"accept_lower_bound"`) || strings.Contains(auditStr, `"lower_bound_accepted":true`) {
+		t.Fatalf("unexpected audit after failed append: %s", auditStr)
+	}
+
+	reopened, err := Open("ack-intent", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	totals, err := reopened.UsageTotals()
+	if err != nil || totals.LowerBoundTokensAccepted() {
+		t.Fatalf("failed append activated lower-bound acceptance: %+v %v", totals, err)
+	}
+	totals, changed, err := reopened.AcceptUsageLowerBound()
+	if err != nil || !changed || !totals.LowerBoundTokensAccepted() {
+		t.Fatalf("retry after failed append failed: %+v changed=%t err=%v", totals, changed, err)
+	}
+	auditData, err = os.ReadFile(auditPath)
+	if err != nil || !strings.Contains(string(auditData), `"action":"accept_lower_bound"`) {
+		t.Fatalf("committed audit missing after retry: %s %v", string(auditData), err)
+	}
+}
+
 func TestOversizedDamagedRecordRetainsValidPrefix(t *testing.T) {
 	setTestHome(t, t.TempDir())
 	root := t.TempDir()
