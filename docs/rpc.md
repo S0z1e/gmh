@@ -62,10 +62,14 @@ echoed in the response):
   `/steal <id>`, `/rename <old> <new>`, `/plugins`, `/attach [path]`, `/quit`) behaves as the
   matching control request, exactly like the REPL; any other line,
   including an unknown `/foo`, is a task for the model.
-- `approval_response` `{"approval_id":"appr-1","approved":true}` →
+- `approval_response` `{"approval_id":"appr-<connection_id>-1","approved":true}` →
   `{"ok":true}`. The approval id comes from the `approval_request`
-  event; `id` (the request's own correlation id) is separate.
-- `continuation_response` `{"continuation_id":"cont-1","decision":"once"|"session"|"deny","updated_args":"{...}"}` →
+  event; `id` (the request's own correlation id) is separate. Approval
+  ids are unique to the process's `connection_id` (an optional
+  `connection_id` field is also checked against the current connection
+  when supplied); requests replayed from other connections cannot be
+  answered.
+- `continuation_response` `{"continuation_id":"cont-<connection_id>-1","decision":"once"|"session"|"deny","updated_args":"{...}"}` →
   `{"ok":true}`. Answers the doom-loop guard's `continuation_request`
   (see below): the model asked for the exact same tool call five
   times in a row. `decision` is `"once"` (run it this once, then the
@@ -75,17 +79,23 @@ echoed in the response):
   arguments, as a JSON string. This channel is deliberately separate
   from `approval_response`: the question is about the shape of the
   conversation, not whether a tool may act, so no approval rule
-  applies to it. In a headless run (`-p`, or no GUI) there is nobody
+  applies to it. Continuation ids are unique to the process's
+  `connection_id` (an optional `connection_id` field is also checked
+  when supplied); requests replayed from other connections cannot be
+  answered. In a headless run (`-p`, or no GUI) there is nobody
   to ask and the guard denies.
 - `abort` → `{"aborted":true|false}`. Cancels the running turn, cancels
   running background jobs belonging to the active session, and
   fails any approval, continuation, or question waiting on a dialog,
   so a turn blocked on approval can still be stopped.
-- `question_response` `{"question_id":"quest-1","answers":[{"question":0,"selected":["Postgres"],"custom":""}]}` →
+- `question_response` `{"question_id":"quest-<connection_id>-1","answers":[{"question":0,"selected":["Postgres"],"custom":""}]}` →
   `{"ok":true}`. Answers the model's `question_request` (see below):
   one answer per question, `selected` is the chosen option labels
   (several for a multi-select question), `custom` is free text when
   the user answered in their own words instead of picking an option.
+  Question ids are unique to the process's `connection_id` (an optional
+  `connection_id` field is also checked when supplied); requests
+  replayed from other connections cannot be answered.
   Answering fails a turn blocked on a question the same way `abort`
   does when the turn is aborted.
 - `clear_queue` → `{"cleared":N}`. Drops queued prompts, keeps
@@ -129,6 +139,9 @@ echoed in the response):
   a single oversized event listed in `skipped_sequences`. `output_open` reports
   this process's stdout. It is false after that stream fails. Reading another
   connection's log does not by itself mean this process's stdout is closed.
+  Any `approval_request`, `continuation_request`, or `question_request`
+  replayed from another connection is historical only and cannot be
+  answered.
 - `usage` returns lifetime `session` and `current_run` usage. Treat counts
   as subtotals when their corresponding completeness flag is false.
   `metering_available` indicates whether lifetime metering can be read.
@@ -239,7 +252,7 @@ Events (stdout):
 - `tool_backgrounded` / `background_wait` / `tool_background_done` —
   the background bash events, the same shapes as the CLI's scrollback
   notices.
-- `approval_request` `{"id":"appr-1","tool":"write","args":{...},"prompt":"Run write ...?"}` — `args` contains the complete invocation, without a preview cap; render it in a scrollable or expandable view. Emitted by the approval bridge (not
+- `approval_request` `{"id":"appr-<connection_id>-1","tool":"write","args":{...},"prompt":"Run write ...?"}` — `args` contains the complete invocation, without a preview cap; render it in a scrollable or expandable view. Emitted by the approval bridge (not
   by the loop's `approval` event, which the server ignores to avoid
   sending it twice). The agent blocks until the GUI answers, the RPC
   approval timeout elapses, or the client detaches. The timeout defaults to
@@ -257,8 +270,8 @@ Events (stdout):
   `decision` (`approved` or `denied`), and a display `text`.
   The server emits it when automatic review finishes. The GUI sends no
   reply for this event.
-- `continuation_request` `{"id":"cont-1","tool":"read","prompt":"<canonical args>","repeat_count":5,"threshold":5}` — the doom-loop guard: the same tool call (tool name + canonical arguments) was requested five consecutive times. A different file, command or error breaks the streak, and a tool result that differs from the previous one for the same call does too (the call is making progress). The agent blocks until the GUI answers with `continuation_response`.
-- `question_request` `{"id":"quest-1","questions":[{"question":"Which database?","header":"DB","options":[{"label":"Postgres","description":"..."}],"multi_select":false}]}` — the model's `ask_user` tool: up to 4 questions, 2–4 options each. The agent blocks until the GUI answers with `question_response`. The answers reach the model as a tool observation; in a headless run there is nobody to ask, so the model gets an observation telling it to proceed with its best judgement and state its assumptions. The TUI does not ask either (same headless observation).
+- `continuation_request` `{"id":"cont-<connection_id>-1","tool":"read","prompt":"<canonical args>","repeat_count":5,"threshold":5}` — the doom-loop guard: the same tool call (tool name + canonical arguments) was requested five consecutive times. A different file, command or error breaks the streak, and a tool result that differs from the previous one for the same call does too (the call is making progress). The agent blocks until the GUI answers with `continuation_response`.
+- `question_request` `{"id":"quest-<connection_id>-1","questions":[{"question":"Which database?","header":"DB","options":[{"label":"Postgres","description":"..."}],"multi_select":false}]}` — the model's `ask_user` tool: up to 4 questions, 2–4 options each. The agent blocks until the GUI answers with `question_response`. The answers reach the model as a tool observation; in a headless run there is nobody to ask, so the model gets an observation telling it to proceed with its best judgement and state its assumptions. The TUI does not ask either (same headless observation).
 - `stop_blocked` `{"text":"go test failed"}` — a plugin `stop` hook vetoed the turn end (see `docs/plugins.md`). The turn continues; the GUI should show the reason as a notice, not as a failure. After 8 consecutive vetoes the turn is allowed to end anyway.
 - `step_retry` `{"text":"LLM call failed (attempt 1/4): LLM API 403 Forbidden: ...; retrying in 2s"}` — a transient LLM failure is being retried; the turn continues. The GUI should show it as a notice, not as a failure.
 - `step_discard` `{"text":"LLM stream cut off after partial output (...); discarding the partial reply"}` — the stream was cut off after showing partial text/thinking, and the call is being replayed from scratch. The GUI must drop everything it showed for the current step (text and thinking deltas since the last `step_usage`) before the replay's deltas arrive, or the half-reply will be duplicated.
