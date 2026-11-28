@@ -652,6 +652,7 @@ func TestHealthyOverrideAuditFailureRetainsRecoverableEvidence(t *testing.T) {
 	path := s.usagePathLocked()
 	auditPath := s.AuditPath()
 	s.Close()
+	_ = os.Remove(auditPath)
 	if err := os.MkdirAll(auditPath, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -789,6 +790,166 @@ func TestPendingQuarantinePlanRejectsOutsidePaths(t *testing.T) {
 	data, err := os.ReadFile(outsideFile)
 	if err != nil || string(data) != "keep" {
 		t.Fatalf("outside file was modified: %q %v", string(data), err)
+	}
+}
+
+func TestInterruptedQuarantineRebuildsTruncatedReplacementHeader(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("trunc-repl", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 25)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s, err = Open("trunc-repl", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	plan, _, staged, err := s.stageQuarantineLocked(path, UsageRepairOptions{})
+	if err != nil || !staged {
+		s.mu.Unlock()
+		t.Fatalf("stage=%t err=%v", staged, err)
+	}
+	if err := s.executeQuarantineMovesLocked(plan); err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	// Truncate the installed replacement before closing, simulating lost content.
+	if err := os.Truncate(path, 0); err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	s.Close()
+
+	reopened, err := Open("trunc-repl", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatalf("reopen failed after truncated replacement: %v", err)
+	}
+	defer reopened.Close()
+	totals, err := reopened.UsageTotals()
+	if err != nil || totals.Attempts != 1 || totals.Usage.TotalTokens != 25 || !totals.LowerBound || totals.QuarantinedFile != plan.Dest {
+		t.Fatalf("truncated replacement reset baseline: %+v %v", totals, err)
+	}
+}
+
+func TestQuarantineRejectsSymlinkedQuarantineDirectory(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	outsideDir := t.TempDir()
+	s, err := Open("sym-q", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 10)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	qDir := s.quarantinePathLocked()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := os.Symlink(outsideDir, qDir); err != nil {
+		t.Skipf("symlink not permitted: %v", err)
+	}
+
+	s, err = Open("sym-q", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.RepairUsage(UsageRepairQuarantine, path); err == nil {
+		t.Fatal("quarantine accepted symlinked usage-quarantine directory")
+	}
+	entries, err := os.ReadDir(outsideDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("quarantine wrote into symlink target: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestAcceptUsageLowerBoundAuditFailureRemainsRetryable(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("ack-audit", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 30)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	auditPath := s.AuditPath()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s, err = Open("ack-audit", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RepairUsage(UsageRepairQuarantine, path); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	_ = os.Remove(auditPath)
+	if err := os.MkdirAll(auditPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open("ack-audit", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AcceptUsageLowerBound(); err == nil {
+		t.Fatal("expected AcceptUsageLowerBound to fail when audit sidecar is unwritable")
+	}
+	s.Close()
+
+	if err := os.RemoveAll(auditPath); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open("ack-audit", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	totals, err := reopened.UsageTotals()
+	if err != nil || totals.LowerBoundTokensAccepted() {
+		t.Fatalf("failed audit still activated lower-bound acceptance: %+v %v", totals, err)
+	}
+	totals, changed, err := reopened.AcceptUsageLowerBound()
+	if err != nil || !changed || !totals.LowerBoundTokensAccepted() {
+		t.Fatalf("retry after audit fix failed: %+v changed=%t err=%v", totals, changed, err)
+	}
+	auditData, err := os.ReadFile(auditPath)
+	if err != nil || !strings.Contains(string(auditData), `"accept_lower_bound"`) {
+		t.Fatalf("audit entry missing after retry: %s %v", string(auditData), err)
 	}
 }
 

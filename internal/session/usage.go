@@ -674,16 +674,20 @@ func (s *Store) AcceptUsageLowerBound() (totals UsageTotals, changed bool, accep
 	if err != nil {
 		return UsageTotals{}, false, err
 	}
+	previewRecovery := s.usageRecovery
+	previewRecovery.LowerBoundAccepted = true
+	previewRecovery.ChainSequences = s.usageChainSeq + 1
+	if err := s.auditUsageActionWithMgmtLocked("accept_lower_bound", previewRecovery, false); err != nil {
+		// Audit failed before modifying usage.jsonl; keep baseline unaccepted so retry works.
+		recorded = true
+		return UsageTotals{}, false, err
+	}
 	if err := s.appendJournalLineLocked(data, s.usageTotals.LegacyHistory); err != nil {
 		return UsageTotals{}, false, err
 	}
 	s.usageTotals = nextTotals
-	s.usageRecovery.LowerBoundAccepted = true
-	s.usageRecovery.ChainSequences = s.usageChainSeq
+	s.usageRecovery = previewRecovery
 	recorded = true
-	if err := s.auditUsageActionLocked("accept_lower_bound", s.usageRecovery); err != nil {
-		return UsageTotals{}, true, err
-	}
 	return s.usageTotals, true, nil
 }
 

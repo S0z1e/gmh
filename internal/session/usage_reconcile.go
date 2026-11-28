@@ -421,7 +421,12 @@ func (s *Store) RepairUsageWithOptions(action, artifact string, opts UsageRepair
 		if err := s.executeQuarantineMovesLocked(plan); err != nil {
 			return UsageReconciliation{}, err
 		}
-		report, _, err := s.finishQuarantineLocked(plan, planPath, false)
+		familyRoot, family, err := s.openUsageFamilyRootLocked(false)
+		if err != nil {
+			return UsageReconciliation{}, err
+		}
+		defer familyRoot.Close()
+		report, _, err := s.finishQuarantineLocked(familyRoot, family, plan, planPath, false)
 		return report, err
 	default:
 		return UsageReconciliation{}, fmt.Errorf("unknown usage repair %q; use %s", action, usageRepairQuarantine)
@@ -474,21 +479,146 @@ func (s *Store) validateUsageArtifactPathLocked(artifact string) (clean, base st
 	return clean, base, nil
 }
 
-func checkRegularOrMissing(path, label string) (os.FileInfo, error) {
-	info, err := os.Lstat(path)
+func openSessionChildDirRoot(parent *os.Root, name string, create bool) (*os.Root, error) {
+	if create {
+		if err := parent.Mkdir(name, 0700); err != nil && !os.IsExist(err) {
+			return nil, err
+		}
+	}
+	info, err := parent.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%s must be a directory without symlinks", name)
+	}
+	child, err := parent.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := child.Stat(".")
+	if err != nil || !os.SameFile(info, opened) {
+		child.Close()
+		return nil, fmt.Errorf("%s directory changed while opening", name)
+	}
+	return child, nil
+}
+
+func (s *Store) openUsageFamilyRootLocked(create bool) (*os.Root, string, error) {
+	sessionsRoot, err := os.OpenRoot(Dir())
+	if err != nil {
+		return nil, "", err
+	}
+	defer sessionsRoot.Close()
+	familyPath := filepath.Dir(s.usagePathLocked())
+	familyName := filepath.Base(familyPath)
+	if create {
+		if err := sessionsRoot.Mkdir(familyName, 0700); err != nil && !os.IsExist(err) {
+			return nil, "", err
+		}
+		if err := syncRecoveryDirectory(Dir()); err != nil {
+			return nil, "", err
+		}
+	}
+	familyRoot, err := openSessionChildDirRoot(sessionsRoot, familyName, false)
+	if err != nil {
+		return nil, "", err
+	}
+	return familyRoot, familyPath, nil
+}
+
+func checkRootRegularOrMissing(root *os.Root, name, label string) (os.FileInfo, error) {
+	info, err := root.Lstat(name)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s %s is not a regular file", label, path)
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s %s is not a regular file", label, name)
 	}
 	return info, nil
 }
 
-func (s *Store) validatePendingQuarantineLocked(plan pendingUsageQuarantine) error {
+func carryForwardMatches(got, want *UsageCarryForward) bool {
+	if got == nil || want == nil {
+		return got == want
+	}
+	return got.QuarantinedFile == want.QuarantinedFile &&
+		got.Attempts == want.Attempts &&
+		got.InvalidAttempts == want.InvalidAttempts &&
+		got.UnreportedAttempts == want.UnreportedAttempts &&
+		got.PartialAttempts == want.PartialAttempts &&
+		got.PricedAttempts == want.PricedAttempts &&
+		got.RejectedAttempts == want.RejectedAttempts &&
+		got.TransientAttempts == want.TransientAttempts &&
+		got.Usage.PromptTokens == want.Usage.PromptTokens &&
+		got.Usage.CompletionTokens == want.Usage.CompletionTokens &&
+		got.Usage.TotalTokens == want.Usage.TotalTokens &&
+		got.EstimateUSD == want.EstimateUSD &&
+		got.ExactEstimateUSD == want.ExactEstimateUSD &&
+		got.LowerBound == want.LowerBound &&
+		got.LowerBoundAccepted == want.LowerBoundAccepted &&
+		got.HealthyOverride == want.HealthyOverride
+}
+
+func verifyReplacementJournalHeader(root *os.Root, name string, plan pendingUsageQuarantine) (bool, error) {
+	f, err := root.OpenFile(name, os.O_RDONLY|imageBlobReadFlags, 0)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return false, fmt.Errorf("replacement journal %s must be a regular file", name)
+	}
+	if err := checkTranscriptLinks(f); err != nil {
+		return false, err
+	}
+	scan, err := scanUsageJournal(f, nil)
+	if err != nil {
+		return false, err
+	}
+	if scan.damaged || !scan.hasHeader {
+		return false, nil
+	}
+	return carryForwardMatches(scan.carryForward, plan.CarryForward), nil
+}
+
+func writePrivateJSONInRootNoRename(root *os.Root, name string, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write(data)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		_ = root.Remove(name)
+		return errors.Join(writeErr, syncErr, closeErr)
+	}
+	return nil
+}
+
+func writePrivateJSONInRoot(root *os.Root, dirPath, name string, v any) error {
+	temp := name + ".tmp-" + rand.Text()
+	if err := writePrivateJSONInRootNoRename(root, temp, v); err != nil {
+		return err
+	}
+	if err := root.Rename(temp, name); err != nil {
+		_ = root.Remove(temp)
+		return err
+	}
+	return syncRecoveryDirectory(dirPath)
+}
+
+func (s *Store) validatePendingQuarantineLocked(familyRoot *os.Root, plan pendingUsageQuarantine) error {
 	if plan.Version != 1 || plan.Artifact == "" || plan.Source == "" || plan.Dest == "" {
 		return fmt.Errorf("invalid pending quarantine plan")
 	}
@@ -506,11 +636,18 @@ func (s *Store) validatePendingQuarantineLocked(plan pendingUsageQuarantine) err
 	if cleanDest != plan.Dest || relErr != nil || relDest == "." || relDest == ".." || strings.Contains(relDest, string(os.PathSeparator)) || !strings.HasSuffix(filepath.Base(cleanDest), "-"+base) {
 		return fmt.Errorf("invalid pending quarantine destination path: %s", plan.Dest)
 	}
-	if _, err := checkRegularOrMissing(plan.Source, "quarantine source"); err != nil {
+	if _, err := checkRootRegularOrMissing(familyRoot, base, "quarantine source"); err != nil {
 		return err
 	}
-	if _, err := checkRegularOrMissing(plan.Dest, "quarantine destination"); err != nil {
+	qRoot, err := openSessionChildDirRoot(familyRoot, usageQuarantineDir, false)
+	if err != nil && !os.IsNotExist(err) {
 		return err
+	}
+	if qRoot != nil {
+		defer qRoot.Close()
+		if _, err := checkRootRegularOrMissing(qRoot, filepath.Base(cleanDest), "quarantine destination"); err != nil {
+			return err
+		}
 	}
 	if base == "usage.jsonl" {
 		family := filepath.Dir(s.usagePathLocked())
@@ -521,7 +658,7 @@ func (s *Store) validatePendingQuarantineLocked(plan pendingUsageQuarantine) err
 		if plan.StagedHeader == "" || cleanStaged != plan.StagedHeader || relErr != nil || relStaged == "." || relStaged == ".." || strings.Contains(relStaged, string(os.PathSeparator)) || !strings.HasPrefix(stagedBase, "usage.jsonl.tmp-") || !validBackupID(nonce) {
 			return fmt.Errorf("invalid pending quarantine staged header path: %s", plan.StagedHeader)
 		}
-		if _, err := checkRegularOrMissing(plan.StagedHeader, "staged header"); err != nil {
+		if _, err := checkRootRegularOrMissing(familyRoot, stagedBase, "staged header"); err != nil {
 			return err
 		}
 		if plan.CarryForward == nil {
@@ -546,14 +683,26 @@ func (s *Store) stageQuarantineLocked(artifact string, opts UsageRepairOptions) 
 	if err != nil {
 		return pendingUsageQuarantine{}, "", false, err
 	}
-	info, err := checkRegularOrMissing(clean, "artifact")
+	familyRoot, family, err := s.openUsageFamilyRootLocked(false)
+	if os.IsNotExist(err) {
+		return pendingUsageQuarantine{}, "", false, nil
+	}
+	if err != nil {
+		return pendingUsageQuarantine{}, "", false, err
+	}
+	defer familyRoot.Close()
+	if qRoot, qErr := openSessionChildDirRoot(familyRoot, usageQuarantineDir, false); qErr != nil && !os.IsNotExist(qErr) {
+		return pendingUsageQuarantine{}, "", false, qErr
+	} else if qRoot != nil {
+		qRoot.Close()
+	}
+	info, err := checkRootRegularOrMissing(familyRoot, base, "artifact")
 	if err != nil {
 		return pendingUsageQuarantine{}, "", false, err
 	}
 	if info == nil {
 		return pendingUsageQuarantine{}, "", false, nil
 	}
-	family := filepath.Dir(s.usagePathLocked())
 	destDir := s.quarantinePathLocked()
 	dest := filepath.Join(destDir, time.Now().UTC().Format("20060102T150405.000000000Z")+"-"+rand.Text()+"-"+base)
 	plan := pendingUsageQuarantine{
@@ -611,15 +760,15 @@ func (s *Store) stageQuarantineLocked(artifact string, opts UsageRepairOptions) 
 		if len(headerBytes) >= 64<<10 {
 			return pendingUsageQuarantine{}, "", false, fmt.Errorf("carry-forward header exceeds 64 KiB journal record limit")
 		}
-		stagedHeader := clean + ".tmp-" + rand.Text()
-		if err := writePrivateJSONNoRename(stagedHeader, header); err != nil {
+		stagedBase := base + ".tmp-" + rand.Text()
+		if err := writePrivateJSONInRootNoRename(familyRoot, stagedBase, header); err != nil {
 			return pendingUsageQuarantine{}, "", false, err
 		}
 		if err := syncRecoveryDirectory(family); err != nil {
-			os.Remove(stagedHeader)
+			_ = familyRoot.Remove(stagedBase)
 			return pendingUsageQuarantine{}, "", false, err
 		}
-		plan.StagedHeader = stagedHeader
+		plan.StagedHeader = filepath.Join(family, stagedBase)
 		plan.LegacyHistory = legacyHistory
 		plan.HealthyOverride = healthyOverride
 		plan.CarryForward = cf
@@ -628,51 +777,59 @@ func (s *Store) stageQuarantineLocked(artifact string, opts UsageRepairOptions) 
 		}
 		slices.Sort(plan.CommittedIDs)
 	}
-	planPath := s.quarantinePlanPathLocked()
-	if err := writePrivateJSON(planPath, plan); err != nil {
+	if err := writePrivateJSONInRoot(familyRoot, family, usageQuarantinePlanFile, plan); err != nil {
 		if plan.StagedHeader != "" {
-			os.Remove(plan.StagedHeader)
+			_ = familyRoot.Remove(filepath.Base(plan.StagedHeader))
 		}
 		return pendingUsageQuarantine{}, "", false, err
 	}
-	return plan, planPath, true, nil
+	return plan, s.quarantinePlanPathLocked(), true, nil
 }
 
 func (s *Store) executeQuarantineMovesLocked(plan pendingUsageQuarantine) error {
-	destDir := filepath.Dir(plan.Dest)
-	if err := os.MkdirAll(destDir, 0700); err != nil {
+	familyRoot, family, err := s.openUsageFamilyRootLocked(false)
+	if err != nil {
 		return err
 	}
-	if _, err := os.Lstat(plan.Source); err == nil {
-		if err := os.Rename(plan.Source, plan.Dest); err != nil {
-			return err
-		}
-		if err := syncRecoveryDirectory(destDir); err != nil {
-			return err
-		}
-	} else if !os.IsNotExist(err) {
+	defer familyRoot.Close()
+	qRoot, err := openSessionChildDirRoot(familyRoot, usageQuarantineDir, true)
+	if err != nil {
 		return err
+	}
+	defer qRoot.Close()
+	sourceBase := filepath.Base(plan.Source)
+	destBase := filepath.Base(plan.Dest)
+	if info, err := checkRootRegularOrMissing(familyRoot, sourceBase, "quarantine source"); err != nil {
+		return err
+	} else if info != nil {
+		if err := familyRoot.Rename(sourceBase, filepath.Join(usageQuarantineDir, destBase)); err != nil {
+			return err
+		}
+		if err := syncRecoveryDirectory(filepath.Join(family, usageQuarantineDir)); err != nil {
+			return err
+		}
 	}
 	if plan.StagedHeader != "" {
-		if _, err := os.Lstat(plan.StagedHeader); err == nil {
-			if err := os.Rename(plan.StagedHeader, plan.Source); err != nil {
-				return err
-			}
-			if err := syncRecoveryDirectory(filepath.Dir(plan.Source)); err != nil {
-				return err
-			}
-		} else if !os.IsNotExist(err) {
+		stagedBase := filepath.Base(plan.StagedHeader)
+		if info, err := checkRootRegularOrMissing(familyRoot, stagedBase, "staged header"); err != nil {
 			return err
+		} else if info != nil {
+			if err := familyRoot.Rename(stagedBase, sourceBase); err != nil {
+				return err
+			}
+			if err := syncRecoveryDirectory(family); err != nil {
+				return err
+			}
 		}
 	} else {
-		if err := syncRecoveryDirectory(filepath.Dir(plan.Source)); err != nil {
+		if err := syncRecoveryDirectory(family); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Store) finishQuarantineLocked(plan pendingUsageQuarantine, planPath string, holdingMgmt bool) (UsageReconciliation, bool, error) {
+func (s *Store) finishQuarantineLocked(familyRoot *os.Root, family string, plan pendingUsageQuarantine, planPath string, holdingMgmt bool) (UsageReconciliation, bool, error) {
 	if len(plan.CommittedIDs) > 0 {
 		pending, err := s.pendingUsageIDsLocked()
 		if err != nil {
@@ -696,6 +853,9 @@ func (s *Store) finishQuarantineLocked(plan pendingUsageQuarantine, planPath str
 	if err := s.loadUsageAfterRecoveryLocked(); err != nil && !errors.Is(err, errUsageDamaged) {
 		return UsageReconciliation{}, false, err
 	}
+	if plan.CarryForward != nil && !carryForwardMatches(s.usageRecovery.CarryForward, plan.CarryForward) {
+		return UsageReconciliation{}, false, fmt.Errorf("pending quarantine plan %s does not match loaded carry-forward baseline", planPath)
+	}
 	report, err := s.reconcileUsageLocked(usageRepairQuarantine)
 	if err != nil {
 		return UsageReconciliation{}, false, err
@@ -709,10 +869,10 @@ func (s *Store) finishQuarantineLocked(plan pendingUsageQuarantine, planPath str
 	if err := s.auditUsageActionWithMgmtLocked(usageRepairQuarantine, report, holdingMgmt); err != nil {
 		return UsageReconciliation{}, false, err
 	}
-	if err := os.Remove(planPath); err != nil && !os.IsNotExist(err) {
+	if err := familyRoot.Remove(usageQuarantinePlanFile); err != nil && !os.IsNotExist(err) {
 		return UsageReconciliation{}, false, err
 	}
-	if err := syncRecoveryDirectory(filepath.Dir(planPath)); err != nil {
+	if err := syncRecoveryDirectory(family); err != nil {
 		return UsageReconciliation{}, false, err
 	}
 	return report, true, nil
@@ -724,77 +884,129 @@ func (s *Store) recoverPendingQuarantineLocked() (UsageReconciliation, bool, err
 
 func (s *Store) recoverPendingQuarantineWithMgmtLocked(holdingMgmt bool) (UsageReconciliation, bool, error) {
 	planPath := s.quarantinePlanPathLocked()
-	info, err := checkRegularOrMissing(planPath, "pending quarantine plan")
+	familyRoot, family, err := s.openUsageFamilyRootLocked(false)
+	if os.IsNotExist(err) {
+		return UsageReconciliation{}, false, nil
+	}
+	if err != nil {
+		return UsageReconciliation{}, false, err
+	}
+	defer familyRoot.Close()
+	info, err := checkRootRegularOrMissing(familyRoot, usageQuarantinePlanFile, "pending quarantine plan")
 	if err != nil {
 		return UsageReconciliation{}, false, err
 	}
 	if info == nil {
 		return UsageReconciliation{}, false, nil
 	}
-	data, err := os.ReadFile(planPath)
+	f, err := familyRoot.OpenFile(usageQuarantinePlanFile, os.O_RDONLY|imageBlobReadFlags, 0)
 	if err != nil {
 		return UsageReconciliation{}, false, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(f, (4<<20)+1))
+	closeErr := f.Close()
+	if readErr != nil || closeErr != nil {
+		return UsageReconciliation{}, false, errors.Join(readErr, closeErr)
 	}
 	var plan pendingUsageQuarantine
 	if err := json.Unmarshal(data, &plan); err != nil {
 		return UsageReconciliation{}, false, err
 	}
-	if err := s.validatePendingQuarantineLocked(plan); err != nil {
+	if err := s.validatePendingQuarantineLocked(familyRoot, plan); err != nil {
 		return UsageReconciliation{}, false, err
 	}
-	srcInfo, err := checkRegularOrMissing(plan.Source, "quarantine source")
+	sourceBase := filepath.Base(plan.Source)
+	destBase := filepath.Base(plan.Dest)
+	srcInfo, err := checkRootRegularOrMissing(familyRoot, sourceBase, "quarantine source")
 	if err != nil {
 		return UsageReconciliation{}, false, err
 	}
-	dstInfo, err := checkRegularOrMissing(plan.Dest, "quarantine destination")
-	if err != nil {
+	qRoot, err := openSessionChildDirRoot(familyRoot, usageQuarantineDir, false)
+	if err != nil && !os.IsNotExist(err) {
 		return UsageReconciliation{}, false, err
+	}
+	var dstInfo os.FileInfo
+	if qRoot != nil {
+		defer qRoot.Close()
+		dstInfo, err = checkRootRegularOrMissing(qRoot, destBase, "quarantine destination")
+		if err != nil {
+			return UsageReconciliation{}, false, err
+		}
 	}
 	if srcInfo != nil && dstInfo == nil {
 		// Interrupted before moving the original artifact; roll back staged files.
 		if plan.StagedHeader != "" {
-			_ = os.Remove(plan.StagedHeader)
+			_ = familyRoot.Remove(filepath.Base(plan.StagedHeader))
 		}
-		if err := os.Remove(planPath); err != nil && !os.IsNotExist(err) {
+		if err := familyRoot.Remove(usageQuarantinePlanFile); err != nil && !os.IsNotExist(err) {
 			return UsageReconciliation{}, false, err
 		}
-		return UsageReconciliation{}, false, syncRecoveryDirectory(filepath.Dir(planPath))
+		return UsageReconciliation{}, false, syncRecoveryDirectory(family)
 	}
 	if dstInfo == nil {
 		return UsageReconciliation{}, false, fmt.Errorf("pending quarantine plan %s missing quarantined artifact %s", planPath, plan.Dest)
 	}
 	if plan.StagedHeader != "" {
-		stagedInfo, err := checkRegularOrMissing(plan.StagedHeader, "staged header")
+		stagedBase := filepath.Base(plan.StagedHeader)
+		stagedInfo, err := checkRootRegularOrMissing(familyRoot, stagedBase, "staged header")
 		if err != nil {
 			return UsageReconciliation{}, false, err
 		}
-		if srcInfo == nil {
-			if stagedInfo != nil {
-				if err := os.Rename(plan.StagedHeader, plan.Source); err != nil {
-					return UsageReconciliation{}, false, err
-				}
-				if err := syncRecoveryDirectory(filepath.Dir(plan.Source)); err != nil {
-					return UsageReconciliation{}, false, err
-				}
-			} else {
-				if plan.CarryForward == nil {
-					return UsageReconciliation{}, false, fmt.Errorf("pending quarantine plan %s missing replacement header and carry-forward data", planPath)
-				}
-				header := UsageAttempt{
-					Version:       1,
-					LegacyHistory: plan.LegacyHistory,
-					CarryForward:  plan.CarryForward,
-				}
-				if err := writePrivateJSON(plan.Source, header); err != nil {
-					return UsageReconciliation{}, false, err
-				}
+		stagedValid := false
+		if stagedInfo != nil {
+			stagedValid, err = verifyReplacementJournalHeader(familyRoot, stagedBase, plan)
+			if err != nil {
+				return UsageReconciliation{}, false, err
 			}
-		} else if stagedInfo != nil {
-			_ = os.Remove(plan.StagedHeader)
-			_ = syncRecoveryDirectory(filepath.Dir(plan.StagedHeader))
+		}
+		installReplacement := func() error {
+			if stagedValid {
+				if err := familyRoot.Rename(stagedBase, sourceBase); err != nil {
+					return err
+				}
+				return syncRecoveryDirectory(family)
+			}
+			if plan.CarryForward == nil {
+				return fmt.Errorf("pending quarantine plan %s missing replacement header and carry-forward data", planPath)
+			}
+			header := UsageAttempt{
+				Version:       1,
+				LegacyHistory: plan.LegacyHistory,
+				CarryForward:  plan.CarryForward,
+			}
+			if err := writePrivateJSONInRoot(familyRoot, family, sourceBase, header); err != nil {
+				return err
+			}
+			if stagedInfo != nil {
+				_ = familyRoot.Remove(stagedBase)
+				_ = syncRecoveryDirectory(family)
+			}
+			return nil
+		}
+		if srcInfo == nil {
+			if err := installReplacement(); err != nil {
+				return UsageReconciliation{}, false, err
+			}
+		} else {
+			installedValid, err := verifyReplacementJournalHeader(familyRoot, sourceBase, plan)
+			if err != nil {
+				return UsageReconciliation{}, false, err
+			}
+			if !installedValid {
+				if srcInfo.Size() == 0 {
+					if err := installReplacement(); err != nil {
+						return UsageReconciliation{}, false, err
+					}
+				} else {
+					return UsageReconciliation{}, false, fmt.Errorf("pending quarantine plan %s does not match replacement journal %s", planPath, plan.Source)
+				}
+			} else if stagedInfo != nil {
+				_ = familyRoot.Remove(stagedBase)
+				_ = syncRecoveryDirectory(family)
+			}
 		}
 	}
-	return s.finishQuarantineLocked(plan, planPath, holdingMgmt)
+	return s.finishQuarantineLocked(familyRoot, family, plan, planPath, holdingMgmt)
 }
 
 func (s *Store) auditUsageActionLocked(action string, report UsageReconciliation) error {
