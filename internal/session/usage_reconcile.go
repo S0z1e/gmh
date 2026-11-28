@@ -987,6 +987,9 @@ func (s *Store) recoverPendingQuarantineWithMgmtLocked(holdingMgmt bool) (UsageR
 	if dstInfo == nil {
 		return UsageReconciliation{}, false, fmt.Errorf("pending quarantine plan %s missing quarantined artifact %s", planPath, plan.Dest)
 	}
+	if err := syncRootDirectory(qRoot); err != nil {
+		return UsageReconciliation{}, false, err
+	}
 	if plan.StagedHeader != "" {
 		stagedBase := filepath.Base(plan.StagedHeader)
 		stagedInfo, err := checkRootRegularOrMissing(familyRoot, stagedBase, "staged header")

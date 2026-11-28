@@ -1102,6 +1102,86 @@ func TestAcceptUsageLowerBoundAppendFailureRecordsIntentOnly(t *testing.T) {
 	}
 }
 
+func TestAcceptUsageLowerBoundCommittedAuditBackfillAcrossReopen(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("ack-backfill", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 30)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	auditPath := s.AuditPath()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s, err = Open("ack-backfill", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RepairUsage(UsageRepairQuarantine, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AcceptUsageLowerBound(); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// Simulate crash after journal ack landed and after intent audit landed,
+	// before the committed accept_lower_bound audit line was persisted.
+	auditData, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept []string
+	for _, line := range strings.Split(strings.TrimRight(string(auditData), "\n"), "\n") {
+		if strings.Contains(line, `"action":"accept_lower_bound"`) {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if err := os.WriteFile(auditPath, []byte(strings.Join(kept, "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open("ack-backfill", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	totals, changed, err := reopened.AcceptUsageLowerBound()
+	if err != nil || !changed || !totals.LowerBoundTokensAccepted() {
+		t.Fatalf("backfill retry failed: %+v changed=%t err=%v", totals, changed, err)
+	}
+	auditAfter, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, line := range strings.Split(strings.TrimRight(string(auditAfter), "\n"), "\n") {
+		var rec struct {
+			Action    string              `json:"action"`
+			AttemptID string              `json:"attempt_id"`
+			Report    UsageReconciliation `json:"report"`
+		}
+		if json.Unmarshal([]byte(line), &rec) == nil && rec.Action == "accept_lower_bound" {
+			found = rec.Report.LowerBoundAccepted && rec.AttemptID != ""
+		}
+	}
+	if !found {
+		t.Fatalf("backfilled committed audit missing lower_bound_accepted=true: %s", string(auditAfter))
+	}
+}
+
 func TestOversizedDamagedRecordRetainsValidPrefix(t *testing.T) {
 	setTestHome(t, t.TempDir())
 	root := t.TempDir()

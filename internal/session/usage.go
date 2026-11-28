@@ -435,11 +435,12 @@ func (s *Store) loadUsageAfterRecoveryLocked() error {
 	artifacts := usageArtifactsLocked(f.Name(), pending, backups)
 	scan.totals.RecoveryGap = len(artifacts) > 0
 	s.usageRecovery = UsageReconciliation{
-		SessionID:      s.ID,
-		Artifacts:      artifacts,
-		RecoveryGap:    scan.totals.RecoveryGap,
-		ChainSequences: s.usageChainSeq,
-		CarryForward:   scan.carryForward,
+		SessionID:          s.ID,
+		Artifacts:          artifacts,
+		RecoveryGap:        scan.totals.RecoveryGap,
+		ChainSequences:     s.usageChainSeq,
+		CarryForward:       scan.carryForward,
+		LowerBoundAccepted: scan.totals.LowerBoundBaselineReady(),
 	}
 	s.usageInfo, err = f.Stat()
 	if err != nil {
@@ -662,10 +663,14 @@ func (s *Store) AcceptUsageLowerBound() (totals UsageTotals, changed bool, accep
 	}
 	if s.usageTotals.LowerBoundBaselineReady() {
 		if s.usageTotals.lastAcceptID != "" && !s.hasCommittedAcceptAuditLocked(s.usageTotals.lastAcceptID) {
-			if err := s.auditAcceptLowerBoundLocked("accept_lower_bound", s.usageTotals.lastAcceptID, s.usageRecovery); err != nil {
+			committedReport := s.usageRecovery
+			committedReport.LowerBoundAccepted = true
+			committedReport.ChainSequences = s.usageChainSeq
+			if err := s.auditAcceptLowerBoundLocked("accept_lower_bound", s.usageTotals.lastAcceptID, committedReport); err != nil {
 				recorded = true
 				return UsageTotals{}, false, err
 			}
+			s.usageRecovery = committedReport
 			recorded = true
 			return s.usageTotals, true, nil
 		}
