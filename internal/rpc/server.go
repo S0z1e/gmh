@@ -519,12 +519,12 @@ func (s *Server) checkResponseConnection(req Request, kind, id string) error {
 	return nil
 }
 
-func popPending[T any](mu *sync.Mutex, pending map[string]T, id string) (T, bool) {
+func popPending[T any](mu *sync.Mutex, pending *map[string]T, id string) (T, bool) {
 	mu.Lock()
 	defer mu.Unlock()
-	val, ok := pending[id]
+	val, ok := (*pending)[id]
 	if ok {
-		delete(pending, id)
+		delete(*pending, id)
 	}
 	return val, ok
 }
@@ -534,7 +534,7 @@ func (s *Server) handleApprovalResponse(req Request) {
 		s.respond(req, nil, err)
 		return
 	}
-	pending, ok := popPending(&s.approvalsMu, s.approvals, req.ApprovalID)
+	pending, ok := popPending(&s.approvalsMu, &s.approvals, req.ApprovalID)
 	if !ok {
 		s.respond(req, nil, fmt.Errorf("unknown approval id %q", req.ApprovalID))
 		return
@@ -1163,7 +1163,7 @@ func (s *Server) handleContinuationResponse(req Request) {
 			return
 		}
 	}
-	wait, ok := popPending(&s.continuationsMu, s.continuations, req.ContinuationID)
+	wait, ok := popPending(&s.continuationsMu, &s.continuations, req.ContinuationID)
 	if !ok {
 		s.respond(req, nil, fmt.Errorf("unknown continuation id %q", req.ContinuationID))
 		return
@@ -1230,7 +1230,7 @@ func (s *Server) handleQuestionResponse(req Request) {
 		s.respond(req, nil, err)
 		return
 	}
-	ch, ok := popPending(&s.questionsMu, s.questions, req.QuestionID)
+	ch, ok := popPending(&s.questionsMu, &s.questions, req.QuestionID)
 	if !ok {
 		s.respond(req, nil, fmt.Errorf("unknown question id %q", req.QuestionID))
 		return

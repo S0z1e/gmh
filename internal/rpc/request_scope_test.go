@@ -2,13 +2,16 @@ package rpc
 
 import (
 	"encoding/json"
+	"io"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"minimalharness/internal/agent"
 	"minimalharness/internal/app"
 )
 
@@ -259,5 +262,45 @@ func waitForReply(d *driver, id string, timeout time.Duration) map[string]any {
 			return rec
 		}
 		d.pending = append(d.pending, rec)
+	}
+}
+
+func TestResponseHandlersRaceSafeWithCleanup(t *testing.T) {
+	const iterations = 200
+	for i := 0; i < iterations; i++ {
+		s := &Server{
+			out:           io.Discard,
+			connectionID:  "conn-race",
+			approvals:     map[string]pendingApproval{"appr-conn-race-1": {ch: make(chan approvalAnswer, 1)}},
+			continuations: map[string]continuationWait{"cont-conn-race-1": {ch: make(chan agent.ContinuationDecision, 1), err: make(chan error, 1)}},
+			questions:     map[string]chan questionAnswer{"quest-conn-race-1": make(chan questionAnswer, 1)},
+		}
+		var wg sync.WaitGroup
+		wg.Add(6)
+		go func() {
+			defer wg.Done()
+			s.handleApprovalResponse(Request{ApprovalID: "appr-conn-race-1", ConnectionID: "conn-race", Approved: true})
+		}()
+		go func() {
+			defer wg.Done()
+			s.failApprovals(agent.ErrApprovalDetached)
+		}()
+		go func() {
+			defer wg.Done()
+			s.handleContinuationResponse(Request{ContinuationID: "cont-conn-race-1", ConnectionID: "conn-race", Decision: "once"})
+		}()
+		go func() {
+			defer wg.Done()
+			s.failContinuations(agent.ErrApprovalDetached)
+		}()
+		go func() {
+			defer wg.Done()
+			s.handleQuestionResponse(Request{QuestionID: "quest-conn-race-1", ConnectionID: "conn-race"})
+		}()
+		go func() {
+			defer wg.Done()
+			s.failQuestions(agent.ErrApprovalDetached)
+		}()
+		wg.Wait()
 	}
 }
