@@ -684,9 +684,111 @@ func TestHealthyOverrideAuditFailureRetainsRecoverableEvidence(t *testing.T) {
 	if !report.HealthyOverride || report.CarryForward == nil || report.CarryForward.Usage.TotalTokens != 25 {
 		t.Fatalf("unexpected retry report: %+v", report)
 	}
+	quarantinedEntries, err := os.ReadDir(s.quarantinePathLocked())
+	if err != nil || len(quarantinedEntries) != 1 {
+		t.Fatalf("retry created duplicate quarantine artifacts: entries=%d err=%v", len(quarantinedEntries), err)
+	}
+	wantQuarantined := filepath.Join(s.quarantinePathLocked(), quarantinedEntries[0].Name())
+	if report.CarryForward.QuarantinedFile != wantQuarantined {
+		t.Fatalf("carry-forward pointed at %s, want %s", report.CarryForward.QuarantinedFile, wantQuarantined)
+	}
 	auditData, err := os.ReadFile(auditPath)
 	if err != nil || !strings.Contains(string(auditData), `"healthy_override":true`) {
 		t.Fatalf("healthy override audit missing after recovery: %s %v", string(auditData), err)
+	}
+}
+
+func TestInterruptedQuarantineRebuildsMissingStagedHeaderFromPlan(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	s, err := Open("missing-staged", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordUsage(usageAttempt("FIRSTID", 25)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.usagePathLocked()
+	s.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("broken\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s, err = Open("missing-staged", OpenOptions{Workspace: root, RepairDamagedUsage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	plan, _, staged, err := s.stageQuarantineLocked(path, UsageRepairOptions{})
+	if err != nil || !staged {
+		s.mu.Unlock()
+		t.Fatalf("stage=%t err=%v", staged, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(plan.Dest), 0700); err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	if err := os.Rename(plan.Source, plan.Dest); err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	// Remove staged header so neither live journal nor staged header exists.
+	if err := os.Remove(plan.StagedHeader); err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	s.Close()
+
+	reopened, err := Open("missing-staged", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatalf("reopen failed with missing staged header: %v", err)
+	}
+	defer reopened.Close()
+	totals, err := reopened.UsageTotals()
+	if err != nil || totals.Attempts != 1 || totals.Usage.TotalTokens != 25 || !totals.LowerBound || totals.QuarantinedFile != plan.Dest {
+		t.Fatalf("rebuilt header lost baseline: %+v %v", totals, err)
+	}
+}
+
+func TestPendingQuarantinePlanRejectsOutsidePaths(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	root := t.TempDir()
+	outsideFile := filepath.Join(t.TempDir(), "victim.txt")
+	if err := os.WriteFile(outsideFile, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open("bad-plan", OpenOptions{Workspace: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPath := s.quarantinePlanPathLocked()
+	usageDir := filepath.Dir(s.usagePathLocked())
+	s.Close()
+	if err := os.MkdirAll(usageDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	badPlan := pendingUsageQuarantine{
+		Version:      1,
+		Artifact:     outsideFile,
+		Source:       outsideFile,
+		Dest:         filepath.Join(usageDir, usageQuarantineDir, "stolen-victim.txt"),
+		StagedHeader: outsideFile,
+	}
+	if err := writePrivateJSON(planPath, badPlan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open("bad-plan", OpenOptions{Workspace: root}); err == nil {
+		t.Fatal("malformed quarantine plan with outside path was accepted")
+	}
+	data, err := os.ReadFile(outsideFile)
+	if err != nil || string(data) != "keep" {
+		t.Fatalf("outside file was modified: %q %v", string(data), err)
 	}
 }
 

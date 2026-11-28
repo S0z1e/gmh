@@ -76,6 +76,7 @@ func (c *Config) startBudgetWithPolicy(parent context.Context, policy *turnbudge
 			}
 		}
 		tokensComplete := totals.TokenCountsComplete()
+		seed := b.SeedSessionUsage
 		if limits.StrictMetering {
 			needTokensBlock := limits.SessionTokens > 0 && !tokensComplete && !totals.LowerBoundTokensAccepted()
 			needCostBlock := limits.SessionCostUSD > 0 && !costComplete && !totals.LowerBoundCostAccepted()
@@ -95,19 +96,13 @@ func (c *Config) startBudgetWithPolicy(parent context.Context, policy *turnbudge
 				c.resources.failure = unavail
 				return parent, func() {}, unavail
 			}
-			seed := b.SeedSessionUsage
 			if (limits.SessionTokens > 0 && !tokensComplete) || (limits.SessionCostUSD > 0 && !costComplete) {
 				seed = b.SeedSessionLowerBound
 			}
-			if err := seed(int64(totals.Usage.TotalTokens), totals.ExactCost(), tokensComplete, costComplete); err != nil {
-				c.resources.failure = err
-				return parent, func() {}, err
-			}
-		} else {
-			if err := b.SeedSessionUsage(int64(totals.Usage.TotalTokens), totals.ExactCost(), tokensComplete, costComplete); err != nil {
-				c.resources.failure = err
-				return parent, func() {}, err
-			}
+		}
+		if err := seed(int64(totals.Usage.TotalTokens), totals.ExactCost(), tokensComplete, costComplete); err != nil {
+			c.resources.failure = err
+			return parent, func() {}, err
 		}
 		if b.State().BaselineIncomplete {
 			fmt.Fprintf(os.Stderr, "warning: session %s metering baseline is incomplete; enforcing budgets against recorded lower-bound usage\n", c.Session.ID)

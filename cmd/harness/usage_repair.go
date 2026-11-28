@@ -84,7 +84,7 @@ func usageRepair(args []string, stdout, stderr io.Writer) error {
 		return nil
 	}
 	if !totals.TokenCountsComplete() || totals.UnpricedAttempts() > 0 {
-		fmt.Fprintln(stdout, "strict metering unblocked with lower-bound baseline")
+		fmt.Fprintln(stdout, "persisted lower-bound usage baseline ready (strict session caps enforce against recorded totals when required rates are configured)")
 		return nil
 	}
 	fmt.Fprintln(stdout, "recovery gap cleared")

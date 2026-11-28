@@ -75,7 +75,7 @@ func TestUsageRepairQuarantinesDamagedJournalAndMatchesRealState(t *testing.T) {
 	if err := usageRepair([]string{"--session", "repair", "--root", root, "--accept-lower-bound"}, &stdout, &stderr); err != nil {
 		t.Fatalf("accept-lower-bound failed: %v\n%s", err, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "strict metering unblocked with lower-bound baseline") {
+	if !strings.Contains(stdout.String(), "persisted lower-bound usage baseline ready") || strings.Contains(stdout.String(), "strict metering unblocked") || strings.Contains(stdout.String(), "recovery gap cleared") {
 		t.Fatalf("stdout=%s", stdout.String())
 	}
 }
@@ -187,7 +187,7 @@ func TestUsageRepairDoesNotClearWhenUnpricedAttemptsBlockCostCaps(t *testing.T) 
 	if err := usageRepair([]string{"--session", "repair-unpriced", "--root", root, "--accept-lower-bound"}, &stdout, &stderr); err != nil {
 		t.Fatalf("accept-lower-bound: %v\n%s", err, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "strict metering unblocked with lower-bound baseline") {
+	if !strings.Contains(stdout.String(), "persisted lower-bound usage baseline ready") || strings.Contains(stdout.String(), "strict metering unblocked") || strings.Contains(stdout.String(), "recovery gap cleared") {
 		t.Fatalf("stdout=%s", stdout.String())
 	}
 }

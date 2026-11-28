@@ -319,8 +319,13 @@ func (s *Store) loadUsageWithMgmtLocked(holdingMgmt bool) error {
 	if s.usageLoaded {
 		return nil
 	}
-	if _, _, err := s.recoverPendingQuarantineWithMgmtLocked(holdingMgmt); err != nil {
+	report, recovered, err := s.recoverPendingQuarantineWithMgmtLocked(holdingMgmt)
+	if err != nil {
 		return err
+	}
+	if recovered {
+		cp := report
+		s.recoveredQuarantine = &cp
 	}
 	return s.loadUsageAfterRecoveryLocked()
 }
